@@ -34,6 +34,7 @@ panic            = "deny"
 unreachable      = "deny"
 unimplemented    = "deny"
 todo             = "deny"
+dbg_macro        = "deny"
 indexing_slicing = "deny"
 missing_errors_doc = "warn"
 await_holding_lock = "deny"
@@ -54,9 +55,6 @@ targets = [
 	"x86_64-pc-windows-gnu",
 	"aarch64-apple-darwin",
 ]
-
-[workspace.metadata.cargo-fc.subcommands.lint]
-dedupe = true
 
 [workspace.metadata.cargo-fc.subcommands.udeps]
 maximal_features = true
