@@ -1,0 +1,13 @@
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+
+[alias]
+c = "check --workspace --all-targets"
+t = "nextest run -P default --retries 0 --no-tests warn --all-targets"
+
+# Linting. These are thin clippy aliases on purpose: the lint policy itself lives in
+# `[workspace.lints]` in Cargo.toml and in clippy.toml, not in the invocation. Callers
+# add the scope, so `task lint` expands to `clippy --all-targets --no-deps --workspace
+# --all-features`.
+lint = "clippy --all-targets --no-deps"
+fixit = "clippy --fix --allow-dirty --allow-staged --all-targets --no-deps"
