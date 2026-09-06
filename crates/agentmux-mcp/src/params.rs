@@ -1,0 +1,330 @@
+//! The shapes a caller fills in, and how they become core types.
+//!
+//! Changes when the tool arguments change.
+//!
+//! # Why the delegate is flat here and an enum inside
+//!
+//! [`agentmux::delegate::Delegate`] is an enum whose variants carry only what that vendor accepts,
+//! so a Codex consultation with a Claude account does not compile.
+//! A JSON Schema cannot express that without a discriminated union, and a discriminated union is
+//! the shape language models fill in wrong most often.
+//! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
+//! message, and the enum's guarantee intact everywhere behind it.
+
+use std::borrow::Cow;
+
+use agentmux::delegate::{ClaudeAccount, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::run::{Retention, RunId};
+use rmcp::ErrorData;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::Deserialize;
+
+/// Build the schema for a string-valued choice as a flat `enum`.
+///
+/// The derive would emit a `$ref` into `$defs` holding a `oneOf` of `const`s, and attach the
+/// field's description as a sibling of that `$ref`.
+/// Both halves are a problem here.
+/// `oneOf`-of-`const` is the shape models fill in least reliably and that strict function-calling
+/// modes rewrite, and hosts routinely drop `$ref` siblings — which on `delegate` would discard the
+/// one sentence that tells a caller to pick the vendor they are not.
+/// A flat `{"type": "string", "enum": [...]}` survives all of that.
+fn string_choice(description: &str, values: &[&str]) -> Schema {
+    json_schema!({
+        "type": "string",
+        "enum": values,
+        "description": description,
+    })
+}
+
+/// Which CLI to consult.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Vendor {
+    /// Anthropic's `claude` CLI: Claude models.
+    Claude,
+    /// The `codex` CLI from `OpenAI`: GPT models.
+    Codex,
+}
+
+/// Which of the machine's two Claude accounts to authenticate as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Account {
+    /// The default account.
+    #[default]
+    Work,
+    /// The secondary account, out of its own config directory.
+    Personal,
+}
+
+/// How much of the filesystem a Codex delegate may write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sandbox {
+    /// Read the working directory, write nothing.
+    #[default]
+    ReadOnly,
+    /// Also write inside the working directory.
+    WorkspaceWrite,
+}
+
+impl JsonSchema for Vendor {
+    fn schema_name() -> Cow<'static, str> {
+        "Vendor".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        string_choice("Which delegate CLI to run.", &["claude", "codex"])
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+impl JsonSchema for Account {
+    fn schema_name() -> Cow<'static, str> {
+        "Account".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        string_choice(
+            "Which of the machine's two Claude accounts to authenticate as.",
+            &["work", "personal"],
+        )
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+impl JsonSchema for Sandbox {
+    fn schema_name() -> Cow<'static, str> {
+        "Sandbox".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        string_choice(
+            "How much of the working directory a Codex delegate may write.",
+            &["read_only", "workspace_write"],
+        )
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+/// Who to consult, and on what terms.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DelegateParams {
+    /// Which CLI to run.
+    /// Choose the vendor you are NOT: your own harness already spawns same-vendor subagents
+    /// natively, so agentmux is for the cross-vendor second opinion.
+    pub delegate: Vendor,
+
+    /// Model identifier, passed to the delegate CLI verbatim and never checked against a list —
+    /// a model released tomorrow works today.
+    /// Use the vendor's full identifier, for example `claude-opus-5` or `claude-fable-5-1` for
+    /// `claude`, `gpt-6-astra` or `gpt-5.6-sol` for `codex`.
+    /// If the identifier is wrong the vendor's own error comes back and names what it accepts.
+    pub model: String,
+
+    /// Reasoning effort, passed verbatim: usually `high` or `xhigh`.
+    /// Always set it deliberately; leaving it to the delegate's configured default is how a review
+    /// silently runs at the wrong depth.
+    pub effort: String,
+
+    /// `claude` only.
+    /// `work` is the default account; `personal` authenticates out of the secondary config
+    /// directory instead.
+    /// Ask the user which one before the first consultation of a session, then keep using that
+    /// answer.
+    #[serde(default)]
+    #[schemars(with = "Account")]
+    pub account: Option<Account>,
+
+    /// `codex` only.
+    /// `read_only` is right for a review.
+    /// Use `workspace_write` only when the delegate must write a file itself — a read-only
+    /// delegate told to write its report completes the work, fails the write, and reports the
+    /// failure instead of the findings.
+    #[serde(default)]
+    #[schemars(with = "Sandbox")]
+    pub sandbox: Option<Sandbox>,
+}
+
+impl DelegateParams {
+    /// Parse the flat wire shape into the closed enum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error when the model or effort is not argv-safe, or when a
+    /// vendor-specific field was set for the other vendor.
+    pub fn build(&self) -> Result<Delegate, ErrorData> {
+        let model = ModelId::parse(&self.model).map_err(|error| {
+            ErrorData::invalid_params(
+                format!(
+                    "{error}. `model` is passed to the CLI as a single argument, so it must look \
+                     like a model identifier."
+                ),
+                None,
+            )
+        })?;
+        let effort = Effort::parse(&self.effort).map_err(|error| {
+            ErrorData::invalid_params(format!("{error}. Try `high` or `xhigh`."), None)
+        })?;
+
+        match self.delegate {
+            Vendor::Claude => {
+                if self.sandbox.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "`sandbox` belongs to `delegate: codex`, which is the only vendor with a \
+                         sandbox setting. A `claude` delegate runs in plan mode and is offered no \
+                         editing tools. Drop `sandbox`."
+                            .to_owned(),
+                        None,
+                    ));
+                }
+                Ok(Delegate::Claude {
+                    model,
+                    effort,
+                    account: match self.account.unwrap_or_default() {
+                        Account::Work => ClaudeAccount::Work,
+                        Account::Personal => ClaudeAccount::Personal,
+                    },
+                })
+            }
+            Vendor::Codex => {
+                if self.account.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "`account` belongs to `delegate: claude`, which has two accounts on this \
+                         machine. `codex` has one. Drop `account`."
+                            .to_owned(),
+                        None,
+                    ));
+                }
+                Ok(Delegate::Codex {
+                    model,
+                    effort,
+                    sandbox: match self.sandbox.unwrap_or_default() {
+                        Sandbox::ReadOnly => CodexSandbox::ReadOnly,
+                        Sandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// What to ask, and where the delegate reads the project from.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QuestionParams {
+    /// The question, in full.
+    /// The delegate starts with **no** conversation context and cannot see anything you have said,
+    /// so restate everything it needs: the goal, the files or diff to read, the scope, and the
+    /// output format you want back.
+    /// A one-line question gets a one-line answer.
+    pub question: String,
+
+    /// Absolute path to the checkout the delegate reads; it is the only project directory it
+    /// sees.
+    /// Defaults to the directory agentmux was started in, which is **not** where you are working
+    /// if you are in a git worktree or a nested checkout — pass it explicitly then, or the
+    /// delegate returns a confident review of code that was never under review.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub cwd: Option<String>,
+
+    /// Keep the consultation indefinitely, so a follow-up can arrive at any time.
+    /// Without this it is deleted 24 hours after it started.
+    /// Set it only when you expect to ask a follow-up after that window, because nothing deletes
+    /// a kept consultation automatically — a person runs `agentmux prune <run_id>`.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub keep: Option<bool>,
+}
+
+impl QuestionParams {
+    /// The question, rejected if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error when the question has no content.
+    pub fn text(&self) -> Result<String, ErrorData> {
+        if self.question.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "`question` is empty. The delegate starts with no context, so the question has to \
+                 carry everything it needs."
+                    .to_owned(),
+                None,
+            ));
+        }
+        Ok(self.question.clone())
+    }
+
+    /// The working directory, defaulting to the server's own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error when `cwd` is not an existing directory.
+    pub fn working_dir(&self) -> Result<std::path::PathBuf, ErrorData> {
+        let Some(cwd) = &self.cwd else {
+            return std::env::current_dir().map_err(|error| {
+                ErrorData::internal_error(
+                    format!(
+                        "agentmux cannot determine its own working directory: {error}. Pass \
+                             `cwd` explicitly."
+                    ),
+                    None,
+                )
+            });
+        };
+        let path = std::path::PathBuf::from(cwd);
+        if !path.is_absolute() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "`cwd` must be an absolute path; you passed {cwd:?}. A relative path resolves \
+                     against agentmux's own directory rather than yours, so it silently picks a \
+                     checkout you did not choose. Pass the absolute path, or omit `cwd`."
+                ),
+                None,
+            ));
+        }
+        if !path.is_dir() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "`cwd` {cwd} is not a directory. Pass an absolute path to the project the \
+                         delegate should read, or omit it to use agentmux's own directory."
+                ),
+                None,
+            ));
+        }
+        Ok(path)
+    }
+
+    /// How long the consultation is kept.
+    #[must_use]
+    pub fn retention(&self) -> Retention {
+        if self.keep.unwrap_or(false) {
+            Retention::UntilReleased
+        } else {
+            Retention::Ttl
+        }
+    }
+}
+
+/// Parse a run id supplied by a caller.
+///
+/// # Errors
+///
+/// Returns an invalid-params error naming the accepted shape and how to recover a real id.
+pub fn run_id(value: &str) -> Result<RunId, ErrorData> {
+    RunId::parse(value).map_err(|error| {
+        ErrorData::invalid_params(
+            format!("{error}. Call `list` to see the ids of recent consultations."),
+            None,
+        )
+    })
+}

@@ -1,0 +1,42 @@
+[package]
+name = "agentmux"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+documentation = "https://docs.rs/agentmux"
+publish = true
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["agent", "llm", "mcp", "review"]
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Only the timer, for the bounded wait in `run`.
+# The binary pulls in the full runtime.
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+# Detached process groups, liveness that survives pid reuse, and group-wide termination.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["process", "signal"] }
+
+[dev-dependencies]
+chrono = { workspace = true, features = ["serde"] }
+# The async tests need a runtime; the library itself needs only the timer.
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+googletest.workspace = true
+indoc.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "agentmux-mcp"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+documentation = "https://docs.rs/agentmux-mcp"
+publish = true
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["agent", "llm", "mcp", "review"]
+
+[lints]
+workspace = true
+
+[dependencies]
+agentmux = { path = "../agentmux" }
+
+rmcp.workspace = true
+schemars.workspace = true
+
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+googletest.workspace = true
+indoc.workspace = true
+tempfile.workspace = true

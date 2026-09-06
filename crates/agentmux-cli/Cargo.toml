@@ -1,0 +1,31 @@
+[package]
+name = "agentmux-cli"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+publish = true
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmux"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+agentmux = { path = "../agentmux" }
+agentmux-mcp = { path = "../agentmux-mcp" }
+
+clap.workspace = true
+color-eyre.workspace = true
+serde_json.workspace = true
+# `io-std` is the stdio transport the MCP server runs on.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-std", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

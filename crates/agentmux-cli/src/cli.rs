@@ -1,0 +1,394 @@
+//! The command-line surface.
+//!
+//! Changes when the CLI's arguments change.
+//!
+//! The same eight verbs the MCP server exposes, plus `mcp` to serve them and `prune` to remove
+//! consultations by hand.
+//! A human debugging a delegation and an agent calling the tool are exercising exactly the same
+//! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
+
+use std::path::PathBuf;
+
+use agentmux::delegate::{ClaudeAccount, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::run::{Retention, RunId};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use color_eyre::eyre::{Result, WrapErr as _, bail};
+
+/// Delegate a question to another vendor's coding agent and keep the whole transcript.
+#[derive(Debug, Parser)]
+#[command(name = "agentmux", version, about, long_about = None)]
+pub struct Cli {
+    /// Where consultations are stored.
+    /// Defaults to the platform state directory.
+    #[arg(long, global = true, env = agentmux::run::RunStore::STATE_DIR_ENV)]
+    pub state_dir: Option<PathBuf>,
+
+    /// Print machine-readable JSON instead of prose.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// What to do.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Ask a delegate a question and wait for the answer.
+    ///
+    /// Starts the consultation and blocks until it finishes or `--wait` elapses, whichever comes
+    /// first.
+    /// Waiting too long is never fatal: the consultation keeps running and its id is printed so it
+    /// can be collected later.
+    Ask(AskArgs),
+
+    /// Begin a consultation and return immediately.
+    Start(StartArgs),
+
+    /// Report how a consultation is doing.
+    Status(RunArgs),
+
+    /// Print the transcript written since a cursor, then the next cursor.
+    Tail(TailArgs),
+
+    /// Print the whole transcript.
+    Result(ResultArgs),
+
+    /// Ask a finished consultation one more question, in the delegate's own session.
+    #[command(name = "follow-up", alias = "followup")]
+    FollowUp(FollowUpArgs),
+
+    /// Stop a running consultation, keeping everything collected so far.
+    Cancel(RunArgs),
+
+    /// List recent consultations.
+    List(ListArgs),
+
+    /// Delete consultations past their retention, or one by id.
+    Prune(PruneArgs),
+
+    /// Serve the tools over stdio, for an MCP host to launch.
+    Mcp,
+}
+
+/// Which delegate to consult, and on what terms.
+#[derive(Debug, Args)]
+pub struct DelegateArgs {
+    /// Which CLI to consult: `claude` reaches Anthropic models, `codex` reaches GPT models.
+    #[arg(long, value_enum)]
+    pub delegate: VendorArg,
+
+    /// Model identifier, passed to the delegate CLI verbatim, for example `claude-opus-5` or
+    /// `gpt-6-astra`.
+    /// agentmux keeps no roster; the delegate CLI decides what is valid.
+    #[arg(long)]
+    pub model: String,
+
+    /// Reasoning effort, passed verbatim, for example `xhigh`.
+    /// Always pinned explicitly rather than inherited from the delegate's configured default.
+    #[arg(long)]
+    pub effort: String,
+
+    /// Which Claude account to authenticate as, for `--delegate claude`.
+    /// Defaults to `work`.
+    ///
+    /// Optional rather than defaulted, so setting it on a codex delegate is an error rather than
+    /// a silently ignored flag.
+    /// The MCP surface rejects the same mistake, and the two must not disagree about one request.
+    #[arg(long, value_enum)]
+    pub account: Option<AccountArg>,
+
+    /// How much of the filesystem the delegate may write, for `--delegate codex`.
+    /// Defaults to `read-only`.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<SandboxArg>,
+}
+
+/// Which CLI to consult.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VendorArg {
+    /// Anthropic's `claude`.
+    Claude,
+    /// The `codex` CLI from `OpenAI`.
+    Codex,
+}
+
+/// Which of the machine's two Claude accounts to authenticate as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AccountArg {
+    /// The default account, using the CLI's own config directory.
+    Work,
+    /// The secondary account, out of `$HOME/.claude-personal`.
+    Personal,
+}
+
+/// How much of the filesystem a Codex delegate may write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SandboxArg {
+    /// Read the working directory, write nothing.
+    ReadOnly,
+    /// Also write inside the working directory.
+    WorkspaceWrite,
+}
+
+impl DelegateArgs {
+    /// Build the delegate, rejecting an option that belongs to the other vendor.
+    ///
+    /// The core type carries only what each vendor accepts, so the mismatch has to be caught here
+    /// rather than deeper down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model or effort is not argv-safe, or when a vendor-specific
+    /// option was set for the wrong vendor.
+    pub fn build(&self) -> Result<Delegate> {
+        let model = ModelId::parse(&self.model).wrap_err("invalid --model")?;
+        let effort = Effort::parse(&self.effort).wrap_err("invalid --effort")?;
+        match self.delegate {
+            VendorArg::Claude => {
+                if self.sandbox.is_some() {
+                    bail!(
+                        "--sandbox applies to --delegate codex, the only vendor with a sandbox \
+                         setting. A claude delegate runs in plan mode and is offered no editing \
+                         tools."
+                    );
+                }
+                Ok(Delegate::Claude {
+                    model,
+                    effort,
+                    account: match self.account.unwrap_or(AccountArg::Work) {
+                        AccountArg::Work => ClaudeAccount::Work,
+                        AccountArg::Personal => ClaudeAccount::Personal,
+                    },
+                })
+            }
+            VendorArg::Codex => {
+                if self.account.is_some() {
+                    bail!(
+                        "--account applies to --delegate claude, which has two accounts on this \
+                         machine. codex has one."
+                    );
+                }
+                Ok(Delegate::Codex {
+                    model,
+                    effort,
+                    sandbox: match self.sandbox.unwrap_or(SandboxArg::ReadOnly) {
+                        SandboxArg::ReadOnly => CodexSandbox::ReadOnly,
+                        SandboxArg::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// Where the question comes from, and where the delegate reads the project.
+#[derive(Debug, Args)]
+pub struct QuestionArgs {
+    /// The question.
+    /// Omit it to read the question from stdin, which is what a long brief wants.
+    pub question: Option<String>,
+
+    /// Read the question from a file instead.
+    #[arg(long, short = 'f', conflicts_with = "question")]
+    pub file: Option<PathBuf>,
+
+    /// The directory the delegate reads the project from.
+    /// Defaults to the current directory.
+    #[arg(long, short = 'C')]
+    pub cwd: Option<PathBuf>,
+
+    /// Keep the consultation indefinitely so a follow-up can arrive at any time.
+    ///
+    /// Without this it is swept 24 hours after it started.
+    #[arg(long)]
+    pub keep: bool,
+}
+
+impl QuestionArgs {
+    /// Read the question from wherever it was supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, stdin cannot be read, or the question is
+    /// empty — a delegate given an empty brief burns money to say nothing.
+    pub fn text(&self) -> Result<String> {
+        let text = match (&self.question, &self.file) {
+            (Some(text), _) => text.clone(),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .wrap_err_with(|| format!("reading the question from {}", path.display()))?,
+            (None, None) => {
+                use std::io::Read as _;
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .wrap_err("reading the question from stdin")?;
+                buffer
+            }
+        };
+        if text.trim().is_empty() {
+            bail!(
+                "the question is empty. Pass it as an argument, with --file, or on stdin. The \
+                 delegate starts with no context, so the question has to be self-contained."
+            );
+        }
+        Ok(text)
+    }
+
+    /// The directory the delegate reads from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current directory cannot be determined.
+    pub fn working_dir(&self) -> Result<PathBuf> {
+        match &self.cwd {
+            Some(dir) => Ok(dir.clone()),
+            None => std::env::current_dir().wrap_err("determining the working directory"),
+        }
+    }
+
+    /// How long the consultation is kept.
+    #[must_use]
+    pub fn retention(&self) -> Retention {
+        if self.keep {
+            Retention::UntilReleased
+        } else {
+            Retention::Ttl
+        }
+    }
+}
+
+/// Arguments for `agentmux ask`: who to consult, what to ask, and how long to wait.
+#[derive(Debug, Args)]
+pub struct AskArgs {
+    #[command(flatten)]
+    pub delegate: DelegateArgs,
+    #[command(flatten)]
+    pub question: QuestionArgs,
+
+    /// How long to wait for the answer, in seconds.
+    /// `0` returns as soon as the child is running.
+    #[arg(long, default_value_t = 600)]
+    pub wait: u64,
+}
+
+/// Arguments for `agentmux start`: who to consult and what to ask.
+#[derive(Debug, Args)]
+pub struct StartArgs {
+    #[command(flatten)]
+    pub delegate: DelegateArgs,
+    #[command(flatten)]
+    pub question: QuestionArgs,
+}
+
+/// A command that names one consultation.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// The consultation id, as printed by `start` or `list`.
+    pub run_id: RunIdArg,
+}
+
+/// Arguments for `agentmux tail`: which consultation to follow, and from where.
+#[derive(Debug, Args)]
+pub struct TailArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// Start from this byte offset.
+    /// Use the `next_cursor` a previous `tail` printed.
+    #[arg(long, default_value_t = 0)]
+    pub cursor: u64,
+
+    /// Most bytes to print.
+    #[arg(long, default_value_t = 64_000)]
+    pub max_bytes: usize,
+
+    /// Keep printing until the consultation finishes.
+    #[arg(long, short = 'F')]
+    pub follow: bool,
+}
+
+/// Arguments for `agentmux result`: which consultation to collect, and which page.
+#[derive(Debug, Args)]
+pub struct ResultArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// Wait up to this many seconds for the consultation to finish first.
+    #[arg(long, default_value_t = 0)]
+    pub wait: u64,
+
+    /// Start from this byte offset.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+
+    /// Most bytes to print.
+    #[arg(long, default_value_t = 2_000_000)]
+    pub max_bytes: usize,
+}
+
+/// Arguments for `agentmux follow-up`: which consultation to continue, and with what.
+///
+/// Deliberately does not take `--cwd` or `--keep`.
+/// A follow-up continues the delegate's own session, so the working directory and the retention
+/// were both fixed when the consultation started.
+#[derive(Debug, Args)]
+pub struct FollowUpArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// The follow-up question.
+    /// Omit it to read from stdin.
+    pub question: Option<String>,
+
+    /// Read the follow-up question from a file instead.
+    #[arg(long, short = 'f', conflicts_with = "question")]
+    pub file: Option<PathBuf>,
+
+    /// How long to wait for the answer, in seconds.
+    #[arg(long, default_value_t = 600)]
+    pub wait: u64,
+}
+
+impl FollowUpArgs {
+    /// Read the follow-up question from wherever it was supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file or stdin cannot be read, or the question is empty.
+    pub fn text(&self) -> Result<String> {
+        QuestionArgs {
+            question: self.question.clone(),
+            file: self.file.clone(),
+            cwd: None,
+            keep: false,
+        }
+        .text()
+    }
+}
+
+/// Arguments for `agentmux list`: how many consultations to show.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Most consultations to list.
+    #[arg(long, short = 'n', default_value_t = 20)]
+    pub limit: usize,
+}
+
+/// Arguments for `agentmux prune`: one consultation to delete, or none to sweep.
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Delete this consultation outright, whatever its retention.
+    pub run_id: Option<RunIdArg>,
+}
+
+/// A consultation id parsed at the boundary, so nothing downstream can be handed a path.
+#[derive(Debug, Clone)]
+pub struct RunIdArg(pub RunId);
+
+impl std::str::FromStr for RunIdArg {
+    type Err = agentmux::run::RunIdError;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        RunId::parse(value).map(Self)
+    }
+}

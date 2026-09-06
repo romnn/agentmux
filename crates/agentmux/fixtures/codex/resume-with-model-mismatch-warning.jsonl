@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"This session was recorded with model `gpt-5.3-codex-spark` but is resuming with `gpt-6-astra`. Consider switching back to `gpt-5.3-codex-spark` as it may affect Codex performance."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"BANANAPHONE"}}
+{"type":"turn.completed","usage":{"input_tokens":19000,"cached_input_tokens":7040,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0}}
