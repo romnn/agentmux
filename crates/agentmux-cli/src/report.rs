@@ -42,6 +42,13 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     if let Some(cost) = status.cost_usd {
         println!("  cost        ${cost:.4}");
     }
+    if let Some(limit) = &status.rate_limit {
+        // Printed for a healthy run too: the point is to see the window closing before it closes.
+        println!(
+            "  rate limit  {}",
+            agentmux_mcp::render::rate_limit_line(limit)
+        );
+    }
     if let Some(drift) = status.unrecognised.summary() {
         println!("  UNRECOGNISED {drift} — the delegate CLI may have changed its output format");
     }
@@ -201,6 +208,7 @@ fn json_status(status: &RunStatus) -> serde_json::Value {
         "cost_usd": status.cost_usd,
         "unrecognised_events": status.unrecognised,
         "reopened_by_hook": status.reopened_by_hook,
+        "rate_limit": status.rate_limit,
         "cwd": status.cwd,
         "transcript_path": status.transcript_path,
         "events_path": status.events_path,

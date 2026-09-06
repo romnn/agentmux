@@ -24,7 +24,7 @@ use crate::render;
 const DEFAULT_WAIT_SECONDS: u64 = 45;
 
 /// Longest wait any tool will honour, safely inside Claude Code's ten-minute default.
-const MAX_WAIT_SECONDS: u64 = 540;
+pub(crate) const MAX_WAIT_SECONDS: u64 = 540;
 
 /// Default bytes of transcript returned inline by `result`.
 ///

@@ -18,10 +18,14 @@
 //! There is deliberately no `answer`, `final_message` or `summary` anywhere in this module.
 //! That absence is the product, and [`crate`]'s tests guard it.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use agentmux::run::{RunStatus, RunSummary, TranscriptPage};
-use agentmux::transcript::{FailureKind, Outcome};
+use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use chrono::Utc;
+
+use crate::tools::MAX_WAIT_SECONDS;
 
 /// A one-line state, with the failure reason inline when there is one.
 #[must_use]
@@ -146,7 +150,7 @@ pub fn warnings(status: &RunStatus) -> String {
              \x20           The delegate said: {}\n",
             kind.label(),
             status.message_count,
-            recovery_advice(*kind),
+            recovery_advice(*kind, status.rate_limit.as_ref()),
             summarise(detail, 600),
         );
     }
@@ -200,7 +204,72 @@ pub fn warnings(status: &RunStatus) -> String {
 /// The most valuable case is the one where retrying is exactly wrong: a blocked closing message
 /// means the analysis is already in the transcript and paying for it again would produce the same
 /// block.
-fn recovery_advice(kind: FailureKind) -> &'static str {
+fn recovery_advice(kind: FailureKind, rate_limit: Option<&RateLimit>) -> Cow<'static, str> {
+    // A rate limit is the only failure whose advice inverts on a number, so it is decided before
+    // the table of fixed answers below.
+    if kind == FailureKind::RateLimited
+        && let Some(limit) = rate_limit
+    {
+        return Cow::Owned(rate_limit_advice(limit));
+    }
+
+    Cow::Borrowed(fixed_advice(kind))
+}
+
+/// One line describing where an account's usage window stands.
+///
+/// Shared with the CLI so both surfaces name the window the same way; a caller comparing the two
+/// should never have to work out whether they mean the same thing.
+#[must_use]
+pub fn rate_limit_line(limit: &RateLimit) -> String {
+    let window = limit.window.as_deref().unwrap_or("usage");
+    match limit.reopens_in(Utc::now()) {
+        Some(remaining) => format!(
+            "{window} window reopens in {} ({})",
+            duration(remaining),
+            limit.resets_at.to_rfc3339()
+        ),
+        None => format!("{window} window has reopened"),
+    }
+}
+
+/// Advice for a rate limit whose window reopening time the vendor disclosed.
+///
+/// The choice between waiting and switching is not a matter of taste: below the cap a single
+/// `start` call can block for, waiting costs one call, and above it waiting means a caller polling
+/// a run that cannot progress.
+fn rate_limit_advice(limit: &RateLimit) -> String {
+    let window = limit
+        .window
+        .as_deref()
+        .map_or_else(String::new, |name| format!(" ({name})"));
+
+    let Some(remaining) = limit.reopens_in(Utc::now()) else {
+        return format!(
+            "The usage window{window} has already reopened, so this failure is stale — `start` \
+             the same question again."
+        );
+    };
+
+    if remaining <= std::time::Duration::from_secs(MAX_WAIT_SECONDS) {
+        format!(
+            "Nothing to fix in your call. The window{window} reopens in {}, which is inside what \
+             one `start` can wait for — retry with `wait_seconds` set to cover it rather than \
+             switching vendor.",
+            duration(remaining)
+        )
+    } else {
+        format!(
+            "Nothing to fix in your call, and waiting is not worth it: the window{window} does \
+             not reopen for {}. `start` the same question against the other vendor, or against a \
+             model this account has not exhausted.",
+            duration(remaining)
+        )
+    }
+}
+
+/// Advice that depends only on the kind of failure.
+fn fixed_advice(kind: FailureKind) -> &'static str {
     match kind {
         FailureKind::ContentFlagged => {
             "A guardrail refused the write-up, not the work — the findings above are usually \

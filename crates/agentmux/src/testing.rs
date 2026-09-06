@@ -268,6 +268,15 @@ pub mod fixtures {
     /// `terminal_reason: "api_error"`, `api_error_status: 404`.
     pub const CLAUDE_UNKNOWN_MODEL: &str = include_str!("../fixtures/claude/unknown-model.jsonl");
 
+    /// A Claude account that has exhausted one model's usage window.
+    ///
+    /// The refusal arrives as `api_error_status: 429` alongside `subtype: "success"`, so the
+    /// classification is structural and survives the vendor rewording the message.
+    /// It also carries the `rate_limit_event` this crate reads the reopening time out of, which is
+    /// the only thing that distinguishes a window worth waiting for from one worth switching away
+    /// from.
+    pub const CLAUDE_RATE_LIMITED: &str = include_str!("../fixtures/claude/rate-limited.jsonl");
+
     /// A short Codex consultation that answered and finished cleanly.
     pub const CODEX_HAPPY: &str = include_str!("../fixtures/codex/happy.jsonl");
 
@@ -292,6 +301,7 @@ pub mod fixtures {
         use crate::delegate::Vendor::{Claude, Codex};
         vec![
             (Claude, "claude/happy", CLAUDE_HAPPY),
+            (Claude, "claude/rate-limited", CLAUDE_RATE_LIMITED),
             (Claude, "claude/tool-use", CLAUDE_TOOL_USE),
             (Claude, "claude/resume", CLAUDE_RESUME),
             (

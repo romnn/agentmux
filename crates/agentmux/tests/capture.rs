@@ -251,6 +251,59 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
     }
 }
 
+/// A rate limit must be classified from the status code, not from the vendor's wording.
+///
+/// The recorded refusal says "You've reached your Fable limit", which no rule could match for long:
+/// the model name is in it, and the sentence is marketing copy that changes.
+/// `api_error_status: 429` is the part that does not change, and the same event carries
+/// `subtype: "success"`, so anything reading the subtype would have called this a clean run.
+#[gtest]
+fn a_rate_limited_run_is_classified_from_the_status_code() {
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_RATE_LIMITED);
+
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::RateLimited),
+            detail: contains_substring("Fable limit"),
+        })
+    );
+    // The delegate's own explanation is kept as a message rather than collapsed into the failure,
+    // because it is the only place the remedy ("switch to another model") is stated.
+    assert_that!(
+        turn.messages
+            .iter()
+            .any(|m| m.text.contains("Switch to another model")),
+        eq(true)
+    );
+}
+
+/// The reopening time decides whether waiting or switching is correct, so it must survive the fold.
+///
+/// A caller told only "rate limited" cannot choose between the two, and the difference is nine
+/// hours in the recorded run.
+#[gtest]
+fn a_rate_limited_run_keeps_the_window_reopening_time() {
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_RATE_LIMITED);
+
+    let limit = turn
+        .rate_limit
+        .clone()
+        .expect("the recorded stream carries one");
+    assert_that!(limit.resets_at.timestamp(), eq(1_788_768_000));
+    assert_that!(
+        limit.window.as_deref(),
+        some(eq("seven_day_overage_included"))
+    );
+
+    // The transcript states it too, so a reader of the rendered text is not worse off than a
+    // caller reading the struct.
+    assert_that!(
+        agentmux::transcript::render_turn(&turn),
+        contains_substring("seven_day_overage_included window reopens at")
+    );
+}
+
 /// The drift guard: no committed fixture may contain an event type the parser cannot name.
 ///
 /// This is what turns "we captured a fixture once" into a standing obligation.

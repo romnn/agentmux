@@ -45,7 +45,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Delegate, DelegateError, SessionRef, TurnPlan};
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher};
-use crate::transcript::{FailureKind, Outcome, Transcript, UnrecognisedEvents, Usage, render_turn};
+use crate::transcript::{
+    FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage, render_turn,
+};
 
 /// Anything that can go wrong while running a consultation.
 #[derive(Debug, thiserror::Error)]
@@ -350,6 +352,12 @@ pub struct RunStatus {
     /// Without this a follow-up onto a failed turn would report the consultation as `completed`
     /// and leave the failure visible only deep inside the transcript body.
     pub earlier_failure: Option<(u32, FailureKind)>,
+    /// The most recent usage window the delegate reported, when it reported one.
+    ///
+    /// Carried out of the transcript because the right response to a rate limit depends on how
+    /// long the window has left, and a caller should not have to read the transcript body to find
+    /// a timestamp the stream already gave up.
+    pub rate_limit: Option<RateLimit>,
     /// Whether any turn asked to continue a session and silently opened a new one instead.
     pub broke_continuity: bool,
     /// Where the rendered transcript is written.
@@ -676,6 +684,14 @@ impl RunStore {
             unrecognised: state.transcript.unrecognised(),
             reopened_by_hook: state.transcript.was_reopened_by_hook(),
             earlier_failure: state.transcript.earlier_failure(),
+            // The newest window wins: an earlier turn's reading is stale the moment another
+            // arrives, and a caller acting on it would wait against a window that already moved.
+            rate_limit: state
+                .transcript
+                .turns
+                .iter()
+                .rev()
+                .find_map(|turn| turn.rate_limit.clone()),
             broke_continuity: state
                 .transcript
                 .turns

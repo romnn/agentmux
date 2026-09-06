@@ -12,6 +12,8 @@ use std::sync::Arc;
 use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
+use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use chrono::Utc;
 use googletest::prelude::*;
 
 /// Drive one scripted consultation and return the status a tool would render.
@@ -232,5 +234,85 @@ fn no_rendered_result_names_an_answer_field() -> Result<()> {
             assert_that!(rendered.as_str(), not(contains_substring(forbidden)));
         }
     }
+    Ok(())
+}
+
+/// A rate limit whose window reopens soon must not send the caller to the other vendor.
+///
+/// Switching vendor costs a whole consultation against a different model, so it is the wrong
+/// advice when the window reopens inside what a single `start` can already wait for.
+/// The reopening time is the only thing that separates this case from the next one, which is why
+/// discarding it made both cases produce the same sentence.
+#[gtest]
+fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::minutes(4),
+        window: Some("five_hour".to_owned()),
+    });
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("five_hour"));
+    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, not(contains_substring("other vendor")));
+    Ok(())
+}
+
+/// A rate limit whose window is hours away must send the caller elsewhere.
+///
+/// This is the recorded case: an exhausted seven-day window with nine hours left on it. Advising
+/// "wait" there strands the calling agent on a run that cannot progress within any wait it is
+/// allowed to ask for.
+#[gtest]
+fn a_window_hours_away_advises_switching_rather_than_waiting() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::hours(9),
+        window: Some("seven_day_overage_included".to_owned()),
+    });
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("seven_day_overage_included"));
+    assert_that!(warnings, contains_substring("other vendor"));
+    assert_that!(warnings, not(contains_substring("wait_seconds")));
+    Ok(())
+}
+
+/// Without a reopening time the advice must stay honest rather than guess a duration.
+///
+/// Codex reports no usage window with the flags this crate builds, so this is the live path for
+/// every Codex rate limit, not a defensive branch.
+#[gtest]
+fn a_rate_limit_without_a_window_still_advises_something_actionable() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = None;
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("rate limited"));
+    assert_that!(warnings, contains_substring("other vendor"));
     Ok(())
 }

@@ -20,11 +20,14 @@
 //!   That is what makes the reopening test below structural: in `--print` mode the *only* way a
 //!   `user` message carrying a `text` block reaches the main conversation is an injection.
 
+use std::fmt::Write as _;
+
+use chrono::DateTime;
 use serde::Deserialize;
 
 use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines, probe};
-use crate::transcript::{FailureKind, Message, Outcome, Role, Turn, Usage};
+use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Role, Turn, Usage};
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
 ///
@@ -187,6 +190,47 @@ struct RateLimitEvent {
 struct RateLimitInfo {
     #[serde(default)]
     status: Option<String>,
+    /// Unix seconds at which the window reopens.
+    #[serde(default, rename = "resetsAt")]
+    resets_at: Option<i64>,
+    #[serde(default, rename = "rateLimitType")]
+    rate_limit_type: Option<String>,
+}
+
+/// Record what a `rate_limit_event` says about the account's usage window.
+///
+/// The window is kept whatever the status says, because a run that succeeded against a nearly
+/// closed window still tells the caller what to expect from the next question.
+/// Only a refusal earns a line in the transcript.
+fn fold_rate_limit(turn: &mut Turn, line: &str) {
+    let Ok(event) = serde_json::from_str::<RateLimitEvent>(line) else {
+        turn.unrecognised.record("rate_limit_event.<unparsable>");
+        return;
+    };
+    let info = event.rate_limit_info;
+
+    if let Some(resets_at) = info.resets_at.and_then(DateTime::from_timestamp_secs) {
+        turn.rate_limit = Some(RateLimit {
+            resets_at,
+            window: info.rate_limit_type.clone(),
+        });
+    }
+
+    if let Some(status) = info.status.filter(|s| s != "allowed") {
+        let mut note = format!("delegate rate limit status: {status}");
+        if let Some(limit) = &turn.rate_limit {
+            match &limit.window {
+                Some(window) => {
+                    let _ = write!(note, "; the {window} window reopens at ");
+                }
+                None => {
+                    let _ = write!(note, "; the window reopens at ");
+                }
+            }
+            let _ = write!(note, "{}", limit.resets_at.to_rfc3339());
+        }
+        turn.messages.push(Message::synthetic(note));
+    }
 }
 
 /// Fold a Claude `stream-json` stream into a turn.
@@ -267,20 +311,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     }
                 }
             }
-            "rate_limit_event" => {
-                if let Ok(event) = serde_json::from_str::<RateLimitEvent>(line)
-                    && event
-                        .rate_limit_info
-                        .status
-                        .as_deref()
-                        .is_some_and(|s| s != "allowed")
-                {
-                    let status = event.rate_limit_info.status.unwrap_or_default();
-                    turn.messages.push(Message::synthetic(format!(
-                        "delegate rate limit status: {status}"
-                    )));
-                }
-            }
+            "rate_limit_event" => fold_rate_limit(&mut turn, line),
             "result" => {
                 let Ok(event) = serde_json::from_str::<ResultEvent>(line) else {
                     turn.unrecognised.record("result.<unparsable>");

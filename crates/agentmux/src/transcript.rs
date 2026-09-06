@@ -14,7 +14,35 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// What the vendor said about the usage window the delegate was refused against.
+///
+/// A rate limit is the one failure whose right response depends on a number the failure itself does
+/// not contain: a window reopening in ten minutes is worth waiting for, and one reopening in nine
+/// hours is not.
+/// Both vendors report the reopening time in the stream and neither puts it in the error message,
+/// so it is captured here rather than left for a caller to parse back out of prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimit {
+    /// When the window reopens.
+    pub resets_at: DateTime<Utc>,
+    /// The vendor's own name for the window, such as `seven_day_overage_included`.
+    ///
+    /// Quoted rather than parsed into a closed set: these names are account-plan specific and new
+    /// ones appear without notice, and the name is only ever shown to a reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+}
+
+impl RateLimit {
+    /// How long until the window reopens, or `None` once it already has.
+    #[must_use]
+    pub fn reopens_in(&self, now: DateTime<Utc>) -> Option<std::time::Duration> {
+        (self.resets_at - now).to_std().ok()
+    }
+}
 
 /// Who produced a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +316,13 @@ pub struct Turn {
     pub outcome: Outcome,
     /// Event types the parser met but does not model.
     pub unrecognised: UnrecognisedEvents,
+    /// What the vendor reported about the account's usage window, when it reported anything.
+    ///
+    /// Set whenever the stream carries the information, not only on a rate-limited failure: a run
+    /// that succeeded against a nearly exhausted window is worth knowing about before the next
+    /// question is asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
     /// Whether this turn was meant to continue an earlier session but did not.
     ///
     /// Both CLIs accept a resume against a session they no longer hold, and answer from an empty
@@ -321,6 +356,7 @@ impl Turn {
             messages: Vec::new(),
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
+            rate_limit: None,
             broke_continuity: false,
             recovered: None,
         }
