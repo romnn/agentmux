@@ -3,7 +3,7 @@ name = "agentmux-mcp"
 license-file = "../../LICENSE"
 readme = "../../README.md"
 documentation = "https://docs.rs/agentmux-mcp"
-publish = true
+publish = false
 
 version.workspace = true
 edition.workspace = true

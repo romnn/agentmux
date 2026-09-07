@@ -2,7 +2,6 @@
 
 [![build](https://github.com/romnn/agentmux/actions/workflows/build.yaml/badge.svg)](https://github.com/romnn/agentmux/actions/workflows/build.yaml)
 [![test](https://github.com/romnn/agentmux/actions/workflows/test.yaml/badge.svg)](https://github.com/romnn/agentmux/actions/workflows/test.yaml)
-[![crates.io](https://img.shields.io/crates/v/agentmux)](https://crates.io/crates/agentmux)
 
 `agentmux` delegates a question to another vendor's coding agent and captures the whole transcript.
 
@@ -33,14 +32,16 @@ wrong, the delegate CLI's own error â€” which names the values it does accept â€
 ### Installation
 
 ```bash
-brew install romnn/tap/agentmux
+brew install --cask romnn/tap/agentmux
 ```
 
 Or from source:
 
 ```bash
-cargo install agentmux-cli
+cargo install --git https://github.com/romnn/agentmux agentmux-cli
 ```
+
+There is no crates.io release: the name is taken by an unrelated crate.
 
 You also need whichever delegate CLIs you intend to use (`claude`, `codex`) on your `PATH`, already
 authenticated.

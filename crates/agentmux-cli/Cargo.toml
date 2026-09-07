@@ -2,7 +2,7 @@
 name = "agentmux-cli"
 license-file = "../../LICENSE"
 readme = "../../README.md"
-publish = true
+publish = false
 
 version.workspace = true
 edition.workspace = true

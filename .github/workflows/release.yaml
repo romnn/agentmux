@@ -18,6 +18,10 @@ jobs:
     uses: ./.github/workflows/test.yaml
 
   publish-crate:
+    # An unrelated crate owns the crates.io name `agentmux`, so a tag releases binaries only.
+    # Publishing again takes two switches: this repository variable set to `true`, and `publish`
+    # restored to `true` in each crate manifest.
+    if: ${{ vars.PUBLISH_TO_CRATES_IO == 'true' }}
     runs-on: ubuntu-24.04
     needs: [tests]
     timeout-minutes: 30
