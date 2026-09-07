@@ -669,11 +669,18 @@ fn a_config_base_outside_home_is_ignored() -> Result<()> {
     );
 
     // A base that starts under home and climbs back out is not under it either.
+    // Only the named components are appended: a root or a drive prefix would make the join
+    // discard everything before it, leaving a path that never mentions home at all.
+    let elsewhere_relative: std::path::PathBuf = elsewhere
+        .path()
+        .components()
+        .filter(|part| matches!(part, std::path::Component::Normal(_)))
+        .collect();
     host.insert(
         "XDG_CONFIG_HOME".to_owned(),
         home.path()
             .join("../..")
-            .join(elsewhere.path().strip_prefix("/").or_fail()?)
+            .join(elsewhere_relative)
             .to_string_lossy()
             .into_owned(),
     );
