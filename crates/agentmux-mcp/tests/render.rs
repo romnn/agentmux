@@ -18,6 +18,39 @@ use googletest::prelude::*;
 
 /// Drive one scripted consultation and return the status a tool would render.
 fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
+    consult_with(
+        events,
+        Delegate::Codex {
+            model: ModelId::parse("gpt-6-astra").or_fail()?,
+            effort: Effort::parse("xhigh").or_fail()?,
+            sandbox: CodexSandbox::ReadOnly,
+            account: None,
+            isolation: None,
+        },
+    )
+}
+
+/// Drive one scripted Claude consultation against a named model.
+///
+/// Claude rather than Codex because only Claude's stream reports the model it ran, which is the
+/// asymmetry the model tests are about.
+fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
+    consult_with(
+        events,
+        Delegate::Claude {
+            model: ModelId::parse(model).or_fail()?,
+            effort: Effort::parse("high").or_fail()?,
+            account: None,
+            isolation: None,
+        },
+    )
+}
+
+/// Drive one scripted consultation of the given delegate.
+fn consult_with(
+    events: &str,
+    delegate: Delegate,
+) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
@@ -31,13 +64,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
-                model: ModelId::parse("gpt-6-astra").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
-                sandbox: CodexSandbox::ReadOnly,
-                account: None,
-                isolation: None,
-            },
+            delegate,
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
@@ -86,7 +113,7 @@ fn an_unavailable_model_is_told_to_fix_the_model_not_to_wait() -> Result<()> {
     assert_that!(rendered, contains_substring("failed (model unavailable)"));
     assert_that!(
         rendered,
-        contains_substring("Correct `model` and `start` again")
+        contains_substring("Correct `model` and try again")
     );
     // And it must not be advertised as resumable, or the caller pays for a turn that cannot work.
     assert_that!(status.resumable, eq(false));
@@ -172,6 +199,23 @@ fn a_finished_consultation_names_the_next_call() -> Result<()> {
     assert_that!(rendered, contains_substring(expected_id.as_str()));
     assert_that!(rendered, contains_substring("result {"));
     assert_that!(rendered, contains_substring("follow_up {"));
+    Ok(())
+}
+
+/// A finished transcript says the delegate's session is still open, and how to use it.
+///
+/// `result` is where a caller arrives holding the answer, so it is the page on which a missing
+/// next call strands them, and every other renderer fills one in.
+#[gtest]
+fn a_finished_transcript_offers_the_follow_up() -> Result<()> {
+    let (store, started, _dir) = consult(agentmux::testing::fixtures::CODEX_HAPPY)?;
+    let (status, page) = store.view(&started.run_id, 0, 100_000).or_fail()?;
+
+    let rendered = agentmux_mcp::render::transcript(&status, &page);
+
+    assert_that!(rendered, contains_substring("follow_up {"));
+    let expected_id = format!("\"run_id\": \"{}\"", status.run_id);
+    assert_that!(rendered, contains_substring(expected_id.as_str()));
     Ok(())
 }
 
@@ -312,5 +356,57 @@ fn a_rate_limit_without_a_window_still_advises_something_actionable() -> Result<
 
     assert_that!(warnings, contains_substring("rate limited"));
     assert_that!(warnings, contains_substring("other vendor"));
+    Ok(())
+}
+
+/// A model the vendor expanded is named, so two consultations cannot look alike when they are not.
+///
+/// The requested identifier may be an alias, and a result that echoes only the request reports the
+/// alias as though it were the model that answered.
+#[gtest]
+fn a_model_the_vendor_expanded_is_reported_beside_the_one_requested() -> Result<()> {
+    let (_store, status, _dir) = consult_claude(
+        agentmux::testing::fixtures::CLAUDE_TOOL_USE,
+        "claude-opus-5",
+    )?;
+
+    let rendered = agentmux_mcp::render::status(&status);
+
+    // Both identifiers survive: what was asked for, and what the stream said actually answered.
+    assert_that!(rendered, contains_substring("claude-opus-5"));
+    assert_that!(rendered, contains_substring("answered by claude-sonnet-5"));
+    Ok(())
+}
+
+/// A model that answered as asked adds nothing, because there is no ambiguity to resolve.
+#[gtest]
+fn a_model_that_matches_the_request_is_not_repeated() -> Result<()> {
+    let (_store, status, _dir) = consult_claude(
+        agentmux::testing::fixtures::CLAUDE_TOOL_USE,
+        "claude-sonnet-5",
+    )?;
+
+    let rendered = agentmux_mcp::render::status(&status);
+
+    assert_that!(rendered, not(contains_substring("answered by")));
+    Ok(())
+}
+
+/// A dollar figure is labelled as list price, and a vendor reporting none says so.
+///
+/// An unlabelled amount reads as money charged, which it is not on a subscription account, and a
+/// blank reads as a consultation that cost nothing rather than one whose vendor reported no
+/// figure at all.
+#[gtest]
+fn cost_says_which_kind_of_number_it_is() -> Result<()> {
+    let (_store, priced, _dir) =
+        consult_claude(agentmux::testing::fixtures::CLAUDE_HAPPY, "claude-opus-5")?;
+    let (_store, unpriced, _dir2) = consult(agentmux::testing::fixtures::CODEX_HAPPY)?;
+
+    let priced = agentmux_mcp::render::status(&priced);
+    let unpriced = agentmux_mcp::render::status(&unpriced);
+
+    assert_that!(priced, contains_substring("list price"));
+    assert_that!(unpriced, contains_substring("no cost reported"));
     Ok(())
 }

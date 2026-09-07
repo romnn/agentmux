@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId, Vendor};
-use agentmux::quota::{AccountQuota, Observation, Origin};
+use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
@@ -288,4 +288,57 @@ fn the_advice_never_names_an_account_of_the_other_vendor() -> Result<()> {
     // With no usable alternative it falls back to the window, as it would with none at all.
     assert_that!(warnings, contains_substring("other vendor"));
     Ok(())
+}
+
+/// Cached figures that survived a failed refresh do not read as current ones.
+///
+/// The age alone cannot tell them apart: a refresh that timed out leaves the previous numbers in
+/// place, and `fetchedAtMs` then describes a reading nobody managed to replace.
+/// A caller choosing an account on those numbers is choosing on figures agentmux could not
+/// confirm.
+#[gtest]
+fn a_refresh_that_did_not_happen_is_named_rather_than_implied() {
+    let timed_out = cached_with(Refresh::TimedOut);
+    let failed = cached_with(Refresh::Failed {
+        reason: "`claude --print /usage` exited with exit status: 1".to_owned(),
+    });
+
+    let timed_out = agentmux_mcp::render::quota_report(&timed_out).join("\n");
+    let failed = agentmux_mcp::render::quota_report(&failed).join("\n");
+
+    // Both say the figures predate the attempt, so neither can be mistaken for a fresh reading.
+    assert_that!(timed_out, contains_substring("timed out"));
+    assert_that!(timed_out, contains_substring("predate it"));
+    assert_that!(failed, contains_substring("refresh failed"));
+    assert_that!(failed, contains_substring("exit status: 1"));
+}
+
+/// The ordinary outcomes are named too, so silence never has to be interpreted.
+#[gtest]
+fn a_refresh_that_happened_says_so() {
+    let refreshed = agentmux_mcp::render::quota_report(&cached_with(Refresh::Succeeded)).join("\n");
+    let skipped = agentmux_mcp::render::quota_report(&cached_with(Refresh::Skipped)).join("\n");
+
+    assert_that!(refreshed, contains_substring("just refreshed"));
+    assert_that!(
+        skipped,
+        contains_substring("still inside the refresh window")
+    );
+}
+
+/// A cached Claude reading whose refresh ended the given way.
+fn cached_with(refresh: Refresh) -> AccountQuota {
+    AccountQuota {
+        vendor: Vendor::Claude,
+        account: None,
+        description: None,
+        observation: Observation::Reported {
+            origin: Origin::Cache {
+                path: PathBuf::from("/home/dev/.claude.json"),
+                fetched_at_ms: None,
+                refresh,
+            },
+            payload: serde_json::json!({"utilization": {"limits": []}}),
+        },
+    }
 }

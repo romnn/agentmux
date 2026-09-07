@@ -21,7 +21,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use agentmux::quota::{AccountQuota, Observation, Origin};
+use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, RunStatus, RunSummary, TranscriptPage};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
 use chrono::Utc;
@@ -92,7 +92,7 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
          progress:   {} elapsed · {} turn(s) · {} message(s)",
         status.run_id,
         state,
-        status.delegate.summary(),
+        delegate_line(status),
         status.cwd.display(),
         duration(status.elapsed),
         status.turns,
@@ -105,8 +105,14 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
             status.usage.output_tokens.unwrap_or(0)
         );
     }
+    // Labelled because the figure is token counts priced at list: on a subscription account
+    // nothing of the sort is charged, and a bare dollar amount reads as money that was billed.
     if let Some(cost) = status.cost_usd {
-        let _ = write!(out, " · ${cost:.4}");
+        let _ = write!(out, " · ${cost:.4} list price");
+    } else if status.is_terminal() {
+        // Said rather than left blank, because a vendor that reports no figure and a turn that
+        // cost nothing render identically otherwise.
+        let _ = write!(out, " · no cost reported");
     }
     let _ = writeln!(out, "\ntranscript: {}", status.transcript_path.display());
 
@@ -358,7 +364,7 @@ fn fixed_advice(kind: FailureKind) -> &'static str {
         }
         FailureKind::ModelUnavailable => {
             "The delegate CLI named what it does accept in the detail below. Correct `model` and \
-             `start` again."
+             try again."
         }
         FailureKind::RateLimited => {
             "Nothing to fix in your call. Wait, or `start` the same question against the other \
@@ -381,28 +387,40 @@ fn fixed_advice(kind: FailureKind) -> &'static str {
     }
 }
 
+/// The `follow_up` call, filled in, under whichever lead-in the caller needs.
+///
+/// Shared, because a transcript that has just been handed over must offer the follow-up as a next
+/// step in its own right rather than underneath a `result` the caller has already made.
+fn follow_up_step(status: &RunStatus, lead: &str) -> String {
+    let id = &status.run_id;
+    indoc::formatdoc! {r#"
+        {lead}follow_up {{"run_id": "{id}", "question": "…"}} — continues the
+                    delegate's own session, so do not restate the brief
+    "#}
+}
+
 /// What to call next, with the arguments filled in.
 #[must_use]
 pub fn next_steps(status: &RunStatus) -> String {
     let id = &status.run_id;
     if status.is_terminal() {
-        let mut out = format!("\nnext:       result {{\"run_id\": \"{id}\"}}\n");
+        let mut out = indoc::formatdoc! {r#"
+
+            next:       result {{"run_id": "{id}"}}
+        "#};
         if status.resumable {
-            let _ = write!(
-                out,
-                "            follow_up {{\"run_id\": \"{id}\", \"question\": \"…\"}} — continues the\n\
-                 \x20           delegate's own session, so do not restate the brief\n",
-            );
+            out.push_str(&follow_up_step(status, "            "));
         }
         out
     } else {
-        format!(
-            "\nStill working. The delegate is detached and survives an agentmux restart.\n\
-             next:       tail {{\"run_id\": \"{id}\", \"cursor\": {}}} — new output only\n\
-             \x20           result {{\"run_id\": \"{id}\", \"wait_seconds\": 45}} — block for the answer\n\
-             \x20           cancel {{\"run_id\": \"{id}\"}} — stop it, keeping what was collected\n",
-            status.transcript_bytes,
-        )
+        let cursor = status.transcript_bytes;
+        indoc::formatdoc! {r#"
+
+            Still working. The delegate is detached and survives an agentmux restart.
+            next:       tail {{"run_id": "{id}", "cursor": {cursor}}} — new output only
+                        result {{"run_id": "{id}", "wait_seconds": 45}} — block for the answer
+                        cancel {{"run_id": "{id}"}} — stop it, keeping what was collected
+        "#}
     }
 }
 
@@ -436,6 +454,15 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
              read the whole transcript from the file named above with your own file tools.]\n",
             status.run_id, page.next_offset,
         );
+    }
+    // A finished consultation's one remaining move is the follow-up, and a running one still needs
+    // the whole watch loop, so neither is left for a caller holding the answer to reconstruct.
+    if status.is_terminal() {
+        if status.resumable {
+            out.push_str(&follow_up_step(status, "\nnext:       "));
+        }
+    } else {
+        out.push_str(&next_steps(status));
     }
     out
 }
@@ -655,22 +682,60 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
     lines
 }
 
+/// Who ran, and what actually answered when that is not what was asked for.
+///
+/// A vendor may expand a requested identifier into a fuller one — `sonnet` answering as
+/// `claude-sonnet-5` — and the expansion is invisible in a result that echoes only the request.
+/// Two consultations then look like they used the same model when one of them may not have.
+fn delegate_line(status: &RunStatus) -> String {
+    let summary = status.delegate.summary();
+    match &status.resolved_model {
+        Some(resolved) if resolved != status.delegate.model().as_str() => {
+            format!("{summary} (answered by {resolved})")
+        }
+        _ => summary,
+    }
+}
+
 /// How current a set of figures is.
 fn describe_origin(origin: &Origin) -> String {
     match origin {
         Origin::Live => "live".to_owned(),
-        Origin::Cache { fetched_at_ms, .. } => fetched_at_ms
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .map_or_else(
-                || "from the CLI's cache, age unknown".to_owned(),
-                |at| {
-                    let age = Utc::now().signed_duration_since(at).to_std().ok();
-                    age.map_or_else(
-                        || "from the CLI's cache".to_owned(),
-                        |age| format!("from the CLI's cache, measured {} ago", duration(age)),
-                    )
-                },
-            ),
+        Origin::Cache {
+            fetched_at_ms,
+            refresh,
+            ..
+        } => {
+            let age = fetched_at_ms
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(
+                    || "from the CLI's cache, age unknown".to_owned(),
+                    |at| {
+                        let age = Utc::now().signed_duration_since(at).to_std().ok();
+                        age.map_or_else(
+                            || "from the CLI's cache".to_owned(),
+                            |age| format!("from the CLI's cache, measured {} ago", duration(age)),
+                        )
+                    },
+                );
+            format!("{age}{}", describe_refresh(refresh))
+        }
+    }
+}
+
+/// What the attempt to refresh the cache adds to a cached reading.
+///
+/// Always said, including when nothing was spawned.
+/// The age alone cannot distinguish figures that are current from figures that merely survived a
+/// refresh which timed out, and that is the difference a reader is trying to make.
+fn describe_refresh(refresh: &Refresh) -> String {
+    match refresh {
+        Refresh::Skipped => ", still inside the refresh window".to_owned(),
+        Refresh::Succeeded => ", just refreshed".to_owned(),
+        Refresh::TimedOut => ", and a refresh timed out — these figures predate it".to_owned(),
+        Refresh::Failed { reason } => {
+            format!(", and the refresh failed ({reason}) — these figures predate it")
+        }
     }
 }
 
