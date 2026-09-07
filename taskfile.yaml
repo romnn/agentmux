@@ -32,8 +32,12 @@ tasks:
     requires:
       vars: [GORELEASER_ARGS]
     cmds:
-      # The image ships zig, cargo-zigbuild, rust and every release target; only goreleaser
-      # is missing. safe.directory: the bind-mounted repo is owned by another uid.
+      # The image ships zig and cargo-zigbuild; only goreleaser is missing.
+      # safe.directory: the bind-mounted repo is owned by another uid.
+      # The rust it ships is pinned to a version rather than tracking stable, so it drifts below
+      # what the dependency tree needs and fails the build naming a crate rather than the image.
+      # Installing stable is enough: goreleaser's rust builder runs `rustup target add` for every
+      # target it is configured with, so `.goreleaser.yaml` stays the only copy of that list.
       # prettier-ignore
       - >-
         docker run --rm
@@ -46,6 +50,8 @@ tasks:
         trap fix_perms EXIT;
         case "$(uname -m)" in x86_64) arch=x86_64 ;; aarch64|arm64) arch=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac;
         curl -sSfL "https://github.com/goreleaser/goreleaser/releases/download/v{{.GORELEASER_VERSION}}/goreleaser_Linux_${arch}.tar.gz" | tar -xz -C /usr/local/bin goreleaser;
+        rustup toolchain install stable --profile minimal --no-self-update;
+        rustup default stable;
         git config --global --add safe.directory "$(pwd)";
         goreleaser {{.GORELEASER_ARGS}}'
 
