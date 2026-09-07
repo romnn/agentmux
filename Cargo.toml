@@ -103,6 +103,11 @@ rmcp = { version = "3.1.4", features = ["server", "macros", "schemars", "transpo
 # MCP host configures it.
 clap = { version = "4", features = ["derive", "env"] }
 
+# The Linux release is built against musl so it runs whatever the host's glibc is, and musl's
+# own allocator is slow enough under concurrent allocation to be worth replacing. Linked into
+# the musl builds only; every other target keeps the system allocator.
+mimalloc = "0.1"
+
 # Supplies the random tail of a run identifier, so two consultations started in the same
 # second cannot collide.
 uuid = { version = "1", features = ["v4"] }

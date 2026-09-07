@@ -17,6 +17,12 @@ use color_eyre::eyre::{Result, WrapErr as _, bail};
 
 use crate::cli::{Cli, Command, McpArgs};
 
+/// musl's allocator serialises enough under the multi-threaded runtime to show up in wall-clock
+/// time, and the Linux release is built against musl so that it runs on any host's glibc.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
