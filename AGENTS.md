@@ -38,6 +38,16 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `--strict-mcp-config` and Codex's `--ignore-user-config` are what suppress settings, hooks and
   MCP servers; no environment variable can switch them on or off. `Isolation::Inherit` drops
   exactly those flags and nothing else — plan mode and the read-only tool list are a separate axis.
+- **A server denies its own harness's vendor, and the store is what enforces it.**
+  `agentmux mcp --deny <vendor>` — `claude-code` is an accepted spelling of `claude` — sets
+  `RunStore::with_denied_vendors`, checked beside the recursion refusal in `launch_turn`, which is
+  the one place `start` and `follow_up` both pass through: a consultation begun in a terminal is
+  not a way to drive a denied vendor from a server. The MCP layer only *advertises* the narrower choice, rewriting the
+  `delegate` enum of every tool that requires one, and a schema whose shape has moved leaves the
+  list wide rather than hiding a vendor that works — the refusal is the gate, the schema is the
+  saved call. `quota` keeps both vendors because reading a usage window launches nothing. Denying
+  every vendor is refused at startup, where a host surfaces it, rather than at every call, where
+  a host swallows it.
 - **Every delegate carries `AGENTMUX_DELEGATE=1`, and agentmux refuses to launch a delegate — or
   to serve MCP at all — when it finds itself inside one.** An isolated delegate cannot reach
   agentmux, but an inheriting one loads the operator's own MCP servers. The marker is not the only

@@ -76,7 +76,23 @@ pub enum Command {
     Quota(QuotaArgs),
 
     /// Serve the tools over stdio, for an MCP host to launch.
-    Mcp,
+    Mcp(McpArgs),
+}
+
+/// How the server is served.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Refuse to launch this vendor's delegates.
+    ///
+    /// Repeatable.
+    /// Name the vendor of the harness this server is registered in — `--deny claude` under Claude
+    /// Code, `--deny codex` under Codex.
+    /// That harness spawns its own same-vendor subagents natively and supervises them itself, so
+    /// a consultation agentmux runs for it is a slower, blinder copy of something it already has;
+    /// agentmux is worth paying for across the vendor line, not along it.
+    /// Denying both leaves nothing to consult and is refused.
+    #[arg(long = "deny", value_enum, value_name = "VENDOR")]
+    pub deny: Vec<VendorArg>,
 }
 
 /// Which delegate to consult, and on what terms.
@@ -133,6 +149,10 @@ pub struct DelegateArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum VendorArg {
     /// Anthropic's `claude`.
+    ///
+    /// Aliased to `claude-code` because the CLI and the harness that runs it are spelled
+    /// differently, and `--deny` is written while thinking of the harness.
+    #[value(alias = "claude-code")]
     Claude,
     /// The `codex` CLI from `OpenAI`.
     Codex,

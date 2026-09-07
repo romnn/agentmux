@@ -23,10 +23,13 @@ mod params;
 pub mod render;
 mod tools;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use agentmux::delegate::Vendor;
 use agentmux::run::RunStore;
 use rmcp::handler::server::router::tool::ToolRouter;
+use serde_json::Value;
 
 pub use crate::tools::AgentMux;
 
@@ -65,11 +68,67 @@ pub async fn serve_stdio(store: RunStore) -> Result<(), ServeError> {
     Ok(())
 }
 
-/// The tools this server offers.
+/// The tools this server offers, without the vendors it will not launch.
 ///
 /// Exposed so a test can assert the generated schemas are the flat, fully described shapes a
 /// calling model can fill in without guessing.
 #[must_use]
-pub fn tool_router() -> ToolRouter<AgentMux> {
-    AgentMux::tool_router()
+pub fn tool_router(denied: &BTreeSet<Vendor>) -> ToolRouter<AgentMux> {
+    let mut router = AgentMux::tool_router();
+    narrow_delegate_choice(&mut router, denied);
+    router
+}
+
+/// Leave a denied vendor out of the choices a tool that starts a consultation offers.
+///
+/// This is advertising, not the gate.
+/// [`RunStore`] refuses the launch itself, so a host that ignores schemas — or a caller that sends
+/// the denied name anyway — still gets that refusal; what this buys is that a calling model never
+/// spends a call discovering it.
+/// A schema whose shape has moved therefore leaves the list intact rather than failing: the wide
+/// list costs one refused call, while a wrong narrowing would hide a vendor that does work.
+///
+/// A tool that only reads *about* a vendor keeps both: `quota` leaves `delegate` optional, and an
+/// account this server will not launch still has a quota worth reporting.
+/// Requiring a delegate is what marks a tool as one that starts a consultation, so a tool added
+/// later cannot quietly escape this by being forgotten in a list of names.
+fn narrow_delegate_choice(router: &mut ToolRouter<AgentMux>, denied: &BTreeSet<Vendor>) {
+    // Spelled by the enum's own serde name, so the schema cannot disagree with what the store
+    // will match against.
+    let denied: Vec<Value> = denied
+        .iter()
+        .filter_map(|vendor| serde_json::to_value(vendor).ok())
+        .collect();
+    if denied.is_empty() {
+        return;
+    }
+
+    for route in router.map.values_mut() {
+        if !requires_delegate(&route.attr.input_schema) {
+            continue;
+        }
+        let Some(choice) = Arc::make_mut(&mut route.attr.input_schema)
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("delegate"))
+            .and_then(Value::as_object_mut)
+            .and_then(|delegate| delegate.get_mut("enum"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        choice.retain(|value| !denied.contains(value));
+    }
+}
+
+/// Whether a tool takes a delegate it must launch, rather than one it may ask about.
+fn requires_delegate(schema: &serde_json::Map<String, Value>) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field.as_str() == Some("delegate"))
+        })
 }

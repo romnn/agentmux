@@ -7,12 +7,13 @@
 
 use std::collections::BTreeSet;
 
+use agentmux::delegate::Vendor;
 use googletest::prelude::*;
 
 /// The nine tools, and nothing else.
 #[gtest]
 fn the_server_offers_exactly_the_documented_tools() {
-    let names: BTreeSet<String> = agentmux_mcp::tool_router()
+    let names: BTreeSet<String> = agentmux_mcp::tool_router(&BTreeSet::new())
         .list_all()
         .into_iter()
         .map(|t| t.name.to_string())
@@ -38,7 +39,7 @@ fn the_server_offers_exactly_the_documented_tools() {
 /// required.
 #[gtest]
 fn every_tool_argument_is_flat_and_described() {
-    for tool in agentmux_mcp::tool_router().list_all() {
+    for tool in agentmux_mcp::tool_router(&BTreeSet::new()).list_all() {
         let name = tool.name.to_string();
         let schema = &*tool.input_schema;
 
@@ -109,7 +110,7 @@ fn every_tool_argument_is_flat_and_described() {
 #[gtest]
 fn the_required_arguments_are_the_unguessable_ones() {
     let required = |name: &str| -> BTreeSet<String> {
-        agentmux_mcp::tool_router()
+        agentmux_mcp::tool_router(&BTreeSet::new())
             .list_all()
             .into_iter()
             .find(|t| t.name == name)
@@ -153,7 +154,7 @@ fn the_required_arguments_are_the_unguessable_ones() {
 /// the failure this project exists to prevent, so the absence is asserted rather than assumed.
 #[gtest]
 fn no_tool_offers_a_single_answer_field() {
-    for tool in agentmux_mcp::tool_router().list_all() {
+    for tool in agentmux_mcp::tool_router(&BTreeSet::new()).list_all() {
         let name = tool.name.to_string();
         let schema = serde_json::to_string(&*tool.input_schema).unwrap_or_default();
         let description = tool.description.clone().unwrap_or_default().to_string();
@@ -175,7 +176,7 @@ fn no_tool_offers_a_single_answer_field() {
 /// The whole schema is self-contained, with nothing hidden behind a definitions table.
 #[gtest]
 fn no_tool_schema_needs_a_definitions_table() {
-    for tool in agentmux_mcp::tool_router().list_all() {
+    for tool in agentmux_mcp::tool_router(&BTreeSet::new()).list_all() {
         assert_that!(
             tool.input_schema.get("$defs"),
             none(),
@@ -183,4 +184,60 @@ fn no_tool_schema_needs_a_definitions_table() {
             tool.name
         );
     }
+}
+
+/// A vendor this server will not launch is not offered as a choice.
+///
+/// The store refuses the launch either way, so what this buys is that the call is never made: a
+/// model fills in the enum it is shown, and an option whose only outcome is a refusal does not
+/// belong in it.
+/// `quota` keeps both vendors on purpose — reading what an account has left launches nothing, and
+/// an operator watching two accounts still wants both numbers from the host they work in.
+#[gtest]
+fn a_denied_vendor_is_not_offered_where_it_would_be_launched() {
+    let delegates = |denied: BTreeSet<Vendor>, tool: &str| -> Vec<String> {
+        agentmux_mcp::tool_router(&denied)
+            .list_all()
+            .into_iter()
+            .find(|offered| offered.name == tool)
+            .and_then(|offered| {
+                offered
+                    .input_schema
+                    .get("properties")
+                    .and_then(|properties| properties.get("delegate"))
+                    .and_then(|delegate| delegate.get("enum"))
+                    .and_then(|values| values.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    };
+    let both = || vec!["claude".to_owned(), "codex".to_owned()];
+
+    // Under Claude Code, the two tools that spawn a delegate offer only the other vendor.
+    let claude_denied = || BTreeSet::from([Vendor::Claude]);
+    assert_that!(
+        delegates(claude_denied(), "ask"),
+        eq(&vec!["codex".to_owned()])
+    );
+    assert_that!(
+        delegates(claude_denied(), "start"),
+        eq(&vec!["codex".to_owned()])
+    );
+    assert_that!(delegates(claude_denied(), "quota"), eq(&both()));
+
+    // Under Codex, the mirror image.
+    assert_that!(
+        delegates(BTreeSet::from([Vendor::Codex]), "ask"),
+        eq(&vec!["claude".to_owned()])
+    );
+
+    // A server that denies nothing advertises everything, which is the terminal's case and the
+    // default.
+    assert_that!(delegates(BTreeSet::new(), "ask"), eq(&both()));
+    assert_that!(delegates(BTreeSet::new(), "start"), eq(&both()));
 }

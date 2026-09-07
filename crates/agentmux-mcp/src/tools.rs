@@ -2,9 +2,11 @@
 //!
 //! Changes when the tool API changes.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentmux::delegate::Vendor;
 use agentmux::run::{RunId, RunStore, StartRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -212,9 +214,9 @@ impl AgentMux {
         // machine a consultation will actually run on, and from the directory the host started
         // the server in, which is where a consultation that names no `cwd` will read.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let instructions = instructions(store.host_env(), &cwd);
+        let instructions = instructions(store.host_env(), &cwd, store.denied_vendors());
         Self {
-            tool_router: Self::tool_router(),
+            tool_router: crate::tool_router(store.denied_vendors()),
             store,
             instructions,
         }
@@ -465,7 +467,9 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::Delegate(_)
         // The caller is a delegate that inherited its account's MCP servers and found agentmux
         // among them; the remedy is to answer, not to retry.
-        | RunError::Recursive => ErrorData::invalid_params(error.to_string(), None),
+        | RunError::Recursive
+        // The operator denied the vendor, and the message names the subagent to use instead.
+        | RunError::VendorDenied { .. } => ErrorData::invalid_params(error.to_string(), None),
         // A malformed or missing config file is the operator's to fix, not the caller's, but the
         // caller is the one holding the failed request and can at least retry without `account`.
         RunError::Config(inner) => ErrorData::invalid_params(
@@ -486,6 +490,44 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
     }
 }
 
+/// What the instructions say about a vendor this server will not launch, if any.
+///
+/// The reason is worth stating, not just the refusal.
+/// A caller told only that a delegate is unavailable retries it with another model or another
+/// account; one told the delegation is redundant reaches for the subagent its own harness already
+/// gives it, which is the outcome the operator asked for by denying the vendor.
+fn denial(denied: &BTreeSet<Vendor>) -> String {
+    if denied.is_empty() {
+        return String::new();
+    }
+    let allowed = named(
+        Vendor::ALL
+            .into_iter()
+            .filter(|vendor| !denied.contains(vendor)),
+    );
+    // The binary refuses a server that denies every vendor, but this library is not the only
+    // thing that can build a store.
+    let here = if allowed.is_empty() {
+        String::new()
+    } else {
+        format!(" Here, `delegate` is {allowed}.")
+    };
+    format!(
+        "\n\nThis server launches no {} delegates: the harness it serves already spawns those \
+         subagents natively, so use its own for that side.{here}",
+        named(denied.iter().copied())
+    )
+}
+
+/// A vendor list as prose, each name backticked and any two joined with "and".
+fn named(vendors: impl IntoIterator<Item = Vendor>) -> String {
+    vendors
+        .into_iter()
+        .map(|vendor| format!("`{vendor}`"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// What a host injects into the calling agent's context, plus this machine's own accounts.
 ///
 /// The roster is appended rather than baked into the schema: a tool schema is sent once and cached
@@ -495,16 +537,16 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
 fn instructions(
     host_env: &std::collections::BTreeMap<String, String>,
     cwd: &std::path::Path,
+    denied: &BTreeSet<Vendor>,
 ) -> String {
-    use agentmux::delegate::Vendor;
-
+    let denial = denial(denied);
     let config = match agentmux::config::Config::load(host_env, cwd) {
         Ok(config) => config,
         Err(error) => {
             // Said out loud: a server that starts fine but names no accounts looks like a machine
             // with none, and the operator has no other signal that their file was rejected.
             tracing::warn!(%error, "account configuration could not be read; instructions omit the roster");
-            return INSTRUCTIONS.to_owned();
+            return format!("{INSTRUCTIONS}{denial}");
         }
     };
 
@@ -556,7 +598,7 @@ fn instructions(
     };
 
     format!(
-        "{INSTRUCTIONS}\n\n{roster} `quota` reports what each has left and costs nothing: call it \
+        "{INSTRUCTIONS}{denial}\n\n{roster} `quota` reports what each has left and costs nothing: call it \
          before a long consultation, and again after a rate-limited failure to find one that can \
          answer now.\n\nA delegate loads no settings, hooks or MCP servers unless its account is \
          marked above as inheriting them. Pass `inherit_settings: true` when the point of the \

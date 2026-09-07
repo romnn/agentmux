@@ -57,7 +57,7 @@
 
 mod settle;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -97,6 +97,21 @@ pub enum RunError {
          question you were asked instead."
     )]
     Recursive,
+    /// The operator forbade this vendor on this server.
+    ///
+    /// A same-vendor delegate is a subagent the calling harness already spawns natively and
+    /// supervises itself, so an operator registering agentmux inside one harness denies that
+    /// harness's own vendor here.
+    #[error(
+        "this agentmux server does not launch `{vendor}` delegates: it was started with `--deny \
+         {vendor}` because the harness it serves is itself `{vendor}` and spawns same-vendor \
+         subagents natively. Consult the other vendor here, and use your own harness's subagents \
+         for `{vendor}`."
+    )]
+    VendorDenied {
+        /// The vendor that was asked for.
+        vendor: Vendor,
+    },
     /// A child could not be launched.
     #[error(transparent)]
     Launch(#[from] LaunchError),
@@ -549,6 +564,8 @@ pub struct RunStore {
     launcher: Arc<dyn Launcher>,
     probe: Arc<dyn crate::quota::QuotaProbe>,
     host_env: BTreeMap<String, String>,
+    /// Vendors this store will not launch, whatever a caller asks for.
+    denied: BTreeSet<Vendor>,
     /// Whether this process runs inside a delegate, decided once: neither witness can change
     /// while the process lives.
     inside_delegate: OnceLock<bool>,
@@ -606,6 +623,8 @@ impl RunStore {
             // embedder did not ask for; the binary installs a real probe in `main`.
             probe: Arc::new(crate::quota::DisabledProbe),
             host_env,
+            // Every vendor reachable until an operator says otherwise: a terminal denies none.
+            denied: BTreeSet::new(),
             inside_delegate: OnceLock::new(),
         })
     }
@@ -625,6 +644,28 @@ impl RunStore {
     pub fn with_quota_probe(mut self, probe: Arc<dyn crate::quota::QuotaProbe>) -> Self {
         self.probe = probe;
         self
+    }
+
+    /// Refuse to launch delegates of these vendors, whatever a caller asks for.
+    ///
+    /// `agentmux mcp --deny <vendor>` is the only thing that sets this, so a terminal keeps both
+    /// vendors while a server registered inside a harness gives up the one that harness already
+    /// spawns natively.
+    /// Set by argument and never by environment, like isolation, so what a server offers is fixed
+    /// by its registration rather than by whatever environment the host started it in.
+    #[must_use]
+    pub fn with_denied_vendors(mut self, denied: impl IntoIterator<Item = Vendor>) -> Self {
+        self.denied = denied.into_iter().collect();
+        self
+    }
+
+    /// The vendors this store will not launch.
+    ///
+    /// Exposed so that a front end can leave a denied vendor out of what it offers, rather than
+    /// advertising a choice every call would refuse.
+    #[must_use]
+    pub fn denied_vendors(&self) -> &BTreeSet<Vendor> {
+        &self.denied
     }
 
     /// The default state directory: `$AGENTMUX_STATE_DIR`, else the platform's own.
@@ -837,9 +878,7 @@ impl RunStore {
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
         // refused request leaves no half-made consultation for `list` to report as running.
-        if self.running_inside_a_delegate()? {
-            return Err(RunError::Recursive);
-        }
+        self.refuse_to_spawn(request.delegate.vendor())?;
         let cwd = std::path::absolute(&request.cwd)
             .map_err(RunError::io("resolving the working directory"))?;
         let config = crate::config::Config::load(&self.host_env, &cwd)?;
@@ -982,12 +1021,28 @@ impl RunStore {
             })
     }
 
+    /// Refuse a launch for the reasons that belong to this process rather than to any run.
+    ///
+    /// Both are settled before anything is written, because neither can change while the process
+    /// lives: agentmux inside a delegate spawns nothing, and a narrowed store spawns nothing of a
+    /// denied vendor.
+    fn refuse_to_spawn(&self, vendor: Vendor) -> Result<(), RunError> {
+        if self.running_inside_a_delegate()? {
+            return Err(RunError::Recursive);
+        }
+        if self.denied.contains(&vendor) {
+            return Err(RunError::VendorDenied { vendor });
+        }
+        Ok(())
+    }
+
     /// Spawn one turn's delegate.
     ///
-    /// The recursion check lives here rather than in `start` alone because this is the one place
-    /// a child is actually spawned.
+    /// The refusals are repeated here rather than left to `start` alone because this is the one
+    /// place a child is actually spawned.
     /// `follow_up` and anything added later are then covered by construction rather than by
-    /// remembering.
+    /// remembering: a consultation begun from a terminal is not a way to drive a denied vendor
+    /// from a server, because its follow-up spawns the same delegate again from here.
     fn launch_turn(
         &self,
         meta: &Meta,
@@ -996,9 +1051,7 @@ impl RunStore {
         resume: Option<&SessionRef>,
         config: &crate::config::Config,
     ) -> Result<(), RunError> {
-        if self.running_inside_a_delegate()? {
-            return Err(RunError::Recursive);
-        }
+        self.refuse_to_spawn(meta.delegate.vendor())?;
         let _lock = self.lock(&meta.run_id)?;
         // The run may have been swept or removed while this caller waited for the lock, and a
         // turn launched into a directory with no metadata would be a child nothing can reach.

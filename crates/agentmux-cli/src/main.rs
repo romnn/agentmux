@@ -5,15 +5,17 @@
 mod cli;
 mod report;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, McpArgs};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,29 +51,7 @@ async fn main() -> Result<()> {
         Command::Quota(args) => {
             report::quota(&store.quota(args.delegate.map(Into::into))?, cli.json)
         }
-        Command::Mcp => {
-            // A server started by a delegate would hand that delegate the means to start
-            // another.
-            // Refusing to serve at all is simpler than refusing tool by tool, and the host
-            // reports a server that would not start.
-            if store.running_inside_a_delegate()? {
-                bail!(
-                    "this agentmux was started inside a delegate that agentmux launched, so it \
-                     will not serve consultations to it. A delegate that inherits its account's \
-                     MCP servers also inherits agentmux; leave it out of that account's \
-                     configuration, or run the account isolated."
-                );
-            }
-            // The sweep runs once at server start.
-            // No timer, no daemon.
-            match store.sweep() {
-                Ok(0) => {}
-                Ok(removed) => tracing::info!(removed, "swept expired consultations"),
-                Err(error) => tracing::warn!(%error, "sweep failed; serving anyway"),
-            }
-            agentmux_mcp::serve_stdio(store).await?;
-            Ok(())
-        }
+        Command::Mcp(args) => serve(store, &args).await,
         Command::Ask(args) => {
             let status = store.start(&StartRequest {
                 delegate: args.delegate.build()?,
@@ -125,4 +105,48 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Serve the tools over stdio until the host disconnects.
+///
+/// Everything decided here is decided once, before the first tool call: which vendors this server
+/// will launch, whether it may serve at all, and what expired while it was not running.
+///
+/// # Errors
+///
+/// Returns an error when `--deny` leaves no vendor to consult, when this process is itself a
+/// delegate, or when the host does not complete the handshake.
+async fn serve(store: RunStore, args: &McpArgs) -> Result<()> {
+    let denied: BTreeSet<Vendor> = args.deny.iter().copied().map(Vendor::from).collect();
+    // Serving with every vendor denied would refuse every call it accepted.
+    // A host surfaces a server that will not start, where it would quietly swallow one that
+    // answers nothing.
+    if Vendor::ALL.iter().all(|vendor| denied.contains(vendor)) {
+        bail!(
+            "--deny names every vendor, which leaves nothing to consult. Deny the vendor of the \
+             harness this server is registered in — `--deny claude` under Claude Code, `--deny \
+             codex` under Codex — and leave the other."
+        );
+    }
+    let store = store.with_denied_vendors(denied);
+    // A server started by a delegate would hand that delegate the means to start another.
+    // Refusing to serve at all is simpler than refusing tool by tool, and the host reports a
+    // server that would not start.
+    if store.running_inside_a_delegate()? {
+        bail!(
+            "this agentmux was started inside a delegate that agentmux launched, so it will not \
+             serve consultations to it. A delegate that inherits its account's MCP servers also \
+             inherits agentmux; leave it out of that account's configuration, or run the account \
+             isolated."
+        );
+    }
+    // The sweep runs once at server start.
+    // No timer, no daemon.
+    match store.sweep() {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "swept expired consultations"),
+        Err(error) => tracing::warn!(%error, "sweep failed; serving anyway"),
+    }
+    agentmux_mcp::serve_stdio(store).await?;
+    Ok(())
 }

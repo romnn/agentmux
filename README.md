@@ -53,7 +53,21 @@ authenticated.
 **Claude Code**
 
 ```bash
-claude mcp add agentmux -- agentmux mcp
+claude mcp add agentmux -- agentmux mcp --deny claude
+```
+
+That writes the entry below, which can also be added by hand: to `~/.claude.json` under
+`mcpServers` for every project (`--scope user`), or to a checkout's `.mcp.json` (`--scope project`).
+
+```json
+{
+  "mcpServers": {
+    "agentmux": {
+      "command": "agentmux",
+      "args": ["mcp", "--deny", "claude"]
+    }
+  }
+}
 ```
 
 **Codex** — add to `~/.codex/config.toml`:
@@ -61,11 +75,26 @@ claude mcp add agentmux -- agentmux mcp
 ```toml
 [mcp_servers.agentmux]
 command = "agentmux"
-args = ["mcp"]
+args = ["mcp", "--deny", "codex"]
 # Codex kills a tool call after 60 seconds by default, which is shorter than the wait `ask` and
 # `result` accept. Raising it lets a caller block for a whole short consultation.
 tool_timeout_sec = 600
 ```
+
+`--deny <vendor>` keeps the server to the job it exists for. Each registration denies the vendor of
+the harness it is registered in, because that harness already spawns same-vendor subagents itself —
+natively, in-process, and under its own supervision, which is cheaper and better managed than
+anything `agentmux` can start for it. So under Claude Code the tools offer `codex` and nothing else,
+and under Codex they offer `claude`.
+
+A denied vendor is left out of the `delegate` choices `ask` and `start` advertise, so a calling model
+does not spend a call discovering it; one that names it anyway is refused before any process starts,
+and so is a `follow_up` that would resume it. `quota` still reports both vendors — reading what an
+account has left launches nothing. `--deny claude-code` is accepted as another spelling of
+`--deny claude`, and denying both vendors is refused rather than served, since it would leave nothing
+to consult. The flag is a server flag only: `agentmux ask` in a terminal still reaches either vendor.
+Leave it off when the server is how you reach a second account of your own vendor — it refuses the
+vendor as a whole, not one account.
 
 ### Tools
 
