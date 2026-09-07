@@ -26,6 +26,7 @@ fn the_server_offers_exactly_the_documented_tools() {
         "follow_up",
         "cancel",
         "list",
+        "quota",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -81,10 +82,19 @@ fn every_tool_argument_is_flat_and_described() {
                 some(anything()),
                 "{name}.{field} must declare one plain type"
             );
+            // A flat map of string to string is the one object shape allowed: it has no inner
+            // struct for a caller to get wrong, and `env` has no faithful flat encoding — a list
+            // of `KEY=VALUE` strings would just move the parsing into the caller.
+            let flat_string_map = spec.get("properties").is_none()
+                && spec
+                    .get("additionalProperties")
+                    .and_then(|a| a.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("string");
             assert_that!(
-                kind,
-                not(some(eq("object"))),
-                "{name}.{field} must not be nested"
+                kind != Some("object") || flat_string_map,
+                eq(true),
+                "{name}.{field} must not be a nested object"
             );
             assert_that!(
                 spec.get("$ref"),

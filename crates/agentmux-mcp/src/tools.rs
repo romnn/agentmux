@@ -13,7 +13,7 @@ use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::params::{DelegateParams, QuestionParams, run_id};
+use crate::params::{DelegateParams, QuestionParams, QuotaParams, Vendor, run_id};
 use crate::render;
 
 /// Default seconds a blocking tool waits.
@@ -227,6 +227,7 @@ impl AgentMux {
                 question: params.question.text()?,
                 cwd: params.question.working_dir()?,
                 retention: params.question.retention(),
+                env: params.question.environment(),
             })
             .map_err(|error| run_error(&error))?;
 
@@ -266,6 +267,7 @@ impl AgentMux {
                 question: params.question.text()?,
                 cwd: params.question.working_dir()?,
                 retention: params.question.retention(),
+                env: params.question.environment(),
             })
             .map_err(|error| run_error(&error))?;
         Ok(text(render::status(&status)))
@@ -412,6 +414,34 @@ impl AgentMux {
             .map_err(|error| run_error(&error))?;
         Ok(text(render::list(&runs)))
     }
+
+    #[tool(
+        description = "Report what each configured account has left of its usage windows, for \
+                       both vendors, in the vendor's own numbers. Free and fast: it spends no \
+                       tokens. Use it to choose an `account` before a long consultation, or after \
+                       a rate-limited failure to find one that can answer now. Read `severity` \
+                       and the per-model windows yourself — agentmux does not rank accounts, \
+                       because a percentage means nothing without the plan behind it. An account \
+                       reported as unavailable is NOT an idle account."
+    )]
+    fn quota(
+        &self,
+        Parameters(params): Parameters<QuotaParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let vendors = match params.delegate {
+            Some(Vendor::Claude) => vec![agentmux::delegate::Vendor::Claude],
+            Some(Vendor::Codex) => vec![agentmux::delegate::Vendor::Codex],
+            None => vec![
+                agentmux::delegate::Vendor::Claude,
+                agentmux::delegate::Vendor::Codex,
+            ],
+        };
+        let reported = self
+            .store
+            .quota(&vendors)
+            .map_err(|error| run_error(&error))?;
+        Ok(text(render::quota(&reported)))
+    }
 }
 
 /// Turn a store error into something the calling agent can act on.
@@ -428,6 +458,12 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::NotResumable(_)
         | RunError::TurnAlreadyClaimed { .. }
         | RunError::Delegate(_) => ErrorData::invalid_params(error.to_string(), None),
+        // A malformed or missing config file is the operator's to fix, not the caller's, but the
+        // caller is the one holding the failed request and can at least retry without `account`.
+        RunError::Config(inner) => ErrorData::invalid_params(
+            format!("{inner}\nOmit `account` to run against the CLI's own default configuration."),
+            None,
+        ),
         RunError::Launch(inner) => ErrorData::internal_error(
             format!(
                 "{inner}\nagentmux runs the vendor's own CLI, so that CLI must be installed and \

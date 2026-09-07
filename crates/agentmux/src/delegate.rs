@@ -18,9 +18,11 @@
 //! names the valid set — reaches the caller verbatim.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::config::{Config, Secret};
 
 /// A delegate argument that could not be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -39,6 +41,78 @@ pub enum DelegateError {
     /// The child environment cannot be built because the host environment lacks something.
     #[error("cannot build the delegate environment: {0}")]
     Environment(String),
+
+    /// The requested account alias is not defined by this machine's configuration.
+    ///
+    /// The message lists what *is* defined, because the caller is usually an agent that guessed a
+    /// plausible name and cannot see the file.
+    #[error("no {vendor} account named `{alias}` is configured{}. {}",
+        describe_selection(selected_by.as_deref()),
+        describe_configured(configured, config_path.as_deref()))]
+    UnknownAccount {
+        /// Which CLI the alias was being resolved for.
+        vendor: Vendor,
+        /// The alias that was asked for.
+        alias: String,
+        /// Every alias that vendor does have.
+        configured: Vec<String>,
+        /// Which file supplied them, when one did.
+        config_path: Option<std::path::PathBuf>,
+        /// The file that chose this alias, when the caller did not.
+        ///
+        /// A default selected by a checked-out `agentmux.toml` is the likeliest way to meet this
+        /// error without having named anything, and the file is the thing to go and fix.
+        selected_by: Option<std::path::PathBuf>,
+    },
+
+    /// An account names a configuration directory that is not there.
+    #[error(
+        "the {vendor} account `{alias}` points at {path}, which does not exist. Either that \
+         account has not been logged in on this machine, or the path is wrong."
+    )]
+    AccountDirMissing {
+        /// Which CLI the account belongs to.
+        vendor: Vendor,
+        /// The alias that was asked for.
+        alias: String,
+        /// The directory that is missing.
+        path: std::path::PathBuf,
+    },
+}
+
+/// How an account reads in a one-line summary.
+///
+/// Named rather than left blank when absent, because "which identity ran this" is the question a
+/// reader of a surprising result asks first.
+/// "The CLI's own login" and "a configured account" are spelled differently, because a listing in
+/// which both read `default` cannot answer that question.
+fn describe_account(alias: Option<&AccountAlias>) -> &str {
+    alias.map_or("cli-default", AccountAlias::as_str)
+}
+
+/// Name the file that chose an alias the caller did not ask for.
+fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
+    selected_by.map_or_else(String::new, |path| {
+        format!(", and {} selects it as the default", path.display())
+    })
+}
+
+/// Describe which aliases exist, for an unknown-alias error.
+fn describe_configured(configured: &[String], source: Option<&std::path::Path>) -> String {
+    if configured.is_empty() {
+        return match source {
+            Some(path) => format!("{} defines none for it.", path.display()),
+            None => "No agentmux.toml was found, so no accounts are configured. Create one at \
+                     ~/.config/agentmux/agentmux.toml, or omit `account` to use the CLI's own \
+                     default."
+                .to_owned(),
+        };
+    }
+    let names = configured.join(", ");
+    match source {
+        Some(path) => format!("{} defines: {names}.", path.display()),
+        None => format!("Configured: {names}."),
+    }
 }
 
 fn parse_token(
@@ -160,31 +234,47 @@ macro_rules! string_newtype_conversions {
 }
 string_newtype_conversions!(ModelId, Effort);
 
-/// Which Claude account a consultation authenticates as.
+/// An account alias, resolved through the machine's configuration.
 ///
-/// Two accounts live on one machine, separated by config directory.
-/// `Personal` reproduces in process what a `CLAUDE_CONFIG_DIR` wrapper script does: point the CLI
-/// at the other config directory and drop the API-key variables, so the session authenticates as
-/// that account rather than silently spending an API key that happens to be exported.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaudeAccount {
-    /// The default account, using the CLI's own default config directory.
-    #[default]
-    Work,
-    /// The secondary account, authenticated out of a separate config directory.
-    Personal,
-}
+/// Opaque for the same reason a model id is: agentmux keeps no roster of accounts, and the set of
+/// them is a property of the machine rather than of this crate.
+/// The alias is what an agent names; [`crate::config::Config`] is what turns it into a directory,
+/// so one prompt works across machines that store the same account in different places.
+///
+/// Omitting an alias entirely runs the vendor CLI against its own default configuration, which is
+/// what a machine with a single account of that vendor wants and needs no configuration for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AccountAlias(String);
 
-impl ClaudeAccount {
-    /// Environment variable that overrides where the personal account's config directory lives.
+impl AccountAlias {
+    /// Longest accepted alias.
+    const MAX_LEN: usize = 64;
+
+    /// Validate an alias.
     ///
-    /// Unset, the personal account is `$HOME/.claude-personal`.
-    pub const CONFIG_DIR_ENV: &'static str = "AGENTMUX_CLAUDE_PERSONAL_CONFIG_DIR";
+    /// Aliases name a table key in `agentmux.toml` and appear in error messages, so they are held
+    /// to a plain-identifier shape rather than to argv-safety alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::Argument`] when the alias is empty, over-long, or contains
+    /// anything but letters, digits, `-`, `_` or `.`.
+    pub fn parse(value: &str) -> Result<Self, DelegateError> {
+        parse_token("account", value, Self::MAX_LEN, |c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+        })
+        .map(Self)
+    }
 
-    /// Directory name appended to `$HOME` when [`Self::CONFIG_DIR_ENV`] is unset.
-    pub const DEFAULT_PERSONAL_DIR: &'static str = ".claude-personal";
+    /// The alias as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
+
+string_newtype_conversions!(AccountAlias);
 
 /// How much of the filesystem a Codex delegate may write.
 ///
@@ -257,9 +347,9 @@ pub enum Delegate {
         model: ModelId,
         /// Reasoning effort, forwarded verbatim.
         effort: Effort,
-        /// Which of the machine's two Claude accounts to authenticate as.
-        #[serde(default)]
-        account: ClaudeAccount,
+        /// Which configured account to authenticate as, or the CLI's own default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountAlias>,
     },
     /// The `OpenAI` CLI.
     Codex {
@@ -270,6 +360,9 @@ pub enum Delegate {
         /// How much the delegate may write.
         #[serde(default)]
         sandbox: CodexSandbox,
+        /// Which configured account to authenticate as, or the CLI's own default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountAlias>,
     },
 }
 
@@ -280,6 +373,28 @@ impl Delegate {
         match self {
             Self::Claude { .. } => Vendor::Claude,
             Self::Codex { .. } => Vendor::Codex,
+        }
+    }
+
+    /// The same delegate, with its account pinned to `alias`.
+    ///
+    /// Used to record the account a consultation actually ran as, once a configured default has
+    /// chosen one.
+    /// Without it the record would say the caller named nothing, which is true but does not answer
+    /// the question a reader of a surprising result asks: which identity paid for this.
+    #[must_use]
+    pub fn with_account(mut self, alias: AccountAlias) -> Self {
+        match &mut self {
+            Self::Claude { account, .. } | Self::Codex { account, .. } => *account = Some(alias),
+        }
+        self
+    }
+
+    /// The configured account this delegate authenticates as, if one was named.
+    #[must_use]
+    pub fn account(&self) -> Option<&AccountAlias> {
+        match self {
+            Self::Claude { account, .. } | Self::Codex { account, .. } => account.as_ref(),
         }
     }
 
@@ -308,18 +423,22 @@ impl Delegate {
                 effort,
                 account,
             } => {
-                let account = match account {
-                    ClaudeAccount::Work => "work",
-                    ClaudeAccount::Personal => "personal",
-                };
-                format!("claude {model} effort={effort} account={account}")
+                format!(
+                    "claude {model} effort={effort} account={}",
+                    describe_account(account.as_ref())
+                )
             }
             Self::Codex {
                 model,
                 effort,
                 sandbox,
+                account,
             } => {
-                format!("codex {model} effort={effort} sandbox={}", sandbox.as_str())
+                format!(
+                    "codex {model} effort={effort} sandbox={} account={}",
+                    sandbox.as_str(),
+                    describe_account(account.as_ref())
+                )
             }
         }
     }
@@ -336,6 +455,13 @@ pub struct TurnPlan<'a> {
     pub last_message_path: &'a Path,
     /// The delegate's own session identifier, when continuing a consultation.
     pub resume: Option<&'a SessionRef>,
+    /// Environment the caller asked for on this consultation.
+    ///
+    /// Applied last, over the machine and account layers, so a one-off can override a standing
+    /// setting.
+    /// It may not name a credential or an endpoint: those decide which identity pays, and a
+    /// request arriving from a delegating agent must not be able to redirect that.
+    pub extra_env: &'a BTreeMap<String, String>,
 }
 
 /// The delegate CLI's own handle on a conversation, so a later turn can continue it.
@@ -422,6 +548,32 @@ const BASE_ALLOWLIST: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
 ];
 
+/// Variables a Windows process needs before it can do anything at all.
+///
+/// Both delegates are Node programs, and a child started without `SystemRoot` cannot initialise
+/// winsock, so it fails to reach the network rather than failing to authenticate.
+/// `USERPROFILE` is Windows' `HOME`, which is how the CLIs find their own configuration.
+#[cfg(windows)]
+const PLATFORM_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "TEMP",
+    "TMP",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Nothing beyond [`BASE_ALLOWLIST`] is needed on a unix host.
+#[cfg(not(windows))]
+const PLATFORM_ALLOWLIST: &[&str] = &[];
+
 /// Credential variables the Claude CLI reads.
 ///
 /// Forwarded for the work account, withheld from the personal account so it authenticates as
@@ -467,9 +619,11 @@ impl Delegate {
         &self,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
+        config: &Config,
     ) -> Result<Invocation, DelegateError> {
         let mut env: BTreeMap<String, String> = BASE_ALLOWLIST
             .iter()
+            .chain(PLATFORM_ALLOWLIST.iter())
             .filter_map(|key| {
                 host_env
                     .get(*key)
@@ -484,44 +638,30 @@ impl Delegate {
         env.insert("NO_COLOR".to_owned(), "1".to_owned());
         env.insert("CI".to_owned(), "1".to_owned());
 
+        // The machine-wide layer, before any account chooses an identity.
+        config.launch.apply(&mut env, host_env);
+
         let args = match self {
             Self::Claude {
                 model,
                 effort,
                 account,
             } => {
-                for key in CLAUDE_CREDENTIAL_ALLOWLIST {
-                    // The personal account is exactly the work account minus these variables plus
-                    // its own config directory; that is the whole difference between the two.
-                    if *account == ClaudeAccount::Work
-                        && let Some(value) = host_env.get(*key)
-                    {
-                        env.insert((*key).to_owned(), value.clone());
-                    }
-                }
-                if *account == ClaudeAccount::Personal {
-                    env.insert(
-                        "CLAUDE_CONFIG_DIR".to_owned(),
-                        personal_config_dir(host_env)?
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
+                apply_account(&mut env, Vendor::Claude, account.as_ref(), config, host_env)?;
                 claude_args(model, effort, plan)
             }
             Self::Codex {
                 model,
                 effort,
                 sandbox,
+                account,
             } => {
-                for key in CODEX_CREDENTIAL_ALLOWLIST {
-                    if let Some(value) = host_env.get(*key) {
-                        env.insert((*key).to_owned(), value.clone());
-                    }
-                }
+                apply_account(&mut env, Vendor::Codex, account.as_ref(), config, host_env)?;
                 codex_args(model, effort, *sandbox, plan)
             }
         };
+
+        apply_request_env(&mut env, plan.extra_env)?;
 
         Ok(Invocation {
             program: self.vendor().program(),
@@ -531,18 +671,245 @@ impl Delegate {
     }
 }
 
-fn personal_config_dir(host_env: &BTreeMap<String, String>) -> Result<PathBuf, DelegateError> {
-    if let Some(explicit) = host_env.get(ClaudeAccount::CONFIG_DIR_ENV) {
-        return Ok(PathBuf::from(explicit));
+/// The environment variables a vendor reads for credentials, in the order they are documented.
+///
+/// Forwarded from the host only when no account alias was chosen.
+/// Choosing an alias means "authenticate as this identity", and a key exported in the launching
+/// agent's own shell would otherwise win over it silently — the caller would believe it had
+/// switched accounts while spending the other one.
+fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
+    match vendor {
+        Vendor::Claude => CLAUDE_CREDENTIAL_ALLOWLIST,
+        Vendor::Codex => CODEX_CREDENTIAL_ALLOWLIST,
     }
-    let home = host_env.get("HOME").ok_or_else(|| {
-        DelegateError::Environment(
-            "the personal Claude account lives under $HOME, which is not set. Set HOME, or point \
-             AGENTMUX_CLAUDE_PERSONAL_CONFIG_DIR at that account's config directory."
-                .to_owned(),
+}
+
+/// Names of the variables an account's fields map onto, per vendor.
+struct CredentialVars {
+    config_dir: &'static str,
+    api_key: &'static str,
+    base_url: &'static str,
+}
+
+fn credential_vars(vendor: Vendor) -> CredentialVars {
+    match vendor {
+        Vendor::Claude => CredentialVars {
+            config_dir: "CLAUDE_CONFIG_DIR",
+            api_key: "ANTHROPIC_API_KEY",
+            base_url: "ANTHROPIC_BASE_URL",
+        },
+        Vendor::Codex => CredentialVars {
+            config_dir: "CODEX_HOME",
+            api_key: "OPENAI_API_KEY",
+            base_url: "OPENAI_BASE_URL",
+        },
+    }
+}
+
+/// Put one account's credentials into the child environment.
+///
+/// With no alias the host's own credential variables are forwarded and the CLI uses its default
+/// configuration, which is what a machine with a single account of that vendor needs.
+fn apply_account(
+    env: &mut BTreeMap<String, String>,
+    vendor: Vendor,
+    alias: Option<&AccountAlias>,
+    config: &Config,
+    host_env: &BTreeMap<String, String>,
+) -> Result<(), DelegateError> {
+    // A caller that names no account gets the machine's or the checkout's chosen default, which is
+    // the only thing a project file is allowed to say and therefore the only reason it exists.
+    //
+    // `selected_by` records the file that made the choice, so an unresolvable default sends the
+    // reader to the file that named it rather than to their own tool call.
+    let (alias, selected_by) = if let Some(alias) = alias {
+        (alias.clone(), None)
+    } else if let Some(name) = config.default_account(vendor) {
+        (
+            AccountAlias::parse(name)?,
+            config
+                .project_source
+                .clone()
+                .or_else(|| config.source.clone()),
         )
-    })?;
-    Ok(PathBuf::from(home).join(ClaudeAccount::DEFAULT_PERSONAL_DIR))
+    } else {
+        for key in credential_keys(vendor) {
+            if let Some(value) = host_env.get(*key) {
+                env.insert((*key).to_owned(), value.clone());
+            }
+        }
+        return Ok(());
+    };
+
+    let account =
+        config
+            .account(vendor, alias.as_str())
+            .ok_or_else(|| DelegateError::UnknownAccount {
+                vendor,
+                alias: alias.to_string(),
+                configured: config.alias_names(vendor),
+                config_path: config.source.clone(),
+                selected_by,
+            })?;
+
+    if account.is_empty() {
+        return Err(DelegateError::Environment(format!(
+            "the {vendor} account `{alias}` is configured but empty. Give it a `config_dir`, an \
+             `api_key`, an `api_key_env` or a `base_url`."
+        )));
+    }
+
+    let vars = credential_vars(vendor);
+    let home = host_env.get("HOME").map(std::path::PathBuf::from);
+
+    if let Some(dir) = &account.config_dir {
+        let resolved = crate::config::expand_tilde(dir, home.as_deref());
+        // Checked here rather than left to the CLI: both vendors happily create a fresh config
+        // directory and then report "Not logged in", which sends the caller looking at their
+        // credentials instead of at the path that was wrong.
+        if !resolved.is_dir() {
+            return Err(DelegateError::AccountDirMissing {
+                vendor,
+                alias: alias.to_string(),
+                path: resolved,
+            });
+        }
+        env.insert(
+            vars.config_dir.to_owned(),
+            resolved.to_string_lossy().into_owned(),
+        );
+    }
+
+    if let Some(key) = secret_value(
+        account.api_key.as_ref(),
+        account.api_key_env.as_deref(),
+        host_env,
+        vendor,
+        &alias,
+        "api_key",
+    )? {
+        env.insert(vars.api_key.to_owned(), key);
+    }
+
+    if let Some(token) = secret_value(
+        account.auth_token.as_ref(),
+        account.auth_token_env.as_deref(),
+        host_env,
+        vendor,
+        &alias,
+        "auth_token",
+    )? {
+        if vendor == Vendor::Codex {
+            return Err(DelegateError::Environment(format!(
+                "the codex account `{alias}` sets an auth token, which only the claude CLI reads. \
+                 Use `api_key` or `api_key_env` instead."
+            )));
+        }
+        env.insert("ANTHROPIC_AUTH_TOKEN".to_owned(), token);
+    }
+
+    if let Some(base) = &account.base_url {
+        env.insert(vars.base_url.to_owned(), base.clone());
+    }
+
+    account.launch.apply(env, host_env);
+    Ok(())
+}
+
+/// Apply the environment the caller asked for on this one consultation.
+///
+/// Refuses any name that decides which identity runs.
+/// The caller here is frequently another model acting on text it was given, and a request that
+/// could set `ANTHROPIC_BASE_URL` could send the account's credentials somewhere else.
+/// Those names belong in the machine's own configuration, which no request can reach.
+fn apply_request_env(
+    env: &mut BTreeMap<String, String>,
+    requested: &BTreeMap<String, String>,
+) -> Result<(), DelegateError> {
+    for (name, value) in requested {
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            return Err(DelegateError::Argument {
+                field: "env",
+                reason: "is not a usable environment variable name",
+                value: name.clone(),
+            });
+        }
+        if is_reserved(name) {
+            return Err(DelegateError::Environment(format!(
+                "`{name}` is part of how agentmux decides which account a consultation \
+                 authenticates as, which program runs and how it reaches the network, so it \
+                 cannot be set per request. Put it in an account or in `[launch]` in \
+                 agentmux.toml, which no request can reach."
+            )));
+        }
+        env.insert(name.clone(), value.clone());
+    }
+    Ok(())
+}
+
+/// Whether a variable name is agentmux's to decide rather than a caller's.
+///
+/// Derived from the allowlists rather than listed by hand, because a hand-kept denylist forgets
+/// the name that was added last week — the same reason the child environment is an allowlist in
+/// the first place.
+///
+/// The set is wider than credentials alone, and every part of it is load-bearing.
+/// `PATH` selects which binary the child actually executes, so a caller able to set it runs a
+/// program of its choosing with the resolved account's credentials in its environment.
+/// `HOME` relocates the default account's identity.
+/// The proxy and CA variables together route every request through a chosen host and make that
+/// host's certificate trusted, which is credential capture without touching a credential.
+///
+/// Both vendors' names are refused regardless of which vendor is being launched, so the answer
+/// does not depend on a host variable happening to be exported.
+fn is_reserved(name: &str) -> bool {
+    // A vendor's own namespace, refused wholesale rather than name by name.
+    // `CLAUDE_CODE_USE_BEDROCK` reroutes a consultation to a caller-supplied Bedrock endpoint, and
+    // matching the prefix closes that without agentmux having to learn what Bedrock is — the same
+    // reason it keeps no roster of model identifiers.
+    const RESERVED_PREFIXES: &[&str] = &[
+        "ANTHROPIC_",
+        "CLAUDE_",
+        "OPENAI_",
+        "CODEX_",
+        "AWS_",
+        "GOOGLE_",
+        "GEMINI_",
+        "VERTEX_",
+        "AZURE_",
+    ];
+
+    BASE_ALLOWLIST.contains(&name)
+        || PLATFORM_ALLOWLIST.contains(&name)
+        || CLAUDE_CREDENTIAL_ALLOWLIST.contains(&name)
+        || CODEX_CREDENTIAL_ALLOWLIST.contains(&name)
+        || matches!(name, "TERM" | "NO_COLOR" | "CI")
+        || RESERVED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        // A proxy variable is spelled either case, and both spellings are read.
+        || name.to_ascii_uppercase().contains("PROXY")
+}
+
+/// Resolve a credential written into the file, or named as a host variable.
+fn secret_value(
+    literal: Option<&Secret>,
+    from_env: Option<&str>,
+    host_env: &BTreeMap<String, String>,
+    vendor: Vendor,
+    alias: &AccountAlias,
+    field: &'static str,
+) -> Result<Option<String>, DelegateError> {
+    if let Some(name) = from_env {
+        let value = host_env.get(name).ok_or_else(|| {
+            DelegateError::Environment(format!(
+                "the {vendor} account `{alias}` reads {field} from ${name}, which is not set in \
+                 the environment agentmux was launched with."
+            ))
+        })?;
+        return Ok(Some(value.clone()));
+    }
+    Ok(literal.map(|secret| secret.expose().to_owned()))
 }
 
 /// Argument vector for the Claude CLI.

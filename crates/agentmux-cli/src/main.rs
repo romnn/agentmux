@@ -8,12 +8,13 @@ mod report;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, VendorArg};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,9 +36,18 @@ async fn main() -> Result<()> {
         Some(dir) => dir.clone(),
         None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
     };
-    let store = RunStore::open(root, Arc::new(ProcessLauncher), host_env)?;
+    let store = RunStore::open(root, Arc::new(ProcessLauncher), host_env)?
+        .with_quota_probe(Arc::new(agentmux::quota::SystemProbe));
 
     match cli.command {
+        Command::Accounts => {
+            // Resolved from the current directory, so the answer is the one a consultation started
+            // here would actually get.
+            let cwd = std::env::current_dir().wrap_err("locating the working directory")?;
+            let config = agentmux::config::Config::load(&agentmux::host_env(), &cwd)?;
+            report::accounts(&config, cli.json)
+        }
+        Command::Quota(args) => run_quota(args.delegate, cli.json),
         Command::Mcp => {
             // The sweep runs once at server start.
             // No timer, no daemon.
@@ -55,6 +65,7 @@ async fn main() -> Result<()> {
                 question: args.question.text()?,
                 cwd: args.question.working_dir()?,
                 retention: args.question.retention(),
+                env: args.question.environment()?,
             })?;
             let status = store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
@@ -67,6 +78,7 @@ async fn main() -> Result<()> {
                 question: args.question.text()?,
                 cwd: args.question.working_dir()?,
                 retention: args.question.retention(),
+                env: args.question.environment()?,
             })?;
             report::status(&status, cli.json)
         }
@@ -102,4 +114,26 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Report what each configured account has left.
+///
+/// Split out of `main` because the vendor fan-out and configuration load are a whole step of their
+/// own, and `main` is otherwise a dispatch table.
+fn run_quota(delegate: Option<VendorArg>, json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().wrap_err("locating the working directory")?;
+    let host_env = agentmux::host_env();
+    let config = agentmux::config::Config::load(&host_env, &cwd)?;
+    let vendors = match delegate {
+        Some(VendorArg::Claude) => vec![Vendor::Claude],
+        Some(VendorArg::Codex) => vec![Vendor::Codex],
+        None => vec![Vendor::Claude, Vendor::Codex],
+    };
+    let reported: Vec<_> = vendors
+        .into_iter()
+        .flat_map(|vendor| {
+            agentmux::quota::probe_vendor(vendor, &config, &host_env, &agentmux::quota::SystemProbe)
+        })
+        .collect();
+    report::quota(&reported, json)
 }

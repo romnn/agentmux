@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use agentmux::delegate::{ClaudeAccount, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -46,17 +46,6 @@ pub enum Vendor {
     Codex,
 }
 
-/// Which of the machine's two Claude accounts to authenticate as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Account {
-    /// The default account.
-    #[default]
-    Work,
-    /// The secondary account, out of its own config directory.
-    Personal,
-}
-
 /// How much of the filesystem a Codex delegate may write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,23 +64,6 @@ impl JsonSchema for Vendor {
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         string_choice("Which delegate CLI to run.", &["claude", "codex"])
-    }
-
-    fn inline_schema() -> bool {
-        true
-    }
-}
-
-impl JsonSchema for Account {
-    fn schema_name() -> Cow<'static, str> {
-        "Account".into()
-    }
-
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        string_choice(
-            "Which of the machine's two Claude accounts to authenticate as.",
-            &["work", "personal"],
-        )
     }
 
     fn inline_schema() -> bool {
@@ -136,14 +108,15 @@ pub struct DelegateParams {
     /// silently runs at the wrong depth.
     pub effort: String,
 
-    /// `claude` only.
-    /// `work` is the default account; `personal` authenticates out of the secondary config
-    /// directory instead.
-    /// Ask the user which one before the first consultation of a session, then keep using that
-    /// answer.
+    /// Which configured account to authenticate as, for either vendor.
+    ///
+    /// Omit it to use the CLI's own default configuration, which is right on a machine with one
+    /// account of that vendor.
+    /// Aliases are defined per machine in `agentmux.toml`; naming one that does not exist returns
+    /// an error listing the ones that do, so guessing is cheap to recover from.
     #[serde(default)]
-    #[schemars(with = "Account")]
-    pub account: Option<Account>,
+    #[schemars(with = "String")]
+    pub account: Option<String>,
 
     /// `codex` only.
     /// `read_only` is right for a review.
@@ -156,6 +129,29 @@ pub struct DelegateParams {
 }
 
 impl DelegateParams {
+    /// Validate the account alias, if one was named.
+    ///
+    /// Only the shape is checked here; whether the alias exists is a property of the machine, and
+    /// answering that at the edge would mean loading configuration before the working directory
+    /// that selects it is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error when the alias is not a plain name.
+    fn alias(&self) -> Result<Option<AccountAlias>, ErrorData> {
+        self.account
+            .as_deref()
+            .map(|name| {
+                AccountAlias::parse(name).map_err(|error| {
+                    ErrorData::invalid_params(
+                        format!("{error}. An account alias is a name from `agentmux.toml`."),
+                        None,
+                    )
+                })
+            })
+            .transpose()
+    }
+
     /// Parse the flat wire shape into the closed enum.
     ///
     /// # Errors
@@ -190,30 +186,18 @@ impl DelegateParams {
                 Ok(Delegate::Claude {
                     model,
                     effort,
-                    account: match self.account.unwrap_or_default() {
-                        Account::Work => ClaudeAccount::Work,
-                        Account::Personal => ClaudeAccount::Personal,
-                    },
+                    account: self.alias()?,
                 })
             }
-            Vendor::Codex => {
-                if self.account.is_some() {
-                    return Err(ErrorData::invalid_params(
-                        "`account` belongs to `delegate: claude`, which has two accounts on this \
-                         machine. `codex` has one. Drop `account`."
-                            .to_owned(),
-                        None,
-                    ));
-                }
-                Ok(Delegate::Codex {
-                    model,
-                    effort,
-                    sandbox: match self.sandbox.unwrap_or_default() {
-                        Sandbox::ReadOnly => CodexSandbox::ReadOnly,
-                        Sandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
-                    },
-                })
-            }
+            Vendor::Codex => Ok(Delegate::Codex {
+                model,
+                effort,
+                sandbox: match self.sandbox.unwrap_or_default() {
+                    Sandbox::ReadOnly => CodexSandbox::ReadOnly,
+                    Sandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
+                },
+                account: self.alias()?,
+            }),
         }
     }
 }
@@ -236,6 +220,16 @@ pub struct QuestionParams {
     #[serde(default)]
     #[schemars(with = "String")]
     pub cwd: Option<String>,
+
+    /// Extra environment variables for the delegate process, as a flat string map.
+    ///
+    /// Useful for switching off something in the delegate's own setup for this consultation, such
+    /// as a hook the caller does not want running inside a review.
+    /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
+    /// Names that decide which account authenticates are rejected.
+    #[serde(default)]
+    #[schemars(with = "std::collections::BTreeMap<String, String>")]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 
     /// Keep the consultation indefinitely, so a follow-up can arrive at any time.
     /// Without this it is deleted 24 hours after it started.
@@ -262,6 +256,12 @@ impl QuestionParams {
             ));
         }
         Ok(self.question.clone())
+    }
+
+    /// The environment the caller asked for, defaulting to none.
+    #[must_use]
+    pub fn environment(&self) -> std::collections::BTreeMap<String, String> {
+        self.env.clone().unwrap_or_default()
     }
 
     /// The working directory, defaulting to the server's own.
@@ -327,4 +327,15 @@ pub fn run_id(value: &str) -> Result<RunId, ErrorData> {
             None,
         )
     })
+}
+
+/// Arguments for `quota`: which vendor's accounts to ask about.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct QuotaParams {
+    /// Ask only this vendor's accounts.
+    /// Both are asked when omitted, which is usually what you want before choosing where to send
+    /// a consultation.
+    #[serde(default)]
+    #[schemars(with = "Vendor")]
+    pub delegate: Option<Vendor>,
 }

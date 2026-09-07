@@ -80,6 +80,7 @@ tracing-subscriber = { version = "0", features = ["env-filter"] }
 # serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 # `schemars` derives the JSON Schema for every MCP tool's input; `rmcp`'s `schemars`
 # feature must stay on the same major.
 schemars = "1"

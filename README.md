@@ -84,10 +84,11 @@ disk. The inline text is a bounded convenience; the file is the record.
 | `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
 | `cancel`    | Stop a running consultation, keeping everything collected so far                    |
 | `list`      | Recent consultations with their ids, so an id can be recovered                       |
+| `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
 
 ### Use from the command line
 
-The same eight verbs are available directly, as a unified CLI over both vendors:
+The same nine verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.
@@ -104,11 +105,95 @@ agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
 
 agentmux list
 agentmux prune            # drop consultations past their retention
+
+# Which accounts this machine has, and what each has left.
+agentmux accounts
+agentmux quota
 ```
 
-`--account personal` selects the second Claude account on a machine that has two: it points the CLI
-at `$HOME/.claude-personal` and withholds `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, so the
-session authenticates as that account rather than spending an API key that happens to be exported.
+### Accounts
+
+An agent asking for a second opinion knows it wants "the personal account". It has no way to know
+where that account's credentials live, and the answer differs on every machine. `agentmux.toml`
+is the map between the two, so one prompt works everywhere:
+
+```toml
+# ~/.config/agentmux/agentmux.toml
+
+# Applied to every delegate launch, before any account chooses an identity.
+[launch]
+env = { DISABLE_HOOKS = "true" }
+env_passthrough = ["AWS_PROFILE"]
+
+# Used when a caller names no account.
+[defaults.claude]
+account = "personal"
+
+# A second logged-in profile.
+[accounts.claude.personal]
+config_dir = "~/.claude-personal"
+description = "Personal Max subscription"
+
+# A key kept out of the file, read from the environment at launch.
+[accounts.claude.ci]
+api_key_env = "CI_ANTHROPIC_KEY"
+
+# A locally served OpenAI-compatible endpoint.
+[accounts.codex.local]
+base_url = "http://localhost:11434/v1"
+api_key = "ollama"
+```
+
+Aliases are opaque, exactly like model identifiers: agentmux keeps no roster, and naming one that
+does not exist returns an error listing the ones that do. Omit `account` entirely and the vendor
+CLI's own configuration is used, which is right on a machine with one login per vendor and needs
+no file at all.
+
+Choosing an account **withholds** that vendor's credential variables from the host environment, so
+an exported `ANTHROPIC_API_KEY` cannot silently outrank the account you asked for. That is the
+whole point: without it a caller believes it switched accounts while spending another.
+
+**Two files, two jobs.** A *machine* file — `$AGENTMUX_CONFIG`, `~/.config/agentmux/agentmux.toml`,
+`~/agentmux.toml`, or the platform config directory — may define accounts. A *project* file, found
+by walking up from the delegate's working directory to `$HOME`, may only **select** one:
+
+```toml
+# <repo>/agentmux.toml — safe to commit
+[defaults.claude]
+account = "clientx"
+```
+
+A project file that tries to define an account is refused by name. It has to be, because such a
+file arrives with a `git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a
+repository and asking for one second opinion would send your key to whoever wrote it.
+
+### Rate limits
+
+Every consultation records the usage window its vendor reported, and a rate-limited failure says
+when the window reopens rather than only that it closed — the difference between "wait four
+minutes" and "wait nine hours, go elsewhere". On a refusal, agentmux also reports what the
+machine's *other* accounts have left, so the next call is obvious.
+
+`agentmux quota` asks the same question at any time. It costs nothing and spends no tokens: Claude
+answers from the cache it keeps itself, refreshed with its own free `/usage`; Codex answers over
+its app-server protocol.
+
+The numbers are the vendor's own, passed through unchanged. agentmux does not rank accounts,
+because a percentage means nothing without the plan behind it — every absolute figure comes back
+null on a subscription — and because a per-model window like `Fable` is reported by display name
+while agentmux only ever sees an opaque model id. An account that could not be asked is reported
+as **unavailable, not idle**; an unauthenticated configuration directory answers "0% used"
+cheerfully, and anything ranking on "least used" would route straight to the broken one.
+
+### Environment
+
+Three layers reach the delegate, each overriding the last: the `[launch]` table above, then the
+chosen account's own `env`, then whatever one call asks for — `--env KEY=VALUE` on the CLI, an
+`env` object on the MCP tools. Useful for switching off a hook inside a review.
+
+A per-request `env` may not name a credential or a config directory. Those decide which identity
+pays, and a request arriving from a delegating agent must not be able to redirect that; put them in
+`agentmux.toml`, which no request can reach.
 
 ### What the delegate does and does not see
 

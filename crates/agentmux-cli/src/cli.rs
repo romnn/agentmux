@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use agentmux::delegate::{ClaudeAccount, CodexSandbox, Delegate, Effort, ModelId};
+use std::collections::BTreeMap;
+
+use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -67,6 +69,12 @@ pub enum Command {
     /// Delete consultations past their retention, or one by id.
     Prune(PruneArgs),
 
+    /// List the account aliases this machine defines, and where they came from.
+    Accounts,
+
+    /// Report what each configured account has left of its usage windows.
+    Quota(QuotaArgs),
+
     /// Serve the tools over stdio, for an MCP host to launch.
     Mcp,
 }
@@ -89,14 +97,13 @@ pub struct DelegateArgs {
     #[arg(long)]
     pub effort: String,
 
-    /// Which Claude account to authenticate as, for `--delegate claude`.
-    /// Defaults to `work`.
+    /// Which configured account to authenticate as, for either vendor.
     ///
-    /// Optional rather than defaulted, so setting it on a codex delegate is an error rather than
-    /// a silently ignored flag.
-    /// The MCP surface rejects the same mistake, and the two must not disagree about one request.
-    #[arg(long, value_enum)]
-    pub account: Option<AccountArg>,
+    /// Aliases come from `agentmux.toml`; run `agentmux accounts` to see the ones this machine
+    /// defines.
+    /// Omit it to use the CLI's own default configuration.
+    #[arg(long)]
+    pub account: Option<String>,
 
     /// How much of the filesystem the delegate may write, for `--delegate codex`.
     /// Defaults to `read-only`.
@@ -113,13 +120,13 @@ pub enum VendorArg {
     Codex,
 }
 
-/// Which of the machine's two Claude accounts to authenticate as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AccountArg {
-    /// The default account, using the CLI's own config directory.
-    Work,
-    /// The secondary account, out of `$HOME/.claude-personal`.
-    Personal,
+/// Which vendor's accounts to ask about.
+#[derive(Debug, Args)]
+pub struct QuotaArgs {
+    /// Ask only this vendor.
+    /// Both are asked when omitted.
+    #[arg(long, value_enum)]
+    pub delegate: Option<VendorArg>,
 }
 
 /// How much of the filesystem a Codex delegate may write.
@@ -132,6 +139,17 @@ pub enum SandboxArg {
 }
 
 impl DelegateArgs {
+    /// Validate the account alias, if one was given.
+    ///
+    /// Existence is not checked here: which aliases are defined depends on the working directory
+    /// the consultation will run in, which `build` does not know.
+    fn alias(&self) -> Result<Option<AccountAlias>> {
+        self.account
+            .as_deref()
+            .map(|name| Ok(AccountAlias::parse(name)?))
+            .transpose()
+    }
+
     /// Build the delegate, rejecting an option that belongs to the other vendor.
     ///
     /// The core type carries only what each vendor accepts, so the mismatch has to be caught here
@@ -156,28 +174,18 @@ impl DelegateArgs {
                 Ok(Delegate::Claude {
                     model,
                     effort,
-                    account: match self.account.unwrap_or(AccountArg::Work) {
-                        AccountArg::Work => ClaudeAccount::Work,
-                        AccountArg::Personal => ClaudeAccount::Personal,
-                    },
+                    account: self.alias()?,
                 })
             }
-            VendorArg::Codex => {
-                if self.account.is_some() {
-                    bail!(
-                        "--account applies to --delegate claude, which has two accounts on this \
-                         machine. codex has one."
-                    );
-                }
-                Ok(Delegate::Codex {
-                    model,
-                    effort,
-                    sandbox: match self.sandbox.unwrap_or(SandboxArg::ReadOnly) {
-                        SandboxArg::ReadOnly => CodexSandbox::ReadOnly,
-                        SandboxArg::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
-                    },
-                })
-            }
+            VendorArg::Codex => Ok(Delegate::Codex {
+                model,
+                effort,
+                sandbox: match self.sandbox.unwrap_or(SandboxArg::ReadOnly) {
+                    SandboxArg::ReadOnly => CodexSandbox::ReadOnly,
+                    SandboxArg::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
+                },
+                account: self.alias()?,
+            }),
         }
     }
 }
@@ -197,6 +205,13 @@ pub struct QuestionArgs {
     /// Defaults to the current directory.
     #[arg(long, short = 'C')]
     pub cwd: Option<PathBuf>,
+
+    /// Extra environment for the delegate, as a repeatable `KEY=VALUE` pair.
+    ///
+    /// Useful for switching off something in the delegate's own setup for one consultation.
+    /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
 
     /// Keep the consultation indefinitely so a follow-up can arrive at any time.
     ///
@@ -245,6 +260,27 @@ impl QuestionArgs {
             Some(dir) => Ok(dir.clone()),
             None => std::env::current_dir().wrap_err("determining the working directory"),
         }
+    }
+
+    /// The extra environment, parsed from `KEY=VALUE` pairs.
+    ///
+    /// Split on the first `=` only, because a value may legitimately contain one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a pair has no `=`, or an empty name.
+    pub fn environment(&self) -> Result<BTreeMap<String, String>> {
+        let mut env = BTreeMap::new();
+        for pair in &self.env {
+            let Some((name, value)) = pair.split_once('=') else {
+                bail!("--env expects KEY=VALUE, got {pair:?}");
+            };
+            if name.is_empty() {
+                bail!("--env has an empty variable name in {pair:?}");
+            }
+            env.insert(name.to_owned(), value.to_owned());
+        }
+        Ok(env)
     }
 
     /// How long the consultation is kept.
@@ -358,6 +394,7 @@ impl FollowUpArgs {
     /// Returns an error when the file or stdin cannot be read, or the question is empty.
     pub fn text(&self) -> Result<String> {
         QuestionArgs {
+            env: Vec::new(),
             question: self.question.clone(),
             file: self.file.clone(),
             cwd: None,

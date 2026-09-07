@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use agentmux::config::{Account, Config};
 use agentmux::delegate::{
-    ClaudeAccount, CodexSandbox, Delegate, Effort, Invocation, ModelId, SessionRef, TurnPlan,
+    AccountAlias, CodexSandbox, Delegate, Effort, Invocation, ModelId, SessionRef, TurnPlan,
 };
 use googletest::prelude::*;
 
@@ -26,22 +27,24 @@ fn every_delegate() -> Result<Vec<Delegate>> {
         Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
-            account: ClaudeAccount::Work,
+            account: None,
         },
         Delegate::Claude {
             model: model("claude-fable-5-1")?,
             effort: effort("xhigh")?,
-            account: ClaudeAccount::Personal,
+            account: Some(AccountAlias::parse("personal").or_fail()?),
         },
         Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: effort("high")?,
             sandbox: CodexSandbox::ReadOnly,
+            account: None,
         },
         Delegate::Codex {
             model: model("gpt-5.6-sol")?,
             effort: effort("xhigh")?,
             sandbox: CodexSandbox::WorkspaceWrite,
+            account: None,
         },
     ])
 }
@@ -76,12 +79,47 @@ fn host_session_env() -> BTreeMap<String, String> {
 }
 
 fn build(delegate: &Delegate, resume: Option<&SessionRef>) -> Result<Invocation> {
+    build_with(delegate, resume, &Config::default())
+}
+
+/// Build against a specific machine configuration.
+///
+/// Separate from [`build`] because most tests care only about the argument vector, which no
+/// configuration affects; the account tests are the ones that need a populated alias map.
+fn build_with(
+    delegate: &Delegate,
+    resume: Option<&SessionRef>,
+    config: &Config,
+) -> Result<Invocation> {
     let plan = TurnPlan {
         question_path: Path::new("/runs/r/turns/0000/question.md"),
         last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
         resume,
+        extra_env: &BTreeMap::new(),
     };
-    delegate.invocation(&plan, &host_session_env()).or_fail()
+    delegate
+        .invocation(&plan, &host_session_env(), config)
+        .or_fail()
+}
+
+/// A configuration whose `personal` alias points at a directory that exists.
+///
+/// The directory has to be real: agentmux refuses an account whose config directory is missing,
+/// which is the whole point of that check.
+fn config_with_personal(dir: &Path) -> Config {
+    let mut config = Config::default();
+    let account = Account {
+        config_dir: Some(dir.to_path_buf()),
+        ..Account::default()
+    };
+    for vendor in ["claude", "codex"] {
+        config
+            .accounts
+            .entry(vendor.to_owned())
+            .or_default()
+            .insert("personal".to_owned(), account.clone());
+    }
+    config
 }
 
 /// Whether `args` contains `flag` immediately followed by `value`.
@@ -96,8 +134,10 @@ fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
 /// The "never forgets" claim: no delegate can be launched without full capture.
 #[gtest]
 fn every_delegate_captures_its_whole_stream() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let config = config_with_personal(dir.path());
     for delegate in every_delegate()? {
-        let invocation = build(&delegate, None)?;
+        let invocation = build_with(&delegate, None, &config)?;
         let args = &invocation.args;
         let label = delegate.summary();
 
@@ -192,8 +232,10 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
 /// The delegate must not be a nested session wearing its parent's identity.
 #[gtest]
 fn the_child_does_not_inherit_the_host_session() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let config = config_with_personal(dir.path());
     for delegate in every_delegate()? {
-        let invocation = build(&delegate, None)?;
+        let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
 
         for key in invocation.env.keys() {
@@ -247,38 +289,165 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
     Ok(())
 }
 
-/// The personal account is the work account minus the API keys, plus its own config directory.
+/// A named account is the default account minus the host's API keys, plus its own config
+/// directory.
+///
+/// The withholding is the half that is easy to miss: an `ANTHROPIC_API_KEY` exported in the
+/// launching agent's shell would otherwise outrank the config directory, so a caller that asked
+/// for one identity would silently spend another.
 #[gtest]
-fn the_personal_account_authenticates_as_itself() -> Result<()> {
-    let personal = build(
+fn a_named_account_authenticates_as_itself() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let config = config_with_personal(dir.path());
+
+    let personal = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
-            account: ClaudeAccount::Personal,
+            account: Some(AccountAlias::parse("personal").or_fail()?),
         },
         None,
+        &config,
     )?;
     assert_that!(personal.env.get("ANTHROPIC_API_KEY"), none());
     assert_that!(personal.env.get("ANTHROPIC_AUTH_TOKEN"), none());
     assert_that!(
         personal.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-        some(eq("/home/dev/.claude-personal"))
+        some(eq(dir.path().to_string_lossy().as_ref()))
     );
 
-    let work = build(
+    let default = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
-            account: ClaudeAccount::Work,
+            account: None,
         },
         None,
+        &config,
     )?;
     assert_that!(
-        work.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+        default.env.get("ANTHROPIC_API_KEY").map(String::as_str),
         some(eq("sk-ant-secret"))
     );
     // The host's own CLAUDE_CONFIG_DIR must not select the account.
-    assert_that!(work.env.get("CLAUDE_CONFIG_DIR"), none());
+    assert_that!(default.env.get("CLAUDE_CONFIG_DIR"), none());
+    Ok(())
+}
+
+/// An alias the machine does not define must name the ones it does.
+///
+/// The caller is usually a model that guessed a plausible name from the user's prose, and it
+/// cannot see the file.
+/// An error that only says "unknown" leaves it guessing again.
+#[gtest]
+fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let config = config_with_personal(dir.path());
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+    };
+
+    let error = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: Some(AccountAlias::parse("work").or_fail()?),
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .expect_err("`work` is not configured");
+
+    let message = error.to_string();
+    assert_that!(
+        message,
+        contains_substring("no claude account named `work`")
+    );
+    assert_that!(message, contains_substring("personal"));
+    Ok(())
+}
+
+/// An account pointing at a directory that is not there must say so before launching.
+///
+/// Left to the CLI this is silent: `claude` creates the directory, reports "Not logged in", and
+/// sends the reader to look at their credentials rather than at the path that was wrong.
+#[gtest]
+fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let missing = dir.path().join("never-created");
+    let config = config_with_personal(&missing);
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+    };
+
+    let error = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: Some(AccountAlias::parse("personal").or_fail()?),
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .expect_err("the directory does not exist");
+
+    assert_that!(error.to_string(), contains_substring("does not exist"));
+    assert_that!(
+        error.to_string(),
+        contains_substring(missing.to_string_lossy().as_ref())
+    );
+    Ok(())
+}
+
+/// An account may carry credentials directly, which is how a local endpoint is reached.
+///
+/// A locally served model has no config directory to log into; it is a base URL and a token the
+/// server ignores.
+/// The same shape covers a gateway and a CI key.
+#[gtest]
+fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
+    let mut config = Config::default();
+    config
+        .accounts
+        .entry("codex".to_owned())
+        .or_default()
+        .insert(
+            "local".to_owned(),
+            Account {
+                base_url: Some("http://localhost:11434/v1".to_owned()),
+                api_key_env: Some("LOCAL_TOKEN".to_owned()),
+                ..Account::default()
+            },
+        );
+
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+    };
+    let mut host = host_session_env();
+    host.insert("LOCAL_TOKEN".to_owned(), "not-a-real-key".to_owned());
+
+    let invocation = Delegate::Codex {
+        model: model("qwen3-coder")?,
+        effort: effort("high")?,
+        sandbox: CodexSandbox::ReadOnly,
+        account: Some(AccountAlias::parse("local").or_fail()?),
+    }
+    .invocation(&plan, &host, &config)
+    .or_fail()?;
+
+    assert_that!(
+        invocation.env.get("OPENAI_BASE_URL").map(String::as_str),
+        some(eq("http://localhost:11434/v1"))
+    );
+    assert_that!(
+        invocation.env.get("OPENAI_API_KEY").map(String::as_str),
+        some(eq("not-a-real-key"))
+    );
+    // The host's own Codex credentials stay behind: the alias chose the identity.
+    assert_that!(invocation.env.get("CODEX_HOME"), none());
     Ok(())
 }
 
@@ -290,6 +459,7 @@ fn a_codex_resume_passes_its_sandbox_as_config_not_as_a_flag() -> Result<()> {
         model: model("gpt-6-astra")?,
         effort: effort("high")?,
         sandbox: CodexSandbox::ReadOnly,
+        account: None,
     };
 
     let fresh = build(&delegate, None)?;
@@ -315,7 +485,7 @@ fn a_claude_resume_reopens_the_delegates_session() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
-            account: ClaudeAccount::Work,
+            account: None,
         },
         Some(&session),
     )?;
@@ -370,4 +540,225 @@ fn an_argv_unsafe_model_identifier_is_rejected() {
         ModelId::parse(&"x".repeat(ModelId::MAX_LEN + 1)),
         err(anything())
     );
+}
+
+/// A per-request environment may not name anything that decides where the consultation goes.
+///
+/// The caller is frequently another model acting on text it was handed, so this is the boundary
+/// between "switch off a hook for this review" and "run a program of my choosing with the
+/// operator's subscription credentials in its environment".
+/// `PATH` is the sharpest of these: the child environment is installed before the program is
+/// looked up, so setting it chooses which binary executes.
+#[gtest]
+fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()> {
+    let reserved = [
+        // Chooses which binary runs.
+        "PATH",
+        // Relocates the default account's identity.
+        "HOME",
+        // Routes every request through a host of the caller's choosing, and makes its certificate
+        // trusted; together these capture credentials without naming one.
+        "HTTPS_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        // The credential and account-selection names themselves, for both vendors at once.
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        // A vendor namespace that reroutes the consultation without naming a credential.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "http_proxy",
+    ];
+
+    for name in reserved {
+        let requested = [((name).to_owned(), "attacker".to_owned())]
+            .into_iter()
+            .collect();
+        let plan = TurnPlan {
+            question_path: Path::new("/runs/r/turns/0000/question.md"),
+            last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+            resume: None,
+            extra_env: &requested,
+        };
+        let result = Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: None,
+        }
+        .invocation(&plan, &host_session_env(), &Config::default());
+
+        assert_that!(
+            result.is_err(),
+            eq(true),
+            "a request was allowed to set {name}"
+        );
+    }
+    Ok(())
+}
+
+/// A per-request environment still reaches the delegate for everything else.
+///
+/// The point of the guard is to keep identity and routing out of a caller's hands, not to make the
+/// parameter useless: switching off a hook inside a review is exactly what it is for.
+#[gtest]
+fn a_request_environment_reaches_the_delegate() -> Result<()> {
+    let requested = [("DISABLE_HOOKS".to_owned(), "true".to_owned())]
+        .into_iter()
+        .collect();
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &requested,
+    };
+
+    let invocation = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: None,
+    }
+    .invocation(&plan, &host_session_env(), &Config::default())
+    .or_fail()?;
+
+    assert_that!(
+        invocation.env.get("DISABLE_HOOKS").map(String::as_str),
+        some(eq("true"))
+    );
+    Ok(())
+}
+
+/// The three environment layers apply in order, each overriding the one before.
+///
+/// Stated as one test because the ordering is the contract: a machine-wide setting is a default, an
+/// account's setting is more specific, and one call's setting is the most specific of all.
+#[gtest]
+fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut config = config_with_personal(dir.path());
+    config
+        .launch
+        .env
+        .insert("AGENTMUX_TEST_LAYER".to_owned(), "from-machine".to_owned());
+    config
+        .launch
+        .env
+        .insert("MACHINE_ONLY".to_owned(), "yes".to_owned());
+    if let Some(account) = config
+        .accounts
+        .get_mut("claude")
+        .and_then(|table| table.get_mut("personal"))
+    {
+        account
+            .launch
+            .env
+            .insert("AGENTMUX_TEST_LAYER".to_owned(), "from-account".to_owned());
+    }
+
+    let requested = [("AGENTMUX_TEST_LAYER".to_owned(), "from-request".to_owned())]
+        .into_iter()
+        .collect();
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &requested,
+    };
+
+    let invocation = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: Some(AccountAlias::parse("personal").or_fail()?),
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .or_fail()?;
+
+    // The most specific layer wins.
+    assert_that!(
+        invocation
+            .env
+            .get("AGENTMUX_TEST_LAYER")
+            .map(String::as_str),
+        some(eq("from-request"))
+    );
+    // A layer that nothing overrides still reaches the delegate.
+    assert_that!(
+        invocation.env.get("MACHINE_ONLY").map(String::as_str),
+        some(eq("yes"))
+    );
+    Ok(())
+}
+
+/// A configured default account applies when the caller names none.
+///
+/// Without this the machine and project `[defaults]` tables are decoration: a checkout that pins
+/// its client's identity would authenticate as whatever the machine's default login happens to be,
+/// which is the silently-wrong-identity failure the whole account mechanism exists to prevent.
+#[gtest]
+fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut config = config_with_personal(dir.path());
+    config.defaults.insert(
+        "claude".to_owned(),
+        agentmux::config::Defaults {
+            account: Some("personal".to_owned()),
+        },
+    );
+
+    let invocation = build_with(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: None,
+        },
+        None,
+        &config,
+    )?;
+
+    assert_that!(
+        invocation.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        some(eq(dir.path().to_string_lossy().as_ref()))
+    );
+    // The default is a real account selection, so the host's key is withheld exactly as if the
+    // caller had named it.
+    assert_that!(invocation.env.get("ANTHROPIC_API_KEY"), none());
+    Ok(())
+}
+
+/// A default naming an account nobody defined must point at the file that chose it.
+///
+/// The caller named nothing, so an error blaming its arguments sends it looking in the wrong
+/// place entirely.
+#[gtest]
+fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result<()> {
+    let mut config = Config {
+        project_source: Some(std::path::PathBuf::from("/work/client/agentmux.toml")),
+        ..Config::default()
+    };
+    config.defaults.insert(
+        "claude".to_owned(),
+        agentmux::config::Defaults {
+            account: Some("clientx".to_owned()),
+        },
+    );
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+    };
+
+    let error = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: None,
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .expect_err("`clientx` is not defined");
+
+    let message = error.to_string();
+    assert_that!(message, contains_substring("clientx"));
+    assert_that!(message, contains_substring("/work/client/agentmux.toml"));
+    Ok(())
 }

@@ -23,7 +23,7 @@ use super::{
 use crate::delegate::Vendor;
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
-use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn};
+use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Transcript, Turn};
 
 /// Recover a report the event stream lost but the CLI wrote out anyway.
 ///
@@ -52,6 +52,56 @@ fn recover_from_last_message(dir: &TurnDir, turn: &mut Turn) {
 }
 
 impl RunStore {
+    /// The recovered usage window, searched for once and remembered.
+    ///
+    /// The absence of one is cached too.
+    /// A finished turn's rollout does not gain rate limits later, so a fruitless search repeated
+    /// on every `status` would walk the vendor's whole session tree for nothing.
+    fn cached_codex_rate_limit(
+        &self,
+        dir: &TurnDir,
+        meta: &Meta,
+        thread_id: &str,
+    ) -> Option<RateLimit> {
+        if let Some(cached) = read_json::<Option<RateLimit>>(&dir.rate_limit()) {
+            return cached;
+        }
+        let found = self.codex_rate_limit(meta, thread_id);
+        let _ = write_json(&dir.rate_limit(), &found);
+        found
+    }
+
+    /// The usage window Codex recorded while running one turn.
+    ///
+    /// Its rollout files live under `CODEX_HOME`, which an account may relocate, so the same
+    /// configuration that chose the account decides where to look.
+    fn codex_rate_limit(&self, meta: &Meta, thread_id: &str) -> Option<RateLimit> {
+        let config = crate::config::Config::load(&self.host_env, &meta.cwd).ok()?;
+        let home = crate::config::home_dir(&self.host_env);
+        let codex_home = meta
+            .delegate
+            .account()
+            .and_then(|alias| config.account(Vendor::Codex, alias.as_str()))
+            .and_then(|account| account.config_dir.as_ref())
+            .map(|dir| crate::config::expand_tilde(dir, home.as_deref()))
+            .or_else(|| home.map(|home| home.join(".codex")))?;
+
+        let limits = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
+        // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
+        let primary = limits.get("primary")?;
+        let resets_at = primary
+            .get("resets_at")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(chrono::DateTime::from_timestamp_secs)?;
+        Some(RateLimit {
+            resets_at,
+            window: limits
+                .get("limit_id")
+                .and_then(|id| id.as_str())
+                .map(ToOwned::to_owned),
+        })
+    }
+
     /// Rebuild a consultation from its capture files.
     ///
     /// This is the only place a `Transcript` comes from.
@@ -130,6 +180,20 @@ impl RunStore {
                 && *opened != asked_for
             {
                 turn.broke_continuity = true;
+            }
+
+            // Codex says nothing about usage on the stream agentmux captures, but records it in
+            // the session rollout it writes anyway.
+            // Reading that afterwards is the only way a Codex consultation reports a usage window
+            // at all, and it costs neither a process nor a token.
+            // Only once the turn is over: a running turn's rollout is still being written, and
+            // the search is too expensive to repeat on every fold.
+            if vendor == Vendor::Codex
+                && turn.rate_limit.is_none()
+                && turn.outcome.is_terminal()
+                && let Some(thread) = turn_session.as_ref()
+            {
+                turn.rate_limit = self.cached_codex_rate_limit(&dir, meta, thread.as_str());
             }
 
             if turn_session.is_some() {

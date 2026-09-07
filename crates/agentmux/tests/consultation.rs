@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{ClaudeAccount, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunId, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{FailureKind, Outcome};
@@ -22,7 +22,7 @@ fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Effort::parse("xhigh").or_fail()?,
-        account: ClaudeAccount::Work,
+        account: None,
     })
 }
 
@@ -31,6 +31,7 @@ fn codex() -> Result<Delegate> {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Effort::parse("high").or_fail()?,
         sandbox: CodexSandbox::ReadOnly,
+        account: None,
     })
 }
 
@@ -57,6 +58,7 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         question: question.to_owned(),
         cwd: PathBuf::from("/work/project"),
         retention: Retention::Ttl,
+        env: BTreeMap::new(),
     }
 }
 

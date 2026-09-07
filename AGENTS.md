@@ -11,7 +11,7 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 
 | Crate                 | What it is                                                                    |
 | --------------------- | ----------------------------------------------------------------------------- |
-| `crates/agentmux`     | library: `delegate`, `stream/{claude,codex}`, `transcript`, `launch`, `run`    |
+| `crates/agentmux`     | library: `config`, `delegate`, `stream/{claude,codex}`, `transcript`, `launch`, `quota`, `run` |
 | `crates/agentmux-mcp` | library: the `rmcp` stdio server and its tools                                 |
 | `crates/agentmux-cli` | binary `agentmux`: `agentmux mcp` serves, the other subcommands are a unified CLI over both vendors |
 
@@ -26,6 +26,18 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 - Test helpers return `googletest::Result` and convert with `.or_fail()?` rather than
   `unwrap`/`expect`. The workspace denies both, and `clippy.toml`'s test exemption covers only
   code inside a test-attributed function — a free helper in a `tests/` file is not exempt.
+- **Account aliases are opaque too, and so are quota payloads.** The machine's `agentmux.toml` is
+  the only authority on which accounts exist; agentmux keeps no roster and never ranks them. A
+  vendor's usage figures are passed through exactly as they arrived, because a percentage means
+  nothing without the plan tier behind it and every absolute figure is null on a subscription.
+- **A failed quota probe is never zero usage.** `Observation::Unavailable` exists so that an
+  account which could not be asked cannot be confused with an idle one; an unauthenticated Claude
+  config directory reports 0% used, so anything ranking on "least used" would prefer whichever
+  account is broken.
+- **Only a machine config file may define an account.** A project `agentmux.toml`, found by walking
+  up from the delegate's working directory, may only select one. It can arrive with a `git clone`,
+  and a file that could name a `base_url` and an `api_key_env` would be a credential-exfiltration
+  primitive.
 - **Model id and reasoning effort are opaque pass-through strings.** agentmux keeps no roster of
   either, and a new model identifier must never require an agentmux release. The delegate CLI is the
   sole authority on which values it accepts; when one is wrong, that CLI's own error — which names
@@ -51,6 +63,23 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `task audit`           | advisories against the dependency tree                                |
 | `task unused`          | unused dependencies (nightly)                                         |
 | `task lint:actions`    | actionlint over `.github/workflows`                                   |
+
+## Probing accounts
+
+`agentmux quota` reads what each configured account has left, and costs nothing:
+
+- **Claude** keeps its own figures in `$CLAUDE_CONFIG_DIR/.claude.json` under
+  `cachedUsageUtilization`. agentmux reads that file, refreshing it with `claude --print /usage`
+  when it is over five minutes old — that command reports `total_cost_usd: 0` and no API duration.
+  Only `limits[]` carries the per-model windows; the printed text omits some of them.
+- **Codex** publishes nothing to disk outside a session rollout, so agentmux asks
+  `codex app-server` over JSON-RPC for `account/rateLimits/read`. The server interleaves unsolicited
+  notifications with replies, so the response is matched on request id rather than read as the next
+  line.
+- Codex reports no rate limits on the stream `codex exec --json` produces. They are recovered
+  afterwards from `$CODEX_HOME/sessions/**/rollout-*<thread-id>*.jsonl`, and cached per turn in
+  `rate-limit.json`, because that search would otherwise run on every `status` and every page of a
+  `tail`.
 
 ## Testing against the real CLIs
 

@@ -35,10 +35,12 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Effort::parse("xhigh").or_fail()?,
                 sandbox: CodexSandbox::ReadOnly,
+                account: None,
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
+            env: BTreeMap::new(),
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -146,11 +148,12 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Effort::parse("xhigh").or_fail()?,
-                account: agentmux::delegate::ClaudeAccount::Work,
+                account: None,
             },
             question: "Reply with exactly: THE_REPORT_BODY".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
+            env: BTreeMap::new(),
         })
         .or_fail()?;
 
@@ -200,10 +203,12 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Effort::parse("xhigh").or_fail()?,
                 sandbox: CodexSandbox::ReadOnly,
+                account: None,
             },
             question: "A long review.".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
+            env: BTreeMap::new(),
         })
         .or_fail()?;
 
@@ -268,9 +273,9 @@ fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()>
 
 /// A rate limit whose window is hours away must send the caller elsewhere.
 ///
-/// This is the recorded case: an exhausted seven-day window with nine hours left on it. Advising
-/// "wait" there strands the calling agent on a run that cannot progress within any wait it is
-/// allowed to ask for.
+/// This is the recorded case: an exhausted seven-day window with nine hours left on it.
+/// Advising "wait" there strands the calling agent on a run that cannot progress within any wait
+/// it is allowed to ask for.
 #[gtest]
 fn a_window_hours_away_advises_switching_rather_than_waiting() -> Result<()> {
     let (_store, mut status, _dir) = consult(indoc::indoc! {r#"

@@ -217,3 +217,84 @@ fn json_status(status: &RunStatus) -> serde_json::Value {
         "resumable": status.resumable,
     })
 }
+
+/// Print the account aliases this machine defines.
+///
+/// The point of the command is discovery: an alias is a name someone has to know, and the error
+/// for guessing wrong is only visible after a consultation has been attempted.
+///
+/// # Errors
+///
+/// Returns an error only when the JSON form cannot be serialised.
+pub fn accounts(config: &agentmux::config::Config, json: bool) -> Result<()> {
+    use agentmux::delegate::Vendor;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(config)?);
+        return Ok(());
+    }
+
+    match &config.source {
+        Some(path) => println!("config      {}", path.display()),
+        None => println!(
+            "config      none found (searched from the working directory up to $HOME, then the \
+             platform config directory)"
+        ),
+    }
+
+    for vendor in [Vendor::Claude, Vendor::Codex] {
+        println!("\n{vendor}");
+        let accounts = config.accounts(vendor);
+        if accounts.is_empty() {
+            println!("  (none configured — omit --account to use the CLI's own default)");
+            continue;
+        }
+        for (alias, account) in accounts {
+            // Say what each alias would actually do, without printing a credential.
+            let mut how = Vec::new();
+            if let Some(dir) = &account.config_dir {
+                how.push(format!("config_dir={}", dir.display()));
+            }
+            if let Some(base) = &account.base_url {
+                how.push(format!("base_url={base}"));
+            }
+            if account.api_key.is_some() {
+                how.push("api_key=<set in config>".to_owned());
+            }
+            if let Some(name) = &account.api_key_env {
+                how.push(format!("api_key=${name}"));
+            }
+            if account.auth_token.is_some() {
+                how.push("auth_token=<set in config>".to_owned());
+            }
+            if let Some(name) = &account.auth_token_env {
+                how.push(format!("auth_token=${name}"));
+            }
+            println!("  {alias:<16} {}", how.join(", "));
+        }
+    }
+    Ok(())
+}
+
+/// Print what each account has left.
+///
+/// The vendor payload is printed exactly as it arrived under `--json`.
+/// The prose form shows what a person scans for, and defers to the shared renderer so the CLI and
+/// the MCP tool cannot describe the same account differently.
+///
+/// # Errors
+///
+/// Returns an error only when the JSON form cannot be serialised.
+pub fn quota(reported: &[agentmux::quota::AccountQuota], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(reported)?);
+        return Ok(());
+    }
+    for entry in reported {
+        for line in agentmux_mcp::render::quota_report(entry) {
+            println!("{line}");
+        }
+        println!();
+    }
+    Ok(())
+}

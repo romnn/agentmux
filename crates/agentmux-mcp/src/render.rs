@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+use agentmux::quota::{AccountQuota, Observation, Origin};
 use agentmux::run::{RunStatus, RunSummary, TranscriptPage};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
 use chrono::Utc;
@@ -153,6 +154,14 @@ pub fn warnings(status: &RunStatus) -> String {
             recovery_advice(*kind, status.rate_limit.as_ref()),
             summarise(detail, 600),
         );
+        // The alternatives, where the failure itself made them worth fetching.
+        // Naming which account could answer now is the difference between "rate limited" and a
+        // next call the caller can actually make.
+        for entry in &status.quota {
+            for line in quota_report(entry) {
+                let _ = writeln!(out, "\x20           {line}");
+            }
+        }
     }
     if status.broke_continuity {
         out.push_str(
@@ -423,4 +432,155 @@ pub fn duration(duration: std::time::Duration) -> String {
         60..3600 => format!("{}m{}s", seconds / 60, seconds % 60),
         _ => format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60),
     }
+}
+
+/// Every account's quota, for the `quota` tool.
+///
+/// Header first, like every other tool result: a host that truncates cuts the end, and the reason
+/// a caller asked is usually the account at the bottom of a long list.
+#[must_use]
+pub fn quota(reported: &[AccountQuota]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "accounts:   {} across both vendors\nnote:       figures are the vendor's own; agentmux \
+         does not rank accounts, because a percentage means nothing without the plan behind it.\n\
+         warning:    an account reported unavailable is NOT an idle account — it could not be \
+         asked.\n",
+        reported.len()
+    );
+    for entry in reported {
+        for line in quota_report(entry) {
+            let _ = writeln!(out, "{line}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// One account's quota, as lines a reader scans.
+///
+/// The vendor payloads have nothing in common — Claude reports a `limits` array of percentages,
+/// Codex a map of named buckets — so this reads whichever shape is present and says nothing when
+/// it recognises neither.
+/// It is presentation only: the payload itself is passed through untouched, so a field this
+/// function has never heard of still reaches a caller reading the JSON.
+#[must_use]
+pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
+    let mut lines = Vec::new();
+    let account = entry
+        .account
+        .as_ref()
+        .map_or_else(|| "(default)".to_owned(), ToString::to_string);
+    let described = entry
+        .description
+        .as_ref()
+        .map_or_else(String::new, |d| format!(" — {d}"));
+    lines.push(format!("{} {account}{described}", entry.vendor));
+
+    match &entry.observation {
+        Observation::Unavailable { reason } => {
+            // Said plainly, because the one reading this may be choosing where to send work and
+            // must not read silence as spare capacity.
+            lines.push(format!("  unavailable, not idle — {reason}"));
+        }
+        Observation::Reported { origin, payload } => {
+            lines.push(format!("  {}", describe_origin(origin)));
+            let windows = claude_windows(payload)
+                .or_else(|| codex_windows(payload))
+                .unwrap_or_default();
+            if windows.is_empty() {
+                lines.push("  no window this build recognises; read the payload".to_owned());
+            }
+            lines.extend(windows.into_iter().map(|line| format!("  {line}")));
+        }
+    }
+    lines
+}
+
+/// How current a set of figures is.
+fn describe_origin(origin: &Origin) -> String {
+    match origin {
+        Origin::Live => "live".to_owned(),
+        Origin::Cache { fetched_at_ms, .. } => fetched_at_ms
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map_or_else(
+                || "from the CLI's cache, age unknown".to_owned(),
+                |at| {
+                    let age = Utc::now().signed_duration_since(at).to_std().ok();
+                    age.map_or_else(
+                        || "from the CLI's cache".to_owned(),
+                        |age| format!("from the CLI's cache, measured {} ago", duration(age)),
+                    )
+                },
+            ),
+    }
+}
+
+/// Claude reports a `limits` array, each entry a percentage with its own severity.
+fn claude_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let limits = payload.get("utilization")?.get("limits")?.as_array()?;
+    Some(
+        limits
+            .iter()
+            .map(|limit| {
+                let kind = limit
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("window");
+                // The scope names a model, and only by display name: the vendor leaves `id` null,
+                // which is why nothing here tries to match it to the model a caller asked for.
+                let scope = limit
+                    .get("scope")
+                    .and_then(|s| s.get("model"))
+                    .and_then(|m| m.get("display_name"))
+                    .and_then(|n| n.as_str())
+                    .map_or_else(String::new, |name| format!(" ({name})"));
+                let percent = limit
+                    .get("percent")
+                    .and_then(serde_json::Value::as_i64)
+                    .map_or_else(|| "?".to_owned(), |p| format!("{p}%"));
+                let severity = limit
+                    .get("severity")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| *s != "normal")
+                    .map_or_else(String::new, |s| format!(" [{s}]"));
+                let resets = limit
+                    .get("resets_at")
+                    .and_then(|r| r.as_str())
+                    .map_or_else(String::new, |r| format!(", resets {r}"));
+                format!("{kind}{scope}: {percent} used{severity}{resets}")
+            })
+            .collect(),
+    )
+}
+
+/// Codex reports a map of named buckets, each with a primary and optional secondary window.
+fn codex_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let buckets = payload.get("rateLimitsByLimitId")?.as_object()?;
+    Some(
+        buckets
+            .iter()
+            .map(|(id, bucket)| {
+                let name = bucket
+                    .get("limitName")
+                    .and_then(|n| n.as_str())
+                    .map_or_else(String::new, |n| format!(" ({n})"));
+                let windows = ["primary", "secondary"]
+                    .into_iter()
+                    .filter_map(|which| {
+                        let window = bucket.get(which)?;
+                        let percent = window.get("usedPercent")?.as_i64()?;
+                        let minutes = window
+                            .get("windowDurationMins")
+                            .and_then(serde_json::Value::as_i64)
+                            .map_or_else(String::new, |m| format!(" over {m}m"));
+                        Some(format!("{percent}% used{minutes}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{id}{name}: {windows}")
+            })
+            .collect(),
+    )
 }

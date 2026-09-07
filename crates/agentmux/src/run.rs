@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::{Delegate, DelegateError, SessionRef, TurnPlan};
+use crate::delegate::{Delegate, DelegateError, SessionRef, TurnPlan, Vendor};
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher};
 use crate::transcript::{
     FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage, render_turn,
@@ -61,6 +61,9 @@ pub enum RunError {
     /// A delegate argument was rejected.
     #[error(transparent)]
     Delegate(#[from] DelegateError),
+    /// The machine's account configuration could not be loaded.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
     /// A child could not be launched.
     #[error(transparent)]
     Launch(#[from] LaunchError),
@@ -267,6 +270,8 @@ pub struct StartRequest {
     pub cwd: PathBuf,
     /// How long to keep the consultation after it finishes.
     pub retention: Retention,
+    /// Extra environment for the delegate, applied over the machine and account layers.
+    pub env: BTreeMap<String, String>,
 }
 
 /// What agentmux recorded about a consultation when it began.
@@ -282,6 +287,12 @@ pub struct Meta {
     pub retention: Retention,
     /// When `start` was called.
     pub created_at: DateTime<Utc>,
+    /// Extra environment the caller asked for, reapplied on every follow-up.
+    ///
+    /// Recorded so a later turn runs under the same conditions as the first; a follow-up that
+    /// quietly dropped it would answer from a differently configured delegate.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Where one turn's files live, and what agentmux knows about its child.
@@ -308,6 +319,13 @@ impl TurnDir {
     }
     fn invocation(&self) -> PathBuf {
         self.root.join("invocation.json")
+    }
+    /// Where the usage window recovered from a vendor's own session record is kept.
+    ///
+    /// Cached because finding it means searching the vendor's session tree, and a fold runs on
+    /// every `status` and every page of a `tail`.
+    fn rate_limit(&self) -> PathBuf {
+        self.root.join("rate-limit.json")
     }
     fn exit(&self) -> PathBuf {
         self.root.join("exit.json")
@@ -352,6 +370,11 @@ pub struct RunStatus {
     /// Without this a follow-up onto a failed turn would report the consultation as `completed`
     /// and leave the failure visible only deep inside the transcript body.
     pub earlier_failure: Option<(u32, FailureKind)>,
+    /// What each account of this vendor had left, when the consultation was rate limited.
+    ///
+    /// Empty for every other outcome: probing costs a process, and the answer is only actionable
+    /// when the caller has just been refused.
+    pub quota: Vec<crate::quota::AccountQuota>,
     /// The most recent usage window the delegate reported, when it reported one.
     ///
     /// Carried out of the transcript because the right response to a rate limit depends on how
@@ -415,6 +438,7 @@ pub struct TranscriptPage {
 pub struct RunStore {
     root: PathBuf,
     launcher: Arc<dyn Launcher>,
+    probe: Arc<dyn crate::quota::QuotaProbe>,
     host_env: BTreeMap<String, String>,
 }
 
@@ -454,8 +478,18 @@ impl RunStore {
         Ok(Self {
             root,
             launcher,
+            // Asking nothing by default, so embedding this library never spawns a process the
+            // embedder did not ask for; the binary installs a real probe in `main`.
+            probe: Arc::new(crate::quota::DisabledProbe),
             host_env,
         })
+    }
+
+    /// Install the probe used to ask accounts what they have left.
+    #[must_use]
+    pub fn with_quota_probe(mut self, probe: Arc<dyn crate::quota::QuotaProbe>) -> Self {
+        self.probe = probe;
+        self
     }
 
     /// The default state directory: `$AGENTMUX_STATE_DIR`, else the platform's own.
@@ -517,8 +551,13 @@ impl RunStore {
         create_private_dir(&dir)?;
 
         let meta = Meta {
+            env: request.env.clone(),
             run_id: run_id.clone(),
-            delegate: request.delegate.clone(),
+            // Resolved now rather than at each launch, so the record names the identity that
+            // actually ran and every later turn resumes as the same one.
+            // A configuration edited mid-consultation must not silently move a follow-up to
+            // another account, whose session it would then fail to resume.
+            delegate: self.pin_default_account(&request.delegate, &request.cwd),
             cwd: request.cwd.clone(),
             retention: request.retention,
             created_at: Utc::now(),
@@ -527,6 +566,26 @@ impl RunStore {
 
         self.launch_turn(&meta, 0, &request.question, None)?;
         self.status(&run_id)
+    }
+
+    /// Fill in the configured default account, when the caller named none.
+    ///
+    /// A configuration that cannot be read leaves the delegate as it was: the launch that follows
+    /// reads it again and reports the failure with a better message than this could.
+    fn pin_default_account(&self, delegate: &Delegate, cwd: &std::path::Path) -> Delegate {
+        if delegate.account().is_some() {
+            return delegate.clone();
+        }
+        let Ok(config) = crate::config::Config::load(&self.host_env, cwd) else {
+            return delegate.clone();
+        };
+        config
+            .default_account(delegate.vendor())
+            .and_then(|name| crate::delegate::AccountAlias::parse(name).ok())
+            .map_or_else(
+                || delegate.clone(),
+                |alias| delegate.clone().with_account(alias),
+            )
     }
 
     /// Continue a consultation with another question, in the delegate's own session.
@@ -611,8 +670,14 @@ impl RunStore {
             question_path: &turn.question(),
             last_message_path: &last_message,
             resume,
+            extra_env: &meta.env,
         };
-        let invocation = meta.delegate.invocation(&plan, &self.host_env)?;
+        // Discovered from the consultation's own working directory, not agentmux's, so a checkout
+        // can pin the account its reviews run under.
+        // Re-read each turn rather than cached at `start`: a follow-up hours later should see the
+        // configuration as it is now, not as it was.
+        let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
+        let invocation = meta.delegate.invocation(&plan, &self.host_env, &config)?;
 
         // Recorded before the spawn so a launch that fails still leaves evidence of what was
         // tried, and so a later fold can tell whether a resume opened the session it asked for.
@@ -670,6 +735,7 @@ impl RunStore {
         let newest = state.newest_turn_index;
         let turn = self.turn_dir(run_id, newest);
         let outcome = state.transcript.outcome();
+        let quota = self.quota_for_failure(run_id, &meta, &outcome);
 
         Ok(RunStatus {
             run_id: run_id.clone(),
@@ -686,6 +752,7 @@ impl RunStore {
             earlier_failure: state.transcript.earlier_failure(),
             // The newest window wins: an earlier turn's reading is stale the moment another
             // arrives, and a caller acting on it would wait against a window that already moved.
+            quota,
             rate_limit: state
                 .transcript
                 .turns
@@ -711,6 +778,65 @@ impl RunStore {
                 && state.transcript.has_delegate_content(),
             outcome,
         })
+    }
+
+    /// The other accounts' figures, when this consultation was refused for a rate limit.
+    ///
+    /// Probed only on that failure, where the answer is exactly what the caller needs and the
+    /// figures cannot be stale in the way that matters: the window just closed.
+    /// Written beside the run so repeated `status` calls cost nothing, and so the record of why a
+    /// consultation was told to go elsewhere survives with the consultation.
+    fn quota_for_failure(
+        &self,
+        run_id: &RunId,
+        meta: &Meta,
+        outcome: &Outcome,
+    ) -> Vec<crate::quota::AccountQuota> {
+        if !matches!(
+            outcome,
+            Outcome::Failed {
+                kind: FailureKind::RateLimited,
+                ..
+            }
+        ) {
+            return Vec::new();
+        }
+        let path = self.run_dir(run_id).join("quota.json");
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(cached) = serde_json::from_str(&text)
+        {
+            return cached;
+        }
+        let Ok(config) = crate::config::Config::load(&self.host_env, &meta.cwd) else {
+            return Vec::new();
+        };
+        let reported = crate::quota::probe_vendor(
+            meta.delegate.vendor(),
+            &config,
+            &self.host_env,
+            self.probe.as_ref(),
+        );
+        // Best effort: a consultation that cannot cache its quota still reports it.
+        let _ = write_json(&path, &reported);
+        reported
+    }
+
+    /// Ask each configured account what it has left, for the given vendors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Config`] when the machine's configuration cannot be read.
+    pub fn quota(&self, vendors: &[Vendor]) -> Result<Vec<crate::quota::AccountQuota>, RunError> {
+        // Discovered from agentmux's own directory: a quota question is about this machine, not
+        // about any one consultation.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = crate::config::Config::load(&self.host_env, &cwd)?;
+        Ok(vendors
+            .iter()
+            .flat_map(|vendor| {
+                crate::quota::probe_vendor(*vendor, &config, &self.host_env, self.probe.as_ref())
+            })
+            .collect())
     }
 
     /// A slice of the rendered transcript, starting at `offset`.
