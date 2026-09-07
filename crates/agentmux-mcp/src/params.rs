@@ -72,8 +72,8 @@ pub struct DelegateParams {
 
     /// Which configured account to authenticate as, for either vendor.
     ///
-    /// Omit it to use the CLI's own default configuration, which is right on a machine with one
-    /// account of that vendor.
+    /// Omit it to use the account `agentmux.toml` names as the default, or the CLI's own login
+    /// when it names none, which is right on a machine with one account of that vendor.
     /// Aliases are defined per machine in `agentmux.toml`; naming one that does not exist returns
     /// an error listing the ones that do, so guessing is cheap to recover from.
     #[serde(default)]

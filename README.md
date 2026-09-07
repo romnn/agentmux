@@ -187,9 +187,9 @@ api_key = "ollama"
 ```
 
 Aliases are opaque, exactly like model identifiers: agentmux keeps no roster, and naming one that
-does not exist returns an error listing the ones that do. Omit `account` entirely and the vendor
-CLI's own configuration is used, which is right on a machine with one login per vendor and needs
-no file at all.
+does not exist returns an error listing the ones that do. Omit `account` entirely and the
+`[defaults]` alias is used, or the vendor CLI's own configuration when the file names none, which
+is right on a machine with one login per vendor and needs no file at all.
 
 Choosing an account **withholds** that vendor's credential variables from the host environment —
 and from the `[launch]` layer — so an exported `ANTHROPIC_API_KEY` cannot silently outrank the

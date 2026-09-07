@@ -117,7 +117,8 @@ pub struct DelegateArgs {
     ///
     /// Aliases come from `agentmux.toml`; run `agentmux accounts` to see the ones this machine
     /// defines.
-    /// Omit it to use the CLI's own default configuration.
+    /// Omit it to use the account `agentmux.toml` names as the default, or the CLI's own login
+    /// when it names none.
     #[arg(long)]
     pub account: Option<String>,
 
