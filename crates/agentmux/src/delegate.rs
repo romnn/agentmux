@@ -1013,7 +1013,10 @@ pub fn is_credential_name(name: &str) -> bool {
 pub(crate) struct CredentialVars {
     /// The configuration directory, and so the login: `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
     pub(crate) config_dir: &'static str,
-    /// The API key, which both CLIs prefer over a stored login.
+    /// The API key.
+    ///
+    /// Preferred over a stored login by Claude, but not by Codex, which uses the `chatgpt` login
+    /// its `auth.json` records even when this is exported.
     pub(crate) api_key: &'static str,
     /// A bearer token, which only the Claude CLI reads.
     pub(crate) auth_token: Option<&'static str>,

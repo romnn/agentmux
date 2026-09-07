@@ -346,6 +346,12 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
     if let Some(name) = &account.auth_token_env {
         how.push(format!("auth_token=${name}"));
     }
+    // An account that names no directory and no credential is the CLI's own login under a name,
+    // which is a configuration in its own right rather than an unfinished one.
+    // Left unsaid it renders as a blank column, which reads as an entry someone failed to fill in.
+    if how.is_empty() {
+        how.push("the CLI's own login".to_owned());
+    }
     if account.inherit_settings == Some(true) {
         how.push("inherits settings and hooks".to_owned());
     }

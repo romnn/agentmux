@@ -94,9 +94,39 @@ pub enum Origin {
         /// The vendor's own timestamp on the cached figures, in milliseconds.
         #[serde(skip_serializing_if = "Option::is_none")]
         fetched_at_ms: Option<i64>,
+        /// What the attempt to refresh the file did before it was read.
+        refresh: Refresh,
     },
     /// Fetched live from the vendor at the moment of asking.
     Live,
+}
+
+/// What agentmux did about the staleness of a vendor's cache before reading it.
+///
+/// Reported rather than kept internal because the figures are served either way: a refresh that
+/// timed out leaves numbers that look exactly like fresh ones, and a reader deciding whether to
+/// trust a window needs to know which it is holding.
+/// This is the same rule as [`Observation::Unavailable`] one level down: an answer that could
+/// not be obtained must not be indistinguishable from one that was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Refresh {
+    /// The cached figures were recent enough to serve, so no process was spawned.
+    Skipped,
+    /// The cache was rewritten.
+    ///
+    /// Judged by the vendor's own timestamp on the figures advancing, not by the exit status
+    /// alone: a CLI that wrote the file and then hung or exited unhappily still refreshed it.
+    Succeeded,
+    /// The CLI was still running at the deadline and was stopped, and the cache did not advance.
+    ///
+    /// Whatever was already cached is what gets reported.
+    TimedOut,
+    /// The CLI could not be run, or exited without the cache advancing.
+    Failed {
+        /// Why, in enough detail to fix it.
+        reason: String,
+    },
 }
 
 /// Asks one account what it has left.
@@ -118,6 +148,11 @@ pub trait QuotaProbe: Send + Sync + std::fmt::Debug {
 /// then route work by another identity's remaining capacity.
 /// So the target is decided once, from the same fields the delegate launch reads, and a key-only
 /// account is never asked.
+///
+/// A key in the environment does not by itself make an account key-only: a vendor that records a
+/// stored login of its own may prefer that login, and `stored_login_wins` is what asks.
+/// Getting the precedence backwards costs the window of every account on the machine, so it is
+/// decided from what the vendor wrote down rather than from what happens to be exported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeTarget {
     /// A logged-in profile whose window can be read: the CLI's own, or the directory the
@@ -129,6 +164,47 @@ pub enum ProbeTarget {
     /// An identity that supplies a credential or an endpoint, so it is billed per token and has
     /// no window of the vendor's to report.
     Credential,
+}
+
+/// Whether a login stored on disk outranks a key in the environment, for this vendor.
+///
+/// The precedence here is measured, not assumed.
+/// Codex records the mode it authenticated in at `auth.json`, and a `chatgpt` login there is the
+/// one it uses even when `OPENAI_API_KEY` is exported: a delegate launched with both is refused
+/// by the API as a `chatgpt` account.
+///
+/// Reading the key alone would therefore report every Codex account on a machine with a stray key
+/// in its environment as having no window to read, which is the one thing `quota` exists to say.
+///
+/// Claude is left to the environment: it keeps no equivalent file, and nothing measured says its
+/// precedence differs.
+/// A vendor that says nothing about itself is not guessed at.
+fn stored_login_wins(
+    vendor: Vendor,
+    config_dir: Option<&Path>,
+    host_env: &BTreeMap<String, String>,
+) -> bool {
+    if vendor != Vendor::Codex {
+        return false;
+    }
+    // This is the CLI's own default when the identity names no directory, and also where it
+    // wrote the file the last time a person logged in.
+    let Some(dir) = config_dir
+        .map(Path::to_path_buf)
+        .or_else(|| home_dir(host_env).map(|home| home.join(".codex")))
+    else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("auth.json")) else {
+        return false;
+    };
+    let Ok(auth) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    // Only the mode is read.
+    // Whether the stored tokens still work is the probe's business, and it reports that as
+    // `Unavailable` with a reason, which is honest where "billed per token" would be false.
+    auth.get("auth_mode").and_then(serde_json::Value::as_str) == Some("chatgpt")
 }
 
 impl ProbeTarget {
@@ -151,17 +227,18 @@ impl ProbeTarget {
     ) -> Result<Self, crate::delegate::DelegateError> {
         let env = crate::delegate::resolve_identity(vendor, alias, config, host_env)?.env;
         let vars = credential_vars(vendor);
-        // Both CLIs prefer a credential in the environment over a stored login, and an endpoint
-        // of its own has no vendor window at all.
-        let credentialed = env.contains_key(vars.api_key)
-            || env.contains_key(vars.base_url)
-            || vars.auth_token.is_some_and(|name| env.contains_key(name));
-        if credentialed {
+        let config_dir = env.get(vars.config_dir).map(PathBuf::from);
+        // An endpoint of the identity's own is not the vendor's window whatever the login says,
+        // so it answers before the login is consulted at all.
+        if env.contains_key(vars.base_url) {
             return Ok(Self::Credential);
         }
-        Ok(Self::Window {
-            config_dir: env.get(vars.config_dir).map(PathBuf::from),
-        })
+        let keyed = env.contains_key(vars.api_key)
+            || vars.auth_token.is_some_and(|name| env.contains_key(name));
+        if keyed && !stored_login_wins(vendor, config_dir.as_deref(), host_env) {
+            return Ok(Self::Credential);
+        }
+        Ok(Self::Window { config_dir })
     }
 
     /// The configuration directory the probe should point the CLI at, if any.
@@ -206,8 +283,9 @@ impl QuotaProbe for DisabledProbe {
 /// file read and one Codex probe is a short-lived child process, and a machine with four accounts
 /// should answer in the time of the slowest, not the sum.
 ///
-/// The CLI's own default configuration is included as an unnamed account whenever the vendor has
-/// no configured accounts, so a machine with no `agentmux.toml` still gets an answer.
+/// The CLI's own login is included as an unnamed account whenever no defined account holds the
+/// vendor's default, because that is the identity a consultation naming no `account` then spends.
+/// A machine with no `agentmux.toml` reaches this the same way, and so still gets an answer.
 #[must_use]
 pub fn probe_vendor(
     vendor: Vendor,
@@ -215,21 +293,29 @@ pub fn probe_vendor(
     host_env: &BTreeMap<String, String>,
     probe: &dyn QuotaProbe,
 ) -> Vec<AccountQuota> {
-    // A machine with no configuration still has one account: whatever the CLI is logged into.
     // Aliases were validated when the file was read, so every key parses.
     let accounts = config.accounts(vendor);
-    let targets: Vec<(Option<AccountAlias>, Option<&Account>)> = if accounts.is_empty() {
-        vec![(None, None)]
-    } else {
-        accounts
-            .iter()
-            .filter_map(|(alias, account)| {
-                AccountAlias::parse(alias)
-                    .ok()
-                    .map(|alias| (Some(alias), Some(account)))
-            })
-            .collect()
-    };
+    let mut targets: Vec<(Option<AccountAlias>, Option<&Account>)> = accounts
+        .iter()
+        .filter_map(|(alias, account)| {
+            AccountAlias::parse(alias)
+                .ok()
+                .map(|alias| (Some(alias), Some(account)))
+        })
+        .collect();
+    // The unnamed login is asked whenever a consultation naming no `account` would resolve to
+    // it, which is when no defined account holds the default: the same condition the launch
+    // pins on.
+    // A default naming an account the file does not define is reported the way a launch would
+    // refuse it, because the unnamed probe resolves the same identity and carries the same error.
+    // Listing only the named accounts would otherwise omit the one identity actually paying, and
+    // a caller reading the list would choose between the accounts that are not.
+    let default_is_defined = config
+        .default_account(vendor)
+        .is_some_and(|default| config.account(vendor, default.alias).is_some());
+    if !default_is_defined {
+        targets.push((None, None));
+    }
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
@@ -351,9 +437,12 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     // Refreshing first, only when the figures are old enough for it to change anything.
     // A weekly window moves with every other session on the account, so figures from hours ago
     // answer a question nobody asked.
-    if is_stale(read_cached_usage(&path).as_ref()) {
-        refresh_claude_cache(request);
-    }
+    let before = read_cached_usage(&path);
+    let refresh = if is_stale(before.as_ref()) {
+        refresh_claude_cache(request)
+    } else {
+        Refresh::Skipped
+    };
 
     let Some(cached) = read_cached_usage(&path) else {
         return Observation::Unavailable {
@@ -364,12 +453,22 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
         };
     };
 
+    // The figures decide whether the refresh happened, not the process.
+    // The CLI writes the file before it exits, so an exit status or a deadline says only how the
+    // process ended, and calling figures it demonstrably rewrote stale would be the wrong answer
+    // dressed as a careful one.
+    let fetched = fetched_at_ms(Some(&cached));
+    let advanced = fetched > fetched_at_ms(before.as_ref());
+    let refresh = match refresh {
+        Refresh::TimedOut | Refresh::Failed { .. } if advanced => Refresh::Succeeded,
+        outcome => outcome,
+    };
+
     Observation::Reported {
         origin: Origin::Cache {
-            fetched_at_ms: cached
-                .get("fetchedAtMs")
-                .and_then(serde_json::Value::as_i64),
+            fetched_at_ms: fetched,
             path,
+            refresh,
         },
         payload: cached,
     }
@@ -384,10 +483,7 @@ fn read_cached_usage(path: &Path) -> Option<serde_json::Value> {
 
 /// Whether a set of cached figures is old enough to be worth refreshing.
 fn is_stale(cached: Option<&serde_json::Value>) -> bool {
-    let Some(fetched_at_ms) = cached
-        .and_then(|c| c.get("fetchedAtMs"))
-        .and_then(serde_json::Value::as_i64)
-    else {
+    let Some(fetched_at_ms) = fetched_at_ms(cached) else {
         return true;
     };
     let Some(fetched_at) = chrono::DateTime::from_timestamp_millis(fetched_at_ms) else {
@@ -399,35 +495,67 @@ fn is_stale(cached: Option<&serde_json::Value>) -> bool {
         .is_ok_and(|age| age > MAX_CACHE_AGE)
 }
 
+/// The vendor's own timestamp on a set of cached figures, in milliseconds since the epoch.
+fn fetched_at_ms(cached: Option<&serde_json::Value>) -> Option<i64> {
+    cached
+        .and_then(|c| c.get("fetchedAtMs"))
+        .and_then(serde_json::Value::as_i64)
+}
+
 /// Ask the Claude CLI to refresh its usage cache.
 ///
 /// `/usage` is answered locally: the run reports `total_cost_usd: 0` and no API duration, so this
 /// spends nothing.
 /// Its output is discarded because the structured figures land in the cache, and the printed text
 /// omits scoped limits that the cache keeps.
-fn refresh_claude_cache(request: &ProbeRequest<'_>) {
+///
+/// What comes back is how the process ended.
+/// Whether the cache actually advanced is judged by `probe_claude` from the figures themselves.
+fn refresh_claude_cache(request: &ProbeRequest<'_>) -> Refresh {
     use std::process::Stdio;
 
     let mut command = probe_command(request, Vendor::Claude.program());
     command.args(["--print", "/usage", "--output-format", "text"]);
-    let Ok(mut child) = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return Refresh::Failed {
+                reason: format!(
+                    "`{} --print /usage` could not be run: {error}",
+                    Vendor::Claude.program()
+                ),
+            };
+        }
     };
-    // A refresh that does not finish in time is not worth reporting: the cached figures are read
-    // either way, and their own timestamp says how old they are.
+    // The cached figures are read whatever happens here, so the outcome is reported rather than
+    // acted on.
+    // It is the difference between numbers that are current and numbers that only look current.
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(status)) if status.success() => return Refresh::Succeeded,
+            Ok(Some(status)) => {
+                return Refresh::Failed {
+                    reason: format!(
+                        "`{} --print /usage` exited with {status}",
+                        Vendor::Claude.program()
+                    ),
+                };
+            }
+            Err(error) => {
+                return Refresh::Failed {
+                    reason: format!("the refresh could not be waited on: {error}"),
+                };
+            }
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return;
+                return Refresh::TimedOut;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }

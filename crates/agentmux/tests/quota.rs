@@ -6,11 +6,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agentmux::config::{Account, Config};
-use agentmux::delegate::Vendor;
+use agentmux::config::{Account, Config, Defaults};
+use agentmux::delegate::{AccountAlias, Vendor};
 use agentmux::quota::{
-    AccountQuota, Observation, ProbeRequest, ProbeTarget, QuotaProbe, probe_vendor,
+    AccountQuota, Observation, Origin, ProbeRequest, ProbeTarget, QuotaProbe, SystemProbe,
+    probe_vendor,
 };
+// Only the refresh tests read it, and they drive a shell script, so on Windows it would be unused.
+#[cfg(unix)]
+use agentmux::quota::Refresh;
 use googletest::prelude::*;
 
 /// A probe that answers from a script instead of a machine.
@@ -27,7 +31,7 @@ impl QuotaProbe for ScriptedProbe {
             };
         }
         Observation::Reported {
-            origin: agentmux::quota::Origin::Live,
+            origin: Origin::Live,
             payload: self.payload.clone(),
         }
     }
@@ -128,9 +132,10 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
 
 /// An account that names a profile directory but authenticates with a key has no window either.
 ///
-/// Both CLIs prefer a key in the environment over a stored login, so the delegate is billed per
+/// Claude prefers a key in the environment over a stored login, so the delegate is billed per
 /// token, and the profile's subscription figures would be reported under a name that is not
 /// spending them.
+/// Codex does not, which is why this is a Claude account and not a shared rule.
 #[gtest]
 fn a_profile_that_also_supplies_a_key_reports_no_window() {
     let config = config_with(
@@ -293,12 +298,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
         )],
     );
 
-    let reported = probe_vendor(
-        Vendor::Claude,
-        &config,
-        &host_env(),
-        &agentmux::quota::SystemProbe,
-    );
+    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &SystemProbe);
 
     // Asserting the reason, not merely that something was unavailable: without the guard the probe
     // falls through to reading the cache and reports a missing *file*, which is the same verdict
@@ -316,4 +316,270 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
         "the probe created the account's config directory"
     );
     Ok(())
+}
+
+/// A Codex `chatgpt` login outranks a key the environment merely happens to export.
+///
+/// `OPENAI_API_KEY` is exported on plenty of machines by something that is not agentmux, and Codex
+/// ignores it in favour of the login its `auth.json` records — measured: a delegate launched with
+/// both is refused by the API as a `chatgpt` account.
+/// Reading the key alone would report every such account as having no window, which is the one
+/// thing `quota` exists to say, withheld because of a variable nobody set for agentmux.
+#[gtest]
+fn a_codex_chatgpt_login_outranks_a_key_in_the_environment() -> Result<()> {
+    let target = codex_target_with(
+        Some(r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#),
+        None,
+    )?;
+
+    assert_that!(target, matches_pattern!(ProbeTarget::Window { .. }));
+    Ok(())
+}
+
+/// A Codex account whose stored login *is* the key is still billed per token.
+///
+/// The rule reads what the vendor wrote down rather than assuming a precedence in either
+/// direction, so `apikey` must still answer `Credential`.
+#[gtest]
+fn a_codex_apikey_login_still_reports_no_window() -> Result<()> {
+    let target = codex_target_with(Some(r#"{"auth_mode":"apikey"}"#), None)?;
+
+    assert_that!(target, eq(&ProbeTarget::Credential));
+    Ok(())
+}
+
+/// An endpoint of the identity's own has no vendor window whatever the stored login says.
+///
+/// The login decides *which* identity pays; an endpoint decides that the vendor is not the one
+/// being paid, so it answers first and a `chatgpt` login must not talk it round.
+#[gtest]
+fn a_codex_endpoint_outranks_even_a_stored_login() -> Result<()> {
+    let target = codex_target_with(
+        Some(r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#),
+        Some("http://localhost:11434/v1"),
+    )?;
+
+    assert_that!(target, eq(&ProbeTarget::Credential));
+    Ok(())
+}
+
+/// A Codex key with no stored login behind it is billed per token.
+///
+/// Nothing on disk says the vendor would prefer anything else, and a vendor that says nothing is
+/// not guessed at.
+#[gtest]
+fn a_codex_key_with_no_stored_login_reports_no_window() -> Result<()> {
+    let target = codex_target_with(None, None)?;
+
+    assert_that!(target, eq(&ProbeTarget::Credential));
+    Ok(())
+}
+
+/// Resolve the target of a Codex account that supplies a key, against whatever login is on disk.
+///
+/// The key is in the host environment as well as on the account, because that is the machine this
+/// guards: one where something unrelated exported `OPENAI_API_KEY`.
+fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<ProbeTarget> {
+    let home = tempfile::tempdir().or_fail()?;
+    if let Some(auth_json) = auth_json {
+        std::fs::write(home.path().join("auth.json"), auth_json).or_fail()?;
+    }
+    let config = config_with(
+        "codex",
+        &[(
+            "personal",
+            Account {
+                config_dir: Some(home.path().to_path_buf()),
+                api_key_env: Some("OPENAI_API_KEY".to_owned()),
+                base_url: base_url.map(str::to_owned),
+                ..Account::default()
+            },
+        )],
+    );
+    let mut env = host_env();
+    env.insert(
+        "OPENAI_API_KEY".to_owned(),
+        "sk-exported-by-something".to_owned(),
+    );
+    let alias = AccountAlias::parse("personal").or_fail()?;
+
+    ProbeTarget::of(Vendor::Codex, Some(&alias), &config, &env).or_fail()
+}
+
+/// The identity an unnamed consultation spends is probed alongside the named accounts.
+///
+/// With accounts configured but none of them the default, a consultation that names no `account`
+/// runs as the CLI's own login.
+/// Reporting only the named accounts hides the identity actually paying behind a list of the ones
+/// that are not, which is the same mistake as reading a failed probe as spare capacity.
+#[gtest]
+fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
+    let config = config_with("claude", &[("work", Account::default())]);
+    let probe = ScriptedProbe {
+        payload: serde_json::json!({"utilization": {"limits": []}}),
+    };
+
+    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
+
+    // Two entries arrive: the named account, and the unnamed login an omitted `account` would
+    // resolve to.
+    assert_that!(reported.len(), eq(2));
+    assert_that!(
+        reported
+            .iter()
+            .filter(|entry| entry.account.is_none())
+            .count(),
+        eq(1)
+    );
+}
+
+/// A configured default leaves the CLI's own login out, because nothing would spend it.
+///
+/// The unnamed login is reported for being the effective default, not for existing: once an alias
+/// holds that role every consultation resolves to a named account, and listing the login as well
+/// would offer a window no work is drawn against.
+#[gtest]
+fn a_configured_default_leaves_the_cli_login_out() {
+    let mut config = config_with("claude", &[("work", Account::default())]);
+    config.defaults.insert(
+        "claude".to_owned(),
+        Defaults {
+            account: Some("work".to_owned()),
+        },
+    );
+    let probe = ScriptedProbe {
+        payload: serde_json::json!({"utilization": {"limits": []}}),
+    };
+
+    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
+
+    assert_that!(reported.len(), eq(1));
+    assert_that!(
+        reported[0].account.as_ref().map(ToString::to_string),
+        some(eq("work"))
+    );
+}
+
+/// A default naming an account the file does not define is reported as the launch would refuse it.
+///
+/// The unnamed entry resolves the same identity a consultation naming no `account` would, so it
+/// carries the launch's own refusal rather than standing in for a login nothing would spend.
+#[gtest]
+fn a_default_naming_an_undefined_account_carries_the_launch_refusal() -> Result<()> {
+    let mut config = config_with("claude", &[("work", Account::default())]);
+    config.defaults.insert(
+        "claude".to_owned(),
+        Defaults {
+            account: Some("missing".to_owned()),
+        },
+    );
+    let probe = ScriptedProbe {
+        payload: serde_json::json!({"utilization": {"limits": []}}),
+    };
+
+    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
+
+    let Some(unnamed) = reported.iter().find(|entry| entry.account.is_none()) else {
+        return fail!("the unnamed login was not reported");
+    };
+    let Observation::Unavailable { reason } = &unnamed.observation else {
+        return fail!("an undefined default cannot report figures");
+    };
+    assert_that!(reason, contains_substring("missing"));
+    Ok(())
+}
+
+/// A refresh that rewrote the cache counts as one, however the process ended.
+///
+/// The CLI writes its figures before it exits, so an unhappy exit after the write would otherwise
+/// label current figures as ones that predate the attempt.
+#[cfg(unix)]
+#[gtest]
+fn a_refresh_that_rewrote_the_cache_is_a_refresh_however_the_process_ended() -> Result<()> {
+    let observation = probe_claude_with_fake_cli(indoc::indoc! {r#"
+        #!/bin/sh
+        printf '%s' '{"cachedUsageUtilization":{"fetchedAtMs":2000,"utilization":{"limits":[]}}}' \
+            > "$CLAUDE_CONFIG_DIR/.claude.json"
+        exit 1
+    "#})?;
+
+    let Observation::Reported {
+        origin:
+            Origin::Cache {
+                refresh,
+                fetched_at_ms,
+                ..
+            },
+        ..
+    } = observation
+    else {
+        return fail!("a cache the fake CLI rewrote must be reported");
+    };
+    // The rewritten figures are served, and the refresh is not blamed on the exit status.
+    assert_that!(fetched_at_ms, some(eq(2000)));
+    assert_that!(refresh, eq(&Refresh::Succeeded));
+    Ok(())
+}
+
+/// A refresh that left the cache as it was is reported by how its process ended.
+#[cfg(unix)]
+#[gtest]
+fn a_refresh_that_left_the_cache_alone_reports_how_it_ended() -> Result<()> {
+    let observation = probe_claude_with_fake_cli(indoc::indoc! {"
+        #!/bin/sh
+        exit 1
+    "})?;
+
+    let Observation::Reported {
+        origin:
+            Origin::Cache {
+                refresh,
+                fetched_at_ms,
+                ..
+            },
+        ..
+    } = observation
+    else {
+        return fail!("the stale cache must still be reported");
+    };
+    // The stale figures are served under a refresh that names the failure.
+    assert_that!(fetched_at_ms, some(eq(1000)));
+    let Refresh::Failed { reason } = refresh else {
+        return fail!("a refresh that exited unhappily without writing must be a failure");
+    };
+    assert_that!(reason, contains_substring("exit status: 1"));
+    Ok(())
+}
+
+/// Drive the real Claude probe against a fake `claude` on `PATH`, with a stale cache in place.
+///
+/// The cache carries a timestamp old enough to force a refresh, and the script decides what that
+/// refresh does to the file.
+#[cfg(unix)]
+fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().or_fail()?;
+    let config_dir = root.path().join("claude");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&config_dir).or_fail()?;
+    std::fs::create_dir_all(&bin).or_fail()?;
+    std::fs::write(
+        config_dir.join(".claude.json"),
+        r#"{"cachedUsageUtilization":{"fetchedAtMs":1000,"utilization":{"limits":[]}}}"#,
+    )
+    .or_fail()?;
+    let program = bin.join("claude");
+    std::fs::write(&program, script).or_fail()?;
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+
+    let mut env = host_env();
+    env.insert("PATH".to_owned(), bin.display().to_string());
+    Ok(SystemProbe.probe(&ProbeRequest {
+        vendor: Vendor::Claude,
+        target: ProbeTarget::Window {
+            config_dir: Some(config_dir),
+        },
+        host_env: &env,
+    }))
 }
