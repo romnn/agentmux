@@ -12,7 +12,7 @@
 //!   Only `turn.failed` and a top-level `error` end a turn.
 //! - One failure arrives as up to three events — an `item.completed` error, a top-level `error`,
 //!   and `turn.failed` — all carrying the same message.
-//!   They fold into one outcome, and the first terminal event wins.
+//!   The first terminal event ends the fold, so they fold into one outcome.
 //! - Unknown `item.type` values are counted, not skipped.
 //!   If a future release renamed `agent_message`, a parser that filtered on the name alone would
 //!   silently drop every report.
@@ -113,8 +113,6 @@ struct TurnFailed {
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn = Turn::new(index, question);
     let mut session = None;
-    // The message from a top-level `error`, held so `turn.failed` does not report it twice.
-    let mut pending_error: Option<String> = None;
 
     for line in complete_lines(events) {
         let Some(kind) = probe(line) else {
@@ -185,23 +183,21 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     .ok()
                     .and_then(|event| event.message)
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
-                pending_error = Some(message.clone());
-                if !turn.outcome.is_terminal() {
-                    turn.outcome = Outcome::Failed {
-                        kind: classify(&message),
-                        detail: message,
-                    };
-                }
+                turn.outcome = Outcome::Failed {
+                    kind: classify(&message),
+                    detail: message,
+                };
+                // Terminal, like `turn.failed` below: the `turn.failed` that follows carries the
+                // same text, and reading on past a terminal event is what would let a later line
+                // land above a footer already handed out.
+                break;
             }
             "turn.failed" => {
                 let message = serde_json::from_str::<TurnFailed>(line)
                     .ok()
                     .and_then(|event| event.error)
                     .and_then(|error| error.message)
-                    .or_else(|| pending_error.clone())
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
-                // A top-level `error` immediately before carries the same text; the later,
-                // more authoritative event wins without adding a second message.
                 turn.outcome = Outcome::Failed {
                     kind: classify(&message),
                     detail: message,

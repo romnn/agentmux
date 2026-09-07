@@ -61,9 +61,7 @@ fn a_content_flagged_failure_says_the_work_survived() -> Result<()> {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"an hour of findings"}}
         {"type":"turn.failed","error":{"message":"ERROR: This content was flagged for possible cybersecurity risk"}}
     "#})?;
-    let page = store
-        .read_transcript(&status.run_id, 0, 100_000)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
     let rendered = agentmux_mcp::render::transcript(&status, &page);
 
     let (header, body) = rendered.split_once("\n---\n").or_fail()?;
@@ -82,9 +80,7 @@ fn an_unavailable_model_is_told_to_fix_the_model_not_to_wait() -> Result<()> {
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"turn.failed","error":{"message":"The 'gpt-9' model is not supported for this account"}}
     "#})?;
-    let page = store
-        .read_transcript(&status.run_id, 0, 100_000)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
     let rendered = agentmux_mcp::render::transcript(&status, &page);
 
     assert_that!(rendered, contains_substring("failed (model unavailable)"));
@@ -106,9 +102,7 @@ fn a_long_failure_detail_does_not_break_the_header() -> Result<()> {
         "{{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}}\n\
          {{\"type\":\"turn.failed\",\"error\":{{\"message\":\"{sprawling}\"}}}}\n"
     ))?;
-    let page = store
-        .read_transcript(&status.run_id, 0, 100_000)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
     let rendered = agentmux_mcp::render::transcript(&status, &page);
     let header = rendered.split("\n---\n").next().or_fail()?;
 
@@ -159,9 +153,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
         })
         .or_fail()?;
 
-    let page = store
-        .read_transcript(&status.run_id, 0, 100_000)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
     let rendered = agentmux_mcp::render::transcript(&status, &page);
     let (header, body) = rendered.split_once("\n---\n").or_fail()?;
 
@@ -229,9 +221,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
 #[gtest]
 fn no_rendered_result_names_an_answer_field() -> Result<()> {
     let (store, status, _dir) = consult(agentmux::testing::fixtures::CODEX_HAPPY)?;
-    let page = store
-        .read_transcript(&status.run_id, 0, 100_000)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
 
     for rendered in [
         agentmux_mcp::render::status(&status),

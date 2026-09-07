@@ -89,23 +89,44 @@ pub(crate) fn probe(line: &str) -> Option<String> {
 /// The mapping is a best effort over phrases both vendors have been observed to emit; anything
 /// unfamiliar becomes `Unclassified` with the text kept verbatim, because guessing wrong is worse
 /// than admitting ignorance.
+/// Each phrase is a whole word or a specific pairing, because the text this sees is also the tail
+/// of a CLI's stderr: `ECONNREFUSED` is not a refusal and a request id containing `429` is not a
+/// rate limit, and a caller told either would go and fix the wrong thing.
 pub(crate) fn classify(detail: &str) -> crate::transcript::FailureKind {
     use crate::transcript::FailureKind;
 
     let text = detail.to_ascii_lowercase();
     let has = |needle: &str| text.contains(needle);
+    let word = |needle: &str| has_word(&text, needle);
 
-    if has("flagged") || has("cybersecurity risk") || has("refus") || has("safety") {
+    if has("flagged") || has("cybersecurity risk") || word("refusal") || has("content policy") {
         FailureKind::ContentFlagged
-    } else if has("rate limit") || has("rate_limit") || has("429") || has("too many requests") {
+    } else if has("rate limit") || has("rate_limit") || has("too many requests") || word("429") {
         FailureKind::RateLimited
-    } else if has("quota") || has("insufficient_quota") || has("credit") || has("billing") {
+    } else if has("insufficient_quota")
+        || has("quota exceeded")
+        || has("credit balance")
+        || has("billing")
+    {
         FailureKind::BudgetExceeded
-    } else if has("model") && (has("not found") || has("not supported") || has("does not exist")) {
+    } else if has("model")
+        && (has("not found") || has("not supported") || has("does not exist") || has("unsupported"))
+    {
         FailureKind::ModelUnavailable
     } else if has("max turns") || has("max_turns") || has("turn limit") {
         FailureKind::TurnLimit
     } else {
         FailureKind::Unclassified
     }
+}
+
+/// Whether `needle` occurs in `text` bounded by non-alphanumerics on both sides.
+fn has_word(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(start, _)| {
+        let before = text.get(..start).and_then(|s| s.chars().next_back());
+        let after = text
+            .get(start + needle.len()..)
+            .and_then(|s| s.chars().next());
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }

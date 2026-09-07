@@ -2,8 +2,8 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same eight verbs the MCP server exposes, plus `mcp` to serve them and `prune` to remove
-//! consultations by hand.
+//! The same nine verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! this machine defines, and `prune` to remove consultations by hand.
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{CodexSandbox, Delegate, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -128,12 +128,23 @@ pub struct DelegateArgs {
 }
 
 /// Which CLI to consult.
+///
+/// A copy of [`Vendor`] that clap can list in `--help`; the core enum stays free of clap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum VendorArg {
     /// Anthropic's `claude`.
     Claude,
     /// The `codex` CLI from `OpenAI`.
     Codex,
+}
+
+impl From<VendorArg> for Vendor {
+    fn from(vendor: VendorArg) -> Self {
+        match vendor {
+            VendorArg::Claude => Self::Claude,
+            VendorArg::Codex => Self::Codex,
+        }
+    }
 }
 
 /// Which vendor's accounts to ask about.
@@ -154,6 +165,15 @@ pub enum SandboxArg {
     WorkspaceWrite,
 }
 
+impl From<SandboxArg> for CodexSandbox {
+    fn from(sandbox: SandboxArg) -> Self {
+        match sandbox {
+            SandboxArg::ReadOnly => Self::ReadOnly,
+            SandboxArg::WorkspaceWrite => Self::WorkspaceWrite,
+        }
+    }
+}
+
 impl DelegateArgs {
     /// The isolation asked for on the command line, or `None` to let the account decide.
     fn isolation(&self) -> Option<Isolation> {
@@ -164,56 +184,25 @@ impl DelegateArgs {
         }
     }
 
-    /// Validate the account alias, if one was given.
-    ///
-    /// Existence is not checked here: which aliases are defined depends on the working directory
-    /// the consultation will run in, which `build` does not know.
-    fn alias(&self) -> Result<Option<AccountAlias>> {
-        self.account
-            .as_deref()
-            .map(|name| Ok(AccountAlias::parse(name)?))
-            .transpose()
-    }
-
     /// Build the delegate, rejecting an option that belongs to the other vendor.
     ///
-    /// The core type carries only what each vendor accepts, so the mismatch has to be caught here
-    /// rather than deeper down.
+    /// Existence of the alias is not checked here: which aliases are defined depends on the
+    /// working directory the consultation will run in, which `build` does not know.
     ///
     /// # Errors
     ///
-    /// Returns an error when the model or effort is not argv-safe, or when a vendor-specific
-    /// option was set for the wrong vendor.
+    /// Returns an error when the model, effort or alias is not argv-safe, or when a
+    /// vendor-specific option was set for the wrong vendor.
     pub fn build(&self) -> Result<Delegate> {
-        let model = ModelId::parse(&self.model).wrap_err("invalid --model")?;
-        let effort = Effort::parse(&self.effort).wrap_err("invalid --effort")?;
-        match self.delegate {
-            VendorArg::Claude => {
-                if self.sandbox.is_some() {
-                    bail!(
-                        "--sandbox applies to --delegate codex, the only vendor with a sandbox \
-                         setting. A claude delegate runs in plan mode and is offered no editing \
-                         tools."
-                    );
-                }
-                Ok(Delegate::Claude {
-                    model,
-                    effort,
-                    account: self.alias()?,
-                    isolation: self.isolation(),
-                })
-            }
-            VendorArg::Codex => Ok(Delegate::Codex {
-                model,
-                effort,
-                sandbox: match self.sandbox.unwrap_or(SandboxArg::ReadOnly) {
-                    SandboxArg::ReadOnly => CodexSandbox::ReadOnly,
-                    SandboxArg::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
-                },
-                account: self.alias()?,
-                isolation: self.isolation(),
-            }),
-        }
+        Delegate::from_parts(
+            self.delegate.into(),
+            &self.model,
+            &self.effort,
+            self.account.as_deref(),
+            self.isolation(),
+            self.sandbox.map(CodexSandbox::from),
+        )
+        .wrap_err("invalid delegate arguments")
     }
 }
 
@@ -278,16 +267,30 @@ impl QuestionArgs {
         Ok(text)
     }
 
-    /// The directory the delegate reads from.
+    /// The directory the delegate reads from, made absolute.
+    ///
+    /// Absolute because the consultation outlives this process: a follow-up from another
+    /// directory must read the same checkout, and a path recorded relative to this one would
+    /// silently resolve elsewhere.
     ///
     /// # Errors
     ///
-    /// Returns an error when the current directory cannot be determined.
+    /// Returns an error when the current directory cannot be determined, or `--cwd` is not a
+    /// directory.
     pub fn working_dir(&self) -> Result<PathBuf> {
-        match &self.cwd {
-            Some(dir) => Ok(dir.clone()),
-            None => std::env::current_dir().wrap_err("determining the working directory"),
+        let dir = match &self.cwd {
+            Some(dir) => std::path::absolute(dir)
+                .wrap_err_with(|| format!("resolving --cwd {}", dir.display()))?,
+            None => std::env::current_dir().wrap_err("determining the working directory")?,
+        };
+        if !dir.is_dir() {
+            bail!(
+                "--cwd {} is not a directory. Pass the path of the checkout the delegate should \
+                 read.",
+                dir.display()
+            );
         }
+        Ok(dir)
     }
 
     /// The extra environment, parsed from `KEY=VALUE` pairs.
@@ -449,7 +452,15 @@ pub struct PruneArgs {
 
 /// A consultation id parsed at the boundary, so nothing downstream can be handed a path.
 #[derive(Debug, Clone)]
-pub struct RunIdArg(pub RunId);
+pub struct RunIdArg(RunId);
+
+impl RunIdArg {
+    /// The parsed id.
+    #[must_use]
+    pub fn id(&self) -> &RunId {
+        &self.0
+    }
+}
 
 impl std::str::FromStr for RunIdArg {
     type Err = agentmux::run::RunIdError;

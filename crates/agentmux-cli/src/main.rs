@@ -8,13 +8,12 @@ mod report;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{RunStore, StartRequest};
 use clap::Parser as _;
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{Result, WrapErr as _, bail};
 
-use crate::cli::{Cli, Command, VendorArg};
+use crate::cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +35,7 @@ async fn main() -> Result<()> {
         Some(dir) => dir.clone(),
         None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
     };
-    let store = RunStore::open(root, Arc::new(ProcessLauncher), host_env)?
+    let store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe));
 
     match cli.command {
@@ -44,11 +43,25 @@ async fn main() -> Result<()> {
             // Resolved from the current directory, so the answer is the one a consultation started
             // here would actually get.
             let cwd = std::env::current_dir().wrap_err("locating the working directory")?;
-            let config = agentmux::config::Config::load(&agentmux::host_env(), &cwd)?;
-            report::accounts(&config, cli.json)
+            let config = agentmux::config::Config::load(store.host_env(), &cwd)?;
+            report::accounts(&config, store.host_env(), cli.json)
         }
-        Command::Quota(args) => run_quota(args.delegate, cli.json),
+        Command::Quota(args) => {
+            report::quota(&store.quota(args.delegate.map(Into::into))?, cli.json)
+        }
         Command::Mcp => {
+            // A server started by a delegate would hand that delegate the means to start
+            // another.
+            // Refusing to serve at all is simpler than refusing tool by tool, and the host
+            // reports a server that would not start.
+            if store.running_inside_a_delegate()? {
+                bail!(
+                    "this agentmux was started inside a delegate that agentmux launched, so it \
+                     will not serve consultations to it. A delegate that inherits its account's \
+                     MCP servers also inherits agentmux; leave it out of that account's \
+                     configuration, or run the account isolated."
+                );
+            }
             // The sweep runs once at server start.
             // No timer, no daemon.
             match store.sweep() {
@@ -67,10 +80,10 @@ async fn main() -> Result<()> {
                 retention: args.question.retention(),
                 env: args.question.environment()?,
             })?;
-            let status = store
+            store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
                 .await?;
-            report::answer(&store, &status, cli.json)
+            report::answer(&store, &status.run_id, cli.json)
         }
         Command::Start(args) => {
             let status = store.start(&StartRequest {
@@ -82,58 +95,34 @@ async fn main() -> Result<()> {
             })?;
             report::status(&status, cli.json)
         }
-        Command::Status(args) => report::status(&store.status(&args.run_id.0)?, cli.json),
+        Command::Status(args) => report::status(&store.status(args.run_id.id())?, cli.json),
         Command::Tail(args) => report::tail(&store, &args, cli.json).await,
         Command::Result(args) => {
-            let status = if args.wait > 0 {
+            if args.wait > 0 {
                 store
-                    .wait_until_terminal(&args.run_id.0, Duration::from_secs(args.wait))
-                    .await?
-            } else {
-                store.status(&args.run_id.0)?
-            };
-            let page = store.read_transcript(&args.run_id.0, args.offset, args.max_bytes)?;
+                    .wait_until_terminal(args.run_id.id(), Duration::from_secs(args.wait))
+                    .await?;
+            }
+            let (status, page) = store.view(args.run_id.id(), args.offset, args.max_bytes)?;
             report::transcript(&status, &page, cli.json)
         }
         Command::FollowUp(args) => {
-            let status = store.follow_up(&args.run_id.0, &args.text()?)?;
-            let status = store
+            let status = store.follow_up(args.run_id.id(), &args.text()?)?;
+            store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
                 .await?;
-            report::answer(&store, &status, cli.json)
+            report::answer(&store, &status.run_id, cli.json)
         }
-        Command::Cancel(args) => report::status(&store.cancel(&args.run_id.0)?, cli.json),
+        Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
         Command::List(args) => report::list(&store.list(args.limit)?, cli.json),
         Command::Prune(args) => {
-            if let Some(id) = args.run_id {
-                store.remove(&id.0)?;
-                println!("removed {}", id.0);
+            if let Some(run_id) = args.run_id {
+                store.remove(run_id.id())?;
+                println!("removed {}", run_id.id());
             } else {
                 println!("removed {} expired consultation(s)", store.sweep()?);
             }
             Ok(())
         }
     }
-}
-
-/// Report what each configured account has left.
-///
-/// Split out of `main` because the vendor fan-out and configuration load are a whole step of their
-/// own, and `main` is otherwise a dispatch table.
-fn run_quota(delegate: Option<VendorArg>, json: bool) -> Result<()> {
-    let cwd = std::env::current_dir().wrap_err("locating the working directory")?;
-    let host_env = agentmux::host_env();
-    let config = agentmux::config::Config::load(&host_env, &cwd)?;
-    let vendors = match delegate {
-        Some(VendorArg::Claude) => vec![Vendor::Claude],
-        Some(VendorArg::Codex) => vec![Vendor::Codex],
-        None => vec![Vendor::Claude, Vendor::Codex],
-    };
-    let reported: Vec<_> = vendors
-        .into_iter()
-        .flat_map(|vendor| {
-            agentmux::quota::probe_vendor(vendor, &config, &host_env, &agentmux::quota::SystemProbe)
-        })
-        .collect();
-    report::quota(&reported, json)
 }

@@ -38,13 +38,59 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `--strict-mcp-config` and Codex's `--ignore-user-config` are what suppress settings, hooks and
   MCP servers; no environment variable can switch them on or off. `Isolation::Inherit` drops
   exactly those flags and nothing else — plan mode and the read-only tool list are a separate axis.
-- **Every delegate carries `AGENTMUX_DELEGATE=1`, and agentmux refuses to launch a delegate when it sees it.** An
-  isolated delegate cannot reach agentmux, but an inheriting one loads the operator's own MCP
-  servers; the marker is what makes the opt-out safe rather than a recursion waiting to happen.
+- **Every delegate carries `AGENTMUX_DELEGATE=1`, and agentmux refuses to launch a delegate — or
+  to serve MCP at all — when it finds itself inside one.** An isolated delegate cannot reach
+  agentmux, but an inheriting one loads the operator's own MCP servers. The marker is not the only
+  witness: Codex starts its MCP servers with an allowlist environment that drops it (measured:
+  `HOME LANG LC_ALL LOGNAME PATH PWD SHELL TERM TMPDIR USER`, in a fresh process group), so
+  `RunStore::running_inside_a_delegate` also walks the process tree (`launch::ancestors`, through
+  `sysinfo`) and refuses when any ancestor is a recorded delegate whose start time still matches
+  and whose turn nobody has settled. The store names its own resolved root to every delegate as
+  `AGENTMUX_STATE_DIR`, so a nested agentmux looks in the same store whatever the platform
+  default would have been — except under Codex's MCP-server allowlist, which drops that too, so
+  with a non-default state directory the tree witness is blind there (a cost hazard, not an
+  identity one; documented, not solved). Decided once per process; a store that cannot be read
+  is an error, never "not inside".
+- **A request's `env` is an allowlist the operator writes, never a denylist agentmux keeps.** Only
+  the names under `request_env` in `agentmux.toml` may be set per call, and by default none: no
+  list of names to refuse stays complete against `PATH`, `NODE_OPTIONS`, `LD_PRELOAD` and whatever
+  the next runtime reads. An account's own `request_env` counts only when the machine file or the
+  caller chose the account, not when a project file did. Every environment name agentmux handles
+  passes through `config::canonical_env_name` on the way in (upper-cased on Windows, exact
+  elsewhere), so every comparison is a plain one.
+- **The rendered transcript is append-only for the life of a consultation, and a turn's fold input
+  is frozen once it is terminal.** A terminal event ends the fold. A child observed gone is
+  recorded once, together with how much capture existed and the tail of its stderr
+  (`ExitRecord::Exited { status, events_len, stderr_tail }`), and every later fold reads the
+  record rather than the files, which a descendant of the child may still be writing. `cancel`
+  marks the turn as cancelling under the lock, stops the child, waits for it to go, then records
+  `ExitRecord::Cancelled { events_len }`; a concurrent reader that sees the child go first records
+  the same cancellation. A Codex reply recovered from `last-message.md` is only ever added to the
+  newest turn and is then kept in `recovered.md`, so it can neither land above a later turn nor
+  go missing once rendered; text that cannot be kept is not rendered. Nothing taken under the
+  run lock calls back into anything that takes it — a second lock on the same file from one
+  process waits on the first for ever. Whatever record settles a turn, the turn is re-folded
+  from exactly the length that record froze, so two observers publish the same bytes. `remove`
+  and the sweep refuse a run while any recorded child without an exit record is still alive,
+  because both CLIs outlive their closing event. `every_fixture_renders_monotonically_over_its_prefixes`
+  checks every fixture at every line cut.
+- **A pid on disk is trusted only with the start time recorded beside it.** `Launched::started`
+  comes from `sysinfo` at spawn; liveness after a restart requires it to match, and a settled turn
+  is never observed again. Per-run state changes — claiming a turn, cancelling, publishing the
+  render, removing the run — happen under the advisory lock at `runs/<id>.lock`, which is never
+  unlinked.
+- **A project file selects an account but cannot switch on its `inherit_settings`.** It arrives
+  with a clone; `resolve_isolation` answers `Isolated` for an alias the project file chose unless
+  the caller asked explicitly.
 - **Only a machine config file may define an account.** A project `agentmux.toml`, found by walking
   up from the delegate's working directory, may only select one. It can arrive with a `git clone`,
   and a file that could name a `base_url` and an `api_key_env` would be a credential-exfiltration
-  primitive.
+  primitive. Machine files live under the home directory only — `XDG_CONFIG_HOME` and `APPDATA`
+  count only when they point there — with `AGENTMUX_CONFIG` as the one deliberate escape hatch, so
+  a container that points the config base at a workspace cannot promote a checkout to a machine
+  file. A turn directory is a turn once it holds a launch or exit record; one with neither is a
+  claim, and a claim found under the lock is abandoned: it is set aside under a name no fold
+  walks (a child spawned by the caller that died may still be writing to it) and taken over.
 - **Model id and reasoning effort are opaque pass-through strings.** agentmux keeps no roster of
   either, and a new model identifier must never require an agentmux release. The delegate CLI is the
   sole authority on which values it accepts; when one is wrong, that CLI's own error — which names

@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId, Vendor};
+use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId, Vendor};
 use agentmux::quota::{AccountQuota, Observation, Origin};
-use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
+use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
 use chrono::Utc;
@@ -244,9 +244,7 @@ fn a_reopened_turn_reads_as_expected_when_settings_were_inherited() -> Result<()
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the report"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#})?;
-    status.reopened_by_hook = true;
-
-    status.delegate = status.delegate.clone().with_isolation(Isolation::Inherit);
+    status.hook_reopening = Some(HookReopening::Expected);
     let inherited = agentmux_mcp::render::warnings(&status);
     assert_that!(
         inherited,
@@ -254,7 +252,7 @@ fn a_reopened_turn_reads_as_expected_when_settings_were_inherited() -> Result<()
     );
     assert_that!(inherited, not(contains_substring("should not be possible")));
 
-    status.delegate = status.delegate.clone().with_isolation(Isolation::Isolated);
+    status.hook_reopening = Some(HookReopening::Unexpected);
     let isolated = agentmux_mcp::render::warnings(&status);
     assert_that!(isolated, contains_substring("should not be possible"));
     // The load-bearing sentence survives in the world where it is an alarm.

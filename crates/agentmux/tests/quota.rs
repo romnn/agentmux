@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use agentmux::config::{Account, Config};
 use agentmux::delegate::Vendor;
-use agentmux::quota::{AccountQuota, Observation, ProbeRequest, QuotaProbe, probe_vendor};
+use agentmux::quota::{
+    AccountQuota, Observation, ProbeRequest, ProbeTarget, QuotaProbe, probe_vendor,
+};
 use googletest::prelude::*;
 
 /// A probe that answers from a script instead of a machine.
@@ -19,7 +21,7 @@ struct ScriptedProbe {
 
 impl QuotaProbe for ScriptedProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
-        if !request.has_own_profile {
+        if request.target == ProbeTarget::Credential {
             return Observation::Unavailable {
                 reason: "custom endpoint".to_owned(),
             };
@@ -121,6 +123,87 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
     assert_that!(
         reported[0].observation,
         matches_pattern!(Observation::Unavailable { .. })
+    );
+}
+
+/// An account that names a profile directory but authenticates with a key has no window either.
+///
+/// Both CLIs prefer a key in the environment over a stored login, so the delegate is billed per
+/// token, and the profile's subscription figures would be reported under a name that is not
+/// spending them.
+#[gtest]
+fn a_profile_that_also_supplies_a_key_reports_no_window() {
+    let config = config_with(
+        "claude",
+        &[(
+            "ci",
+            Account {
+                config_dir: Some(PathBuf::from("/home/dev/.claude-ci")),
+                api_key_env: Some("CI_ANTHROPIC_KEY".to_owned()),
+                ..Account::default()
+            },
+        )],
+    );
+    let probe = ScriptedProbe {
+        payload: serde_json::json!({"utilization": {"limits": []}}),
+    };
+
+    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
+
+    assert_that!(
+        reported[0].observation,
+        matches_pattern!(Observation::Unavailable { .. })
+    );
+}
+
+/// With no account named, the probe reads exactly the login a delegate without an account runs
+/// as.
+///
+/// A no-account Codex delegate is handed the host's `CODEX_HOME`; a no-account Claude delegate is
+/// deliberately not handed the host's `CLAUDE_CONFIG_DIR`, which under Claude Code names the
+/// launching session's own identity.
+/// The probe follows the same rule, or `quota` would report one login's window for a delegate
+/// that spends another's.
+#[gtest]
+fn the_default_target_reads_the_login_a_delegate_would_run_as() {
+    let mut env = host_env();
+    env.insert(
+        "CLAUDE_CONFIG_DIR".to_owned(),
+        "/home/dev/.claude-work".to_owned(),
+    );
+    env.insert("CODEX_HOME".to_owned(), "/home/dev/.codex-work".to_owned());
+    let config = Config::default();
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, None, &config, &env),
+        ok(eq(&ProbeTarget::Window { config_dir: None }))
+    );
+    assert_that!(
+        ProbeTarget::of(Vendor::Codex, None, &config, &env),
+        ok(eq(&ProbeTarget::Window {
+            config_dir: Some(PathBuf::from("/home/dev/.codex-work"))
+        }))
+    );
+}
+
+/// A key the host exports, or the machine's launch layer forwards, is what a no-account delegate
+/// authenticates with — so the probe must not report the subscription window it would not spend.
+#[gtest]
+fn a_forwarded_key_makes_the_default_identity_a_credential() {
+    let mut env = host_env();
+    env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-host".to_owned());
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, None, &Config::default(), &env),
+        ok(eq(&ProbeTarget::Credential))
+    );
+
+    let mut config = Config::default();
+    config.launch.env.insert(
+        "OPENAI_API_KEY".to_owned(),
+        agentmux::config::Secret::new("sk-launch"),
+    );
+    assert_that!(
+        ProbeTarget::of(Vendor::Codex, None, &config, &host_env()),
+        ok(eq(&ProbeTarget::Credential))
     );
 }
 
@@ -226,7 +309,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
         Observation::Reported { .. } => panic!("a missing directory cannot report figures"),
     };
     assert_that!(reason, contains_substring("does not exist"));
-    assert_that!(reason, contains_substring("never been logged in"));
+    assert_that!(reason, contains_substring("not been logged in"));
     assert_that!(
         missing.exists(),
         eq(false),

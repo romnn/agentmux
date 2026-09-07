@@ -29,11 +29,13 @@ pub struct Script {
     pub stderr: String,
     /// The exit status a later reap reports, or `None` for a child that is still running.
     pub exit: Option<ExitStatus>,
-    /// Events appended to the capture file the first time liveness is asked about this child.
+    /// Events appended to the capture file the first time this child is observed leaving.
     ///
-    /// Models a real child flushing the tail of its stream as it exits, which is what makes the
-    /// gap between reading the capture file and observing the process a race worth testing.
-    pub flush_on_liveness: Option<String>,
+    /// A child that exits on its own flushes at its first observation; one that is still running
+    /// flushes once it has been asked to stop.
+    /// Both model a real child flushing the tail of its stream as it exits, which is what makes
+    /// the gap between reading the capture file and observing the process a race worth testing.
+    pub flush_on_departure: Option<String>,
 }
 
 impl Script {
@@ -42,12 +44,8 @@ impl Script {
     pub fn completed(events: impl Into<String>) -> Self {
         Self {
             events: events.into(),
-            stderr: String::new(),
-            exit: Some(ExitStatus {
-                code: Some(0),
-                signal: None,
-            }),
-            flush_on_liveness: None,
+            exit: Some(0.into()),
+            ..Self::default()
         }
     }
 
@@ -57,11 +55,8 @@ impl Script {
         Self {
             events: events.into(),
             stderr: stderr.into(),
-            exit: Some(ExitStatus {
-                code: Some(code),
-                signal: None,
-            }),
-            flush_on_liveness: None,
+            exit: Some(code.into()),
+            ..Self::default()
         }
     }
 
@@ -70,27 +65,36 @@ impl Script {
     pub fn running(events: impl Into<String>) -> Self {
         Self {
             events: events.into(),
-            stderr: String::new(),
-            exit: None,
-            flush_on_liveness: None,
+            ..Self::default()
         }
     }
 
     /// A child that emits `events`, then flushes `tail` and exits at the moment it is first
-    /// asked whether it is alive.
+    /// observed.
     ///
     /// This reproduces the one interleaving that matters: agentmux reads the capture file, the
-    /// child writes its terminal event and exits, and only then is liveness observed.
+    /// child writes its terminal event and exits, and only then is the process observed.
     #[must_use]
     pub fn flushes_as_it_exits(events: impl Into<String>, tail: impl Into<String>) -> Self {
         Self {
             events: events.into(),
-            stderr: String::new(),
-            exit: Some(ExitStatus {
-                code: Some(0),
-                signal: None,
-            }),
-            flush_on_liveness: Some(tail.into()),
+            exit: Some(0.into()),
+            flush_on_departure: Some(tail.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A child that emits `events`, keeps running, and flushes `tail` as it dies once it has been
+    /// asked to stop.
+    ///
+    /// Models a delegate that had already finished its turn when the signal landed and got its
+    /// terminal event out before going.
+    #[must_use]
+    pub fn flushes_when_stopped(events: impl Into<String>, tail: impl Into<String>) -> Self {
+        Self {
+            events: events.into(),
+            flush_on_departure: Some(tail.into()),
+            ..Self::default()
         }
     }
 }
@@ -134,6 +138,7 @@ pub struct ScriptedLauncher {
     scripts: Mutex<VecDeque<Script>>,
     launches: Mutex<Vec<RecordedLaunch>>,
     terminated: Mutex<Vec<u32>>,
+    killed: Mutex<Vec<u32>>,
     flushed: Mutex<BTreeSet<u32>>,
 }
 
@@ -145,6 +150,7 @@ impl ScriptedLauncher {
             scripts: Mutex::new(scripts.into_iter().collect()),
             launches: Mutex::new(Vec::new()),
             terminated: Mutex::new(Vec::new()),
+            killed: Mutex::new(Vec::new()),
             flushed: Mutex::new(BTreeSet::new()),
         }
     }
@@ -161,8 +167,41 @@ impl ScriptedLauncher {
         lock(&self.terminated).clone()
     }
 
+    /// The pids the launcher was asked to kill outright, after termination was not enough.
+    #[must_use]
+    pub fn killed(&self) -> Vec<u32> {
+        lock(&self.killed).clone()
+    }
+
+    /// Whether a scripted child has been asked to stop.
+    ///
+    /// A scripted child is cooperative: it dies on the first request, the way both real CLIs do
+    /// on `SIGTERM`.
+    /// A script that flushes on liveness still gets to flush first, which is how the "outran the
+    /// signal" interleaving is reproduced.
+    fn stopped(&self, pid: u32) -> bool {
+        lock(&self.terminated).contains(&pid) || lock(&self.killed).contains(&pid)
+    }
+
     fn script_for(&self, index: usize) -> Script {
         lock(&self.scripts).get(index).cloned().unwrap_or_default()
+    }
+
+    /// Append the script's late tail the first time the child is observed.
+    ///
+    /// The flush happens before the answer, so a caller that reads the capture file and then
+    /// observes the process sees exactly the interleaving a real exiting child produces.
+    fn flush_on_first_observation(&self, pid: u32, index: usize, script: &Script) {
+        let leaving = script.exit.is_some() || self.stopped(pid);
+        if leaving
+            && let Some(tail) = &script.flush_on_departure
+            && lock(&self.flushed).insert(pid)
+            && let Some(recorded) = lock(&self.launches).get(index)
+            && let Ok(mut existing) = std::fs::read_to_string(&recorded.events)
+        {
+            existing.push_str(tail);
+            let _ = std::fs::write(&recorded.events, existing);
+        }
     }
 }
 
@@ -196,38 +235,47 @@ impl Launcher for ScriptedLauncher {
         Ok(Launched {
             pid: FAKE_PID_BASE.saturating_add(u32::try_from(index).unwrap_or(0)),
             process_group: None,
+            started: None,
         })
     }
 
     fn liveness(&self, launched: Launched) -> Liveness {
         let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
         let script = self.script_for(index);
+        self.flush_on_first_observation(launched.pid, index, &script);
 
-        // The flush happens before the answer, so a caller that reads the capture file and then
-        // asks this question sees exactly the interleaving a real exiting child produces.
-        if let Some(tail) = &script.flush_on_liveness
-            && lock(&self.flushed).insert(launched.pid)
-            && let Some(recorded) = lock(&self.launches).get(index)
-            && let Ok(mut existing) = std::fs::read_to_string(&recorded.events)
-        {
-            existing.push_str(tail);
-            let _ = std::fs::write(&recorded.events, existing);
-        }
-
-        if script.exit.is_some() {
+        if script.exit.is_some() || self.stopped(launched.pid) {
             Liveness::Gone
         } else {
             Liveness::Alive
         }
     }
 
+    // Both stop requests are recorded only for a child that is still there, as the real
+    // launcher delivers them: a test counting terminations sees what a process would have seen.
     fn terminate(&self, launched: Launched) {
-        lock(&self.terminated).push(launched.pid);
+        if self.liveness(launched) == Liveness::Alive {
+            lock(&self.terminated).push(launched.pid);
+        }
+    }
+
+    fn kill(&self, launched: Launched) {
+        if self.liveness(launched) == Liveness::Alive {
+            lock(&self.killed).push(launched.pid);
+        }
     }
 
     fn reap(&self, launched: Launched) -> Option<ExitStatus> {
         let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
-        self.script_for(index).exit
+        let script = self.script_for(index);
+        self.flush_on_first_observation(launched.pid, index, &script);
+        script.exit.or_else(|| {
+            // A stopped child reports the signal that stopped it, as a real one would.
+            self.stopped(launched.pid).then_some(ExitStatus {
+                code: None,
+                signal: Some(15),
+            })
+        })
     }
 }
 

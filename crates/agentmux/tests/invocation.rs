@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentmux::config::{Account, Config};
+use agentmux::config::{Account, Config, Secret};
 use agentmux::delegate::{
     AccountAlias, CodexSandbox, Delegate, Effort, Invocation, Isolation, ModelId, SessionRef,
     TurnPlan,
@@ -556,20 +556,29 @@ fn an_argv_unsafe_model_identifier_is_rejected() {
     );
 }
 
-/// A per-request environment may not name anything that decides where the consultation goes.
+/// A per-request environment may set nothing the machine's configuration has not listed.
 ///
 /// The caller is frequently another model acting on text it was handed, so this is the boundary
 /// between "switch off a hook for this review" and "run a program of my choosing with the
 /// operator's subscription credentials in its environment".
-/// `PATH` is the sharpest of these: the child environment is installed before the program is
-/// looked up, so setting it chooses which binary executes.
+/// No list of names to refuse stays complete against that: `PATH` chooses which binary executes,
+/// `NODE_OPTIONS` runs code inside the CLI before it reads a setting, `LD_PRELOAD` does the same
+/// to the loader, and the next runtime will read one more.
+/// So a request may only set what the operator listed, and by default that is nothing.
 #[gtest]
 fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()> {
-    let reserved = [
+    let refused = [
         // Chooses which binary runs.
         "PATH",
+        // Windows reads names without regard to case, so this spells the same variable there.
+        "path",
         // Relocates the default account's identity.
         "HOME",
+        // Runs the caller's code inside the CLI before it reads a single setting.
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
         // Routes every request through a host of the caller's choosing, and makes its certificate
         // trusted; together these capture credentials without naming one.
         "HTTPS_PROXY",
@@ -588,9 +597,14 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
         "AGENTMUX_CONFIG",
         "AWS_BEARER_TOKEN_BEDROCK",
         "http_proxy",
+        // Something entirely innocuous, because the rule is an allowlist and not a judgement.
+        "DISABLE_HOOKS",
     ];
+    // The one name the operator did list must not widen what the caller may set.
+    let mut config = Config::default();
+    config.launch.request_env = vec!["REVIEW_MODE".to_owned()];
 
-    for name in reserved {
+    for name in refused {
         let requested = [((name).to_owned(), "attacker".to_owned())]
             .into_iter()
             .collect();
@@ -606,7 +620,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             account: None,
             isolation: None,
         }
-        .invocation(&plan, &host_session_env(), &Config::default());
+        .invocation(&plan, &host_session_env(), &config);
 
         assert_that!(
             result.is_err(),
@@ -617,12 +631,14 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
     Ok(())
 }
 
-/// A per-request environment still reaches the delegate for everything else.
+/// A per-request environment reaches the delegate for the names the operator listed.
 ///
 /// The point of the guard is to keep identity and routing out of a caller's hands, not to make the
 /// parameter useless: switching off a hook inside a review is exactly what it is for.
 #[gtest]
-fn a_request_environment_reaches_the_delegate() -> Result<()> {
+fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
+    let mut config = Config::default();
+    config.launch.request_env = vec!["DISABLE_HOOKS".to_owned()];
     let requested = [("DISABLE_HOOKS".to_owned(), "true".to_owned())]
         .into_iter()
         .collect();
@@ -639,12 +655,81 @@ fn a_request_environment_reaches_the_delegate() -> Result<()> {
         account: None,
         isolation: None,
     }
-    .invocation(&plan, &host_session_env(), &Config::default())
+    .invocation(&plan, &host_session_env(), &config)
     .or_fail()?;
 
     assert_that!(
         invocation.env.get("DISABLE_HOOKS").map(String::as_str),
         some(eq("true"))
+    );
+    Ok(())
+}
+
+/// A value no environment can carry is refused at the request, not blamed on the CLI.
+///
+/// `Command::spawn` refuses a NUL byte with an error that the launcher would report as "cannot
+/// run `claude` … is it installed?", sending the caller to reinstall a working tool.
+#[gtest]
+fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
+    let mut config = Config::default();
+    config.launch.request_env = vec!["DISABLE_HOOKS".to_owned()];
+    let requested = [("DISABLE_HOOKS".to_owned(), "a\0b".to_owned())]
+        .into_iter()
+        .collect();
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &requested,
+    };
+
+    let error = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: None,
+        isolation: None,
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .expect_err("a NUL byte cannot reach the child");
+    assert_that!(
+        error,
+        matches_pattern!(agentmux::delegate::DelegateError::Argument { .. })
+    );
+    Ok(())
+}
+
+/// Choosing an account withholds the host's credentials even when the machine layer forwarded
+/// them.
+///
+/// `[launch] env_passthrough = ["ANTHROPIC_API_KEY"]` is a reasonable line on a machine that was
+/// key-only when it was written; an account added later must still authenticate as itself, or
+/// the caller believes it switched to a subscription while billing the key.
+#[gtest]
+fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut config = config_with_personal(dir.path());
+    config.launch.env_passthrough = vec!["ANTHROPIC_API_KEY".to_owned()];
+    config.launch.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        Secret::new("http://gateway.internal"),
+    );
+
+    let invocation = build_with(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: Some(AccountAlias::parse("personal").or_fail()?),
+            isolation: None,
+        },
+        None,
+        &config,
+    )?;
+
+    assert_that!(invocation.env.get("ANTHROPIC_API_KEY"), none());
+    assert_that!(invocation.env.get("ANTHROPIC_BASE_URL"), none());
+    assert_that!(
+        invocation.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        some(eq(dir.path().to_string_lossy().as_ref()))
     );
     Ok(())
 }
@@ -657,23 +742,24 @@ fn a_request_environment_reaches_the_delegate() -> Result<()> {
 fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let mut config = config_with_personal(dir.path());
+    config.launch.env.insert(
+        "DELEGATE_TEST_LAYER".to_owned(),
+        Secret::new("from-machine"),
+    );
     config
         .launch
         .env
-        .insert("DELEGATE_TEST_LAYER".to_owned(), "from-machine".to_owned());
-    config
-        .launch
-        .env
-        .insert("MACHINE_ONLY".to_owned(), "yes".to_owned());
+        .insert("MACHINE_ONLY".to_owned(), Secret::new("yes"));
+    config.launch.request_env = vec!["DELEGATE_TEST_LAYER".to_owned()];
     if let Some(account) = config
         .accounts
         .get_mut("claude")
         .and_then(|table| table.get_mut("personal"))
     {
-        account
-            .launch
-            .env
-            .insert("DELEGATE_TEST_LAYER".to_owned(), "from-account".to_owned());
+        account.launch.env.insert(
+            "DELEGATE_TEST_LAYER".to_owned(),
+            Secret::new("from-account"),
+        );
     }
 
     let requested = [("DELEGATE_TEST_LAYER".to_owned(), "from-request".to_owned())]
@@ -756,6 +842,7 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
 fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result<()> {
     let mut config = Config {
         project_source: Some(std::path::PathBuf::from("/work/client/agentmux.toml")),
+        project_defaults: ["claude".to_owned()].into_iter().collect(),
         ..Config::default()
     };
     config.defaults.insert(
@@ -933,5 +1020,66 @@ fn every_delegate_is_marked_so_agentmux_cannot_consult_itself() -> Result<()> {
             delegate.summary()
         );
     }
+    Ok(())
+}
+
+/// An account a project file selects does not bring its own `request_env` with it.
+///
+/// A checkout may say which of the operator's accounts pays, and nothing more.
+/// Its instructions can also tell the calling agent what `env` to pass, so an account whose
+/// `request_env` names something the machine layer would refuse must not become reachable just
+/// because the checkout chose it — while the same account, chosen by the machine file, keeps it.
+#[gtest]
+fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
+    let mut config = Config::default();
+    config
+        .accounts
+        .entry("claude".to_owned())
+        .or_default()
+        .insert(
+            "debug".to_owned(),
+            Account {
+                api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
+                launch: agentmux::config::LaunchEnv {
+                    request_env: vec!["NODE_OPTIONS".to_owned()],
+                    ..agentmux::config::LaunchEnv::default()
+                },
+                ..Account::default()
+            },
+        );
+    config.defaults.insert(
+        "claude".to_owned(),
+        agentmux::config::Defaults {
+            account: Some("debug".to_owned()),
+        },
+    );
+    let requested = [("NODE_OPTIONS".to_owned(), "--require /tmp/x.js".to_owned())]
+        .into_iter()
+        .collect();
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &requested,
+    };
+    let delegate = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: effort("xhigh")?,
+        account: None,
+        isolation: None,
+    };
+
+    // The machine's own default: the account's request_env applies.
+    let machine = delegate.invocation(&plan, &host_session_env(), &config);
+    assert_that!(machine.is_ok(), eq(true), "{machine:?}");
+
+    // The same account chosen by the checkout: it does not.
+    config.project_source = Some(std::path::PathBuf::from("/work/client/agentmux.toml"));
+    config.project_defaults = ["claude".to_owned()].into_iter().collect();
+    let project = delegate.invocation(&plan, &host_session_env(), &config);
+    assert_that!(
+        project.map(|_| ()),
+        err(displays_as(contains_substring("cannot be set per request")))
+    );
     Ok(())
 }

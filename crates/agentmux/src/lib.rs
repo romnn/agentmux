@@ -35,7 +35,11 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let env = agentmux::host_env();
-//! let store = RunStore::open(RunStore::default_root(&env)?, Arc::new(ProcessLauncher), env)?;
+//! let store = RunStore::open(
+//!     RunStore::default_root(&env)?,
+//!     Arc::new(ProcessLauncher::new()),
+//!     env,
+//! )?;
 //!
 //! let status = store.start(&StartRequest {
 //!     delegate: Delegate::Claude {
@@ -70,7 +74,16 @@ use std::collections::BTreeMap;
 ///
 /// Captured once and threaded through, rather than read from the process at each use, so a test
 /// can supply a hostile environment and assert that none of it reaches a child.
+/// Names are spelled the way the platform reads them, and a value that is not text is left out
+/// rather than allowed to end the process.
 #[must_use]
 pub fn host_env() -> BTreeMap<String, String> {
-    std::env::vars().collect()
+    std::env::vars_os()
+        .filter_map(|(name, value)| {
+            Some((
+                config::canonical_env_name(name.to_str()?),
+                value.into_string().ok()?,
+            ))
+        })
+        .collect()
 }

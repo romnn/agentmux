@@ -68,6 +68,13 @@ pub enum MessageSource {
     Delegate,
     /// Injected by a hook in the delegate's own environment, reopening a finished turn.
     HookInjection,
+    /// Injected by a hook in the delegate's own environment while the turn was still under way.
+    ///
+    /// A `PostToolUse` hook adding context, or a `PreToolUse` hook refusing a call with a reason,
+    /// arrives with the same shape as a reopening: a `user` text message the user did not write.
+    /// It differs in what it means for the reader — the delegate's later messages are still the
+    /// answer — so it is kept apart rather than collapsed into [`Self::HookInjection`].
+    HookContext,
     /// Written by agentmux to record something the event stream implied but did not say.
     Synthetic,
 }
@@ -101,6 +108,16 @@ impl Message {
             role: Role::User,
             text: text.into(),
             source: MessageSource::HookInjection,
+        }
+    }
+
+    /// A `user` message a hook injected while the delegate was still working.
+    #[must_use]
+    pub fn hook_context(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            text: text.into(),
+            source: MessageSource::HookContext,
         }
     }
 
@@ -259,13 +276,16 @@ pub struct UnrecognisedEvents(BTreeMap<String, u32>);
 impl UnrecognisedEvents {
     /// Record one sighting of an event type the parser does not model.
     pub fn record(&mut self, kind: impl Into<String>) {
-        *self.0.entry(kind.into()).or_insert(0) += 1;
+        let count = self.0.entry(kind.into()).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     /// Total sightings across all unrecognised types.
     #[must_use]
     pub fn total(&self) -> u32 {
-        self.0.values().copied().sum()
+        self.0
+            .values()
+            .fold(0, |sum, count| sum.saturating_add(*count))
     }
 
     /// Whether every event in the stream was understood.
@@ -282,7 +302,8 @@ impl UnrecognisedEvents {
     /// Fold another tally into this one.
     pub fn merge(&mut self, other: &Self) {
         for (kind, count) in other.iter() {
-            *self.0.entry(kind.to_owned()).or_insert(0) += count;
+            let total = self.0.entry(kind.to_owned()).or_insert(0);
+            *total = total.saturating_add(count);
         }
     }
 
@@ -347,6 +368,13 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Whether the delegate said anything in this turn: a reply in the stream, or one recovered
+    /// from the CLI's own output file.
+    #[must_use]
+    pub fn has_delegate_content(&self) -> bool {
+        self.messages.iter().any(Message::is_report_content) || self.recovered.is_some()
+    }
+
     /// An empty turn that has not produced anything yet.
     #[must_use]
     pub fn new(index: u32, question: impl Into<String>) -> Self {
@@ -433,8 +461,7 @@ impl Transcript {
     /// on the category alone would lock a caller out of a consultation that is merely paused.
     #[must_use]
     pub fn has_delegate_content(&self) -> bool {
-        self.messages().any(Message::is_report_content)
-            || self.turns.iter().any(|turn| turn.recovered.is_some())
+        self.turns.iter().any(Turn::has_delegate_content)
     }
 
     /// Whether any turn was reopened by a hook, which makes [`Self::final_message`] untrustworthy.
@@ -537,6 +564,17 @@ pub fn render_turn(turn: &Turn) -> String {
                     "\n> [!WARNING]\n\
                      > **A hook in the delegate's environment reopened this finished turn.**\n\
                      > Everything below is the reopened turn, not the answer. The answer is above.\n\
+                     >\n\
+                     > Injected text: {}\n",
+                    single_line(&message.text)
+                );
+            }
+            MessageSource::HookContext => {
+                let _ = write!(
+                    out,
+                    "\n> [!NOTE]\n\
+                     > A hook in the delegate's environment added context here, mid-turn. The\n\
+                     > delegate's later messages are still its own.\n\
                      >\n\
                      > Injected text: {}\n",
                     single_line(&message.text)

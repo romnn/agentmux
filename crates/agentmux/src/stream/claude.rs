@@ -19,6 +19,9 @@
 //! - Tool results arrive as `user` events whose content blocks are `tool_result`, never `text`.
 //!   That is what makes the reopening test below structural: in `--print` mode the *only* way a
 //!   `user` message carrying a `text` block reaches the main conversation is an injection.
+//!   Whether that injection *reopened* a finished turn or merely added context mid-turn is
+//!   decided by what the delegate was doing when it arrived: after a message that called a
+//!   tool, the turn was still under way; after a message that did not, the turn had ended.
 
 use std::fmt::Write as _;
 
@@ -95,8 +98,10 @@ impl Default for Content {
 struct ContentBlock {
     #[serde(rename = "type")]
     kind: String,
+    /// Absent on every non-text block; absent on a *text* block only if the vendor renamed it,
+    /// which is counted rather than read as an empty message.
     #[serde(default)]
-    text: String,
+    text: Option<String>,
 }
 
 /// Content block types that carry no prose and are dropped on purpose.
@@ -106,22 +111,41 @@ struct ContentBlock {
 /// be dropped by the filter, and take the report with it without a single diagnostic.
 const KNOWN_SILENT_BLOCKS: &[&str] = &["tool_use", "tool_result", "thinking", "image"];
 
+/// What one message's content amounts to.
+#[derive(Debug, Default)]
+struct Inspected<'a> {
+    /// The prose, in order.
+    texts: Vec<&'a str>,
+    /// Block shapes the parser does not account for, for the drift counter.
+    unknown: Vec<&'a str>,
+    /// Whether the message called a tool, which means the turn was not over when it was sent.
+    calls_a_tool: bool,
+}
+
 impl Content {
-    /// The prose of a message, plus any block type the parser does not account for.
-    fn texts(&self) -> (Vec<&str>, Vec<&str>) {
+    /// The prose of a message, plus any block shape the parser does not account for.
+    fn inspect(&self) -> Inspected<'_> {
         match self {
-            Self::Text(text) => (vec![text.as_str()], Vec::new()),
+            Self::Text(text) => Inspected {
+                texts: vec![text.as_str()],
+                ..Inspected::default()
+            },
             Self::Blocks(blocks) => {
-                let mut texts = Vec::new();
-                let mut unknown = Vec::new();
+                let mut inspected = Inspected::default();
                 for block in blocks {
-                    if block.kind == "text" {
-                        texts.push(block.text.as_str());
-                    } else if !KNOWN_SILENT_BLOCKS.contains(&block.kind.as_str()) {
-                        unknown.push(block.kind.as_str());
+                    match (block.kind.as_str(), block.text.as_deref()) {
+                        ("text", Some(text)) => inspected.texts.push(text),
+                        // A text block without its text is not an empty message; it is the
+                        // payload field renamed, and dropping it would drop the report.
+                        ("text", None) => inspected.unknown.push("text.<missing>"),
+                        ("tool_use", _) => inspected.calls_a_tool = true,
+                        (kind, _) if !KNOWN_SILENT_BLOCKS.contains(&kind) => {
+                            inspected.unknown.push(kind);
+                        }
+                        _ => {}
                     }
                 }
-                (texts, unknown)
+                inspected
             }
         }
     }
@@ -135,7 +159,9 @@ struct ResultEvent {
     /// `"success"` on a failed turn, so it is useless for the decision and misleading in a
     /// message.
     /// Branch on this field alone.
-    #[serde(default)]
+    ///
+    /// Required, not defaulted: a `result` without it is a `result` whose shape changed, and
+    /// defaulting it to "no error" would turn that drift into a clean, empty completion.
     is_error: bool,
     #[serde(default)]
     terminal_reason: Option<String>,
@@ -239,10 +265,9 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn = Turn::new(index, question);
     let mut session = None;
     let mut reopened = false;
-    // Whether the delegate has said anything yet.
-    // A `user` text message before it speaks is the prompt; one after it has spoken is something
-    // reopening a turn it had finished.
-    let mut spoken = false;
+    // What the delegate was doing when a `user` text message arrives decides what that message
+    // is: see [`classify_injection`].
+    let mut delegate = DelegateActivity::Silent;
 
     for line in complete_lines(events) {
         let Some(kind) = probe(line) else {
@@ -274,16 +299,20 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
-                let (texts, unknown) = event.message.content.texts();
-                for kind in unknown {
+                let inspected = event.message.content.inspect();
+                for kind in inspected.unknown {
                     turn.unrecognised
                         .record(format!("assistant.content.{kind}"));
                 }
-                for text in texts {
+                delegate = if inspected.calls_a_tool {
+                    DelegateActivity::CallingATool
+                } else {
+                    DelegateActivity::Finished
+                };
+                for text in inspected.texts {
                     if text.trim().is_empty() {
                         continue;
                     }
-                    spoken = true;
                     turn.messages.push(Message::delegate(Role::Assistant, text));
                 }
             }
@@ -295,20 +324,23 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
-                let (texts, unknown) = event.message.content.texts();
-                for kind in unknown {
+                let inspected = event.message.content.inspect();
+                for kind in inspected.unknown {
                     turn.unrecognised.record(format!("user.content.{kind}"));
                 }
-                for text in texts {
+                for text in inspected.texts {
                     if text.trim().is_empty() {
                         continue;
                     }
-                    if is_reopening(text, spoken) {
-                        reopened = true;
-                        turn.messages.push(Message::hook_injection(text));
-                    } else {
-                        turn.messages.push(Message::delegate(Role::User, text));
-                    }
+                    turn.messages
+                        .push(match classify_injection(text, delegate) {
+                            Injection::Reopening => {
+                                reopened = true;
+                                Message::hook_injection(text)
+                            }
+                            Injection::Context => Message::hook_context(text),
+                            Injection::None => Message::delegate(Role::User, text),
+                        });
                 }
             }
             "rate_limit_event" => fold_rate_limit(&mut turn, line),
@@ -330,13 +362,37 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     Fold { turn, session }
 }
 
-/// Whether a `user` text message is something reopening a turn the delegate had finished.
+/// What the delegate was doing when a `user` text message arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateActivity {
+    /// It has not said anything yet.
+    Silent,
+    /// Its latest message called a tool, so the turn is still under way.
+    CallingATool,
+    /// Its latest message called no tool, so as far as the model is concerned the turn ended.
+    Finished,
+}
+
+/// What a `user` text message turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Injection {
+    /// Nothing injected: an ordinary turn input.
+    None,
+    /// A hook added context while the delegate was still working.
+    Context,
+    /// A hook reopened a turn the delegate had finished, so what follows is not the answer.
+    Reopening,
+}
+
+/// Decide what a `user` text message is from what the delegate was doing when it arrived.
 ///
 /// The test is **structural**, not textual.
 /// Under `--print` the delegate's own tool results arrive as `tool_result` blocks, which never
 /// reach this function, and subagent chatter is filtered by `parent_tool_use_id`.
 /// So a `text` block attributed to the user, arriving after the delegate has already spoken, is by
-/// construction something that was injected into a finished turn.
+/// construction something that was injected — and whether it *reopened* the turn follows from the
+/// delegate's latest message: one that called a tool was mid-turn and the injection is context
+/// (a `PostToolUse` hook, say); one that did not had finished, and the injection reopened it.
 ///
 /// Matching the CLI's `"… hook feedback:"` wording would be simpler and is the wrong test: the day
 /// that string is reworded, the injection would be recorded as an ordinary user message, nothing
@@ -344,8 +400,15 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
 /// read as the answer.
 /// That is precisely the silent loss this crate exists to prevent, so detection must not depend on
 /// prose.
-fn is_reopening(text: &str, delegate_has_spoken: bool) -> bool {
-    delegate_has_spoken || names_a_hook(text)
+/// The wording is consulted only before the delegate has spoken, where structure cannot tell an
+/// injected prelude from the prompt.
+fn classify_injection(text: &str, delegate: DelegateActivity) -> Injection {
+    match delegate {
+        DelegateActivity::Finished => Injection::Reopening,
+        DelegateActivity::CallingATool => Injection::Context,
+        DelegateActivity::Silent if names_a_hook(text) => Injection::Context,
+        DelegateActivity::Silent => Injection::None,
+    }
 }
 
 /// Whether the text is the CLI's own hook-feedback wording, for naming rather than detection.

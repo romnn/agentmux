@@ -480,3 +480,152 @@ fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
         some(eq("850f440b-be0f-411e-aaf3-bc8fdcc6b6b8"))
     );
 }
+
+/// The render of every fixture is append-only over every prefix of its stream.
+///
+/// `tail` pages the rendered transcript by byte offset, so appending an event to a stream may only
+/// ever append bytes to its render.
+/// Each parser holds that by discipline in several places — the `break` on a terminal event, the
+/// footer written only once terminal, the labels that depend only on what came before — and this
+/// is the one test that covers every path at once: for every recorded stream and every line cut,
+/// the render of the shorter prefix is a prefix of the render of the longer one.
+#[gtest]
+fn every_fixture_renders_monotonically_over_its_prefixes() {
+    for (vendor, name, fixture) in fixtures::all() {
+        let lines: Vec<&str> = fixture.lines().collect();
+        let mut previous = String::new();
+        for cut in 0..=lines.len() {
+            let prefix: String = lines
+                .get(..cut)
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|line| [*line, "\n"])
+                .collect();
+            let Fold { turn, .. } = stream::fold(vendor, 0, "q", &prefix);
+            let rendered = agentmux::transcript::render_turn(&turn);
+            assert_that!(
+                rendered.starts_with(&previous),
+                eq(true),
+                "fixture {name}: the render of {cut} lines does not extend the render of {} lines",
+                cut.saturating_sub(1)
+            );
+            previous = rendered;
+        }
+    }
+}
+
+/// A top-level Codex `error` ends the fold, as every other terminal event does.
+///
+/// Reading on would let a later line land above a footer already handed out, and the
+/// `turn.failed` that follows carries the same text anyway.
+#[gtest]
+fn a_codex_top_level_error_ends_the_fold() {
+    let stream = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"error","message":"stream disconnected before completion"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"after the failure"}}
+        {"type":"turn.failed","error":{"message":"a different message"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
+
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: anything(),
+            detail: eq("stream disconnected before completion"),
+        })
+    );
+    assert_that!(turn.messages, is_empty());
+}
+
+/// A text block whose payload field was renamed is counted, not read as an empty message.
+///
+/// Defaulting the text to empty would drop every report the day the vendor renames the field,
+/// with a clean exit and no diagnostic — the silent loss the drift counter exists to prevent.
+#[gtest]
+fn a_renamed_text_payload_is_counted_not_dropped() {
+    let stream = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
+        {"type":"assistant","message":{"content":[{"type":"text","value":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
+        {"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","result":""}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
+
+    assert_that!(
+        turn.unrecognised.summary(),
+        some(contains_substring("text.<missing>"))
+    );
+    assert_that!(turn.messages, is_empty());
+}
+
+/// A `result` without its success flag is drift, not a clean completion.
+///
+/// Defaulting `is_error` to false would turn a renamed field into a "completed" turn with no
+/// report, and nothing would say so.
+#[gtest]
+fn a_result_without_its_error_flag_is_drift_not_success() {
+    let stream = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
+        {"type":"assistant","message":{"content":[{"type":"text","text":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
+        {"type":"result","subtype":"success","terminal_reason":"completed","result":""}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
+
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Running));
+    assert_that!(
+        turn.unrecognised.summary(),
+        some(contains_substring("result.<unparsable>"))
+    );
+}
+
+/// A hook that adds context while the delegate is still working is not a reopening.
+///
+/// Under inherited settings a `PostToolUse` hook injects a `user` text message mid-turn, after a
+/// message that called a tool.
+/// Reading that as "the turn was reopened" would label the delegate's real answer, which comes
+/// afterwards, as not the answer.
+#[gtest]
+fn context_injected_mid_turn_is_not_a_reopening() {
+    let stream = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
+        {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]},"parent_tool_use_id":null}
+        {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file contents"}]},"parent_tool_use_id":null}
+        {"type":"user","message":{"content":[{"type":"text","text":"PostToolUse hook: remember the house style."}]},"parent_tool_use_id":null}
+        {"type":"assistant","message":{"content":[{"type":"text","text":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
+        {"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","result":"THE_REPORT_BODY"}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
+
+    assert_that!(turn.was_reopened_by_hook(), eq(false));
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|m| m.source == MessageSource::HookContext)
+            .count(),
+        eq(1)
+    );
+    let rendered = agentmux::transcript::render_turn(&turn);
+    assert_that!(rendered, contains_substring("added context here"));
+    assert_that!(rendered, not(contains_substring("not the answer")));
+}
+
+/// A connection refused is not a content refusal.
+///
+/// The classifier also reads the tail of a CLI's stderr, and a caller told "content flagged"
+/// about a proxy error would rephrase its question instead of fixing its proxy.
+#[gtest]
+fn an_infrastructure_error_is_not_classified_as_a_refusal() {
+    let stream = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"connect ECONNREFUSED 127.0.0.1:8080 (request id req_4291)"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
+
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::Unclassified),
+            detail: anything()
+        })
+    );
+}

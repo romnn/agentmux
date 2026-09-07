@@ -22,6 +22,7 @@ chrono = { workspace = true, features = ["serde"] }
 directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 # Only the timer, for the bounded wait in `run`.
 # The binary pulls in the full runtime.
@@ -32,7 +33,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 # Detached process groups, liveness that survives pid reuse, and group-wide termination.
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["process", "signal"] }
+nix = { workspace = true, features = ["process", "signal", "user"] }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["serde"] }

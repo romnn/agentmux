@@ -114,6 +114,10 @@ directories = "6"
 # The minor version is pinned because `nix` makes breaking changes within 0.x.
 # Features are chosen per crate.
 nix = "0.31.3"
+# Process start time and liveness by pid, on every release target and without `unsafe` of our
+# own. A delegate outlives the agentmux that started it, so a pid on disk needs a start time
+# beside it before it can be trusted not to have been recycled.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # testing
 googletest = "0"

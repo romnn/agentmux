@@ -11,9 +11,7 @@
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use std::borrow::Cow;
-
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -28,6 +26,10 @@ use serde::Deserialize;
 /// modes rewrite, and hosts routinely drop `$ref` siblings — which on `delegate` would discard the
 /// one sentence that tells a caller to pick the vendor they are not.
 /// A flat `{"type": "string", "enum": [...]}` survives all of that.
+///
+/// The fields carry the core crate's own enums — their `snake_case` serde names are the wire
+/// spellings — and only the *schema* is written by hand here, so the two cannot disagree about
+/// which values exist.
 fn string_choice(description: &str, values: &[&str]) -> Schema {
     json_schema!({
         "type": "string",
@@ -36,56 +38,15 @@ fn string_choice(description: &str, values: &[&str]) -> Schema {
     })
 }
 
-/// Which CLI to consult.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Vendor {
-    /// Anthropic's `claude` CLI: Claude models.
-    Claude,
-    /// The `codex` CLI from `OpenAI`: GPT models.
-    Codex,
+fn vendor_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_choice("Which delegate CLI to run.", &["claude", "codex"])
 }
 
-/// How much of the filesystem a Codex delegate may write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Sandbox {
-    /// Read the working directory, write nothing.
-    #[default]
-    ReadOnly,
-    /// Also write inside the working directory.
-    WorkspaceWrite,
-}
-
-impl JsonSchema for Vendor {
-    fn schema_name() -> Cow<'static, str> {
-        "Vendor".into()
-    }
-
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        string_choice("Which delegate CLI to run.", &["claude", "codex"])
-    }
-
-    fn inline_schema() -> bool {
-        true
-    }
-}
-
-impl JsonSchema for Sandbox {
-    fn schema_name() -> Cow<'static, str> {
-        "Sandbox".into()
-    }
-
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        string_choice(
-            "How much of the working directory a Codex delegate may write.",
-            &["read_only", "workspace_write"],
-        )
-    }
-
-    fn inline_schema() -> bool {
-        true
-    }
+fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_choice(
+        "How much of the working directory a Codex delegate may write.",
+        &["read_only", "workspace_write"],
+    )
 }
 
 /// Who to consult, and on what terms.
@@ -94,6 +55,7 @@ pub struct DelegateParams {
     /// Which CLI to run.
     /// Choose the vendor you are NOT: your own harness already spawns same-vendor subagents
     /// natively, so agentmux is for the cross-vendor second opinion.
+    #[schemars(schema_with = "vendor_schema")]
     pub delegate: Vendor,
 
     /// Model identifier, passed to the delegate CLI verbatim and never checked against a list —
@@ -141,8 +103,8 @@ pub struct DelegateParams {
     /// delegate told to write its report completes the work, fails the write, and reports the
     /// failure instead of the findings.
     #[serde(default)]
-    #[schemars(with = "Sandbox")]
-    pub sandbox: Option<Sandbox>,
+    #[schemars(schema_with = "sandbox_schema")]
+    pub sandbox: Option<CodexSandbox>,
 }
 
 impl DelegateParams {
@@ -157,78 +119,46 @@ impl DelegateParams {
         })
     }
 
-    /// Validate the account alias, if one was named.
+    /// Parse the flat wire shape into the closed enum.
     ///
-    /// Only the shape is checked here; whether the alias exists is a property of the machine, and
+    /// Only shapes are checked here; whether an alias exists is a property of the machine, and
     /// answering that at the edge would mean loading configuration before the working directory
     /// that selects it is known.
     ///
     /// # Errors
     ///
-    /// Returns an invalid-params error when the alias is not a plain name.
-    fn alias(&self) -> Result<Option<AccountAlias>, ErrorData> {
-        self.account
-            .as_deref()
-            .map(|name| {
-                AccountAlias::parse(name).map_err(|error| {
-                    ErrorData::invalid_params(
-                        format!("{error}. An account alias is a name from `agentmux.toml`."),
-                        None,
-                    )
-                })
-            })
-            .transpose()
-    }
-
-    /// Parse the flat wire shape into the closed enum.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-params error when the model or effort is not argv-safe, or when a
-    /// vendor-specific field was set for the other vendor.
+    /// Returns an invalid-params error when the model, effort or alias is not argv-safe, or when
+    /// a vendor-specific field was set for the other vendor.
     pub fn build(&self) -> Result<Delegate, ErrorData> {
-        let model = ModelId::parse(&self.model).map_err(|error| {
-            ErrorData::invalid_params(
-                format!(
-                    "{error}. `model` is passed to the CLI as a single argument, so it must look \
-                     like a model identifier."
-                ),
-                None,
-            )
-        })?;
-        let effort = Effort::parse(&self.effort).map_err(|error| {
-            ErrorData::invalid_params(format!("{error}. Try `high` or `xhigh`."), None)
-        })?;
-
-        match self.delegate {
-            Vendor::Claude => {
-                if self.sandbox.is_some() {
-                    return Err(ErrorData::invalid_params(
-                        "`sandbox` belongs to `delegate: codex`, which is the only vendor with a \
-                         sandbox setting. A `claude` delegate runs in plan mode and is offered no \
-                         editing tools. Drop `sandbox`."
-                            .to_owned(),
-                        None,
-                    ));
+        Delegate::from_parts(
+            self.delegate,
+            &self.model,
+            &self.effort,
+            self.account.as_deref(),
+            self.isolation(),
+            self.sandbox,
+        )
+        .map_err(|error| {
+            // Each refusal says what shape would have been accepted, because the caller is a
+            // model that will retry from this text alone.
+            let hint = match &error {
+                DelegateError::Argument { field: "model", .. } => {
+                    " `model` is passed to the CLI as a single argument, so it must look like a \
+                     model identifier."
                 }
-                Ok(Delegate::Claude {
-                    model,
-                    effort,
-                    account: self.alias()?,
-                    isolation: self.isolation(),
-                })
-            }
-            Vendor::Codex => Ok(Delegate::Codex {
-                model,
-                effort,
-                sandbox: match self.sandbox.unwrap_or_default() {
-                    Sandbox::ReadOnly => CodexSandbox::ReadOnly,
-                    Sandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
-                },
-                account: self.alias()?,
-                isolation: self.isolation(),
-            }),
-        }
+                DelegateError::Argument {
+                    field: "effort", ..
+                } => " Try `high` or `xhigh`.",
+                DelegateError::Argument {
+                    field: "account", ..
+                } => " An account alias is a name from `agentmux.toml`.",
+                DelegateError::NotForVendor { .. } => {
+                    " A `claude` delegate runs in plan mode and is offered no editing tools."
+                }
+                _ => "",
+            };
+            ErrorData::invalid_params(format!("{error}.{hint}"), None)
+        })
     }
 }
 
@@ -253,11 +183,11 @@ pub struct QuestionParams {
 
     /// Extra environment variables for the delegate process, as a flat string map.
     ///
-    /// Only useful with `inherit_settings`: an isolated delegate loads no settings, hooks or MCP
-    /// servers, so nothing in it reads these.
+    /// Only the names this machine's `agentmux.toml` lists under `request_env` are accepted,
+    /// and by default it lists none: anything else is refused, because a request must not be able
+    /// to decide which identity pays, which program runs, or what it loads before it reads a
+    /// setting.
     /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
-    /// Names that decide which account authenticates, which program runs, or how it reaches the
-    /// network are rejected.
     #[serde(default)]
     #[schemars(with = "std::collections::BTreeMap<String, String>")]
     pub env: Option<std::collections::BTreeMap<String, String>>,
@@ -367,6 +297,6 @@ pub struct QuotaParams {
     /// Both are asked when omitted, which is usually what you want before choosing where to send
     /// a consultation.
     #[serde(default)]
-    #[schemars(with = "Vendor")]
+    #[schemars(schema_with = "vendor_schema")]
     pub delegate: Option<Vendor>,
 }

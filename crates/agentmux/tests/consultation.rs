@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
-use agentmux::run::{Retention, RunId, RunStore, StartRequest};
+use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::run::{
+    HookReopening, NotResumable, Retention, RunError, RunId, RunStore, StartRequest,
+};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{FailureKind, Outcome};
 use googletest::prelude::*;
@@ -138,7 +140,7 @@ fn a_follow_up_appends_a_turn_to_the_same_run() -> Result<()> {
     assert_that!(resume.question, eq("What was the secret word?"));
 
     // Both turns are in one transcript, in order.
-    let page = h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("FIXTURE_OK"));
     assert_that!(page.text, contains_substring("BANANAPHONE"));
     assert_that!(page.text, contains_substring("Turn 1 — question"));
@@ -200,7 +202,8 @@ fn a_clean_exit_with_no_completion_event_is_not_a_success() -> Result<()> {
 
 /// Cancelling keeps everything collected so far.
 #[gtest]
-fn cancelling_keeps_what_was_collected() -> Result<()> {
+#[tokio::test]
+async fn cancelling_keeps_what_was_collected() -> Result<()> {
     let partial = indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"turn.started"}
@@ -210,11 +213,11 @@ fn cancelling_keeps_what_was_collected() -> Result<()> {
     let started = h.store.start(&request(codex()?, "long review"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Running));
 
-    let cancelled = h.store.cancel(&started.run_id)?;
+    let cancelled = h.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
     assert_that!(h.launcher.terminated().len(), eq(1));
 
-    let page = h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("partial findings"));
     assert_that!(page.text, contains_substring("cancelled"));
     Ok(())
@@ -231,7 +234,7 @@ fn a_transcript_cursor_only_moves_forward() -> Result<()> {
     let mut cursor = 0;
     let mut assembled = String::new();
     loop {
-        let page = h.store.read_transcript(&started.run_id, cursor, 512)?;
+        let page = h.store.page(&started.run_id, cursor, 512)?;
         assembled.push_str(&page.text);
         assert_that!(page.next_offset >= cursor, eq(true));
         if page.at_end {
@@ -245,7 +248,7 @@ fn a_transcript_cursor_only_moves_forward() -> Result<()> {
         cursor = page.next_offset;
     }
 
-    let whole = h.store.read_transcript(&started.run_id, 0, 10_000_000)?;
+    let whole = h.store.page(&started.run_id, 0, 10_000_000)?;
     assert_that!(assembled, eq(&whole.text));
     assert_that!(assembled, contains_substring("THE_REPORT_BODY"));
     Ok(())
@@ -265,7 +268,7 @@ fn a_transcript_cursor_never_splits_a_character() -> Result<()> {
     let mut cursor = 0;
     let mut assembled = String::new();
     loop {
-        let page = h.store.read_transcript(&started.run_id, cursor, 7)?;
+        let page = h.store.page(&started.run_id, cursor, 7)?;
         assembled.push_str(&page.text);
         if page.at_end {
             break;
@@ -312,7 +315,7 @@ fn status_surfaces_drift_and_hook_interference() -> Result<()> {
     let started = h.store.start(&request(claude()?, "q"))?;
     let status = h.store.status(&started.run_id)?;
 
-    assert_that!(status.reopened_by_hook, eq(true));
+    assert_that!(status.hook_reopening, some(eq(HookReopening::Unexpected)));
     assert_that!(status.unrecognised.is_empty(), eq(true));
     assert_that!(status.message_count, gt(2));
     assert_that!(status.transcript_bytes, gt(0));
@@ -330,12 +333,12 @@ async fn waiting_past_the_cap_leaves_the_consultation_running() -> Result<()> {
         .store
         .start(&request(codex()?, "a ninety minute review"))?;
 
-    let waited = h
-        .store
+    h.store
         .wait_until_terminal(&started.run_id, Duration::from_millis(50))
         .await?;
+    let waited = h.store.status(&started.run_id)?;
     assert_that!(waited.outcome, matches_pattern!(Outcome::Running));
-    assert_that!(h.store.status(&started.run_id)?.run_id, eq(&started.run_id));
+    assert_that!(waited.run_id, eq(&started.run_id));
     Ok(())
 }
 
@@ -354,19 +357,22 @@ fn the_sweep_keeps_what_must_be_kept() -> Result<()> {
     })?;
     let running = h.store.start(&request(codex()?, "still going"))?;
 
-    // Age all three past the TTL by rewriting their recorded creation time on disk.
-    // The sweep reads the clock, so there is nothing else to move.
+    // Age all three past the TTL: the recorded creation time, and the capture files' own
+    // timestamps, because the clock runs from the last thing the delegate wrote to any of them.
+    let long_ago = std::time::SystemTime::now() - Duration::from_hours(48);
     for id in [&expiring.run_id, &kept.run_id, &running.run_id] {
-        let path = h
-            .store
-            .root()
-            .join("runs")
-            .join(id.as_str())
-            .join("meta.json");
+        let run = h.store.root().join("runs").join(id.as_str());
+        let path = run.join("meta.json");
         let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         meta["created_at"] =
             serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339());
         std::fs::write(&path, serde_json::to_string(&meta)?)?;
+        for capture in ["events.jsonl", "stderr.log"] {
+            std::fs::File::options()
+                .write(true)
+                .open(run.join("turns/0000").join(capture))?
+                .set_modified(long_ago)?;
+        }
     }
 
     assert_that!(h.store.sweep()?, eq(1));
@@ -385,7 +391,8 @@ fn the_sweep_keeps_what_must_be_kept() -> Result<()> {
 /// continue a delegate that was killed part-way through a thought, which is never what a caller
 /// means.
 #[gtest]
-fn a_cancelled_consultation_is_not_resumable() -> Result<()> {
+#[tokio::test]
+async fn a_cancelled_consultation_is_not_resumable() -> Result<()> {
     let partial = indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"turn.started"}
@@ -394,14 +401,14 @@ fn a_cancelled_consultation_is_not_resumable() -> Result<()> {
     let h = harness([Script::running(partial)])?;
     let started = h.store.start(&request(codex()?, "long review"))?;
 
-    let cancelled = h.store.cancel(&started.run_id)?;
+    let cancelled = h.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.resumable, eq(false));
     assert_that!(
         h.store.follow_up(&started.run_id, "and now?").map(|_| ()),
         err(anything())
     );
     // Everything collected is still there.
-    let page = h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("halfway through"));
     Ok(())
 }
@@ -425,7 +432,7 @@ fn status_reports_an_unrecognised_event() -> Result<()> {
         some(contains_substring("a_shape_nobody_has_seen"))
     );
     // And the transcript tells a reader the same thing, so it survives being read from the file.
-    let page = h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("did not recognise"));
     Ok(())
 }
@@ -448,7 +455,8 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
     let started = h.store.start(&request(codex()?, "q"))?;
 
     // What a caller would already have seen, and paged past, before the file appeared.
-    let before_recovery = h.store.read_transcript(&started.run_id, 0, 1_000_000)?.text;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let before_recovery = page.text;
 
     // The codex process writes this file directly, so it survives what the stream does not.
     let last = h
@@ -459,7 +467,7 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
         .join("turns/0000/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
 
-    let page = h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("the findings, in full"));
     assert_that!(page.text, contains_substring("recovered"));
     // The drift note is part of what was already handed out, so it must still be above.
@@ -500,12 +508,12 @@ fn a_terminal_event_flushed_as_the_child_exits_is_not_settled_as_a_failure() -> 
     let status = h.store.start(&request(codex()?, "q"))?;
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
 
-    let page = h.store.read_transcript(&status.run_id, 0, 1_000_000)?;
+    let page = h.store.page(&status.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("the findings"));
     assert_that!(page.text, not(contains_substring("launch failed")));
 
     // And the second read agrees with the first, byte for byte.
-    let again = h.store.read_transcript(&status.run_id, 0, 1_000_000)?;
+    let again = h.store.page(&status.run_id, 0, 1_000_000)?;
     assert_that!(again.text, eq(&page.text));
     Ok(())
 }
@@ -520,10 +528,8 @@ fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
     "#})])?;
     let started = h.store.start(&request(codex()?, "q"))?;
 
-    let mut previous = h
-        .store
-        .read_transcript(&started.run_id, 0, usize::MAX)?
-        .text;
+    let page = h.store.page(&started.run_id, 0, usize::MAX)?;
+    let mut previous = page.text;
     let events = h
         .store
         .root()
@@ -541,10 +547,8 @@ fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
         stream.push('\n');
         std::fs::write(&events, &stream)?;
 
-        let now = h
-            .store
-            .read_transcript(&started.run_id, 0, usize::MAX)?
-            .text;
+        let page = h.store.page(&started.run_id, 0, usize::MAX)?;
+        let now = page.text;
         assert_that!(
             now.starts_with(&previous),
             eq(true),
@@ -569,7 +573,8 @@ fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the first finding"}}
     "#})])?;
     let started = h.store.start(&request(codex()?, "q"))?;
-    let before = h.store.read_transcript(&started.run_id, 0, 1_000_000)?.text;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let before = page.text;
     assert_that!(before, contains_substring("the first finding"));
 
     // Append a line that stops halfway through a four-byte character, as a partial write does.
@@ -584,7 +589,8 @@ fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()
     bytes.extend_from_slice(&"🎉".as_bytes()[..2]);
     std::fs::write(&events, &bytes)?;
 
-    let after = h.store.read_transcript(&started.run_id, 0, 1_000_000)?.text;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let after = page.text;
     assert_that!(after, contains_substring("the first finding"));
     assert_that!(
         after.starts_with(&before),
@@ -607,7 +613,7 @@ fn a_page_smaller_than_one_character_still_makes_progress() -> Result<()> {
     let mut cursor = 0;
     let mut steps = 0;
     loop {
-        let page = h.store.read_transcript(&started.run_id, cursor, 1)?;
+        let page = h.store.page(&started.run_id, cursor, 1)?;
         assert_that!(
             page.next_offset > cursor,
             eq(true),
@@ -624,7 +630,8 @@ fn a_page_smaller_than_one_character_still_makes_progress() -> Result<()> {
 }
 
 fn page_reached_end(h: &Harness, run_id: &RunId, cursor: u64) -> Result<bool> {
-    Ok(h.store.read_transcript(run_id, cursor, 1)?.at_end)
+    let page = h.store.page(run_id, cursor, 1)?;
+    Ok(page.at_end)
 }
 
 /// Each turn owns its own capture files, and a claimed turn is never launched into twice.
@@ -714,18 +721,59 @@ fn a_rate_limited_follow_up_leaves_the_consultation_resumable() -> Result<()> {
     Ok(())
 }
 
-/// A cancellation outranks a terminal event the child managed to emit afterwards.
+/// A child that finished in the moment before the signal landed is reported as having finished.
+///
+/// Cancellation records the child's departure, not the caller's wish, so whatever the child wrote
+/// before it went is part of the consultation — and a delegate that had already delivered its
+/// answer is not made to look interrupted.
 #[gtest]
-fn a_child_that_outruns_cancellation_stays_cancelled() -> Result<()> {
+#[tokio::test]
+async fn a_child_that_finishes_as_it_is_stopped_is_reported_finished() -> Result<()> {
+    let h = harness([Script::flushes_when_stopped(
+        indoc::indoc! {r#"
+            {"type":"thread.started","thread_id":"01a0"}
+            {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
+        "#},
+        indoc::indoc! {r#"
+            {"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"the rest"}}
+            {"type":"turn.completed","usage":{"input_tokens":1}}
+        "#},
+    )])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    assert_that!(started.outcome, matches_pattern!(Outcome::Running));
+
+    let cancelled = h.store.cancel(&started.run_id).await?;
+    assert_that!(
+        cancelled.outcome,
+        matches_pattern!(Outcome::Completed { .. })
+    );
+    assert_that!(cancelled.resumable, eq(true));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    assert_that!(page.text, contains_substring("the rest"));
+    assert_that!(page.text, not(contains_substring("cancelled")));
+    Ok(())
+}
+
+/// Nothing written after a cancellation was recorded is part of the consultation.
+///
+/// The cancelled footer is the last thing the transcript says, and a caller may already hold a
+/// cursor past it.
+/// A child that somehow outlives the kill and keeps writing must not be able to move that footer,
+/// so the fold reads only as much of the capture as existed when the cancellation was recorded.
+#[gtest]
+#[tokio::test]
+async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
     let h = harness([Script::running(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
     "#})])?;
     let started = h.store.start(&request(codex()?, "q"))?;
-    let cancelled = h.store.cancel(&started.run_id)?;
+    let cancelled = h.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let published = page.text;
 
-    // The child ignored SIGTERM and finished anyway.
+    // Something survived the kill and kept writing.
     let events = h
         .store
         .root()
@@ -733,12 +781,130 @@ fn a_child_that_outruns_cancellation_stays_cancelled() -> Result<()> {
         .join(started.run_id.as_str())
         .join("turns/0000/events.jsonl");
     let mut stream = std::fs::read_to_string(&events)?;
-    stream.push_str("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n");
+    stream.push_str(indoc::indoc! {r#"
+        {"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"from beyond"}}
+        {"type":"turn.completed","usage":{"input_tokens":1}}
+    "#});
     std::fs::write(&events, stream)?;
 
     let after = h.store.status(&started.run_id)?;
     assert_that!(after.outcome, matches_pattern!(Outcome::Cancelled));
     assert_that!(after.resumable, eq(false));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let again = page.text;
+    assert_that!(again, eq(&published));
+    assert_that!(again, not(contains_substring("from beyond")));
+    Ok(())
+}
+
+/// A start that is refused leaves nothing behind for `list` to report.
+///
+/// The run directory is made before the delegate is launched, and a launch can be refused for a
+/// mistyped alias.
+/// Left in place, that directory would fold to a consultation with no turns — which is "running"
+/// as far as the sweep is concerned — and `list` would show a phantom for ever.
+#[gtest]
+fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
+    let h = harness([Script::completed(fixtures::CLAUDE_HAPPY)])?;
+    let refused = h.store.start(&request(
+        Delegate::Claude {
+            model: ModelId::parse("claude-opus-5").or_fail()?,
+            effort: Effort::parse("xhigh").or_fail()?,
+            account: Some(AccountAlias::parse("nobody").or_fail()?),
+            isolation: None,
+        },
+        "q",
+    ));
+    assert_that!(refused.map(|_| ()), err(anything()));
+    assert_that!(h.launcher.launches().len(), eq(0));
+    assert_that!(h.store.list(10)?, is_empty());
+    assert_that!(h.store.sweep()?, eq(0));
+    Ok(())
+}
+
+/// A follow-up that is refused after claiming its turn gives the claim back.
+///
+/// Otherwise the transcript gains a phantom turn that folds to a launch failure, the consultation
+/// reads as failed, and the next real turn is told an earlier one failed.
+#[gtest]
+fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
+    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+
+    // The environment the follow-up will re-apply now names something no request may set.
+    let meta_path = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+    meta["env"] = serde_json::json!({"PATH": "/tmp/attacker"});
+    std::fs::write(&meta_path, serde_json::to_string(&meta)?)?;
+
+    let refused = h.store.follow_up(&started.run_id, "again");
+    assert_that!(refused.map(|_| ()), err(anything()));
+    let status = h.store.status(&started.run_id)?;
+    assert_that!(status.turns, eq(1));
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(status.earlier_failure, none());
+    Ok(())
+}
+
+/// A turn that ended without the delegate saying anything is not continued.
+///
+/// There is nothing to continue, and there is a second reason: a reply Codex writes to its own
+/// file after the terminal event is appended to that turn when it lands, and a turn allowed to
+/// follow it would then have bytes inserted above it.
+#[gtest]
+fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
+    let h = harness([
+        Script::completed(indoc::indoc! {r#"
+            {"type":"thread.started","thread_id":"01a0"}
+            {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
+            {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+        "#}),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(started.resumable, eq(false));
+    let refused = h.store.follow_up(&started.run_id, "again");
+    assert_that!(
+        refused.map(|_| ()),
+        err(matches_pattern!(RunError::NotResumable(matches_pattern!(
+            NotResumable::NothingSaid { .. }
+        ))))
+    );
+
+    // Once the CLI's own file lands, the turn has said something and may be continued.
+    let last = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0000/last-message.md");
+    std::fs::write(&last, "the findings, in full")?;
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let before = page.text;
+    let followed = h.store.follow_up(&started.run_id, "again")?;
+    assert_that!(followed.turns, eq(2));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let after = page.text;
+    assert_that!(after.starts_with(&before), eq(true));
+    Ok(())
+}
+
+/// Deleting a running consultation would orphan its child, so it is refused.
+#[gtest]
+fn a_running_consultation_cannot_be_removed() -> Result<()> {
+    let h = harness([Script::running("{\"type\":\"turn.started\"}\n")])?;
+    let started = h.store.start(&request(codex()?, "long"))?;
+    assert_that!(
+        h.store.remove(&started.run_id),
+        err(matches_pattern!(RunError::StillRunning { .. }))
+    );
+    assert_that!(h.store.status(&started.run_id).map(|_| ()), ok(anything()));
     Ok(())
 }
 
@@ -789,12 +955,12 @@ fn a_stale_render_does_not_overwrite_a_newer_transcript() -> Result<()> {
     std::fs::write(&path, &newer)?;
 
     // A read that folds the older state must leave the newer publication alone.
-    h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    h.store.view(&started.run_id, 0, 1_000_000)?;
     assert_that!(std::fs::read_to_string(&path)?, eq(&newer));
 
     // A file that is not a prefix of the render is not a newer snapshot, so it is repaired.
     std::fs::write(&path, "corrupted")?;
-    h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
+    h.store.view(&started.run_id, 0, 1_000_000)?;
     assert_that!(std::fs::read_to_string(&path)?, eq(&complete));
     Ok(())
 }
@@ -830,7 +996,7 @@ fn agentmux_running_as_a_delegate_refuses_to_start_another_consultation() -> Res
 
     assert_that!(
         error.to_string(),
-        contains_substring("running as a delegate")
+        contains_substring("running inside a delegate")
     );
     Ok(())
 }
@@ -853,11 +1019,14 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
     let write_config = |inherit: bool| -> Result<()> {
         std::fs::write(
             &config_path,
-            format!(
-                "[defaults.claude]\naccount = \"personal\"\n\n\
-                 [accounts.claude.personal]\nconfig_dir = {:?}\ninherit_settings = {inherit}\n",
-                account_dir.display().to_string()
-            ),
+            indoc::formatdoc! {r#"
+                [defaults.claude]
+                account = "personal"
+
+                [accounts.claude.personal]
+                config_dir = {:?}
+                inherit_settings = {inherit}
+            "#, account_dir.display().to_string()},
         )
         .or_fail()?;
         Ok(())
@@ -924,5 +1093,264 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
         some(eq(Isolation::Inherit)),
         "a follow-up re-resolved isolation against an edited configuration"
     );
+    Ok(())
+}
+
+/// A turn directory claimed by a caller that died before recording its child is taken over.
+///
+/// The claim is the directory; the launch record is written before the lock is released.
+/// A directory with neither record can only be an abandoned claim, and left alone it would refuse
+/// every later follow-up as "already in flight" for good.
+#[gtest]
+fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
+    let h = harness([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    let abandoned = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001");
+    std::fs::create_dir_all(&abandoned)?;
+    std::fs::write(abandoned.join("question.md"), "never launched")?;
+
+    // Not a turn: the consultation still reads as one finished turn, ready to continue.
+    let status = h.store.status(&started.run_id)?;
+    assert_that!(status.turns, eq(1));
+    assert_that!(status.resumable, eq(true));
+
+    let followed = h.store.follow_up(&started.run_id, "again")?;
+    assert_that!(followed.turns, eq(2));
+    assert_that!(abandoned.join("launch.json").is_file(), eq(true));
+    assert_that!(
+        std::fs::read_to_string(abandoned.join("question.md"))?,
+        eq("again")
+    );
+    // The claim's own files are set aside, not destroyed: a child spawned by the caller that
+    // died may still be writing to them.
+    let set_aside = std::fs::read_dir(abandoned.parent().or_fail()?)?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("0001.abandoned."))
+        .or_fail()?;
+    assert_that!(
+        std::fs::read_to_string(
+            abandoned
+                .parent()
+                .or_fail()?
+                .join(set_aside)
+                .join("question.md")
+        )?,
+        eq("never launched")
+    );
+    Ok(())
+}
+
+/// Cancelling a consultation that never recorded a turn returns, rather than waiting on itself.
+///
+/// The run lock is per file and a second lock from the same process waits for the first, so
+/// nothing taken under it may call back into anything that takes it.
+#[gtest]
+#[tokio::test]
+async fn cancelling_a_consultation_with_no_recorded_turn_returns() -> Result<()> {
+    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    let turn = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0000");
+    std::fs::remove_dir_all(&turn)?;
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), h.store.cancel(&started.run_id))
+        .await
+        .or_fail()??;
+    assert_that!(cancelled.turns, eq(0));
+    Ok(())
+}
+
+/// Where agentmux keeps its runs reaches the delegate, as the store resolved it.
+///
+/// The recursion guard's second witness is a launch record in that store; an agentmux started
+/// underneath the delegate that opened the platform default instead would find nothing and serve.
+#[gtest]
+fn the_delegate_is_told_where_this_store_keeps_its_runs() -> Result<()> {
+    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    h.store.start(&request(codex()?, "q"))?;
+    let launch = h.launcher.launches().into_iter().next().or_fail()?;
+    assert_that!(
+        launch.env.get(RunStore::STATE_DIR_ENV).map(PathBuf::from),
+        some(eq(&h.store.root().to_path_buf()))
+    );
+    Ok(())
+}
+
+/// An account a checkout selects does not bring its own `request_env`, even once the
+/// consultation has pinned that account by name.
+///
+/// A consultation records the alias it resolved to, so every launch after the first names it
+/// as if the caller had; the checkout's choice has to be recognised by the file, not by who
+/// happened to spell the alias out.
+#[gtest]
+fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/client");
+    std::fs::create_dir_all(&repo)?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.claude.debug]
+            api_key_env = "DEBUG_KEY"
+            request_env = ["NODE_OPTIONS"]
+        "#},
+    )?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    host.insert("DEBUG_KEY".to_owned(), "sk-debug".to_owned());
+    let dir = tempfile::tempdir().or_fail()?;
+    let launcher = Arc::new(ScriptedLauncher::new([
+        Script::completed(fixtures::CLAUDE_HAPPY),
+        Script::completed(fixtures::CLAUDE_HAPPY),
+    ]));
+    let store = RunStore::open(dir.path(), launcher, host).or_fail()?;
+    let with_env = |account: Option<&str>| -> Result<StartRequest> {
+        Ok(StartRequest {
+            delegate: Delegate::Claude {
+                model: ModelId::parse("claude-opus-5").or_fail()?,
+                effort: Effort::parse("xhigh").or_fail()?,
+                account: account.map(AccountAlias::parse).transpose().or_fail()?,
+                isolation: None,
+            },
+            question: "q".to_owned(),
+            cwd: repo.clone(),
+            retention: Retention::Ttl,
+            env: [("NODE_OPTIONS".to_owned(), "--require /tmp/x.js".to_owned())]
+                .into_iter()
+                .collect(),
+        })
+    };
+
+    // Named by the caller with no project file in play: the account's own list applies.
+    assert_that!(
+        store.start(&with_env(Some("debug"))?).map(|_| ()),
+        ok(anything())
+    );
+
+    // Selected by the checkout: refused, and refused just the same when named outright.
+    std::fs::write(
+        repo.join("agentmux.toml"),
+        "[defaults.claude]\naccount = \"debug\"\n",
+    )?;
+    assert_that!(
+        store.start(&with_env(None)?).map(|_| ()),
+        err(displays_as(contains_substring("cannot be set per request")))
+    );
+    assert_that!(
+        store.start(&with_env(Some("debug"))?).map(|_| ()),
+        err(displays_as(contains_substring("cannot be set per request")))
+    );
+    Ok(())
+}
+
+/// What a settled failure says is frozen with the record, not re-read from a file something may
+/// still be writing to.
+///
+/// A tool subprocess the delegate started inherits its stderr and can outlive it; a footer that
+/// re-read the file would move under a reader who had already been handed it.
+#[gtest]
+fn a_settled_failure_does_not_move_with_its_stderr() -> Result<()> {
+    let h = harness([Script::exited(
+        "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
+        "boom: the first word\n",
+        2,
+    )])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    let Outcome::Failed { detail, .. } = &started.outcome else {
+        panic!("expected a failure, got {:?}", started.outcome);
+    };
+    assert_that!(detail.as_str(), contains_substring("the first word"));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let published = page.text;
+
+    let stderr = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0000/stderr.log");
+    let mut text = std::fs::read_to_string(&stderr)?;
+    text.push_str("and a second word, from beyond\n");
+    std::fs::write(&stderr, text)?;
+
+    let (again, page) = h.store.view(&started.run_id, 0, 1_000_000)?;
+    assert_that!(again.outcome, eq(&started.outcome));
+    assert_that!(page.text, eq(&published));
+    Ok(())
+}
+
+/// A reply the CLI writes out for an earlier turn after a later turn exists is left where it is.
+///
+/// A follow-up is allowed once the consultation has said something, so a turn that finished
+/// silently can be followed; its late reply must then not be inserted above the turn that
+/// followed, whose bytes a reader may already hold.
+#[gtest]
+fn a_reply_landing_after_a_later_turn_is_not_recovered_into_the_earlier_one() -> Result<()> {
+    let silent = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#};
+    let h = harness([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(silent),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    h.store.follow_up(&started.run_id, "again")?;
+    let followed = h.store.follow_up(&started.run_id, "and again")?;
+    assert_that!(followed.turns, eq(3));
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let before = page.text;
+
+    let earlier = h
+        .store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001");
+    std::fs::write(earlier.join("last-message.md"), "late findings")?;
+
+    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let after = page.text;
+    assert_that!(after, eq(&before));
+    assert_that!(earlier.join("recovered.md").exists(), eq(false));
+    Ok(())
+}
+
+/// A consultation whose child is still there after its stream finished is not deleted.
+///
+/// Both CLIs outlive their closing event by a little, and one told to stop may outlive that by
+/// more; deleting the run would leave the child writing into unlinked files and unreachable.
+#[gtest]
+#[tokio::test]
+async fn a_consultation_whose_child_still_lives_is_not_removed() -> Result<()> {
+    let h = harness([Script::running(fixtures::CODEX_HAPPY)])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+    assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
+
+    assert_that!(
+        h.store.remove(&started.run_id),
+        err(matches_pattern!(RunError::StillRunning { .. }))
+    );
+    // Once the child has been stopped, the run is an ordinary finished one.
+    h.store.cancel(&started.run_id).await?;
+    assert_that!(h.store.remove(&started.run_id), ok(anything()));
     Ok(())
 }

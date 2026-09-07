@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Account, Config, expand_tilde, home_dir};
-use crate::delegate::{AccountAlias, Vendor};
+use crate::config::{Account, Config, home_dir};
+use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars};
 
 /// How long a single account's probe may take before it is abandoned.
 ///
@@ -111,19 +111,76 @@ pub trait QuotaProbe: Send + Sync + std::fmt::Debug {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation;
 }
 
+/// Which identity a probe is asking about.
+///
+/// An account that authenticates with a key has no subscription window at all, and probing it
+/// would answer with the *default* account's figures under this account's name — a caller would
+/// then route work by another identity's remaining capacity.
+/// So the target is decided once, from the same fields the delegate launch reads, and a key-only
+/// account is never asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeTarget {
+    /// A logged-in profile whose window can be read: the CLI's own, or the directory the
+    /// identity's environment names.
+    Window {
+        /// The configuration directory the identity runs against, when it names one.
+        config_dir: Option<PathBuf>,
+    },
+    /// An identity that supplies a credential or an endpoint, so it is billed per token and has
+    /// no window of the vendor's to report.
+    Credential,
+}
+
+impl ProbeTarget {
+    /// The target one identity resolves to: a named account, or the CLI's own login when there
+    /// is none.
+    ///
+    /// Decided from the environment the delegate would actually be launched with, so a key the
+    /// machine's `[launch]` layer forwards or the host exports classifies the identity exactly as
+    /// it would authenticate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the account's own launch error when it cannot be resolved, which is also why it
+    /// cannot be probed.
+    pub fn of(
+        vendor: Vendor,
+        alias: Option<&AccountAlias>,
+        config: &Config,
+        host_env: &BTreeMap<String, String>,
+    ) -> Result<Self, crate::delegate::DelegateError> {
+        let env = crate::delegate::resolve_identity(vendor, alias, config, host_env)?.env;
+        let vars = credential_vars(vendor);
+        // Both CLIs prefer a credential in the environment over a stored login, and an endpoint
+        // of its own has no vendor window at all.
+        let credentialed = env.contains_key(vars.api_key)
+            || env.contains_key(vars.base_url)
+            || vars.auth_token.is_some_and(|name| env.contains_key(name));
+        if credentialed {
+            return Ok(Self::Credential);
+        }
+        Ok(Self::Window {
+            config_dir: env.get(vars.config_dir).map(PathBuf::from),
+        })
+    }
+
+    /// The configuration directory the probe should point the CLI at, if any.
+    #[must_use]
+    pub fn config_dir(&self) -> Option<&Path> {
+        match self {
+            Self::Window { config_dir } => config_dir.as_deref(),
+            Self::Credential => None,
+        }
+    }
+}
+
 /// Everything a probe needs to reach one account.
 #[derive(Debug)]
 pub struct ProbeRequest<'a> {
     /// Which CLI to ask.
     pub vendor: Vendor,
-    /// The account's configuration directory, or `None` for the CLI's own default.
-    pub config_dir: Option<PathBuf>,
-    /// Whether this account has a logged-in profile directory of its own to read.
-    ///
-    /// An account that authenticates with a key has no subscription window at all, and probing it
-    /// would answer with the *default* account's figures under this account's name — a caller
-    /// would then route work by another identity's remaining capacity.
-    pub has_own_profile: bool,
+    /// Whose figures to read.
+    pub target: ProbeTarget,
     /// The host environment, for `HOME` and for anything the CLI needs to run.
     pub host_env: &'a BTreeMap<String, String>,
 }
@@ -158,17 +215,16 @@ pub fn probe_vendor(
     host_env: &BTreeMap<String, String>,
     probe: &dyn QuotaProbe,
 ) -> Vec<AccountQuota> {
-    let home = home_dir(host_env);
-    let accounts = config.accounts(vendor);
-
     // A machine with no configuration still has one account: whatever the CLI is logged into.
-    let targets: Vec<(Option<AccountAlias>, Option<Account>)> = if accounts.is_empty() {
+    // Aliases were validated when the file was read, so every key parses.
+    let accounts = config.accounts(vendor);
+    let targets: Vec<(Option<AccountAlias>, Option<&Account>)> = if accounts.is_empty() {
         vec![(None, None)]
     } else {
         accounts
-            .into_iter()
+            .iter()
             .filter_map(|(alias, account)| {
-                AccountAlias::parse(&alias)
+                AccountAlias::parse(alias)
                     .ok()
                     .map(|alias| (Some(alias), Some(account)))
             })
@@ -179,34 +235,37 @@ pub fn probe_vendor(
         let handles: Vec<_> = targets
             .into_iter()
             .map(|(alias, account)| {
-                let home = home.clone();
-                scope.spawn(move || {
-                    let config_dir = account
-                        .as_ref()
-                        .and_then(|a| a.config_dir.as_ref())
-                        .map(|dir| expand_tilde(dir, home.as_deref()));
-                    // Keyed on the config directory alone: a key-only account is as unreadable
-                    // as an endpoint-only one, and both would otherwise borrow the default
-                    // account's figures.
-                    let has_own_profile = account.as_ref().is_none_or(|a| a.config_dir.is_some());
-                    let observation = probe.probe(&ProbeRequest {
-                        vendor,
-                        config_dir,
-                        has_own_profile,
-                        host_env,
-                    });
-                    AccountQuota {
-                        vendor,
-                        account: alias,
-                        description: account.and_then(|a| a.description),
-                        observation,
+                let handle = scope.spawn({
+                    let alias = alias.clone();
+                    move || match ProbeTarget::of(vendor, alias.as_ref(), config, host_env) {
+                        Ok(target) => probe.probe(&ProbeRequest {
+                            vendor,
+                            target,
+                            host_env,
+                        }),
+                        // An account that cannot be launched cannot be asked either, and the
+                        // launch's own reason is the useful one.
+                        Err(error) => Observation::Unavailable {
+                            reason: error.to_string(),
+                        },
                     }
-                })
+                });
+                (handle, alias, account)
             })
             .collect();
         handles
             .into_iter()
-            .filter_map(|handle| handle.join().ok())
+            .map(|(handle, alias, account)| AccountQuota {
+                vendor,
+                account: alias,
+                description: account.and_then(|a| a.description.clone()),
+                // A probe that panicked is reported as unavailable rather than dropped: an
+                // account missing from the list reads as "does not exist", which is a different
+                // claim.
+                observation: handle.join().unwrap_or_else(|_| Observation::Unavailable {
+                    reason: "the probe for this account failed inside agentmux".to_owned(),
+                }),
+            })
             .collect()
     })
 }
@@ -217,7 +276,17 @@ pub struct SystemProbe;
 
 impl QuotaProbe for SystemProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
-        if let Some(dir) = &request.config_dir
+        if request.target == ProbeTarget::Credential {
+            // Reported rather than skipped: a caller comparing accounts needs to see that this one
+            // exists and simply has no window, not to find it missing from the list.
+            return Observation::Unavailable {
+                reason: "this account authenticates with a key rather than a logged-in profile, \
+                         so it has no subscription window to report — its usage is billed per \
+                         token"
+                    .to_owned(),
+            };
+        }
+        if let Some(dir) = request.target.config_dir()
             && !dir.is_dir()
         {
             // Checked before anything spawns, because both CLIs *create* the directory they are
@@ -232,21 +301,28 @@ impl QuotaProbe for SystemProbe {
                 ),
             };
         }
-        if !request.has_own_profile {
-            // Reported rather than skipped: a caller comparing accounts needs to see that this one
-            // exists and simply has no window, not to find it missing from the list.
-            return Observation::Unavailable {
-                reason: "this account authenticates with a key rather than a logged-in profile, \
-                         so it has no subscription window to report — its usage is billed per \
-                         token"
-                    .to_owned(),
-            };
-        }
         match request.vendor {
             Vendor::Claude => probe_claude(request),
             Vendor::Codex => probe_codex(request),
         }
     }
+}
+
+/// The environment a probe child runs with: the delegate's own base, plus the directory that
+/// selects the account.
+///
+/// The same base as a delegate, so a probe on a managed network has the proxy and CA settings a
+/// delegate has, and a probe on Windows has what a process there needs to start at all.
+fn probe_command(request: &ProbeRequest<'_>, program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear();
+    for (key, value) in base_env(request.host_env) {
+        command.env(key, value);
+    }
+    if let Some(dir) = request.target.config_dir() {
+        command.env(credential_vars(request.vendor).config_dir, dir);
+    }
+    command
 }
 
 /// Read Claude's own usage cache.
@@ -260,7 +336,7 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     let home = home_dir(request.host_env);
     // Without `CLAUDE_CONFIG_DIR` the CLI keeps this file at the root of the home directory, not
     // under `~/.claude`.
-    let path = match &request.config_dir {
+    let path = match request.target.config_dir() {
         Some(dir) => dir.join(".claude.json"),
         None => match &home {
             Some(home) => home.join(".claude.json"),
@@ -330,19 +406,10 @@ fn is_stale(cached: Option<&serde_json::Value>) -> bool {
 /// Its output is discarded because the structured figures land in the cache, and the printed text
 /// omits scoped limits that the cache keeps.
 fn refresh_claude_cache(request: &ProbeRequest<'_>) {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut command = Command::new(Vendor::Claude.program());
+    let mut command = probe_command(request, Vendor::Claude.program());
     command.args(["--print", "/usage", "--output-format", "text"]);
-    command.env_clear();
-    for key in ["PATH", "HOME", "USER", "LANG", "TMPDIR"] {
-        if let Some(value) = request.host_env.get(key) {
-            command.env(key, value);
-        }
-    }
-    if let Some(dir) = &request.config_dir {
-        command.env("CLAUDE_CONFIG_DIR", dir);
-    }
     let Ok(mut child) = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -385,20 +452,10 @@ fn probe_codex(request: &ProbeRequest<'_>) -> Observation {
 /// One JSON-RPC exchange with `codex app-server`.
 fn codex_rate_limits(request: &ProbeRequest<'_>) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut command = Command::new(Vendor::Codex.program());
+    let mut command = probe_command(request, Vendor::Codex.program());
     command.arg("app-server");
-    command.env_clear();
-    for key in ["PATH", "HOME", "USER", "LANG", "TMPDIR"] {
-        if let Some(value) = request.host_env.get(key) {
-            command.env(key, value);
-        }
-    }
-    // Scopes the probe to the account being asked about, exactly as a delegate launch is scoped.
-    if let Some(dir) = &request.config_dir {
-        command.env("CODEX_HOME", dir);
-    }
 
     let mut child = command
         .stdin(Stdio::piped())
@@ -520,16 +577,19 @@ pub fn codex_rollout_rate_limits(codex_home: &Path, thread_id: &str) -> Option<s
         })
 }
 
-/// Find the rollout file whose name carries `thread_id`.
+/// Find the rollout file for `thread_id`.
 ///
-/// Rollouts are filed under `sessions/YYYY/MM/DD/`, so the search is a bounded walk rather than a
-/// glob dependency.
+/// Rollouts are filed under `sessions/YYYY/MM/DD/` as `rollout-<timestamp>-<thread_id>.jsonl`,
+/// so the search is a bounded walk rather than a glob dependency.
+/// The id is matched as the whole tail of the name, not as a substring: a thread id is opaque,
+/// and an opaque id that happened to be short would otherwise match every file on the day.
 fn find_rollout(sessions: &Path, thread_id: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, needle: &str, depth: usize) -> Option<PathBuf> {
+    fn walk(dir: &Path, suffix: &str, depth: usize) -> Option<PathBuf> {
         if depth > 4 {
             return None;
         }
         let mut directories = Vec::new();
+        let mut matches = Vec::new();
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -537,17 +597,21 @@ fn find_rollout(sessions: &Path, thread_id: &str) -> Option<PathBuf> {
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(needle))
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(suffix))
             {
-                return Some(path);
+                matches.push(path);
             }
         }
-        // Newest day first, so a repeated thread id resolves to the most recent run.
+        // Newest first at both levels: names lead with a timestamp, so the last one sorts last,
+        // and a repeated thread id resolves to the most recent run.
+        if let Some(newest) = matches.into_iter().max() {
+            return Some(newest);
+        }
         directories.sort_unstable();
         directories
             .into_iter()
             .rev()
-            .find_map(|child| walk(&child, needle, depth + 1))
+            .find_map(|child| walk(&child, suffix, depth + 1))
     }
-    walk(sessions, thread_id, 0)
+    walk(sessions, &format!("-{thread_id}.jsonl"), 0)
 }

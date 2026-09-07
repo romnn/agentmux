@@ -21,9 +21,8 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use agentmux::delegate::Isolation;
 use agentmux::quota::{AccountQuota, Observation, Origin};
-use agentmux::run::{RunStatus, RunSummary, TranscriptPage};
+use agentmux::run::{HookReopening, RunStatus, RunSummary, TranscriptPage};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
 use chrono::Utc;
 
@@ -162,25 +161,8 @@ pub fn warnings(status: &RunStatus) -> String {
             summarise(detail, 600),
         );
         // The alternatives, where the failure itself made them worth fetching.
-        // Given a lead-in, because a list with no verb reads as background rather than as the
-        // next call to make.
-        let ordered = ordered_quota(
-            &status.quota,
-            status.delegate.vendor(),
-            status.delegate.account(),
-        );
-        // Only when there is genuinely another one: on a single-account machine the header would
-        // otherwise invite the caller to switch to the account that just failed.
-        if ordered.iter().any(|(_, ran)| !ran) {
-            let _ = writeln!(
-                out,
-                "\x20           other accounts on this machine (pass one as `account`):"
-            );
-        }
-        for (entry, ran) in ordered {
-            for line in quota_report_labelled(entry, ran) {
-                let _ = writeln!(out, "\x20           {line}");
-            }
+        for line in quota_block(status) {
+            let _ = writeln!(out, "\x20           {line}");
         }
     }
     if status.broke_continuity {
@@ -192,27 +174,22 @@ pub fn warnings(status: &RunStatus) -> String {
              \x20           answer looks context-free.\n",
         );
     }
-    if status.reopened_by_hook {
-        // The same event means opposite things depending on what the run loaded.
-        // Under inheritance it is the documented consequence of what the caller asked for; under
-        // isolation it should have been impossible, and the whole transcript is then suspect.
-        match status.delegate.isolation() {
-            Some(Isolation::Inherit) => out.push_str(
-                "note:       a hook in the account's settings reopened a finished turn, which is\n\
-                 \x20           expected because this run inherited them. The answer is above the\n\
-                 \x20           injection, which is marked in the transcript.\n",
-            ),
-            // `None` means the run predates isolation being recorded, so the safe reading is the
-            // alarming one: it is written out rather than wildcarded so a third mode cannot land
-            // here by default.
-            None | Some(Isolation::Isolated) => out.push_str(
-                "warning:    a hook reopened a finished turn even though this run loaded no\n\
-                 \x20           settings. That should not be possible: treat this transcript as\n\
-                 \x20           untrusted, and re-run with `inherit_settings: false` set\n\
-                 \x20           explicitly. The last thing the delegate said is NOT the answer —\n\
-                 \x20           the answer is above the injection.\n",
-            ),
-        }
+    // The same event means opposite things depending on what the run loaded, and the library
+    // decides which so the CLI says the same thing.
+    match status.hook_reopening {
+        None => {}
+        Some(HookReopening::Expected) => out.push_str(
+            "note:       a hook in the account's settings reopened a finished turn, which is\n\
+             \x20           expected because this run inherited them. The answer is above the\n\
+             \x20           injection, which is marked in the transcript.\n",
+        ),
+        Some(HookReopening::Unexpected) => out.push_str(
+            "warning:    a hook reopened a finished turn even though this run loaded no\n\
+             \x20           settings. That should not be possible: treat this transcript as\n\
+             \x20           untrusted, and re-run with `inherit_settings: false` set\n\
+             \x20           explicitly. The last thing the delegate said is NOT the answer —\n\
+             \x20           the answer is above the injection.\n",
+        ),
     }
     if let Some(drift) = status.unrecognised.summary() {
         let _ = write!(
@@ -284,12 +261,31 @@ fn recovery_advice(
             .filter_map(|entry| entry.account.as_ref().map(ToString::to_string))
             .collect::<Vec<_>>();
         if !alternatives.is_empty() {
+            // Said only when a window was recovered: without one, "too far off" would be a
+            // claim about a number nobody has.
+            let window = rate_limit.map_or(
+                "and no reopening time was reported",
+                |_| "and the window is too far off to wait for",
+            );
+            // A run on the CLI's own login cannot be told apart from an alias that points at
+            // that same login, so the aliases are offered as candidates, not as different
+            // subscriptions.
+            let candidates = if ran_as.is_some() {
+                format!(
+                    "you also have {} configured for this vendor",
+                    alternatives.join(", ")
+                )
+            } else {
+                format!(
+                    "this machine configures {} for this vendor, though one of them may be the \
+                     same login this consultation ran on",
+                    alternatives.join(", ")
+                )
+            };
             return Cow::Owned(format!(
-                "Nothing to fix in your call, and the window is too far off to wait for. Retry \
-                 with a different `account` — you also have {} configured for this vendor, listed \
-                 below with what each has left — or `start` the same question against the other \
-                 vendor.",
-                alternatives.join(", ")
+                "Nothing to fix in your call, {window}. Retry with a different `account` — \
+                 {candidates}, listed below with what each has left — or `start` the same \
+                 question against the other vendor."
             ));
         }
         if let Some(limit) = rate_limit {
@@ -486,7 +482,7 @@ pub fn list(runs: &[RunSummary]) -> String {
             out,
             "{}  {:<9}  {}\n    {}\n    {}\n",
             run.run_id,
-            run.state,
+            run.outcome.state(),
             run.created_at.to_rfc3339(),
             run.delegate,
             run.question,
@@ -531,6 +527,50 @@ pub fn quota(reported: &[AccountQuota]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The line that introduces the other accounts, for a consultation that ran as `ran_as`.
+///
+/// A consultation on the CLI's own login is not told the listed aliases are *other* accounts:
+/// one of them may name that very login, and agentmux cannot tell.
+/// With no other account at all there is nothing to switch to, and the lead-in says what the
+/// figures are instead of inviting a switch to the account that just failed.
+#[must_use]
+pub fn quota_lead_in(
+    ran_as: Option<&agentmux::delegate::AccountAlias>,
+    others_exist: bool,
+) -> &'static str {
+    match (others_exist, ran_as) {
+        (false, _) => "this account's usage:",
+        (true, Some(_)) => "other accounts on this machine (pass one as `account`):",
+        (true, None) => {
+            "accounts this machine configures (pass one as `account`; this consultation ran on \
+             the CLI's own login, which one of them may also be):"
+        }
+    }
+}
+
+/// The lines that report every account's figures after a rate-limited failure, lead-in first.
+///
+/// Empty for every other outcome, because only a rate limit fetches them.
+/// Both front ends print exactly these lines under their own indentation, so they cannot order
+/// or introduce the list differently.
+#[must_use]
+pub fn quota_block(status: &RunStatus) -> Vec<String> {
+    let ordered = ordered_quota(
+        &status.quota,
+        status.delegate.vendor(),
+        status.delegate.account(),
+    );
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+    let others_exist = ordered.iter().any(|(_, ran)| !ran);
+    let mut lines = vec![quota_lead_in(status.delegate.account(), others_exist).to_owned()];
+    for (entry, ran) in ordered {
+        lines.extend(quota_report_labelled(entry, ran));
+    }
+    lines
 }
 
 /// This vendor's quota entries, in the order a reader should meet them, with the one that ran

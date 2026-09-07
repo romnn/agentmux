@@ -36,7 +36,7 @@ async fn consult(
 ) -> Result<(RunStore, agentmux::run::RunStatus)> {
     let env: BTreeMap<String, String> = std::env::vars().collect();
     let dir = tempfile::tempdir().or_fail()?;
-    let store = RunStore::open(dir.path(), Arc::new(ProcessLauncher), env).or_fail()?;
+    let store = RunStore::open(dir.path(), Arc::new(ProcessLauncher::new()), env).or_fail()?;
     let started = store
         .start(&StartRequest {
             delegate,
@@ -46,10 +46,11 @@ async fn consult(
             env: BTreeMap::new(),
         })
         .or_fail()?;
-    let status = store
+    store
         .wait_until_terminal(&started.run_id, Duration::from_secs(300))
         .await
         .or_fail()?;
+    let status = store.status(&started.run_id).or_fail()?;
     let _kept = dir.keep();
     Ok((store, status))
 }
@@ -76,9 +77,7 @@ async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
         none(),
         "the Claude event stream has drifted"
     );
-    let page = store
-        .read_transcript(&status.run_id, 0, usize::MAX)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, usize::MAX).or_fail()?;
     assert_that!(page.text, contains_substring("LIVE_CLAUDE_OK"));
     Ok(())
 }
@@ -114,15 +113,14 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
             "What was the secret word? Reply with only the word.",
         )
         .or_fail()?;
-    let followed = store
+    store
         .wait_until_terminal(&followed.run_id, Duration::from_secs(300))
         .await
         .or_fail()?;
+    let followed = store.status(&followed.run_id).or_fail()?;
     assert_that!(followed.turns, eq(2));
 
-    let page = store
-        .read_transcript(&status.run_id, 0, usize::MAX)
-        .or_fail()?;
+    let page = store.page(&status.run_id, 0, usize::MAX).or_fail()?;
     assert_that!(page.text, contains_substring("ZEPPELIN"));
     Ok(())
 }

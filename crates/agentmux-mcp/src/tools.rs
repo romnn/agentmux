@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::run::{RunStore, StartRequest};
+use agentmux::run::{RunId, RunStore, StartRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -13,7 +13,7 @@ use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::params::{DelegateParams, QuestionParams, QuotaParams, Vendor, run_id};
+use crate::params::{DelegateParams, QuestionParams, QuotaParams, run_id};
 use crate::render;
 
 /// Default seconds a blocking tool waits.
@@ -41,7 +41,11 @@ const DEFAULT_RESULT_BYTES: usize = 40_000;
 const DEFAULT_TAIL_BYTES: usize = 4_000;
 
 /// Largest slice any tool will return inline, whatever was asked for.
-const MAX_SLICE_BYTES: usize = 400_000;
+///
+/// Held under the smallest host budget agentmux is used from — Claude Code's twenty-five
+/// thousand tokens — so that a page cannot be cut short by the host while its header advertises
+/// a cursor past the bytes the caller never saw; a caller following that cursor would skip them.
+const MAX_SLICE_BYTES: usize = 64_000;
 
 /// The agentmux MCP server.
 #[derive(Clone)]
@@ -205,8 +209,10 @@ impl AgentMux {
         // Built once, at server start: a host injects instructions into the caller's context one
         // time, and the machine's accounts are what a caller most needs and can least guess.
         // Resolved against the store's own captured environment, so the roster describes the
-        // machine a consultation will actually run on.
-        let instructions = instructions(store.host_env(), store.root());
+        // machine a consultation will actually run on, and from the directory the host started
+        // the server in, which is where a consultation that names no `cwd` will read.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let instructions = instructions(store.host_env(), &cwd);
         Self {
             tool_router: Self::tool_router(),
             store,
@@ -239,23 +245,14 @@ impl AgentMux {
             })
             .map_err(|error| run_error(&error))?;
 
-        let status = self
-            .store
+        self.store
             .wait_until_terminal(
                 &status.run_id,
                 wait(params.wait_seconds, DEFAULT_WAIT_SECONDS),
             )
             .await
             .map_err(|error| run_error(&error))?;
-
-        if !status.is_terminal() {
-            return Ok(text(render::status(&status)));
-        }
-        let page = self
-            .store
-            .read_transcript(&status.run_id, 0, DEFAULT_RESULT_BYTES)
-            .map_err(|error| run_error(&error))?;
-        Ok(text(render::transcript(&status, &page)))
+        self.answer(&status.run_id)
     }
 
     #[tool(
@@ -310,10 +307,9 @@ impl AgentMux {
         Parameters(params): Parameters<TailParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let id = run_id(&params.run_id)?;
-        let status = self.store.status(&id).map_err(|error| run_error(&error))?;
-        let page = self
+        let (status, page) = self
             .store
-            .read_transcript(
+            .view(
                 &id,
                 params.cursor.unwrap_or(0),
                 slice(params.max_bytes, DEFAULT_TAIL_BYTES),
@@ -333,17 +329,15 @@ impl AgentMux {
         Parameters(params): Parameters<ResultParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let id = run_id(&params.run_id)?;
-        let status = match params.wait_seconds {
-            Some(seconds) if seconds > 0 => self
-                .store
+        if let Some(seconds) = params.wait_seconds.filter(|seconds| *seconds > 0) {
+            self.store
                 .wait_until_terminal(&id, wait(Some(seconds), 0))
                 .await
-                .map_err(|error| run_error(&error))?,
-            _ => self.store.status(&id).map_err(|error| run_error(&error))?,
-        };
-        let page = self
+                .map_err(|error| run_error(&error))?;
+        }
+        let (status, page) = self
             .store
-            .read_transcript(
+            .view(
                 &id,
                 params.offset.unwrap_or(0),
                 slice(params.max_bytes, DEFAULT_RESULT_BYTES),
@@ -373,37 +367,31 @@ impl AgentMux {
             .store
             .follow_up(&id, &params.question)
             .map_err(|error| run_error(&error))?;
-        let status = self
-            .store
+        self.store
             .wait_until_terminal(
                 &status.run_id,
                 wait(params.wait_seconds, DEFAULT_WAIT_SECONDS),
             )
             .await
             .map_err(|error| run_error(&error))?;
-
-        if !status.is_terminal() {
-            return Ok(text(render::status(&status)));
-        }
-        let page = self
-            .store
-            .read_transcript(&status.run_id, 0, DEFAULT_RESULT_BYTES)
-            .map_err(|error| run_error(&error))?;
-        Ok(text(render::transcript(&status, &page)))
+        self.answer(&status.run_id)
     }
 
     #[tool(
         description = "Stop a running consultation. Everything the delegate said before the stop \
-                       is kept and still readable with `result`. Calling it on a consultation \
-                       that has already finished changes nothing and simply reports its state."
+                       is kept and still readable with `result`. Returns once the delegate has \
+                       actually stopped, which takes a few seconds at most. Calling it on a \
+                       consultation that has already finished changes nothing and simply reports \
+                       its state."
     )]
-    fn cancel(
+    async fn cancel(
         &self,
         Parameters(params): Parameters<RunParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let status = self
             .store
             .cancel(&run_id(&params.run_id)?)
+            .await
             .map_err(|error| run_error(&error))?;
         Ok(text(render::status(&status)))
     }
@@ -436,19 +424,27 @@ impl AgentMux {
         &self,
         Parameters(params): Parameters<QuotaParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let vendors = match params.delegate {
-            Some(Vendor::Claude) => vec![agentmux::delegate::Vendor::Claude],
-            Some(Vendor::Codex) => vec![agentmux::delegate::Vendor::Codex],
-            None => vec![
-                agentmux::delegate::Vendor::Claude,
-                agentmux::delegate::Vendor::Codex,
-            ],
-        };
         let reported = self
             .store
-            .quota(&vendors)
+            .quota(params.delegate)
             .map_err(|error| run_error(&error))?;
         Ok(text(render::quota(&reported)))
+    }
+}
+
+impl AgentMux {
+    /// The transcript of a consultation once a wait has ended, or its state if it is still going.
+    ///
+    /// One reading of the files serves both, so the state and the page agree.
+    fn answer(&self, id: &RunId) -> Result<CallToolResult, ErrorData> {
+        let (status, page) = self
+            .store
+            .view(id, 0, DEFAULT_RESULT_BYTES)
+            .map_err(|error| run_error(&error))?;
+        if !status.is_terminal() {
+            return Ok(text(render::status(&status)));
+        }
+        Ok(text(render::transcript(&status, &page)))
     }
 }
 
@@ -465,6 +461,7 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::BadRunId(_)
         | RunError::NotResumable(_)
         | RunError::TurnAlreadyClaimed { .. }
+        | RunError::StillRunning { .. }
         | RunError::Delegate(_)
         // The caller is a delegate that inherited its account's MCP servers and found agentmux
         // among them; the remedy is to answer, not to retry.
@@ -482,9 +479,10 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
             ),
             None,
         ),
-        RunError::Corrupt { .. } | RunError::Io { .. } | RunError::NoStateDir => {
-            ErrorData::internal_error(error.to_string(), None)
-        }
+        RunError::Corrupt { .. }
+        | RunError::CorruptRecord { .. }
+        | RunError::Io { .. }
+        | RunError::NoStateDir => ErrorData::internal_error(error.to_string(), None),
     }
 }
 
@@ -511,7 +509,7 @@ fn instructions(
     };
 
     let mut described = Vec::new();
-    for vendor in [Vendor::Claude, Vendor::Codex] {
+    for vendor in Vendor::ALL {
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             continue;
@@ -536,10 +534,14 @@ fn instructions(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let omitted = match config.default_account(vendor) {
-            Some(alias) => format!("omitting `account` uses `{alias}`"),
-            None => format!("omitting `account` uses the {vendor} CLI's own login"),
-        };
+        let default = config.default_account(vendor).map_or_else(
+            || format!("the {vendor} CLI's own login"),
+            |default| format!("`{}`", default.alias),
+        );
+        let omitted = format!(
+            "omitting `account` uses {default} unless the checkout's own agentmux.toml selects \
+             another"
+        );
         described.push(format!("{vendor}: {names} — {omitted}"));
     }
 
@@ -548,7 +550,7 @@ fn instructions(
     } else {
         format!(
             "This machine defines these accounts — {}. Pass one as `account`, or omit it for the \
-             vendor CLI's own login.",
+             default; the `delegate:` line of every result names the account that actually ran.",
             described.join("; ")
         )
     };

@@ -55,7 +55,9 @@ fn the_closest_project_file_chooses_the_account() -> Result<()> {
     let config = Config::load(&env(home.path()), &repo).or_fail()?;
 
     assert_that!(
-        config.default_account(agentmux::delegate::Vendor::Claude),
+        config
+            .default_account(agentmux::delegate::Vendor::Claude)
+            .map(|d| d.alias),
         some(eq("clientx"))
     );
     // The machine file still supplied the account itself.
@@ -77,7 +79,9 @@ fn a_directory_without_a_project_file_inherits_the_one_above() -> Result<()> {
     let config = Config::load(&env(home.path()), &deep).or_fail()?;
 
     assert_that!(
-        config.default_account(agentmux::delegate::Vendor::Claude),
+        config
+            .default_account(agentmux::delegate::Vendor::Claude)
+            .map(|d| d.alias),
         some(eq("work-wide"))
     );
     Ok(())
@@ -105,7 +109,10 @@ fn a_project_file_that_defines_an_account_is_refused() -> Result<()> {
 
     let error = Config::load(&env(home.path()), &repo).expect_err("a project file defined one");
 
-    assert_that!(error.to_string(), contains_substring("may only select one"));
+    assert_that!(
+        error.to_string(),
+        contains_substring("may only select an account")
+    );
     Ok(())
 }
 
@@ -129,7 +136,10 @@ fn a_project_file_that_sets_launch_environment_is_refused() -> Result<()> {
 
     let error = Config::load(&env(home.path()), &repo).expect_err("a project file set env");
 
-    assert_that!(error.to_string(), contains_substring("may only select one"));
+    assert_that!(
+        error.to_string(),
+        contains_substring("may only select an account")
+    );
     Ok(())
 }
 
@@ -350,11 +360,15 @@ fn a_project_default_does_not_discard_the_other_vendors() -> Result<()> {
     let config = Config::load(&env(home.path()), &repo).or_fail()?;
 
     assert_that!(
-        config.default_account(agentmux::delegate::Vendor::Codex),
+        config
+            .default_account(agentmux::delegate::Vendor::Codex)
+            .map(|d| d.alias),
         some(eq("clientx"))
     );
     assert_that!(
-        config.default_account(agentmux::delegate::Vendor::Claude),
+        config
+            .default_account(agentmux::delegate::Vendor::Claude)
+            .map(|d| d.alias),
         some(eq("personal")),
         "the machine-wide Claude default was discarded by an unrelated project file"
     );
@@ -374,5 +388,365 @@ fn an_empty_config_path_variable_is_treated_as_unset() -> Result<()> {
     let config = Config::load(&host, home.path()).or_fail()?;
 
     assert_that!(config.source, none());
+    Ok(())
+}
+
+/// A relative configuration base does not make a repo-local file a machine file.
+///
+/// `XDG_CONFIG_HOME=.config` is a real and common typo, and a relative base would resolve
+/// against whatever directory agentmux runs in — under an MCP host, the checkout — so a cloned
+/// `.config/agentmux/agentmux.toml` would be read as the file that may define accounts.
+#[gtest]
+fn a_relative_config_base_is_ignored() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let mut host = env(home.path());
+    host.insert("XDG_CONFIG_HOME".to_owned(), ".config".to_owned());
+    host.insert("APPDATA".to_owned(), "AppData".to_owned());
+
+    let paths = Config::machine_paths(&host);
+
+    assert_that!(
+        paths.iter().all(|path| path.is_absolute()),
+        eq(true),
+        "a relative machine path was searched: {paths:?}"
+    );
+
+    host.insert(
+        agentmux::config::CONFIG_PATH_ENV.to_owned(),
+        "agentmux.toml".to_owned(),
+    );
+    assert_that!(
+        Config::load(&host, home.path()).map(|_| ()),
+        err(matches_pattern!(
+            agentmux::config::ConfigError::RelativeExplicit { .. }
+        ))
+    );
+    Ok(())
+}
+
+/// A checkout outside home is walked up to the root of its repository, and no further.
+///
+/// A checkout on another volume is ordinary on macOS, and a project file committed there must be
+/// found; what must not be found is a file planted above the repository on a shared mount.
+#[gtest]
+fn a_checkout_outside_home_is_walked_up_to_its_repository_root() -> Result<()> {
+    let root = tempfile::tempdir().or_fail()?;
+    let home = root.path().join("home/dev");
+    let checkout = root.path().join("volumes/work/checkout");
+    let nested = checkout.join("crates/one");
+    std::fs::create_dir_all(&home).or_fail()?;
+    std::fs::create_dir_all(checkout.join(".git")).or_fail()?;
+    std::fs::create_dir_all(&nested).or_fail()?;
+    write_machine(&home, "clientx")?;
+    write_project(&checkout, "clientx")?;
+    // Planted above the repository, where an unbounded walk would find it.
+    write_project(&root.path().join("volumes/work"), "attacker")?;
+
+    // The walk canonicalises, and a temporary directory on macOS lives behind a symlink.
+    let paths = Config::project_paths(Some(&nested), Some(&home));
+    let canonical = |path: &Path| path.canonicalize().or_fail();
+    assert_that!(
+        paths.contains(&canonical(&checkout)?.join("agentmux.toml")),
+        eq(true),
+        "the checkout's own file was not searched: {paths:?}"
+    );
+    assert_that!(
+        paths.contains(&canonical(&root.path().join("volumes/work"))?.join("agentmux.toml")),
+        eq(false),
+        "the walk climbed above the repository root"
+    );
+
+    let config = Config::load(&env(&home), &nested).or_fail()?;
+    assert_that!(
+        config
+            .default_account(agentmux::delegate::Vendor::Claude)
+            .map(|d| d.alias),
+        some(eq("clientx"))
+    );
+    Ok(())
+}
+
+/// A project file may choose which account pays, not whether its hooks load.
+///
+/// Such a file arrives with a `git clone`.
+/// Selecting an account the operator configured to inherit its settings would otherwise be a
+/// third way to switch isolation off, from a file the operator never wrote.
+#[gtest]
+fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
+    use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Vendor};
+
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/client");
+    std::fs::create_dir_all(&repo).or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.claude.personal]
+            config_dir = "/tmp"
+            inherit_settings = true
+        "#},
+    )
+    .or_fail()?;
+    write_project(&repo, "personal")?;
+    let config = Config::load(&env(home.path()), &repo).or_fail()?;
+    assert_that!(
+        config.default_account(Vendor::Claude).map(|d| d.chosen_by),
+        some(matches_pattern!(agentmux::config::ChosenBy::Project(_)))
+    );
+
+    let chosen_by_the_checkout = Delegate::Claude {
+        model: ModelId::parse("claude-opus-5").or_fail()?,
+        effort: Effort::parse("xhigh").or_fail()?,
+        account: None,
+        isolation: None,
+    };
+    assert_that!(
+        chosen_by_the_checkout.resolved_isolation(&config),
+        eq(Isolation::Isolated)
+    );
+
+    // Named by the caller, the account's own preference stands.
+    let named = Delegate::Claude {
+        model: ModelId::parse("claude-opus-5").or_fail()?,
+        effort: Effort::parse("xhigh").or_fail()?,
+        account: Some(AccountAlias::parse("personal").or_fail()?),
+        isolation: None,
+    };
+    assert_that!(named.resolved_isolation(&config), eq(Isolation::Inherit));
+    Ok(())
+}
+
+/// An alias the argument parser would refuse is refused when the file is read.
+///
+/// Otherwise `accounts` and the server's roster advertise a name that no call can pass back.
+#[gtest]
+fn an_unusable_alias_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.claude."work account"]
+            config_dir = "/tmp"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), home.path()).expect_err("a space is not a name");
+    assert_that!(
+        error,
+        matches_pattern!(agentmux::config::ConfigError::InvalidName { .. })
+    );
+    assert_that!(error.to_string(), contains_substring("work account"));
+    Ok(())
+}
+
+/// An environment name the operating system would misread is refused when the file is read.
+#[gtest]
+fn an_environment_name_with_an_equals_sign_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [launch]
+            env = { "A=B" = "value" }
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), home.path()).expect_err("`=` ends a name");
+    assert_that!(
+        error,
+        matches_pattern!(agentmux::config::ConfigError::InvalidName { .. })
+    );
+    Ok(())
+}
+
+/// A machine file named explicitly keeps its role even when it sits inside the checkout.
+///
+/// The project walk would otherwise meet the same file, read it as a project file, and refuse it
+/// for defining the very accounts it was named to define.
+#[gtest]
+fn an_explicit_machine_file_inside_the_checkout_keeps_its_role() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("repo");
+    write_machine(&repo, "clientx")?;
+    let mut host = env(home.path());
+    host.insert(
+        agentmux::config::CONFIG_PATH_ENV.to_owned(),
+        repo.join("agentmux.toml").to_string_lossy().into_owned(),
+    );
+
+    let config = Config::load(&host, &repo).or_fail()?;
+
+    assert_that!(
+        config.alias_names(agentmux::delegate::Vendor::Claude),
+        elements_are![eq("clientx")]
+    );
+    assert_that!(config.project_source, none());
+    Ok(())
+}
+
+/// A directory that happens to carry the file's name is not a file.
+///
+/// A `git clone` can create one, and reading it would fail every consultation started in that
+/// checkout with "is a directory".
+#[gtest]
+fn a_directory_named_like_the_config_file_is_skipped() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(repo.join("agentmux.toml")).or_fail()?;
+    std::fs::create_dir_all(home.path().join(".config/agentmux/agentmux.toml")).or_fail()?;
+
+    let config = Config::load(&env(home.path()), &repo).or_fail()?;
+
+    assert_that!(config.source, none());
+    assert_that!(config.project_source, none());
+    Ok(())
+}
+
+/// The values of a launch environment never come back out of the configuration.
+///
+/// The module docs recommend `[launch] env` for a Bedrock key, and `agentmux accounts --json`
+/// prints the configuration back.
+#[gtest]
+fn launch_environment_values_are_redacted_when_shown() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [launch]
+            env = { AWS_SECRET_ACCESS_KEY = "hunter2" }
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+    let shown = serde_json::to_string(&config).or_fail()?;
+
+    assert_that!(shown, not(contains_substring("hunter2")));
+    assert_that!(shown, contains_substring("AWS_SECRET_ACCESS_KEY"));
+    Ok(())
+}
+
+/// A configuration base pointed outside the home directory does not make a file there a machine
+/// file.
+///
+/// A container image may point `XDG_CONFIG_HOME` at a workspace; a checkout under it would then
+/// be able to define accounts, which is the one thing a checkout must never do.
+/// `AGENTMUX_CONFIG` remains the way to keep the file elsewhere on purpose.
+#[gtest]
+fn a_config_base_outside_home_is_ignored() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let elsewhere = tempfile::tempdir().or_fail()?;
+    let mut host = env(home.path());
+    host.insert(
+        "XDG_CONFIG_HOME".to_owned(),
+        elsewhere.path().to_string_lossy().into_owned(),
+    );
+    host.insert(
+        "APPDATA".to_owned(),
+        elsewhere
+            .path()
+            .join("AppData")
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    let paths = Config::machine_paths(&host);
+    assert_that!(
+        paths.iter().all(|path| path.starts_with(home.path())),
+        eq(true),
+        "a machine path outside home was searched: {paths:?}"
+    );
+
+    host.insert(
+        "XDG_CONFIG_HOME".to_owned(),
+        home.path().join("cfg").to_string_lossy().into_owned(),
+    );
+    assert_that!(
+        Config::machine_paths(&host).contains(&home.path().join("cfg/agentmux/agentmux.toml")),
+        eq(true)
+    );
+
+    // A base that starts under home and climbs back out is not under it either.
+    host.insert(
+        "XDG_CONFIG_HOME".to_owned(),
+        home.path()
+            .join("../..")
+            .join(elsewhere.path().strip_prefix("/").or_fail()?)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let paths = Config::machine_paths(&host);
+    assert_that!(
+        paths.iter().all(|path| path.starts_with(home.path())
+            && !path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)),
+        eq(true),
+        "a machine path climbing out of home was searched: {paths:?}"
+    );
+    Ok(())
+}
+
+/// A parse error never quotes the file it failed on, whatever renders it.
+///
+/// The offending line of this file is as likely as not to hold a key, and an error report that
+/// prints its whole chain would print the line with it.
+#[gtest]
+fn a_malformed_file_is_reported_without_its_contents() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        "[accounts.claude.work]\napi_key = \"sk-ant-live-secret\n",
+    )
+    .or_fail()?;
+
+    let unterminated = Config::load(&env(home.path()), home.path()).expect_err("malformed");
+
+    // A value of the wrong kind is repeated by the parser's own message, quotes and all.
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        "[accounts.claude.work]\ninherit_settings = \"sk-ant-live-secret\"\n",
+    )
+    .or_fail()?;
+    let wrong_kind = Config::load(&env(home.path()), home.path()).expect_err("wrong kind");
+
+    for error in [unterminated, wrong_kind] {
+        let mut rendered = vec![error.to_string(), format!("{error:?}")];
+        let mut source = std::error::Error::source(&error);
+        while let Some(inner) = source {
+            rendered.push(inner.to_string());
+            source = inner.source();
+        }
+        for text in rendered {
+            assert_that!(text, not(contains_substring("sk-ant-live-secret")));
+        }
+    }
+    Ok(())
+}
+
+/// A default naming an alias no request could express is refused when the file is read.
+///
+/// Left in, the failure would land at the launch as a complaint about the caller's arguments,
+/// when the caller named nothing.
+#[gtest]
+fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        "[defaults.claude]\naccount = \"work account\"\n",
+    )
+    .or_fail()?;
+
+    assert_that!(
+        Config::load(&env(home.path()), home.path()).map(|_| ()),
+        err(matches_pattern!(
+            agentmux::config::ConfigError::InvalidName {
+                what: eq(&"the default account"),
+                ..
+            }
+        ))
+    );
     Ok(())
 }

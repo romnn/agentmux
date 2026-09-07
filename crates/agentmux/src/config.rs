@@ -12,15 +12,20 @@
 //! # Two files, two jobs
 //!
 //! A **machine** file defines accounts: paths, credentials, endpoints, environment.
-//! It is found only at fixed locations under the home directory.
+//! It is found only at fixed locations under the home directory, or at the one absolute path
+//! `AGENTMUX_CONFIG` names.
 //!
 //! A **project** file is found by walking up from the delegate's working directory, so it can
 //! arrive with a `git clone`.
 //! It may *select* an account and nothing else.
 //! Were it allowed to define one, a cloned repository could name an endpoint of its own and
 //! forward the caller's real key to it on the first delegation.
+//!
+//! Both roles are read only from a file the current user owns and nobody else can write, because
+//! either can change which identity a consultation runs as.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -45,31 +50,53 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// The file exists but is not valid TOML, or does not match the expected shape.
-    #[error("the agentmux config at {path} is not valid: {source}")]
+    ///
+    /// Carries the parser's message and position but not the parser's error, whose own rendering
+    /// quotes the offending source line — and the offending line of this file is as likely as
+    /// not to hold a key.
+    /// Kept out of the error chain too, so no reporter can print it.
+    #[error("the agentmux config at {path} is not valid{}: {message}", describe_offset(*offset))]
     Malformed {
         /// The file that could not be parsed.
         path: PathBuf,
-        /// The underlying parse failure.
-        source: toml::de::Error,
+        /// What the parser objected to.
+        message: String,
+        /// Where in the file, as a byte offset, when the parser knows.
+        offset: Option<usize>,
     },
-    /// A project file tried to define an account rather than select one.
+    /// An alias or environment name in the file is not one agentmux can use.
+    #[error("the agentmux config at {path} names {what} {value:?}, which {reason}")]
+    InvalidName {
+        /// The file.
+        path: PathBuf,
+        /// What kind of name it was.
+        what: &'static str,
+        /// The name as written.
+        value: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A project file tried to define an account, or a launch environment, rather than select one.
     #[error(
-        "{path} defines accounts, and a project agentmux.toml may only select one with \
-         [defaults.<vendor>]. Move the definitions to your machine configuration: a file that \
-         travels with a repository must not be able to name a credential or an endpoint."
+        "{path} defines accounts or a [launch] environment, and a project agentmux.toml may only \
+         select an account with [defaults.<vendor>]. Move the definitions to your machine \
+         configuration: a file that travels with a repository must not be able to name a \
+         credential, an endpoint or an environment variable."
     )]
     ProjectFileDefinesAccounts {
         /// The offending file.
         path: PathBuf,
     },
-    /// A configuration file anyone can write was found.
+    /// A configuration file another user could have written was found.
     #[error(
-        "{path} is writable by other users, and it can name commands, endpoints and credentials. \
-         Run `chmod go-w {path}` before agentmux will read it."
+        "{path} {problem}, and it can name commands, endpoints and credentials. Make it owned by \
+         you and writable only by you (`chmod go-w {path}`) before agentmux will read it."
     )]
-    WorldWritable {
+    Untrusted {
         /// The offending file.
         path: PathBuf,
+        /// What is wrong with it.
+        problem: &'static str,
     },
     /// [`CONFIG_PATH_ENV`] named a file that does not exist.
     ///
@@ -81,6 +108,46 @@ pub enum ConfigError {
         /// The path that was named.
         path: PathBuf,
     },
+    /// [`CONFIG_PATH_ENV`] named a relative path.
+    ///
+    /// A relative path would resolve against whatever directory agentmux happens to run in, which
+    /// under an MCP host is the project — and a project must not be able to supply the machine
+    /// file.
+    #[error("{CONFIG_PATH_ENV} must be an absolute path, not {path}")]
+    RelativeExplicit {
+        /// The path that was named.
+        path: PathBuf,
+    },
+}
+
+/// A parser message with every quoted value blanked.
+///
+/// A message about the wrong kind of value repeats the value — `invalid type: string "…"` — and
+/// in this file a value is as likely as not to be a key.
+fn without_quoted_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut quoted = false;
+    for character in message.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                out.push('"');
+                if quoted {
+                    out.push('…');
+                }
+            }
+            _ if quoted => {}
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
+/// The byte offset of a parse failure, when the parser knows it.
+fn describe_offset(offset: Option<usize>) -> String {
+    offset.map_or_else(String::new, |offset| {
+        format!(" (at byte {offset} of the file)")
+    })
 }
 
 /// A credential value held in the configuration file.
@@ -93,6 +160,12 @@ pub enum ConfigError {
 pub struct Secret(String);
 
 impl Secret {
+    /// Wrap a value that must not be shown again.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     /// The value, for handing to the delegate's environment and nowhere else.
     #[must_use]
     pub fn expose(&self) -> &str {
@@ -117,25 +190,73 @@ impl Serialize for Secret {
 /// The child environment is otherwise an allowlist built from empty, which is deliberate but
 /// cannot anticipate every setup: a Bedrock or Vertex delegate needs variables agentmux has never
 /// heard of, and a user may want to switch off their own hooks for delegate runs.
-/// These two fields are the extension point, so agentmux never has to learn what Bedrock is.
+/// These fields are the extension point, so agentmux never has to learn what Bedrock is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchEnv {
     /// Variables set to a literal value.
+    ///
+    /// Held as secrets because the module docs recommend this very table for a Bedrock key, and
+    /// `agentmux accounts` prints the configuration back.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, Secret>,
     /// Host variables to forward, by name.
     ///
     /// Named rather than valued so a rotated credential is picked up without editing the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_passthrough: Vec<String>,
+    /// Names a single request may set through its own `env`.
+    ///
+    /// Nothing by default.
+    /// A request comes from a delegating agent acting on text it was given, and there is no
+    /// list of names dangerous enough to refuse that stays complete: `PATH` runs a program of the
+    /// caller's choosing, `NODE_OPTIONS` runs code inside the CLI before it reads a setting, and
+    /// the next runtime will read one more.
+    /// So the operator names what may be set, here, in a file no request can reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_env: Vec<String>,
 }
 
 impl LaunchEnv {
     /// Whether this layer contributes nothing.
+    ///
+    /// Compared against the empty layer rather than field by field, so a field added later is
+    /// counted by construction; this is the one gate on what a project file may say.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.env_passthrough.is_empty()
+        *self == Self::default()
+    }
+
+    fn canonicalise_env_names(&mut self) {
+        self.env = std::mem::take(&mut self.env)
+            .into_iter()
+            .map(|(name, value)| (canonical_env_name(&name), value))
+            .collect();
+        for name in self
+            .env_passthrough
+            .iter_mut()
+            .chain(self.request_env.iter_mut())
+        {
+            *name = canonical_env_name(name);
+        }
+    }
+
+    /// Refuse a name that no environment could carry.
+    fn validate(&self, path: &Path) -> Result<(), ConfigError> {
+        let names = self
+            .env
+            .keys()
+            .chain(&self.env_passthrough)
+            .chain(&self.request_env);
+        for name in names {
+            check_env_name(name).map_err(|reason| ConfigError::InvalidName {
+                path: path.to_path_buf(),
+                what: "the environment variable",
+                value: name.clone(),
+                reason,
+            })?;
+        }
+        Ok(())
     }
 
     /// Apply this layer over `target`.
@@ -153,8 +274,43 @@ impl LaunchEnv {
             }
         }
         for (name, value) in &self.env {
-            target.insert(name.clone(), value.clone());
+            target.insert(name.clone(), value.expose().to_owned());
         }
+    }
+}
+
+/// Whether a string can name an environment variable.
+///
+/// The rule is the operating system's, not agentmux's: a name with `=` in it would be read by
+/// the child as a different, shorter name, and a NUL byte cannot be carried at all.
+///
+/// # Errors
+///
+/// Returns the reason, phrased to follow the name in a message.
+pub(crate) fn check_env_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("is empty");
+    }
+    if name.contains('=') {
+        return Err("contains `=`, which would end the name early");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("contains a control character");
+    }
+    Ok(())
+}
+
+/// The spelling of an environment name the platform will read it under.
+///
+/// Windows reads names without regard to case; every other platform reads them exactly.
+/// Every name agentmux handles — from the host environment, a configuration file or a request —
+/// passes through here on the way in, so one comparison rule serves every map.
+#[must_use]
+pub fn canonical_env_name(name: &str) -> String {
+    if cfg!(windows) {
+        name.to_ascii_uppercase()
+    } else {
+        name.to_owned()
     }
 }
 
@@ -212,12 +368,6 @@ impl Account {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-
-    /// Whether this account keeps a credential in the file itself.
-    #[must_use]
-    pub fn holds_a_literal_secret(&self) -> bool {
-        self.api_key.is_some() || self.auth_token.is_some()
-    }
 }
 
 /// What a file asks for when the caller asks for nothing.
@@ -231,6 +381,7 @@ pub struct Defaults {
 
 /// The machine's agentmux configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Accounts by vendor, then by alias.
     ///
@@ -254,6 +405,42 @@ pub struct Config {
     /// Which project file selected a default, when one did.
     #[serde(skip)]
     pub project_source: Option<PathBuf>,
+    /// The vendors whose default the project file changed.
+    ///
+    /// Read only through [`Config::default_account`], which is where the answer is typed.
+    /// Public so a caller can build a `Config` in full; nothing outside this module should read
+    /// it.
+    #[serde(skip)]
+    pub project_defaults: BTreeSet<String>,
+}
+
+/// Which file chose a default account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChosenBy<'a> {
+    /// The machine file, or a configuration built without one.
+    Machine(Option<&'a Path>),
+    /// A project file, which arrived with the checkout.
+    Project(&'a Path),
+}
+
+impl ChosenBy<'_> {
+    /// The file that made the choice, when there was one.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Machine(path) => *path,
+            Self::Project(path) => Some(path),
+        }
+    }
+}
+
+/// The account one vendor falls back to when the caller names none, and who said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultAccount<'a> {
+    /// The alias the file names, already checked to be one a caller could pass back.
+    pub alias: &'a str,
+    /// Which file chose it, because a checkout's choice may switch on less than the machine's.
+    pub chosen_by: ChosenBy<'a>,
 }
 
 impl Config {
@@ -271,13 +458,35 @@ impl Config {
     /// Every path is derived from `host_env` rather than from the process environment, so a caller
     /// that captured the environment resolves against the same snapshot the delegate will run
     /// under — and so a test cannot accidentally read the developer's own configuration.
+    ///
+    /// A base directory named by the environment counts only when it lies under the home
+    /// directory.
+    /// One that is relative would resolve against whatever directory agentmux runs in — under an
+    /// MCP host, the project — and one pointed elsewhere, as a container image may point
+    /// `XDG_CONFIG_HOME` at a workspace, would let a checkout supply the machine file.
+    /// [`CONFIG_PATH_ENV`] is the deliberate way to keep the file anywhere else.
     #[must_use]
     pub fn machine_paths(host_env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+        let home = home_dir(host_env).filter(|home| home.is_absolute());
+        // A prefix test alone would accept `$HOME/../../workspace`, which is under home only
+        // component by component, so a path that climbs is not under anything.
+        let under_home = |name: &str| {
+            host_env
+                .get(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .filter(|path| {
+                    !path
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                })
+                .filter(|path| home.as_deref().is_some_and(|home| path.starts_with(home)))
+        };
         let mut paths = Vec::new();
-        if let Some(xdg) = host_env.get("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            paths.push(PathBuf::from(xdg).join("agentmux").join(FILE_NAME));
+        if let Some(xdg) = under_home("XDG_CONFIG_HOME") {
+            paths.push(xdg.join("agentmux").join(FILE_NAME));
         }
-        if let Some(home) = home_dir(host_env) {
+        if let Some(home) = &home {
             let xdg_default = home.join(".config").join("agentmux").join(FILE_NAME);
             if !paths.contains(&xdg_default) {
                 paths.push(xdg_default);
@@ -285,18 +494,22 @@ impl Config {
             paths.push(home.join(FILE_NAME));
         }
         // Windows keeps per-user application data here rather than under a dot directory.
-        if let Some(appdata) = host_env.get("APPDATA").filter(|v| !v.is_empty()) {
-            paths.push(PathBuf::from(appdata).join("agentmux").join(FILE_NAME));
+        if let Some(appdata) = under_home("APPDATA") {
+            paths.push(appdata.join("agentmux").join(FILE_NAME));
         }
         paths
     }
 
-    /// Project-level locations: every directory from `start` up to, but excluding, the home
-    /// directory.
+    /// Project-level locations: every directory from `start` up to the root of the repository it
+    /// is in, or up to but excluding the home directory when it is in none.
     ///
-    /// The walk stops below home so the home-directory file keeps its machine-level meaning, and
-    /// never rises above it: a checkout on a shared mount would otherwise inherit whatever
-    /// configuration the directory above it happens to hold.
+    /// The repository root — the nearest ancestor holding `.git` — is the boundary a checked-out
+    /// file means: it is where a clone puts it, and stopping there keeps a checkout on a shared
+    /// mount from inheriting whatever the directory above it happens to hold.
+    /// A directory in no repository is walked only inside home, where every ancestor is the
+    /// user's own; outside home there is no such assurance and nothing is read.
+    /// The home directory itself is never a project location, so the file there keeps its
+    /// machine-level meaning.
     ///
     /// Both paths are canonicalised first.
     /// Without that a `start` containing `..` satisfies a component-wise `starts_with` while its
@@ -304,23 +517,32 @@ impl Config {
     /// ahead of the user's own file, and `/tmp` is world-writable.
     #[must_use]
     pub fn project_paths(start: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-        let (Some(start), Some(home)) = (start, home) else {
+        let Some(start) = start else {
             return Vec::new();
         };
         // A path that cannot be resolved is not walked at all.
         // Failing closed costs a project file in an exotic setup; failing open costs the guarantee
         // this function exists for.
-        let (Ok(start), Ok(home)) = (start.canonicalize(), home.canonicalize()) else {
+        let Ok(start) = start.canonicalize() else {
             return Vec::new();
         };
-        if !start.starts_with(&home) {
-            return Vec::new();
+        let home = home.and_then(|home| home.canonicalize().ok());
+
+        let mut paths = Vec::new();
+        for dir in start.ancestors() {
+            if home.as_deref() == Some(dir) {
+                break;
+            }
+            paths.push(dir.join(FILE_NAME));
+            if dir.join(".git").exists() {
+                return paths;
+            }
         }
-        start
-            .ancestors()
-            .take_while(|dir| *dir != home)
-            .map(|dir| dir.join(FILE_NAME))
-            .collect()
+        // No repository root: only a walk that stayed inside home is trusted.
+        match home {
+            Some(home) if start.starts_with(&home) => paths,
+            _ => Vec::new(),
+        }
     }
 
     /// Load the machine's accounts, plus any project file's choice of which to use.
@@ -336,8 +558,9 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError::MissingExplicit`] when [`CONFIG_PATH_ENV`] names a file that is not
-    /// there, [`ConfigError::Unreadable`], [`ConfigError::Malformed`] or
-    /// [`ConfigError::WorldWritable`] for a file that is, and
+    /// there and [`ConfigError::RelativeExplicit`] when it names one relatively;
+    /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
+    /// [`ConfigError::InvalidName`] for a file that is there; and
     /// [`ConfigError::ProjectFileDefinesAccounts`] for a project file that describes an account
     /// rather than naming one.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
@@ -350,6 +573,9 @@ impl Config {
             .filter(|value| !value.is_empty())
         {
             let path = PathBuf::from(explicit);
+            if !path.is_absolute() {
+                return Err(ConfigError::RelativeExplicit { path });
+            }
             if !path.exists() {
                 return Err(ConfigError::MissingExplicit { path });
             }
@@ -357,7 +583,7 @@ impl Config {
         } else {
             let mut found = Self::default();
             for path in Self::machine_paths(host_env) {
-                if path.exists() {
+                if path.is_file() {
                     found = Self::read(&path)?;
                     break;
                 }
@@ -365,8 +591,14 @@ impl Config {
             found
         };
 
+        // The machine file keeps its role even when the walk passes over it, which happens when
+        // an explicit path points inside the checkout.
+        let machine_file = config
+            .source
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok());
         for path in Self::project_paths(Some(start), home.as_deref()) {
-            if !path.exists() {
+            if !path.is_file() || path.canonicalize().ok() == machine_file {
                 continue;
             }
             let project = Self::read(&path)?;
@@ -375,7 +607,14 @@ impl Config {
             }
             // Extended, not replaced: a repository pinning its Codex account must not silently
             // drop a machine-wide Claude default, which would spend a different subscription.
-            config.defaults.extend(project.defaults);
+            // A project entry that merely restates the machine's own default changes nothing,
+            // and is not counted as the project's choice.
+            for (vendor, chosen) in project.defaults {
+                if config.defaults.get(&vendor) != Some(&chosen) {
+                    config.project_defaults.insert(vendor.clone());
+                }
+                config.defaults.insert(vendor, chosen);
+            }
             config.project_source = Some(path);
             break;
         }
@@ -384,27 +623,109 @@ impl Config {
     }
 
     /// Read and parse one file.
+    ///
+    /// The file is opened once and inspected through that handle, so what is checked is what is
+    /// read: a link swapped between the check and the read would otherwise pass one file's
+    /// permissions off as another's.
     fn read(path: &Path) -> Result<Self, ConfigError> {
-        refuse_if_world_writable(path)?;
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Unreadable {
+        let unreadable = |source| ConfigError::Unreadable {
             path: path.to_path_buf(),
             source,
-        })?;
+        };
+        let mut file = std::fs::File::open(path).map_err(unreadable)?;
+        refuse_if_untrusted(path, &file)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(unreadable)?;
         let mut config: Self = toml::from_str(&text).map_err(|source| ConfigError::Malformed {
             path: path.to_path_buf(),
-            source,
+            message: without_quoted_values(source.message()),
+            offset: source.span().map(|span| span.start),
         })?;
+        config.validate(path)?;
+        config.canonicalise_env_names();
         config.source = Some(path.to_path_buf());
         Ok(config)
     }
 
-    /// The accounts defined for one vendor.
+    /// Spell every environment name the way the platform will read it.
+    ///
+    /// Windows reads names without regard to case, so `path` and `PATH` are one variable there
+    /// and every table in the file is spelled in upper case once it is read; everywhere else a
+    /// name is what it is.
+    /// Done once here, so every later comparison — withholding a credential, matching a request
+    /// against `request_env` — is a plain one.
+    fn canonicalise_env_names(&mut self) {
+        self.launch.canonicalise_env_names();
+        for accounts in self.accounts.values_mut() {
+            for account in accounts.values_mut() {
+                account.launch.canonicalise_env_names();
+                if let Some(name) = account.api_key_env.as_mut() {
+                    *name = canonical_env_name(name);
+                }
+                if let Some(name) = account.auth_token_env.as_mut() {
+                    *name = canonical_env_name(name);
+                }
+            }
+        }
+    }
+
+    /// Refuse a name the file uses that could never be used back.
+    ///
+    /// An alias is advertised to callers and passed back as an argument, so one the argument
+    /// parser would refuse must not be advertised; an environment name the operating system
+    /// would misread must not reach a child.
+    /// Vendor keys are left alone, so a file naming a vendor this build does not know still
+    /// loads.
+    fn validate(&self, path: &Path) -> Result<(), ConfigError> {
+        for (vendor, accounts) in &self.accounts {
+            for (alias, account) in accounts {
+                crate::delegate::AccountAlias::parse(alias).map_err(|_| {
+                    ConfigError::InvalidName {
+                        path: path.to_path_buf(),
+                        what: "the account alias",
+                        value: alias.clone(),
+                        reason: "may only contain letters, digits, `-`, `_` and `.`",
+                    }
+                })?;
+                if account.is_empty() {
+                    return Err(ConfigError::InvalidName {
+                        path: path.to_path_buf(),
+                        what: "the account",
+                        value: format!("{vendor}.{alias}"),
+                        reason: "is empty; give it a `config_dir`, an `api_key`, an \
+                                 `api_key_env` or a `base_url`",
+                    });
+                }
+                account.launch.validate(path)?;
+                for name in [&account.api_key_env, &account.auth_token_env]
+                    .into_iter()
+                    .flatten()
+                {
+                    check_env_name(name).map_err(|reason| ConfigError::InvalidName {
+                        path: path.to_path_buf(),
+                        what: "the environment variable",
+                        value: name.clone(),
+                        reason,
+                    })?;
+                }
+            }
+        }
+        for chosen in self.defaults.values().filter_map(|d| d.account.as_ref()) {
+            crate::delegate::AccountAlias::parse(chosen).map_err(|_| ConfigError::InvalidName {
+                path: path.to_path_buf(),
+                what: "the default account",
+                value: chosen.clone(),
+                reason: "may only contain letters, digits, `-`, `_` and `.`",
+            })?;
+        }
+        self.launch.validate(path)
+    }
+
+    /// The accounts defined for one vendor, which may be none.
     #[must_use]
-    pub fn accounts(&self, vendor: Vendor) -> BTreeMap<String, Account> {
-        self.accounts
-            .get(vendor.program())
-            .cloned()
-            .unwrap_or_default()
+    pub fn accounts(&self, vendor: Vendor) -> &BTreeMap<String, Account> {
+        static NONE: BTreeMap<String, Account> = BTreeMap::new();
+        self.accounts.get(vendor.program()).unwrap_or(&NONE)
     }
 
     /// One account, by alias.
@@ -413,49 +734,80 @@ impl Config {
         self.accounts.get(vendor.program())?.get(alias)
     }
 
-    /// The account to use for one vendor when the caller names none.
+    /// The account to use for one vendor when the caller names none, and which file chose it.
+    ///
+    /// A project file may choose which of the machine's accounts pays; it may not, through that
+    /// choice, switch on anything else the account is configured with.
+    /// Whoever acts on a default needs to know which file did the choosing, and this is the one
+    /// place that is decided.
     #[must_use]
-    pub fn default_account(&self, vendor: Vendor) -> Option<&str> {
-        self.defaults
+    pub fn default_account(&self, vendor: Vendor) -> Option<DefaultAccount<'_>> {
+        let alias = self
+            .defaults
             .get(vendor.program())
-            .and_then(|d| d.account.as_deref())
+            .and_then(|d| d.account.as_deref())?;
+        let chosen_by = match (
+            self.project_defaults.contains(vendor.program()),
+            self.project_source.as_deref(),
+        ) {
+            (true, Some(path)) => ChosenBy::Project(path),
+            _ => ChosenBy::Machine(self.source.as_deref()),
+        };
+        Some(DefaultAccount { alias, chosen_by })
     }
 
     /// Every alias defined for one vendor, for an error message or a tool description.
     #[must_use]
     pub fn alias_names(&self, vendor: Vendor) -> Vec<String> {
-        self.accounts
-            .get(vendor.program())
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default()
+        self.accounts(vendor).keys().cloned().collect()
     }
 }
 
-/// Refuse a configuration file that other users can write.
+/// Refuse a configuration file that another user owns or could write.
 ///
 /// It can name commands, endpoints and credentials, so a writable file is an injection point
 /// rather than merely an exposed one — the same reason `ssh` refuses a group-writable config.
+/// Ownership matters for the same reason: a project walk can pass through directories other
+/// users write to, and a file they own with tidy permissions is still theirs.
 /// Readability is not checked: `0644` is normal inside a container image, and failing a delegation
 /// over it would cost a turn for no gain.
 #[cfg(unix)]
-fn refuse_if_world_writable(path: &Path) -> Result<(), ConfigError> {
+fn refuse_if_untrusted(path: &Path, file: &std::fs::File) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(metadata) = file.metadata() else {
         // An unreadable file is reported by the read that follows, with a better message.
         return Ok(());
     };
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(ConfigError::WorldWritable {
+    let refuse = |problem| {
+        Err(ConfigError::Untrusted {
             path: path.to_path_buf(),
-        });
+            problem,
+        })
+    };
+    if !metadata.is_file() {
+        return refuse("is not a regular file");
+    }
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return refuse("is owned by another user");
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return refuse("is writable by other users");
     }
     Ok(())
 }
 
-/// Permission bits do not carry the same meaning on Windows, so the check is skipped there.
+/// Permission bits and ownership do not carry the same meaning on Windows, so only the shape is
+/// checked there.
 #[cfg(not(unix))]
-fn refuse_if_world_writable(_path: &Path) -> Result<(), ConfigError> {
+fn refuse_if_untrusted(path: &Path, file: &std::fs::File) -> Result<(), ConfigError> {
+    if file.metadata().is_ok_and(|metadata| !metadata.is_file()) {
+        return Err(ConfigError::Untrusted {
+            path: path.to_path_buf(),
+            problem: "is not a regular file",
+        });
+    }
     Ok(())
 }
 

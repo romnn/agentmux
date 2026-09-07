@@ -22,12 +22,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Secret};
+use crate::config::{Account, ChosenBy, Config, DefaultAccount, Secret};
 
 /// A delegate argument that could not be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DelegateError {
-    /// A model identifier or reasoning effort was empty, over-long, or not argv-safe.
+    /// A model identifier, reasoning effort, alias or environment name was empty, over-long, or
+    /// not safe to hand to a child process.
     #[error("{field} {reason}: {value:?}")]
     Argument {
         /// Which argument was rejected.
@@ -41,6 +42,20 @@ pub enum DelegateError {
     /// The child environment cannot be built because the host environment lacks something.
     #[error("cannot build the delegate environment: {0}")]
     Environment(String),
+
+    /// An option that belongs to one vendor was given for the other.
+    #[error(
+        "`{option}` belongs to the {owner} delegate, which is the only one that has it; drop it \
+         for a {vendor} consultation"
+    )]
+    NotForVendor {
+        /// The option that was set.
+        option: &'static str,
+        /// The vendor it belongs to.
+        owner: Vendor,
+        /// The vendor that was asked for.
+        vendor: Vendor,
+    },
 
     /// The requested account alias is not defined by this machine's configuration.
     ///
@@ -103,6 +118,11 @@ fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
 /// own configuration directory and "use my personal account, with its hooks" is one thought rather
 /// than two.
 /// With neither, the answer is isolation: it is the safe default and needs no configuration.
+///
+/// An account chosen by a *project* file does not get to decide.
+/// Such a file arrives with a `git clone`, and while it may say which of the operator's accounts
+/// pays, letting it also switch on that account's hooks and MCP servers would make a checkout a
+/// third way to change isolation, which the operator was promised is imposed by argument alone.
 fn resolve_isolation(
     explicit: Option<Isolation>,
     vendor: Vendor,
@@ -112,11 +132,19 @@ fn resolve_isolation(
     if let Some(isolation) = explicit {
         return isolation;
     }
-    let alias = alias
-        .map(AccountAlias::as_str)
-        .or_else(|| config.default_account(vendor));
-    let inherits = alias
-        .and_then(|alias| config.account(vendor, alias))
+    let alias = match alias {
+        Some(alias) => alias.as_str(),
+        None => match config.default_account(vendor) {
+            Some(DefaultAccount {
+                chosen_by: ChosenBy::Project(_),
+                ..
+            })
+            | None => return Isolation::Isolated,
+            Some(default) => default.alias,
+        },
+    };
+    let inherits = config
+        .account(vendor, alias)
         .and_then(|account| account.inherit_settings)
         .unwrap_or(false);
     if inherits {
@@ -391,6 +419,12 @@ pub enum Vendor {
 }
 
 impl Vendor {
+    /// Every vendor, for the places that fan out over all of them.
+    ///
+    /// The one list, so that a third vendor cannot be added to the enum and left out of `quota`,
+    /// `accounts` or the server's roster: those iterate this rather than spelling the set again.
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
     /// The executable name, as found on `PATH`.
     #[must_use]
     pub fn program(self) -> &'static str {
@@ -403,18 +437,17 @@ impl Vendor {
 
 impl std::fmt::Display for Vendor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        })
+        f.write_str(self.program())
     }
 }
 
 /// Who is being consulted, and on what terms.
 ///
-/// Each variant carries only what that vendor accepts.
-/// A Codex consultation with a Claude account, or a Claude consultation with a sandbox mode, does
-/// not compile.
+/// Each variant carries only what that vendor accepts: a Claude consultation with a sandbox mode
+/// does not compile.
+/// The flat shapes a tool schema or a command line present are turned into this by
+/// [`Delegate::from_parts`], which is where a vendor-specific option given for the other vendor
+/// is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "vendor", rename_all = "snake_case")]
 pub enum Delegate {
@@ -450,6 +483,52 @@ pub enum Delegate {
 }
 
 impl Delegate {
+    /// Build a delegate from the flat shape a tool schema or a command line presents.
+    ///
+    /// This is the one parse step both front ends share, so they cannot come to accept
+    /// different things.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::Argument`] when the model, effort or alias is not argv-safe, and
+    /// [`DelegateError::NotForVendor`] when `sandbox` is given for a Claude consultation.
+    pub fn from_parts(
+        vendor: Vendor,
+        model: &str,
+        effort: &str,
+        account: Option<&str>,
+        isolation: Option<Isolation>,
+        sandbox: Option<CodexSandbox>,
+    ) -> Result<Self, DelegateError> {
+        let model = ModelId::parse(model)?;
+        let effort = Effort::parse(effort)?;
+        let account = account.map(AccountAlias::parse).transpose()?;
+        match vendor {
+            Vendor::Claude => {
+                if sandbox.is_some() {
+                    return Err(DelegateError::NotForVendor {
+                        option: "sandbox",
+                        owner: Vendor::Codex,
+                        vendor,
+                    });
+                }
+                Ok(Self::Claude {
+                    model,
+                    effort,
+                    account,
+                    isolation,
+                })
+            }
+            Vendor::Codex => Ok(Self::Codex {
+                model,
+                effort,
+                sandbox: sandbox.unwrap_or_default(),
+                account,
+                isolation,
+            }),
+        }
+    }
+
     /// Which CLI this delegate runs.
     #[must_use]
     pub fn vendor(&self) -> Vendor {
@@ -582,8 +661,9 @@ pub struct TurnPlan<'a> {
     ///
     /// Applied last, over the machine and account layers, so a one-off can override a standing
     /// setting.
-    /// It may not name a credential or an endpoint: those decide which identity pays, and a
-    /// request arriving from a delegating agent must not be able to redirect that.
+    /// Only names the machine's configuration lists under `request_env` are accepted: a request
+    /// arriving from a delegating agent must not be able to decide which identity pays, which
+    /// program runs, or what that program loads before it reads a single setting.
     pub extra_env: &'a BTreeMap<String, String>,
 }
 
@@ -704,15 +784,24 @@ pub const DELEGATE_MARKER: &str = "AGENTMUX_DELEGATE";
 
 /// Credential variables the Claude CLI reads.
 ///
-/// Forwarded for the work account, withheld from the personal account so it authenticates as
+/// Forwarded when no account is named, withheld when one is, so the account authenticates as
 /// itself rather than as whatever key is exported.
+///
+/// `CLAUDE_CONFIG_DIR` is deliberately not among them, although it is where a login lives.
+/// The process that launches agentmux is usually a Claude Code session, and that variable is how
+/// such a session names its *own* identity; a delegate started from it must not quietly become a
+/// second session on the same login.
+/// A no-account Claude delegate therefore runs against the CLI's default directory, and any other
+/// login is reached by naming an account.
+/// Codex is the other way round: `CODEX_HOME` is forwarded, because a Codex session does not set
+/// it for itself and it is the only way a relocated Codex login is found at all.
 const CLAUDE_CREDENTIAL_ALLOWLIST: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
 ];
 
-/// Credential variables the Codex CLI reads.
+/// Credential variables the Codex CLI reads, including where its login is kept.
 const CODEX_CREDENTIAL_ALLOWLIST: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"];
 
 /// The empty MCP configuration handed to the Claude delegate.
@@ -741,61 +830,53 @@ impl Delegate {
     ///
     /// # Errors
     ///
-    /// Returns [`DelegateError`] only for a personal-account consultation whose config directory
-    /// cannot be located, which means `HOME` is absent from the host environment.
+    /// Returns [`DelegateError::UnknownAccount`] for an alias the configuration does not define,
+    /// [`DelegateError::AccountDirMissing`] for one whose directory is not there,
+    /// [`DelegateError::Environment`] for an account that is empty, reads a secret from a host
+    /// variable that is not set, or is otherwise unusable, and [`DelegateError::Argument`] or
+    /// [`DelegateError::Environment`] for a request environment entry the configuration does not
+    /// allow.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
         config: &Config,
     ) -> Result<Invocation, DelegateError> {
-        let mut env: BTreeMap<String, String> = BASE_ALLOWLIST
-            .iter()
-            .chain(PLATFORM_ALLOWLIST.iter())
-            .filter_map(|key| {
-                host_env
-                    .get(*key)
-                    .map(|value| ((*key).to_owned(), value.clone()))
-            })
-            .collect();
-        // A delegate is a non-interactive child with no terminal.
-        // Saying so keeps CLIs from emitting cursor control sequences and colour into the file
-        // that captures their event stream, and `CI` is the conventional way to ask a tool for
-        // its non-interactive behaviour.
-        env.insert("TERM".to_owned(), "dumb".to_owned());
-        env.insert("NO_COLOR".to_owned(), "1".to_owned());
-        env.insert("CI".to_owned(), "1".to_owned());
-
-        // The machine-wide layer, before any account chooses an identity.
-        config.launch.apply(&mut env, host_env);
+        let Identity {
+            mut env,
+            account,
+            chosen_by_project,
+        } = resolve_identity(self.vendor(), self.account(), config, host_env)?;
+        let isolation = self.resolved_isolation(config);
 
         let args = match self {
-            Self::Claude {
-                model,
-                effort,
-                account,
-                isolation,
-            } => {
-                apply_account(&mut env, Vendor::Claude, account.as_ref(), config, host_env)?;
-                let isolation =
-                    resolve_isolation(*isolation, Vendor::Claude, account.as_ref(), config);
-                claude_args(model, effort, plan, isolation)
-            }
+            Self::Claude { model, effort, .. } => claude_args(model, effort, plan, isolation),
             Self::Codex {
                 model,
                 effort,
                 sandbox,
-                account,
-                isolation,
-            } => {
-                apply_account(&mut env, Vendor::Codex, account.as_ref(), config, host_env)?;
-                let isolation =
-                    resolve_isolation(*isolation, Vendor::Codex, account.as_ref(), config);
-                codex_args(model, effort, *sandbox, plan, isolation)
-            }
+                ..
+            } => codex_args(model, effort, *sandbox, plan, isolation),
         };
 
-        apply_request_env(&mut env, plan.extra_env)?;
+        // An account's own `request_env` counts only when the account was the machine's choice
+        // or the caller's.
+        // A checkout that selects an account is allowed to say which account pays, and nothing
+        // more; the names a request may set are policy the same checkout's instructions could
+        // otherwise steer a caller into using.
+        let allowed: Vec<&str> = config
+            .launch
+            .request_env
+            .iter()
+            .chain(
+                account
+                    .filter(|_| !chosen_by_project)
+                    .into_iter()
+                    .flat_map(|a| a.launch.request_env.iter()),
+            )
+            .map(String::as_str)
+            .collect();
+        apply_request_env(&mut env, plan.extra_env, &allowed)?;
 
         // The recursion guard, set last so no layer can change even its value.
         // An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
@@ -813,76 +894,226 @@ impl Delegate {
     }
 }
 
-/// The environment variables a vendor reads for credentials, in the order they are documented.
+impl Delegate {
+    /// The environment that decides which identity this delegate runs as.
+    ///
+    /// The machine's launch layer and the account's own, over the base every child starts from,
+    /// and nothing a request adds.
+    /// Anything that needs to know what a delegate would authenticate as — the quota probe, the
+    /// search for a Codex session's own record — reads it from here, so it cannot disagree with
+    /// the launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Delegate::invocation`] for the account.
+    pub fn identity_env(
+        &self,
+        host_env: &BTreeMap<String, String>,
+        config: &Config,
+    ) -> Result<BTreeMap<String, String>, DelegateError> {
+        Ok(resolve_identity(self.vendor(), self.account(), config, host_env)?.env)
+    }
+}
+
+/// The layers below a request: who the delegate is, and the environment that makes it so.
+pub(crate) struct Identity<'c> {
+    /// The environment, complete but for the request's own names and the recursion marker.
+    pub(crate) env: BTreeMap<String, String>,
+    /// The account that was applied, when one was.
+    pub(crate) account: Option<&'c Account>,
+    /// Whether that account was the checkout's choice rather than the machine's or the caller's.
+    pub(crate) chosen_by_project: bool,
+}
+
+/// Resolve the identity a delegate of one vendor runs as, with or without a named account.
+///
+/// # Errors
+///
+/// Returns the account errors documented on [`Delegate::invocation`].
+pub(crate) fn resolve_identity<'c>(
+    vendor: Vendor,
+    alias: Option<&AccountAlias>,
+    config: &'c Config,
+    host_env: &BTreeMap<String, String>,
+) -> Result<Identity<'c>, DelegateError> {
+    let mut env = base_env(host_env);
+    // The machine-wide layer, before any account chooses an identity.
+    config.launch.apply(&mut env, host_env);
+    let selection = select_alias(vendor, alias, config)?;
+    // Whether the checkout's file names this alias as the default, whoever else did: a
+    // consultation records the alias it resolved to, so a follow-up asks for it by name, and a
+    // caller told by the checkout's own instructions to name it is the checkout's choice too.
+    let chosen_by_project = selection.as_ref().is_some_and(|selection| {
+        matches!(
+            config.default_account(vendor),
+            Some(DefaultAccount {
+                alias,
+                chosen_by: ChosenBy::Project(_),
+            }) if alias == selection.alias.as_str()
+        )
+    });
+    let account = apply_account(&mut env, vendor, selection, config, host_env)?;
+    Ok(Identity {
+        env,
+        account,
+        chosen_by_project,
+    })
+}
+
+/// The environment every child starts from: the host's path, home, locale, proxy and CA settings,
+/// plus the marks of a non-interactive terminal.
+///
+/// Built as an allowlist from empty rather than by filtering a denylist.
+/// A denylist forgets the variable that was added last week; an allowlist cannot leak a variable
+/// nobody thought about.
+/// Shared with the quota probes, so a delegate and a probe that must reach the same network
+/// cannot quietly diverge in what they are given to reach it with.
+#[must_use]
+pub(crate) fn base_env(host_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    // Looked up and carried under the platform's own spelling of each name, which is how the
+    // captured host environment spells them too.
+    let mut env: BTreeMap<String, String> = BASE_ALLOWLIST
+        .iter()
+        .chain(PLATFORM_ALLOWLIST.iter())
+        .map(|key| crate::config::canonical_env_name(key))
+        .filter_map(|key| host_env.get(&key).map(|value| (key, value.clone())))
+        .collect();
+    // A delegate is a non-interactive child with no terminal.
+    // Saying so keeps CLIs from emitting cursor control sequences and colour into the file
+    // that captures their event stream, and `CI` is the conventional way to ask a tool for
+    // its non-interactive behaviour.
+    env.insert("TERM".to_owned(), "dumb".to_owned());
+    env.insert("NO_COLOR".to_owned(), "1".to_owned());
+    env.insert("CI".to_owned(), "1".to_owned());
+    env
+}
+
+/// The environment variables a vendor reads for its identity, in the order they are documented.
 ///
 /// Forwarded from the host only when no account alias was chosen.
 /// Choosing an alias means "authenticate as this identity", and a key exported in the launching
 /// agent's own shell would otherwise win over it silently — the caller would believe it had
 /// switched accounts while spending the other one.
-fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
+pub(crate) fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
     match vendor {
         Vendor::Claude => CLAUDE_CREDENTIAL_ALLOWLIST,
         Vendor::Codex => CODEX_CREDENTIAL_ALLOWLIST,
     }
 }
 
-/// Names of the variables an account's fields map onto, per vendor.
-struct CredentialVars {
-    config_dir: &'static str,
-    api_key: &'static str,
-    base_url: &'static str,
+/// Whether a name is one either CLI reads a credential from, which a named account withholds.
+#[must_use]
+pub fn is_credential_name(name: &str) -> bool {
+    Vendor::ALL
+        .iter()
+        .any(|vendor| credential_keys(*vendor).contains(&name))
 }
 
-fn credential_vars(vendor: Vendor) -> CredentialVars {
+/// Names of the variables an account's fields map onto, per vendor.
+pub(crate) struct CredentialVars {
+    /// The configuration directory, and so the login: `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
+    pub(crate) config_dir: &'static str,
+    /// The API key, which both CLIs prefer over a stored login.
+    pub(crate) api_key: &'static str,
+    /// A bearer token, which only the Claude CLI reads.
+    pub(crate) auth_token: Option<&'static str>,
+    /// The endpoint, whose presence means the vendor's own window is not what is being spent.
+    pub(crate) base_url: &'static str,
+}
+
+pub(crate) fn credential_vars(vendor: Vendor) -> CredentialVars {
     match vendor {
         Vendor::Claude => CredentialVars {
             config_dir: "CLAUDE_CONFIG_DIR",
             api_key: "ANTHROPIC_API_KEY",
+            auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
             base_url: "ANTHROPIC_BASE_URL",
         },
         Vendor::Codex => CredentialVars {
             config_dir: "CODEX_HOME",
             api_key: "OPENAI_API_KEY",
+            auth_token: None,
             base_url: "OPENAI_BASE_URL",
         },
     }
+}
+
+/// Who chose the alias a launch resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chooser {
+    Caller,
+    Machine,
+    Project,
+}
+
+/// Which alias a launch resolves to, and who chose it.
+struct Selection {
+    alias: AccountAlias,
+    chooser: Chooser,
+}
+
+/// The alias a launch resolves to: the caller's, else the configured default, else none.
+///
+/// A caller that names no account gets the machine's or the checkout's chosen default, which is
+/// the only thing a project file is allowed to say and therefore the only reason it exists.
+fn select_alias(
+    vendor: Vendor,
+    requested: Option<&AccountAlias>,
+    config: &Config,
+) -> Result<Option<Selection>, DelegateError> {
+    if let Some(alias) = requested {
+        return Ok(Some(Selection {
+            alias: alias.clone(),
+            chooser: Chooser::Caller,
+        }));
+    }
+    let Some(default) = config.default_account(vendor) else {
+        return Ok(None);
+    };
+    Ok(Some(Selection {
+        alias: AccountAlias::parse(default.alias)?,
+        chooser: match default.chosen_by {
+            ChosenBy::Machine(_) => Chooser::Machine,
+            ChosenBy::Project(_) => Chooser::Project,
+        },
+    }))
 }
 
 /// Put one account's credentials into the child environment.
 ///
 /// With no alias the host's own credential variables are forwarded and the CLI uses its default
 /// configuration, which is what a machine with a single account of that vendor needs.
-fn apply_account(
+/// Returns the account that was applied, when one was.
+fn apply_account<'c>(
     env: &mut BTreeMap<String, String>,
     vendor: Vendor,
-    alias: Option<&AccountAlias>,
-    config: &Config,
+    selection: Option<Selection>,
+    config: &'c Config,
     host_env: &BTreeMap<String, String>,
-) -> Result<(), DelegateError> {
-    // A caller that names no account gets the machine's or the checkout's chosen default, which is
-    // the only thing a project file is allowed to say and therefore the only reason it exists.
-    //
-    // `selected_by` records the file that made the choice, so an unresolvable default sends the
-    // reader to the file that named it rather than to their own tool call.
-    let (alias, selected_by) = if let Some(alias) = alias {
-        (alias.clone(), None)
-    } else if let Some(name) = config.default_account(vendor) {
-        (
-            AccountAlias::parse(name)?,
-            config
-                .project_source
-                .clone()
-                .or_else(|| config.source.clone()),
-        )
-    } else {
+) -> Result<Option<&'c Account>, DelegateError> {
+    let Some(Selection { alias, chooser }) = selection else {
         for key in credential_keys(vendor) {
             if let Some(value) = host_env.get(*key) {
                 env.insert((*key).to_owned(), value.clone());
             }
         }
-        return Ok(());
+        return Ok(None);
     };
+    // Withholding is the other half of the forwarding above, not an absence.
+    // The machine's `[launch]` layer runs before this and may forward the host's own key; left
+    // in place it would outrank the account's login and the caller would believe it had switched
+    // accounts while spending the other one.
+    for key in credential_keys(vendor) {
+        env.remove(*key);
+    }
 
+    // `selected_by` names the file that made the choice, so an unresolvable default sends the
+    // reader to the file that named it rather than to their own tool call.
+    let selected_by = match chooser {
+        Chooser::Project => config.project_source.clone(),
+        Chooser::Machine => config.source.clone(),
+        Chooser::Caller => None,
+    };
     let account =
         config
             .account(vendor, alias.as_str())
@@ -893,7 +1124,6 @@ fn apply_account(
                 config_path: config.source.clone(),
                 selected_by,
             })?;
-
     if account.is_empty() {
         return Err(DelegateError::Environment(format!(
             "the {vendor} account `{alias}` is configured but empty. Give it a `config_dir`, an \
@@ -901,8 +1131,21 @@ fn apply_account(
         )));
     }
 
+    apply_credentials(env, vendor, &alias, account, host_env)?;
+    account.launch.apply(env, host_env);
+    Ok(Some(account))
+}
+
+/// Map one account's fields onto the variables its CLI reads.
+fn apply_credentials(
+    env: &mut BTreeMap<String, String>,
+    vendor: Vendor,
+    alias: &AccountAlias,
+    account: &Account,
+    host_env: &BTreeMap<String, String>,
+) -> Result<(), DelegateError> {
     let vars = credential_vars(vendor);
-    let home = host_env.get("HOME").map(std::path::PathBuf::from);
+    let home = crate::config::home_dir(host_env);
 
     if let Some(dir) = &account.config_dir {
         let resolved = crate::config::expand_tilde(dir, home.as_deref());
@@ -927,7 +1170,7 @@ fn apply_account(
         account.api_key_env.as_deref(),
         host_env,
         vendor,
-        &alias,
+        alias,
         "api_key",
     )? {
         env.insert(vars.api_key.to_owned(), key);
@@ -938,104 +1181,72 @@ fn apply_account(
         account.auth_token_env.as_deref(),
         host_env,
         vendor,
-        &alias,
+        alias,
         "auth_token",
     )? {
-        if vendor == Vendor::Codex {
+        let Some(name) = vars.auth_token else {
             return Err(DelegateError::Environment(format!(
-                "the codex account `{alias}` sets an auth token, which only the claude CLI reads. \
-                 Use `api_key` or `api_key_env` instead."
+                "the {vendor} account `{alias}` sets an auth token, which only the claude CLI \
+                 reads. Use `api_key` or `api_key_env` instead."
             )));
-        }
-        env.insert("ANTHROPIC_AUTH_TOKEN".to_owned(), token);
+        };
+        env.insert(name.to_owned(), token);
     }
 
     if let Some(base) = &account.base_url {
         env.insert(vars.base_url.to_owned(), base.clone());
     }
-
-    account.launch.apply(env, host_env);
     Ok(())
 }
 
 /// Apply the environment the caller asked for on this one consultation.
 ///
-/// Refuses any name that decides which identity runs.
-/// The caller here is frequently another model acting on text it was given, and a request that
-/// could set `ANTHROPIC_BASE_URL` could send the account's credentials somewhere else.
-/// Those names belong in the machine's own configuration, which no request can reach.
+/// Accepts only names the machine's configuration lists under `request_env`, and nothing by
+/// default.
+/// The caller here is frequently another model acting on text it was given.
+/// A request that could set `ANTHROPIC_BASE_URL` could send the account's credentials somewhere
+/// else; one that could set `PATH` could run a program of its choosing with them; one that could
+/// set `NODE_OPTIONS` or `LD_PRELOAD` could run code inside the CLI before it reads a single
+/// setting.
+/// No list of names to refuse stays complete against that, so the operator lists the names to
+/// accept instead, in a file no request can reach.
 fn apply_request_env(
     env: &mut BTreeMap<String, String>,
     requested: &BTreeMap<String, String>,
+    allowed: &[&str],
 ) -> Result<(), DelegateError> {
     for (name, value) in requested {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
+        crate::config::check_env_name(name).map_err(|reason| DelegateError::Argument {
+            field: "env",
+            reason,
+            value: name.clone(),
+        })?;
+        if value.contains('\0') {
             return Err(DelegateError::Argument {
                 field: "env",
-                reason: "is not a usable environment variable name",
+                reason: "has a value containing a NUL byte, which no environment can carry",
                 value: name.clone(),
             });
         }
-        if is_reserved(name) {
+        // Spelled the way the platform reads it, like every name in the allowlist, so `path`
+        // cannot slip past an allowlist that says `PATH` is not on it where the two are one
+        // variable.
+        let canonical = crate::config::canonical_env_name(name);
+        if !allowed.contains(&canonical.as_str()) {
             return Err(DelegateError::Environment(format!(
-                "`{name}` is part of how agentmux decides which account a consultation \
-                 authenticates as, which program runs and how it reaches the network, so it \
-                 cannot be set per request. Put it in an account or in `[launch]` in \
-                 agentmux.toml, which no request can reach."
+                "`{name}` cannot be set per request: a request may only set the names \
+                 agentmux.toml lists under `request_env`{}. Standing settings belong in an \
+                 account or in `[launch]`, which no request can reach.",
+                if allowed.is_empty() {
+                    ", and this machine lists none".to_owned()
+                } else {
+                    format!(" ({})", allowed.join(", "))
+                }
             )));
         }
-        env.insert(name.clone(), value.clone());
+        env.insert(canonical, value.clone());
     }
     Ok(())
-}
-
-/// Whether a variable name is agentmux's to decide rather than a caller's.
-///
-/// Derived from the allowlists rather than listed by hand, because a hand-kept denylist forgets
-/// the name that was added last week — the same reason the child environment is an allowlist in
-/// the first place.
-///
-/// The set is wider than credentials alone, and every part of it is load-bearing.
-/// `PATH` selects which binary the child actually executes, so a caller able to set it runs a
-/// program of its choosing with the resolved account's credentials in its environment.
-/// `HOME` relocates the default account's identity.
-/// The proxy and CA variables together route every request through a chosen host and make that
-/// host's certificate trusted, which is credential capture without touching a credential.
-///
-/// Both vendors' names are refused regardless of which vendor is being launched, so the answer
-/// does not depend on a host variable happening to be exported.
-fn is_reserved(name: &str) -> bool {
-    // A vendor's own namespace, refused wholesale rather than name by name.
-    // `CLAUDE_CODE_USE_BEDROCK` reroutes a consultation to a caller-supplied Bedrock endpoint, and
-    // matching the prefix closes that without agentmux having to learn what Bedrock is — the same
-    // reason it keeps no roster of model identifiers.
-    const RESERVED_PREFIXES: &[&str] = &[
-        "ANTHROPIC_",
-        "CLAUDE_",
-        "OPENAI_",
-        "CODEX_",
-        "AWS_",
-        "GOOGLE_",
-        "GEMINI_",
-        "VERTEX_",
-        "AZURE_",
-        // agentmux's own namespace, so a request cannot reach the recursion marker or point a
-        // nested agentmux at a configuration file of the caller's choosing.
-        // Only relevant once a delegate inherits its account's MCP servers, which is exactly when
-        // a nested agentmux becomes reachable.
-        "AGENTMUX_",
-    ];
-
-    BASE_ALLOWLIST.contains(&name)
-        || PLATFORM_ALLOWLIST.contains(&name)
-        || CLAUDE_CREDENTIAL_ALLOWLIST.contains(&name)
-        || CODEX_CREDENTIAL_ALLOWLIST.contains(&name)
-        || matches!(name, "TERM" | "NO_COLOR" | "CI")
-        || RESERVED_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        // A proxy variable is spelled either case, and both spellings are read.
-        || name.to_ascii_uppercase().contains("PROXY")
 }
 
 /// Resolve a credential written into the file, or named as a host variable.
