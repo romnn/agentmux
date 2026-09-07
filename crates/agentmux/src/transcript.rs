@@ -344,6 +344,14 @@ pub struct Turn {
     /// question is asked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+    /// The model identifier the vendor itself reported using, when it reported one.
+    ///
+    /// A requested identifier can be an alias the vendor expands — `sonnet` arrives as
+    /// `claude-sonnet-5` — so the two are kept apart rather than one overwriting the other.
+    /// agentmux still keeps no roster: this is only what the stream said, and a vendor that says
+    /// nothing leaves it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
     /// Whether this turn was meant to continue an earlier session but did not.
     ///
     /// Both CLIs accept a resume against a session they no longer hold, and answer from an empty
@@ -385,6 +393,7 @@ impl Turn {
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
             rate_limit: None,
+            resolved_model: None,
             broke_continuity: false,
             recovered: None,
         }
@@ -518,6 +527,18 @@ impl Transcript {
             }
         }
         total
+    }
+
+    /// The model the vendor last reported running, or `None` when no turn reported one.
+    ///
+    /// The newest turn wins, because a follow-up may be answered by a different model than the
+    /// turn before it and the caller is asking about the answer just received.
+    #[must_use]
+    pub fn resolved_model(&self) -> Option<&str> {
+        self.turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.resolved_model.as_deref())
     }
 
     /// Total reported dollar cost, or `None` when no turn reported one.
@@ -672,8 +693,9 @@ fn accounting(usage: &Usage, cost_usd: Option<f64>) -> String {
     if let Some(reasoning) = usage.reasoning_output_tokens.filter(|count| *count > 0) {
         parts.push(format!("{reasoning} reasoning"));
     }
+    // Priced at list from the token counts, which is not what a subscription account is charged.
     if let Some(cost) = cost_usd {
-        parts.push(format!("${cost:.4}"));
+        parts.push(format!("${cost:.4} list price"));
     }
     if parts.is_empty() {
         String::new()

@@ -447,6 +447,13 @@ pub struct RunStatus {
     pub usage: Usage,
     /// Reported dollar cost so far, where the vendor reports one.
     pub cost_usd: Option<f64>,
+    /// The model identifier the vendor reported running, where it reported one.
+    ///
+    /// Kept beside the requested identifier rather than replacing it: a vendor may expand an alias
+    /// into a full identifier, and a caller comparing two consultations needs to see which of the
+    /// two it is looking at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
     /// Event types the parser met but does not model.
     pub unrecognised: UnrecognisedEvents,
     /// What it means that a hook reopened a finished turn, when one did.
@@ -1218,6 +1225,7 @@ impl RunStore {
             message_count: state.transcript.messages().count(),
             usage: state.transcript.usage(),
             cost_usd: state.transcript.cost_usd(),
+            resolved_model: state.transcript.resolved_model().map(ToOwned::to_owned),
             unrecognised: state.transcript.unrecognised(),
             hook_reopening: HookReopening::of(
                 state.transcript.was_reopened_by_hook(),

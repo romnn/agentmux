@@ -73,6 +73,9 @@ struct MessageEvent {
 struct MessageBody {
     #[serde(default)]
     content: Content,
+    /// The model the vendor actually ran, which need not be the identifier that was asked for.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// `content` is a bare string on some events and a block list on others.
@@ -298,6 +301,11 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 };
                 if event.parent_tool_use_id.is_some() {
                     continue;
+                }
+                // The first message that names one is kept: later messages in a turn repeat it,
+                // and a subagent's model was skipped above with the rest of its conversation.
+                if turn.resolved_model.is_none() {
+                    turn.resolved_model.clone_from(&event.message.model);
                 }
                 let inspected = event.message.content.inspect();
                 for kind in inspected.unknown {
