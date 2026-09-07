@@ -148,6 +148,45 @@ fn a_follow_up_appends_a_turn_to_the_same_run() -> Result<()> {
     Ok(())
 }
 
+/// The transcript length taken before a follow-up is exactly where the new turn begins.
+///
+/// This is what lets `follow_up` page the new turn alone instead of re-sending every earlier one
+/// to a caller that already has them.
+/// The rendered transcript is append-only, so bytes measured before the turn is claimed cut
+/// between turns rather than through the middle of one.
+///
+/// Were that to stop holding, a follow-up would answer with the tail of the previous turn glued
+/// to the front of the new one.
+#[gtest]
+fn the_bytes_before_a_follow_up_cut_cleanly_between_turns() -> Result<()> {
+    let second_turn = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"turn.started"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"BANANAPHONE"}}
+        {"type":"turn.completed","usage":{"input_tokens":19000,"output_tokens":8}}
+    "#};
+    let h = harness([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(second_turn),
+    ])?;
+
+    let started = h.store.start(&request(
+        codex()?,
+        "Remember BANANAPHONE. Reply FIXTURE_OK.",
+    ))?;
+    let before = started.transcript_bytes;
+
+    h.store
+        .follow_up(&started.run_id, "What was the secret word?")?;
+    let page = h.store.page(&started.run_id, before, 1_000_000)?;
+
+    assert_that!(page.text, contains_substring("Turn 2 — question"));
+    assert_that!(page.text, contains_substring("BANANAPHONE"));
+    assert_that!(page.text, not(contains_substring("Turn 1 — question")));
+    assert_that!(page.text, not(contains_substring("FIXTURE_OK")));
+    Ok(())
+}
+
 /// A follow-up must not silently start a fresh conversation.
 #[gtest]
 fn a_follow_up_is_refused_when_there_is_nothing_to_resume() -> Result<()> {

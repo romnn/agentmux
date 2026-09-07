@@ -173,6 +173,22 @@ pub struct FollowUpParams {
     #[serde(default)]
     #[schemars(with = "u64")]
     pub wait_seconds: Option<u64>,
+
+    /// Byte offset to read from.
+    ///
+    /// Defaults to the end of the turn before this one, so the reply carries the new turn alone:
+    /// the earlier turns are already in your context, and re-sending them spends it twice.
+    /// Pass `0` for the whole consultation from the top.
+    #[serde(default)]
+    #[schemars(with = "u64")]
+    pub offset: Option<u64>,
+
+    /// Most bytes to return.
+    /// Defaults to 40000.
+    /// Read the transcript file for the whole thing.
+    #[serde(default)]
+    #[schemars(with = "usize")]
+    pub max_bytes: Option<usize>,
 }
 
 /// Arguments for `list`: how many consultations to show.
@@ -254,7 +270,7 @@ impl AgentMux {
             )
             .await
             .map_err(|error| run_error(&error))?;
-        self.answer(&status.run_id)
+        self.answer(&status.run_id, 0, DEFAULT_RESULT_BYTES)
     }
 
     #[tool(
@@ -352,7 +368,8 @@ impl AgentMux {
         description = "Ask a finished consultation one more question. It resumes the delegate's \
                        own session, so the delegate still has everything from the earlier turns \
                        and you do not restate the brief. The consultation id does not change; the \
-                       new turn is appended to the same transcript."
+                       new turn is appended to the same transcript, and the reply carries that \
+                       turn alone — pass `offset: 0` for the whole thing."
     )]
     async fn follow_up(
         &self,
@@ -365,6 +382,14 @@ impl AgentMux {
                 None,
             ));
         }
+        // Read before the turn is claimed, so it is the length through the previous turn exactly.
+        // The rendered transcript is append-only, which is what makes that a turn boundary and
+        // not a cut through the middle of one.
+        let before = self
+            .store
+            .status(&id)
+            .map_err(|error| run_error(&error))?
+            .transcript_bytes;
         let status = self
             .store
             .follow_up(&id, &params.question)
@@ -376,7 +401,11 @@ impl AgentMux {
             )
             .await
             .map_err(|error| run_error(&error))?;
-        self.answer(&status.run_id)
+        self.answer(
+            &status.run_id,
+            params.offset.unwrap_or(before),
+            slice(params.max_bytes, DEFAULT_RESULT_BYTES),
+        )
     }
 
     #[tool(
@@ -438,10 +467,15 @@ impl AgentMux {
     /// The transcript of a consultation once a wait has ended, or its state if it is still going.
     ///
     /// One reading of the files serves both, so the state and the page agree.
-    fn answer(&self, id: &RunId) -> Result<CallToolResult, ErrorData> {
+    fn answer(
+        &self,
+        id: &RunId,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<CallToolResult, ErrorData> {
         let (status, page) = self
             .store
-            .view(id, 0, DEFAULT_RESULT_BYTES)
+            .view(id, offset, max_bytes)
             .map_err(|error| run_error(&error))?;
         if !status.is_terminal() {
             return Ok(text(render::status(&status)));
@@ -588,7 +622,7 @@ fn instructions(
     }
 
     let roster = if described.is_empty() {
-        "This machine defines no named accounts, so omit `account`.".to_owned()
+        "No named accounts were defined when this server started, so omit `account`.".to_owned()
     } else {
         format!(
             "This machine defines these accounts — {}. Pass one as `account`, or omit it for the \
@@ -597,15 +631,20 @@ fn instructions(
         )
     };
 
-    format!(
-        "{INSTRUCTIONS}{denial}\n\n{roster} `quota` reports what each has left and costs nothing: call it \
-         before a long consultation, and again after a rate-limited failure to find one that can \
-         answer now.\n\nA delegate loads no settings, hooks or MCP servers unless its account is \
-         marked above as inheriting them. Pass `inherit_settings: true` when the point of the \
-         consultation is to exercise the tooling that configuration sets up, `false` when the \
-         answer must not depend on this machine, and `env` to set variables the account's own \
-         tooling reads."
-    )
+    indoc::formatdoc! {"
+        {INSTRUCTIONS}{denial}
+
+        {roster} That was read when this server started, and a host delivers these instructions
+        only once, so `quota` is the authority if the two disagree: it re-reads the machine's file
+        on every call, as every launch does. It reports what each account has left and costs
+        nothing: call it before a long consultation, and again after a rate-limited failure to
+        find one that can answer now.
+
+        A delegate loads no settings, hooks or MCP servers unless its account is marked above as
+        inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
+        exercise the tooling that configuration sets up, `false` when the answer must not depend
+        on this machine, and `env` to set variables the account's own tooling reads.
+    "}
 }
 
 /// The part of the instructions that is the same on every machine.
