@@ -64,6 +64,7 @@ async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
             effort: Effort::parse("low").or_fail()?,
             account: None,
+            isolation: None,
         },
         "Reply with exactly LIVE_CLAUDE_OK and nothing else.",
     )
@@ -93,6 +94,7 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
             effort: Effort::parse("low").or_fail()?,
             sandbox: CodexSandbox::ReadOnly,
             account: None,
+            isolation: None,
         },
         "Remember the secret word ZEPPELIN. Reply with exactly LIVE_CODEX_OK and nothing else.",
     )
@@ -135,6 +137,7 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
             model: ModelId::parse("does-not-exist-9000").or_fail()?,
             effort: Effort::parse("low").or_fail()?,
             account: None,
+            isolation: None,
         },
         "hello",
     )

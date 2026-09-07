@@ -97,6 +97,48 @@ fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
     })
 }
 
+/// The isolation a consultation actually runs under.
+///
+/// An explicit choice wins; otherwise the account decides, because settings live in an account's
+/// own configuration directory and "use my personal account, with its hooks" is one thought rather
+/// than two.
+/// With neither, the answer is isolation: it is the safe default and needs no configuration.
+fn resolve_isolation(
+    explicit: Option<Isolation>,
+    vendor: Vendor,
+    alias: Option<&AccountAlias>,
+    config: &Config,
+) -> Isolation {
+    if let Some(isolation) = explicit {
+        return isolation;
+    }
+    let alias = alias
+        .map(AccountAlias::as_str)
+        .or_else(|| config.default_account(vendor));
+    let inherits = alias
+        .and_then(|alias| config.account(vendor, alias))
+        .and_then(|account| account.inherit_settings)
+        .unwrap_or(false);
+    if inherits {
+        Isolation::Inherit
+    } else {
+        Isolation::Isolated
+    }
+}
+
+/// Name the isolation mode in a summary, but only when it is not the default.
+///
+/// A line that says `isolated` on every consultation teaches a reader to skip it, and the one
+/// consultation where it matters is the one that inherited.
+fn describe_isolation(isolation: Option<Isolation>) -> &'static str {
+    match isolation {
+        Some(Isolation::Inherit) => " settings=inherited",
+        // Written out rather than wildcarded, so a third mode has to be considered here rather
+        // than silently reading as isolated.
+        None | Some(Isolation::Isolated) => "",
+    }
+}
+
 /// Describe which aliases exist, for an unknown-alias error.
 fn describe_configured(configured: &[String], source: Option<&std::path::Path>) -> String {
     if configured.is_empty() {
@@ -276,6 +318,41 @@ impl AccountAlias {
 
 string_newtype_conversions!(AccountAlias);
 
+/// Whether a delegate runs isolated, or as the account's own CLI would.
+///
+/// Isolation is the default and is what makes a consultation a second opinion rather than a second
+/// copy of the caller's own setup: no settings, no hooks, no MCP servers.
+/// It is imposed by argument, not by environment — no variable can switch it on or off.
+///
+/// `Inherit` exists because the default is sometimes wrong.
+/// A reviewer that is supposed to exercise the project's own tooling needs that tooling, and a
+/// hook the operator wants applied to every model they run is not usefully suppressed here.
+/// It costs the three guarantees named on [`Self::Isolated`], and agentmux says so in the
+/// transcript rather than letting a reopened turn look like a model changing its mind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    /// No user, project or local settings; no hooks; no MCP servers.
+    ///
+    /// Three things follow, and all three are lost by inheriting.
+    /// A blocking `Stop` hook cannot reopen the finished turn and blank its result.
+    /// The delegate cannot re-enter agentmux through a configured MCP server and recurse.
+    /// And what the delegate saw does not depend on the caller's machine, so a consultation is
+    /// reproducible somewhere else.
+    #[default]
+    Isolated,
+    /// The account's own settings, hooks and MCP servers, exactly as its CLI would load them.
+    Inherit,
+}
+
+impl Isolation {
+    /// Whether the delegate loads the account's own configuration.
+    #[must_use]
+    pub fn inherits(self) -> bool {
+        matches!(self, Self::Inherit)
+    }
+}
+
 /// How much of the filesystem a Codex delegate may write.
 ///
 /// A consultation is a second opinion, so `ReadOnly` is the default.
@@ -350,6 +427,9 @@ pub enum Delegate {
         /// Which configured account to authenticate as, or the CLI's own default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<AccountAlias>,
+        /// Whether to load the account's own settings, or the account's preference when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<Isolation>,
     },
     /// The `OpenAI` CLI.
     Codex {
@@ -363,6 +443,9 @@ pub enum Delegate {
         /// Which configured account to authenticate as, or the CLI's own default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<AccountAlias>,
+        /// Whether to load the account's own settings, or the account's preference when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<Isolation>,
     },
 }
 
@@ -373,6 +456,42 @@ impl Delegate {
         match self {
             Self::Claude { .. } => Vendor::Claude,
             Self::Codex { .. } => Vendor::Codex,
+        }
+    }
+
+    /// The isolation recorded on this delegate, once it has been pinned.
+    #[must_use]
+    pub fn isolation(&self) -> Option<Isolation> {
+        match self {
+            Self::Claude { isolation, .. } | Self::Codex { isolation, .. } => *isolation,
+        }
+    }
+
+    /// The same delegate, with its isolation pinned.
+    ///
+    /// Recorded for the same reason the account is: an account may ask to inherit, and a run whose
+    /// provenance stops being reproducible is the one run whose provenance most needs writing
+    /// down.
+    #[must_use]
+    pub fn with_isolation(mut self, resolved: Isolation) -> Self {
+        match &mut self {
+            Self::Claude { isolation, .. } | Self::Codex { isolation, .. } => {
+                *isolation = Some(resolved);
+            }
+        }
+        self
+    }
+
+    /// The isolation this delegate would run under, given the machine's configuration.
+    #[must_use]
+    pub fn resolved_isolation(&self, config: &Config) -> Isolation {
+        match self {
+            Self::Claude {
+                account, isolation, ..
+            } => resolve_isolation(*isolation, Vendor::Claude, account.as_ref(), config),
+            Self::Codex {
+                account, isolation, ..
+            } => resolve_isolation(*isolation, Vendor::Codex, account.as_ref(), config),
         }
     }
 
@@ -422,10 +541,12 @@ impl Delegate {
                 model,
                 effort,
                 account,
+                isolation,
             } => {
                 format!(
-                    "claude {model} effort={effort} account={}",
-                    describe_account(account.as_ref())
+                    "claude {model} effort={effort} account={}{}",
+                    describe_account(account.as_ref()),
+                    describe_isolation(*isolation)
                 )
             }
             Self::Codex {
@@ -433,11 +554,13 @@ impl Delegate {
                 effort,
                 sandbox,
                 account,
+                isolation,
             } => {
                 format!(
-                    "codex {model} effort={effort} sandbox={} account={}",
+                    "codex {model} effort={effort} sandbox={} account={}{}",
                     sandbox.as_str(),
-                    describe_account(account.as_ref())
+                    describe_account(account.as_ref()),
+                    describe_isolation(*isolation)
                 )
             }
         }
@@ -574,6 +697,11 @@ const PLATFORM_ALLOWLIST: &[&str] = &[
 #[cfg(not(windows))]
 const PLATFORM_ALLOWLIST: &[&str] = &[];
 
+/// Marks a process as already running underneath agentmux.
+///
+/// Read before every launch to refuse a delegate spawned from inside one.
+pub const DELEGATE_MARKER: &str = "AGENTMUX_DELEGATE";
+
 /// Credential variables the Claude CLI reads.
 ///
 /// Forwarded for the work account, withheld from the personal account so it authenticates as
@@ -646,22 +774,36 @@ impl Delegate {
                 model,
                 effort,
                 account,
+                isolation,
             } => {
                 apply_account(&mut env, Vendor::Claude, account.as_ref(), config, host_env)?;
-                claude_args(model, effort, plan)
+                let isolation =
+                    resolve_isolation(*isolation, Vendor::Claude, account.as_ref(), config);
+                claude_args(model, effort, plan, isolation)
             }
             Self::Codex {
                 model,
                 effort,
                 sandbox,
                 account,
+                isolation,
             } => {
                 apply_account(&mut env, Vendor::Codex, account.as_ref(), config, host_env)?;
-                codex_args(model, effort, *sandbox, plan)
+                let isolation =
+                    resolve_isolation(*isolation, Vendor::Codex, account.as_ref(), config);
+                codex_args(model, effort, *sandbox, plan, isolation)
             }
         };
 
         apply_request_env(&mut env, plan.extra_env)?;
+
+        // The recursion guard, set last so no layer can change even its value.
+        // An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
+        // inheriting one loads the operator's own — and if agentmux is among them, a delegate can
+        // consult a delegate until something runs out.
+        // The marker makes the depth visible to the next agentmux, which refuses rather than
+        // relying on isolation it may not have.
+        env.insert(DELEGATE_MARKER.to_owned(), "1".to_owned());
 
         Ok(Invocation {
             program: self.vendor().program(),
@@ -877,6 +1019,11 @@ fn is_reserved(name: &str) -> bool {
         "GEMINI_",
         "VERTEX_",
         "AZURE_",
+        // agentmux's own namespace, so a request cannot reach the recursion marker or point a
+        // nested agentmux at a configuration file of the caller's choosing.
+        // Only relevant once a delegate inherits its account's MCP servers, which is exactly when
+        // a nested agentmux becomes reachable.
+        "AGENTMUX_",
     ];
 
     BASE_ALLOWLIST.contains(&name)
@@ -929,7 +1076,12 @@ fn secret_value(
 ///   See [`CLAUDE_READ_ONLY_TOOLS`] for what that does and does not guarantee.
 /// - `--no-session-persistence` is deliberately **absent**.
 ///   It defeats `--resume`, and a consultation must stay open to a follow-up.
-fn claude_args(model: &ModelId, effort: &Effort, plan: &TurnPlan<'_>) -> Vec<String> {
+fn claude_args(
+    model: &ModelId,
+    effort: &Effort,
+    plan: &TurnPlan<'_>,
+    isolation: Isolation,
+) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     args.push("--print".to_owned());
     if let Some(session) = plan.resume {
@@ -947,11 +1099,15 @@ fn claude_args(model: &ModelId, effort: &Effort, plan: &TurnPlan<'_>) -> Vec<Str
     args.push("--output-format".to_owned());
     args.push("stream-json".to_owned());
     args.push("--verbose".to_owned());
-    args.push("--setting-sources".to_owned());
-    args.push(String::new());
-    args.push("--strict-mcp-config".to_owned());
-    args.push("--mcp-config".to_owned());
-    args.push(EMPTY_MCP_CONFIG.to_owned());
+    // Plan mode and the read-only tool list are not part of isolation and stay either way: what
+    // the delegate may *do* is a separate question from whose configuration it loads.
+    if !isolation.inherits() {
+        args.push("--setting-sources".to_owned());
+        args.push(String::new());
+        args.push("--strict-mcp-config".to_owned());
+        args.push("--mcp-config".to_owned());
+        args.push(EMPTY_MCP_CONFIG.to_owned());
+    }
     args
 }
 
@@ -985,6 +1141,7 @@ fn codex_args(
     effort: &Effort,
     sandbox: CodexSandbox,
     plan: &TurnPlan<'_>,
+    isolation: Isolation,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     args.push("exec".to_owned());
@@ -1000,11 +1157,13 @@ fn codex_args(
     // bare TOML basic string needs no escaping.
     args.push("--config".to_owned());
     args.push(format!("model_reasoning_effort=\"{effort}\""));
-    args.push("--ignore-user-config".to_owned());
-    // Redundant with `--ignore-user-config` for config-file hooks, and cheap insurance against a
-    // hook reaching the delegate by any other route.
-    args.push("--config".to_owned());
-    args.push("features.hooks=false".to_owned());
+    if !isolation.inherits() {
+        args.push("--ignore-user-config".to_owned());
+        // Redundant with `--ignore-user-config` for config-file hooks, and cheap insurance against
+        // a hook reaching the delegate by any other route.
+        args.push("--config".to_owned());
+        args.push("features.hooks=false".to_owned());
+    }
     if plan.resume.is_some() {
         args.push("--config".to_owned());
         args.push(format!("sandbox_mode=\"{}\"", sandbox.as_str()));

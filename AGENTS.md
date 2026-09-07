@@ -34,6 +34,13 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   account which could not be asked cannot be confused with an idle one; an unauthenticated Claude
   config directory reports 0% used, so anything ranking on "least used" would prefer whichever
   account is broken.
+- **Isolation is imposed by argument, never by environment.** `--setting-sources ""`,
+  `--strict-mcp-config` and Codex's `--ignore-user-config` are what suppress settings, hooks and
+  MCP servers; no environment variable can switch them on or off. `Isolation::Inherit` drops
+  exactly those flags and nothing else — plan mode and the read-only tool list are a separate axis.
+- **Every delegate carries `AGENTMUX_DELEGATE=1`, and agentmux refuses to launch a delegate when it sees it.** An
+  isolated delegate cannot reach agentmux, but an inheriting one loads the operator's own MCP
+  servers; the marker is what makes the opt-out safe rather than a recursion waiting to happen.
 - **Only a machine config file may define an account.** A project `agentmux.toml`, found by walking
   up from the delegate's working directory, may only select one. It can arrive with a `git clone`,
   and a file that could name a `base_url` and an `api_key_env` would be a credential-exfiltration

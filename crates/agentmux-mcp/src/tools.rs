@@ -1,4 +1,4 @@
-//! The eight tools.
+//! The nine tools.
 //!
 //! Changes when the tool API changes.
 
@@ -47,6 +47,8 @@ const MAX_SLICE_BYTES: usize = 400_000;
 #[derive(Clone)]
 pub struct AgentMux {
     store: Arc<RunStore>,
+    /// The host-facing instructions, including this machine's accounts.
+    instructions: String,
     tool_router: ToolRouter<Self>,
 }
 
@@ -200,9 +202,15 @@ impl AgentMux {
     /// Build a server over an already-open run store.
     #[must_use]
     pub fn new(store: Arc<RunStore>) -> Self {
+        // Built once, at server start: a host injects instructions into the caller's context one
+        // time, and the machine's accounts are what a caller most needs and can least guess.
+        // Resolved against the store's own captured environment, so the roster describes the
+        // machine a consultation will actually run on.
+        let instructions = instructions(store.host_env(), store.root());
         Self {
-            store,
             tool_router: Self::tool_router(),
+            store,
+            instructions,
         }
     }
 
@@ -457,7 +465,10 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::BadRunId(_)
         | RunError::NotResumable(_)
         | RunError::TurnAlreadyClaimed { .. }
-        | RunError::Delegate(_) => ErrorData::invalid_params(error.to_string(), None),
+        | RunError::Delegate(_)
+        // The caller is a delegate that inherited its account's MCP servers and found agentmux
+        // among them; the remedy is to answer, not to retry.
+        | RunError::Recursive => ErrorData::invalid_params(error.to_string(), None),
         // A malformed or missing config file is the operator's to fix, not the caller's, but the
         // caller is the one holding the failed request and can at least retry without `account`.
         RunError::Config(inner) => ErrorData::invalid_params(
@@ -477,7 +488,85 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
     }
 }
 
-/// What a host injects into the calling agent's context, once.
+/// What a host injects into the calling agent's context, plus this machine's own accounts.
+///
+/// The roster is appended rather than baked into the schema: a tool schema is sent once and cached
+/// by the host, while accounts are machine state, and an enum of them would be wrong the moment the
+/// operator edits a file.
+/// agentmux still keeps no roster of its own — the machine does, and this only reads it.
+fn instructions(
+    host_env: &std::collections::BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> String {
+    use agentmux::delegate::Vendor;
+
+    let config = match agentmux::config::Config::load(host_env, cwd) {
+        Ok(config) => config,
+        Err(error) => {
+            // Said out loud: a server that starts fine but names no accounts looks like a machine
+            // with none, and the operator has no other signal that their file was rejected.
+            tracing::warn!(%error, "account configuration could not be read; instructions omit the roster");
+            return INSTRUCTIONS.to_owned();
+        }
+    };
+
+    let mut described = Vec::new();
+    for vendor in [Vendor::Claude, Vendor::Codex] {
+        let accounts = config.accounts(vendor);
+        if accounts.is_empty() {
+            continue;
+        }
+        let names = accounts
+            .iter()
+            .map(|(alias, account)| {
+                let mut notes = Vec::new();
+                if let Some(description) = &account.description {
+                    notes.push(description.clone());
+                }
+                // The one property a caller cannot discover and must not be surprised by.
+                if account.inherit_settings == Some(true) {
+                    notes
+                        .push("INHERITS this machine's settings, hooks and MCP servers".to_owned());
+                }
+                if notes.is_empty() {
+                    format!("`{alias}`")
+                } else {
+                    format!("`{alias}` ({})", notes.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let omitted = match config.default_account(vendor) {
+            Some(alias) => format!("omitting `account` uses `{alias}`"),
+            None => format!("omitting `account` uses the {vendor} CLI's own login"),
+        };
+        described.push(format!("{vendor}: {names} — {omitted}"));
+    }
+
+    let roster = if described.is_empty() {
+        "This machine defines no named accounts, so omit `account`.".to_owned()
+    } else {
+        format!(
+            "This machine defines these accounts — {}. Pass one as `account`, or omit it for the \
+             vendor CLI's own login.",
+            described.join("; ")
+        )
+    };
+
+    format!(
+        "{INSTRUCTIONS}\n\n{roster} `quota` reports what each has left and costs nothing: call it \
+         before a long consultation, and again after a rate-limited failure to find one that can \
+         answer now.\n\nA delegate loads no settings, hooks or MCP servers unless its account is \
+         marked above as inheriting them. Pass `inherit_settings: true` when the point of the \
+         consultation is to exercise the tooling that configuration sets up, `false` when the \
+         answer must not depend on this machine, and `env` to set variables the account's own \
+         tooling reads."
+    )
+}
+
+/// The part of the instructions that is the same on every machine.
+///
+/// [`instructions`] appends the accounts this one has.
 const INSTRUCTIONS: &str = r#"agentmux runs a question past the OTHER vendor's coding agent — `codex` when you are Claude Code,
 `claude` when you are Codex — and keeps the whole transcript. Your own harness already spawns
 same-vendor subagents natively and more cheaply; agentmux exists to cross the vendor line, which is
@@ -519,6 +608,6 @@ impl ServerHandler for AgentMux {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("agentmux", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.instructions.clone())
     }
 }

@@ -9,7 +9,8 @@ use std::path::Path;
 
 use agentmux::config::{Account, Config};
 use agentmux::delegate::{
-    AccountAlias, CodexSandbox, Delegate, Effort, Invocation, ModelId, SessionRef, TurnPlan,
+    AccountAlias, CodexSandbox, Delegate, Effort, Invocation, Isolation, ModelId, SessionRef,
+    TurnPlan,
 };
 use googletest::prelude::*;
 
@@ -28,23 +29,27 @@ fn every_delegate() -> Result<Vec<Delegate>> {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: None,
+            isolation: None,
         },
         Delegate::Claude {
             model: model("claude-fable-5-1")?,
             effort: effort("xhigh")?,
             account: Some(AccountAlias::parse("personal").or_fail()?),
+            isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: effort("high")?,
             sandbox: CodexSandbox::ReadOnly,
             account: None,
+            isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-5.6-sol")?,
             effort: effort("xhigh")?,
             sandbox: CodexSandbox::WorkspaceWrite,
             account: None,
+            isolation: None,
         },
     ])
 }
@@ -270,6 +275,8 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
             "OPENAI_BASE_URL",
             "CODEX_HOME",
             "CLAUDE_CONFIG_DIR",
+            // The recursion guard, which is agentmux's own and carries nothing of the host.
+            "AGENTMUX_DELEGATE",
         ];
         for key in invocation.env.keys() {
             assert_that!(
@@ -305,6 +312,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: Some(AccountAlias::parse("personal").or_fail()?),
+            isolation: None,
         },
         None,
         &config,
@@ -321,6 +329,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: None,
+            isolation: None,
         },
         None,
         &config,
@@ -354,6 +363,7 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
         model: model("claude-opus-5")?,
         effort: effort("xhigh")?,
         account: Some(AccountAlias::parse("work").or_fail()?),
+        isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
     .expect_err("`work` is not configured");
@@ -387,6 +397,7 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
         model: model("claude-opus-5")?,
         effort: effort("xhigh")?,
         account: Some(AccountAlias::parse("personal").or_fail()?),
+        isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
     .expect_err("the directory does not exist");
@@ -434,6 +445,7 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
         effort: effort("high")?,
         sandbox: CodexSandbox::ReadOnly,
         account: Some(AccountAlias::parse("local").or_fail()?),
+        isolation: None,
     }
     .invocation(&plan, &host, &config)
     .or_fail()?;
@@ -460,6 +472,7 @@ fn a_codex_resume_passes_its_sandbox_as_config_not_as_a_flag() -> Result<()> {
         effort: effort("high")?,
         sandbox: CodexSandbox::ReadOnly,
         account: None,
+        isolation: None,
     };
 
     let fresh = build(&delegate, None)?;
@@ -486,6 +499,7 @@ fn a_claude_resume_reopens_the_delegates_session() -> Result<()> {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: None,
+            isolation: None,
         },
         Some(&session),
     )?;
@@ -568,6 +582,10 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
         "CODEX_HOME",
         // A vendor namespace that reroutes the consultation without naming a credential.
         "CLAUDE_CODE_USE_BEDROCK",
+        // agentmux's own namespace: the recursion marker, and the configuration a nested agentmux
+        // would read once a delegate inherits its account's MCP servers.
+        "AGENTMUX_DELEGATE",
+        "AGENTMUX_CONFIG",
         "AWS_BEARER_TOKEN_BEDROCK",
         "http_proxy",
     ];
@@ -586,6 +604,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: None,
+            isolation: None,
         }
         .invocation(&plan, &host_session_env(), &Config::default());
 
@@ -618,6 +637,7 @@ fn a_request_environment_reaches_the_delegate() -> Result<()> {
         model: model("claude-opus-5")?,
         effort: effort("xhigh")?,
         account: None,
+        isolation: None,
     }
     .invocation(&plan, &host_session_env(), &Config::default())
     .or_fail()?;
@@ -640,7 +660,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     config
         .launch
         .env
-        .insert("AGENTMUX_TEST_LAYER".to_owned(), "from-machine".to_owned());
+        .insert("DELEGATE_TEST_LAYER".to_owned(), "from-machine".to_owned());
     config
         .launch
         .env
@@ -653,10 +673,10 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         account
             .launch
             .env
-            .insert("AGENTMUX_TEST_LAYER".to_owned(), "from-account".to_owned());
+            .insert("DELEGATE_TEST_LAYER".to_owned(), "from-account".to_owned());
     }
 
-    let requested = [("AGENTMUX_TEST_LAYER".to_owned(), "from-request".to_owned())]
+    let requested = [("DELEGATE_TEST_LAYER".to_owned(), "from-request".to_owned())]
         .into_iter()
         .collect();
     let plan = TurnPlan {
@@ -670,6 +690,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         model: model("claude-opus-5")?,
         effort: effort("xhigh")?,
         account: Some(AccountAlias::parse("personal").or_fail()?),
+        isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
     .or_fail()?;
@@ -678,7 +699,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     assert_that!(
         invocation
             .env
-            .get("AGENTMUX_TEST_LAYER")
+            .get("DELEGATE_TEST_LAYER")
             .map(String::as_str),
         some(eq("from-request"))
     );
@@ -711,6 +732,7 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
             model: model("claude-opus-5")?,
             effort: effort("xhigh")?,
             account: None,
+            isolation: None,
         },
         None,
         &config,
@@ -753,6 +775,7 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
         model: model("claude-opus-5")?,
         effort: effort("xhigh")?,
         account: None,
+        isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
     .expect_err("`clientx` is not defined");
@@ -760,5 +783,155 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
     let message = error.to_string();
     assert_that!(message, contains_substring("clientx"));
     assert_that!(message, contains_substring("/work/client/agentmux.toml"));
+    Ok(())
+}
+
+/// Inheriting drops exactly the flags that impose isolation, and nothing else.
+///
+/// The opt-out exists because the default is sometimes wrong: a reviewer meant to exercise the
+/// project's own tooling needs that tooling loaded.
+/// What it must not do is quietly widen what the delegate may change: plan mode and the
+/// read-only tool list are a different question from whose configuration is loaded.
+#[gtest]
+fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
+    let inherited = build(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: None,
+            isolation: Some(Isolation::Inherit),
+        },
+        None,
+    )?;
+
+    assert_that!(
+        inherited.args.contains(&"--setting-sources".to_owned()),
+        eq(false)
+    );
+    assert_that!(
+        inherited.args.contains(&"--strict-mcp-config".to_owned()),
+        eq(false)
+    );
+    // Still a second opinion rather than an edit.
+    assert_that!(
+        has_pair(&inherited.args, "--permission-mode", "plan"),
+        eq(true)
+    );
+    assert_that!(inherited.args.contains(&"--tools".to_owned()), eq(true));
+
+    let isolated = build(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: None,
+            isolation: None,
+        },
+        None,
+    )?;
+    assert_that!(
+        isolated.args.contains(&"--setting-sources".to_owned()),
+        eq(true)
+    );
+    assert_that!(
+        isolated.args.contains(&"--strict-mcp-config".to_owned()),
+        eq(true)
+    );
+    Ok(())
+}
+
+/// The same opt-out reaches Codex, whose isolation is one flag over the whole config file.
+#[gtest]
+fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
+    let (model, effort) = (model("gpt-6-astra")?, effort("high")?);
+    let delegate = |isolation| Delegate::Codex {
+        model: model.clone(),
+        effort: effort.clone(),
+        sandbox: CodexSandbox::ReadOnly,
+        account: None,
+        isolation,
+    };
+
+    let inherited = build(&delegate(Some(Isolation::Inherit)), None)?;
+    assert_that!(
+        inherited.args.contains(&"--ignore-user-config".to_owned()),
+        eq(false)
+    );
+    assert_that!(
+        inherited.args.contains(&"features.hooks=false".to_owned()),
+        eq(false)
+    );
+
+    let isolated = build(&delegate(None), None)?;
+    assert_that!(
+        isolated.args.contains(&"--ignore-user-config".to_owned()),
+        eq(true)
+    );
+    Ok(())
+}
+
+/// An account may ask for its own settings, so the choice sits next to the identity it belongs to.
+#[gtest]
+fn an_account_can_ask_for_its_own_settings() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut config = config_with_personal(dir.path());
+    if let Some(account) = config
+        .accounts
+        .get_mut("claude")
+        .and_then(|table| table.get_mut("personal"))
+    {
+        account.inherit_settings = Some(true);
+    }
+
+    let invocation = build_with(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: Some(AccountAlias::parse("personal").or_fail()?),
+            isolation: None,
+        },
+        None,
+        &config,
+    )?;
+
+    assert_that!(
+        invocation.args.contains(&"--setting-sources".to_owned()),
+        eq(false)
+    );
+
+    // An explicit request still overrides the account's preference, in both directions.
+    let forced = build_with(
+        &Delegate::Claude {
+            model: model("claude-opus-5")?,
+            effort: effort("xhigh")?,
+            account: Some(AccountAlias::parse("personal").or_fail()?),
+            isolation: Some(Isolation::Isolated),
+        },
+        None,
+        &config,
+    )?;
+    assert_that!(
+        forced.args.contains(&"--setting-sources".to_owned()),
+        eq(true)
+    );
+    Ok(())
+}
+
+/// Every delegate carries the marker that stops agentmux consulting itself.
+///
+/// An isolated delegate cannot reach agentmux at all, but an inheriting one loads the operator's
+/// own MCP servers — and agentmux may be among them.
+/// The marker is what makes the opt-out safe to offer rather than a recursion waiting to happen.
+#[gtest]
+fn every_delegate_is_marked_so_agentmux_cannot_consult_itself() -> Result<()> {
+    for delegate in every_delegate()? {
+        let dir = tempfile::tempdir().or_fail()?;
+        let invocation = build_with(&delegate, None, &config_with_personal(dir.path()))?;
+        assert_that!(
+            invocation.env.get("AGENTMUX_DELEGATE").map(String::as_str),
+            some(eq("1")),
+            "{}",
+            delegate.summary()
+        );
+    }
     Ok(())
 }

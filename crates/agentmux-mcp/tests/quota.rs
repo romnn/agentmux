@@ -3,9 +3,48 @@
 //! The dangerous failure is not a wrong number but a missing one read as a good one: an account
 //! that could not be asked must never look like an account with capacity to spare.
 
-use agentmux::delegate::Vendor;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId, Vendor};
 use agentmux::quota::{AccountQuota, Observation, Origin};
+use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
+use agentmux::testing::{Script, ScriptedLauncher};
+use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use chrono::Utc;
 use googletest::prelude::*;
+
+/// Drive one scripted consultation and return the status a tool would render.
+fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::completed(events)])),
+        env,
+    )
+    .or_fail()?;
+    let status = store
+        .start(&StartRequest {
+            delegate: Delegate::Codex {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: Effort::parse("xhigh").or_fail()?,
+                sandbox: CodexSandbox::ReadOnly,
+                account: None,
+                isolation: None,
+            },
+            question: "Review the diff.".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+        })
+        .or_fail()?;
+    Ok((store, status, dir))
+}
 
 /// An account that could not be asked must never render as an idle one.
 ///
@@ -63,4 +102,192 @@ fn nothing_rendered_recommends_an_account() {
             "the rendering recommends an account with {verdict:?}"
         );
     }
+}
+
+/// A rate limit with a working account elsewhere must not be told to switch vendor.
+///
+/// The advice and the list beneath it are read together, so advising a vendor switch while showing
+/// a same-vendor account with capacity leaves the caller to resolve a contradiction, or to act on
+/// the more expensive of two remedies.
+#[gtest]
+fn a_rate_limit_with_another_account_available_names_that_account() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::hours(9),
+        window: Some("seven_day".to_owned()),
+    });
+    status.quota = vec![
+        reported(Vendor::Codex, "personal", 11)?,
+        reported(Vendor::Codex, "work", 99)?,
+    ];
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("personal"));
+    assert_that!(warnings, contains_substring("pass one as `account`"));
+    // The expensive remedy is no longer the headline when a cheap one exists.
+    assert_that!(warnings, not(contains_substring("waiting is not worth it")));
+    Ok(())
+}
+
+/// With no other account, the advice falls back to the window's own reopening time.
+#[gtest]
+fn a_rate_limit_with_no_alternative_still_advises_from_the_window() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::hours(9),
+        window: Some("seven_day".to_owned()),
+    });
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("other vendor"));
+    Ok(())
+}
+
+/// One account reporting a figure, for building a status by hand.
+///
+/// The vendor is a parameter because the advice must only ever name an account of the vendor that
+/// failed: an alias from the other vendor's table resolves to nothing but a paid round trip.
+fn reported(vendor: Vendor, alias: &str, percent: i64) -> Result<AccountQuota> {
+    Ok(AccountQuota {
+        vendor,
+        account: Some(agentmux::delegate::AccountAlias::parse(alias).or_fail()?),
+        description: None,
+        observation: Observation::Reported {
+            origin: Origin::Live,
+            payload: serde_json::json!({
+                "utilization": {"limits": [
+                    {"kind": "weekly_all", "percent": percent, "severity": "normal"}
+                ]}
+            }),
+        },
+    })
+}
+
+/// A window that has already reopened must not send the caller to another subscription.
+///
+/// This is the case the alternatives branch got wrong when it was added: it preempted the window
+/// advice entirely, so a failure that had already expired moved work onto a different identity to
+/// solve a problem that no longer existed.
+#[gtest]
+fn a_reopened_window_is_retried_rather_than_routed_elsewhere() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() - chrono::Duration::minutes(5),
+        window: Some("five_hour".to_owned()),
+    });
+    status.quota = vec![reported(Vendor::Codex, "personal", 11)?];
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("already reopened"));
+    assert_that!(warnings, not(contains_substring("Retry with a different")));
+    Ok(())
+}
+
+/// A window reopening within one `start`'s wait is waited for, not routed around.
+#[gtest]
+fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::minutes(3),
+        window: Some("five_hour".to_owned()),
+    });
+    status.quota = vec![reported(Vendor::Codex, "personal", 11)?];
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, not(contains_substring("Retry with a different")));
+    Ok(())
+}
+
+/// A reopened turn reads as expected when the run inherited its account's hooks.
+///
+/// The same event means opposite things in the two worlds.
+/// Under isolation a hook should have been impossible, so the transcript is suspect; under
+/// inheritance it is exactly what the caller asked for, and phrasing it as an anomaly invites the
+/// caller to escalate a working run.
+#[gtest]
+fn a_reopened_turn_reads_as_expected_when_settings_were_inherited() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the report"}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#})?;
+    status.reopened_by_hook = true;
+
+    status.delegate = status.delegate.clone().with_isolation(Isolation::Inherit);
+    let inherited = agentmux_mcp::render::warnings(&status);
+    assert_that!(
+        inherited,
+        contains_substring("expected because this run inherited")
+    );
+    assert_that!(inherited, not(contains_substring("should not be possible")));
+
+    status.delegate = status.delegate.clone().with_isolation(Isolation::Isolated);
+    let isolated = agentmux_mcp::render::warnings(&status);
+    assert_that!(isolated, contains_substring("should not be possible"));
+    // The load-bearing sentence survives in the world where it is an alarm.
+    assert_that!(isolated, contains_substring("NOT the answer"));
+    Ok(())
+}
+
+/// The advice must never name an account belonging to the other vendor.
+///
+/// `quota_for_failure` probes only the failing run's vendor today, but that invariant lives in
+/// another crate and nothing at the point of use depended on it.
+/// An alias from the wrong table resolves to `UnknownAccount` after a paid round trip.
+#[gtest]
+fn the_advice_never_names_an_account_of_the_other_vendor() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.rate_limit = Some(RateLimit {
+        resets_at: Utc::now() + chrono::Duration::hours(9),
+        window: Some("seven_day".to_owned()),
+    });
+    // The consultation ran on Codex; this account belongs to Claude.
+    status.quota = vec![reported(Vendor::Claude, "other-vendor-account", 3)?];
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, not(contains_substring("other-vendor-account")));
+    // With no usable alternative it falls back to the window, as it would with none at all.
+    assert_that!(warnings, contains_substring("other vendor"));
+    Ok(())
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::run::{Retention, RunId, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{FailureKind, Outcome};
@@ -23,6 +23,7 @@ fn claude() -> Result<Delegate> {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Effort::parse("xhigh").or_fail()?,
         account: None,
+        isolation: None,
     })
 }
 
@@ -32,6 +33,7 @@ fn codex() -> Result<Delegate> {
         effort: Effort::parse("high").or_fail()?,
         sandbox: CodexSandbox::ReadOnly,
         account: None,
+        isolation: None,
     })
 }
 
@@ -794,5 +796,133 @@ fn a_stale_render_does_not_overwrite_a_newer_transcript() -> Result<()> {
     std::fs::write(&path, "corrupted")?;
     h.store.read_transcript(&started.run_id, 0, 1_000_000)?;
     assert_that!(std::fs::read_to_string(&path)?, eq(&complete));
+    Ok(())
+}
+
+/// agentmux refuses to consult a delegate when it is itself running as one.
+///
+/// Only reachable once a delegate inherits its account's MCP servers and finds agentmux among
+/// them, which is precisely the case isolation would otherwise have prevented.
+/// Refusing here is what lets the opt-out exist without a consultation being able to spawn
+/// consultations until something runs out.
+#[gtest]
+fn agentmux_running_as_a_delegate_refuses_to_start_another_consultation() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [
+        ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ("HOME".to_owned(), "/home/dev".to_owned()),
+        ("AGENTMUX_DELEGATE".to_owned(), "1".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::completed(
+            fixtures::CODEX_HAPPY,
+        )])),
+        env,
+    )
+    .or_fail()?;
+
+    let error = store
+        .start(&request(codex()?, "q"))
+        .expect_err("a delegate may not start a consultation");
+
+    assert_that!(
+        error.to_string(),
+        contains_substring("running as a delegate")
+    );
+    Ok(())
+}
+
+/// An account that asks to inherit is recorded as having done so, and stays recorded.
+///
+/// Nothing else pins this down, and the consequence of losing it is not a missing label.
+/// A hook in the account's own settings reopens the finished turn, which is exactly what the
+/// operator configured, and a run whose isolation was not recorded reports that as "should not be
+/// possible: treat this transcript as untrusted", on every consultation, forever.
+///
+/// The second half is the follow-up: a configuration edited mid-consultation must not move turn two
+/// to a different isolation than turn one, in one transcript.
+#[gtest]
+fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let config_path = home.path().join("agentmux.toml");
+    let account_dir = home.path().join(".claude-personal");
+    std::fs::create_dir_all(&account_dir).or_fail()?;
+    let write_config = |inherit: bool| -> Result<()> {
+        std::fs::write(
+            &config_path,
+            format!(
+                "[defaults.claude]\naccount = \"personal\"\n\n\
+                 [accounts.claude.personal]\nconfig_dir = {:?}\ninherit_settings = {inherit}\n",
+                account_dir.display().to_string()
+            ),
+        )
+        .or_fail()?;
+        Ok(())
+    };
+    write_config(true)?;
+
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [
+        ("PATH".to_owned(), "/usr/bin".to_owned()),
+        (
+            "HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "AGENTMUX_CONFIG".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([
+            Script::completed(fixtures::CLAUDE_HAPPY),
+            Script::completed(fixtures::CLAUDE_RESUME),
+        ])),
+        env,
+    )
+    .or_fail()?;
+
+    let started = store
+        .start(&StartRequest {
+            delegate: Delegate::Claude {
+                model: ModelId::parse("claude-opus-5").or_fail()?,
+                effort: Effort::parse("xhigh").or_fail()?,
+                // The caller names neither the account nor the isolation.
+                account: None,
+                isolation: None,
+            },
+            question: "q".to_owned(),
+            cwd: home.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+        })
+        .or_fail()?;
+
+    // The account's preference was resolved and written down, not left for each launch to redo.
+    assert_that!(
+        started.delegate.isolation(),
+        some(eq(Isolation::Inherit)),
+        "an account-driven inherit was not recorded"
+    );
+    assert_that!(
+        started.delegate.summary(),
+        contains_substring("settings=inherited")
+    );
+
+    // Changing the machine's mind must not change a consultation already under way.
+    write_config(false)?;
+    let resumed = store.follow_up(&started.run_id, "again").or_fail()?;
+
+    assert_that!(
+        resumed.delegate.isolation(),
+        some(eq(Isolation::Inherit)),
+        "a follow-up re-resolved isolation against an edited configuration"
+    );
     Ok(())
 }

@@ -49,6 +49,33 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
             agentmux_mcp::render::rate_limit_line(limit)
         );
     }
+    let ordered = agentmux_mcp::render::ordered_quota(
+        &status.quota,
+        status.delegate.vendor(),
+        status.delegate.account(),
+    );
+    if !ordered.is_empty() {
+        // Only a rate limit populates this, and the human reading it is the only party who can go
+        // and log another account in.
+        if ordered.iter().any(|(_, ran)| !ran) {
+            println!("  other accounts on this machine:");
+        } else {
+            println!("  this account's usage:");
+        }
+        for (entry, ran) in ordered {
+            for (index, line) in agentmux_mcp::render::quota_report(entry)
+                .into_iter()
+                .enumerate()
+            {
+                let suffix = if index == 0 && ran {
+                    " — this consultation"
+                } else {
+                    ""
+                };
+                println!("    {line}{suffix}");
+            }
+        }
+    }
     if let Some(drift) = status.unrecognised.summary() {
         println!("  UNRECOGNISED {drift} — the delegate CLI may have changed its output format");
     }
@@ -209,6 +236,7 @@ fn json_status(status: &RunStatus) -> serde_json::Value {
         "unrecognised_events": status.unrecognised,
         "reopened_by_hook": status.reopened_by_hook,
         "rate_limit": status.rate_limit,
+        "quota": status.quota,
         "cwd": status.cwd,
         "transcript_path": status.transcript_path,
         "events_path": status.events_path,
@@ -230,30 +258,70 @@ pub fn accounts(config: &agentmux::config::Config, json: bool) -> Result<()> {
     use agentmux::delegate::Vendor;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(config)?);
+        // The prose form names the files it read, so the machine form has to carry them too.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": config.source,
+                "project_source": config.project_source,
+                "accounts": config.accounts,
+                "defaults": config.defaults,
+                "launch": config.launch,
+            }))?
+        );
         return Ok(());
     }
 
-    match &config.source {
-        Some(path) => println!("config      {}", path.display()),
-        None => println!(
-            "config      none found (searched from the working directory up to $HOME, then the \
-             platform config directory)"
-        ),
+    if let Some(path) = &config.source {
+        println!("config      {}", path.display());
+    } else {
+        // Naming the paths actually searched, because the reader's next question is where to put
+        // the file.
+        println!("config      none found. A machine file defines accounts; first that exists:");
+        // Listed first because it outranks every searched path, and a reader who has set it and
+        // seen nothing loaded needs to know it was consulted.
+        println!("              $AGENTMUX_CONFIG (unset)");
+        for path in agentmux::config::Config::machine_paths(&agentmux::host_env()) {
+            println!("              {}", path.display());
+        }
+    }
+    if let Some(path) = &config.project_source {
+        println!("project     {} (selects a default only)", path.display());
     }
 
+    if !config.launch.is_empty() {
+        println!("launch      every delegate also gets:");
+        for (name, value) in &config.launch.env {
+            println!("              {name}={value}");
+        }
+        for name in &config.launch.env_passthrough {
+            println!("              {name} (forwarded from this environment)");
+        }
+    }
+
+    let host_env = agentmux::host_env();
+    let home = agentmux::config::home_dir(&host_env);
+
     for vendor in [Vendor::Claude, Vendor::Codex] {
-        println!("\n{vendor}");
+        println!();
+        let label = format!("{vendor}");
+        match config.default_account(vendor) {
+            Some(alias) => println!("{label:<11} default: {alias}"),
+            None => println!("{label:<11} default: the {vendor} CLI's own login"),
+        }
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             println!("  (none configured — omit --account to use the CLI's own default)");
             continue;
         }
         for (alias, account) in accounts {
-            // Say what each alias would actually do, without printing a credential.
             let mut how = Vec::new();
             if let Some(dir) = &account.config_dir {
-                how.push(format!("config_dir={}", dir.display()));
+                // Availability, because one synced config file describes several machines and not
+                // all of them are logged into everything.
+                let resolved = agentmux::config::expand_tilde(dir, home.as_deref());
+                let state = if resolved.is_dir() { "ok" } else { "MISSING" };
+                how.push(format!("config_dir={} ({state})", dir.display()));
             }
             if let Some(base) = &account.base_url {
                 how.push(format!("base_url={base}"));
@@ -270,7 +338,13 @@ pub fn accounts(config: &agentmux::config::Config, json: bool) -> Result<()> {
             if let Some(name) = &account.auth_token_env {
                 how.push(format!("auth_token=${name}"));
             }
-            println!("  {alias:<16} {}", how.join(", "));
+            if account.inherit_settings == Some(true) {
+                how.push("inherits settings and hooks".to_owned());
+            }
+            println!("  {alias:<14} {}", how.join(", "));
+            if let Some(description) = &account.description {
+                println!("  {:<14} {description}", "");
+            }
         }
     }
     Ok(())

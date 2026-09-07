@@ -187,6 +187,14 @@ pub struct Account {
     /// An alternative API endpoint, such as a local server or a gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Run delegates on this account with its own settings, hooks and MCP servers.
+    ///
+    /// Off unless set.
+    /// Turning it on gives up the three guarantees isolation buys — see
+    /// [`crate::delegate::Isolation`] — and is worth it when the point of the consultation is to
+    /// exercise the tooling that configuration sets up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_settings: Option<bool>,
     /// Free text shown by `agentmux accounts`, so a caller can choose without guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -335,7 +343,12 @@ impl Config {
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
 
-        let mut config = if let Some(explicit) = host_env.get(CONFIG_PATH_ENV) {
+        // An exported-but-empty variable means unset, as it does for the state directory: a shell
+        // that exports it unconditionally would otherwise make every command fail on a path of "".
+        let mut config = if let Some(explicit) = host_env
+            .get(CONFIG_PATH_ENV)
+            .filter(|value| !value.is_empty())
+        {
             let path = PathBuf::from(explicit);
             if !path.exists() {
                 return Err(ConfigError::MissingExplicit { path });

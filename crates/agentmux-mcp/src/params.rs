@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -118,6 +118,23 @@ pub struct DelegateParams {
     #[schemars(with = "String")]
     pub account: Option<String>,
 
+    /// Whether the delegate loads the account's own settings, hooks and MCP servers.
+    ///
+    /// Omit this and the account decides.
+    /// Most accounts are isolated, but one may be configured to inherit, so the account list in
+    /// these instructions is the only way to know which.
+    /// Pass `false` to force isolation when you need an answer that does not depend on this
+    /// machine.
+    ///
+    /// Pass `true` only when the point of the consultation is to exercise the tooling that
+    /// configuration sets up.
+    /// It costs three things: a hook can reopen the delegate's finished turn, so its last message
+    /// is then not the answer; the delegate gains whatever MCP servers that account configures;
+    /// and the same question asked elsewhere may answer differently.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub inherit_settings: Option<bool>,
+
     /// `codex` only.
     /// `read_only` is right for a review.
     /// Use `workspace_write` only when the delegate must write a file itself — a read-only
@@ -129,6 +146,17 @@ pub struct DelegateParams {
 }
 
 impl DelegateParams {
+    /// The isolation the caller asked for, or `None` to let the account decide.
+    fn isolation(&self) -> Option<Isolation> {
+        self.inherit_settings.map(|inherit| {
+            if inherit {
+                Isolation::Inherit
+            } else {
+                Isolation::Isolated
+            }
+        })
+    }
+
     /// Validate the account alias, if one was named.
     ///
     /// Only the shape is checked here; whether the alias exists is a property of the machine, and
@@ -187,6 +215,7 @@ impl DelegateParams {
                     model,
                     effort,
                     account: self.alias()?,
+                    isolation: self.isolation(),
                 })
             }
             Vendor::Codex => Ok(Delegate::Codex {
@@ -197,6 +226,7 @@ impl DelegateParams {
                     Sandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
                 },
                 account: self.alias()?,
+                isolation: self.isolation(),
             }),
         }
     }
@@ -223,10 +253,11 @@ pub struct QuestionParams {
 
     /// Extra environment variables for the delegate process, as a flat string map.
     ///
-    /// Useful for switching off something in the delegate's own setup for this consultation, such
-    /// as a hook the caller does not want running inside a review.
+    /// Only useful with `inherit_settings`: an isolated delegate loads no settings, hooks or MCP
+    /// servers, so nothing in it reads these.
     /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
-    /// Names that decide which account authenticates are rejected.
+    /// Names that decide which account authenticates, which program runs, or how it reaches the
+    /// network are rejected.
     #[serde(default)]
     #[schemars(with = "std::collections::BTreeMap<String, String>")]
     pub env: Option<std::collections::BTreeMap<String, String>>,

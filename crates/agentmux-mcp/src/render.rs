@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+use agentmux::delegate::Isolation;
 use agentmux::quota::{AccountQuota, Observation, Origin};
 use agentmux::run::{RunStatus, RunSummary, TranscriptPage};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
@@ -151,14 +152,33 @@ pub fn warnings(status: &RunStatus) -> String {
              \x20           The delegate said: {}\n",
             kind.label(),
             status.message_count,
-            recovery_advice(*kind, status.rate_limit.as_ref()),
+            recovery_advice(
+                *kind,
+                status.rate_limit.as_ref(),
+                &status.quota,
+                status.delegate.vendor(),
+                status.delegate.account()
+            ),
             summarise(detail, 600),
         );
         // The alternatives, where the failure itself made them worth fetching.
-        // Naming which account could answer now is the difference between "rate limited" and a
-        // next call the caller can actually make.
-        for entry in &status.quota {
-            for line in quota_report(entry) {
+        // Given a lead-in, because a list with no verb reads as background rather than as the
+        // next call to make.
+        let ordered = ordered_quota(
+            &status.quota,
+            status.delegate.vendor(),
+            status.delegate.account(),
+        );
+        // Only when there is genuinely another one: on a single-account machine the header would
+        // otherwise invite the caller to switch to the account that just failed.
+        if ordered.iter().any(|(_, ran)| !ran) {
+            let _ = writeln!(
+                out,
+                "\x20           other accounts on this machine (pass one as `account`):"
+            );
+        }
+        for (entry, ran) in ordered {
+            for line in quota_report_labelled(entry, ran) {
                 let _ = writeln!(out, "\x20           {line}");
             }
         }
@@ -173,11 +193,26 @@ pub fn warnings(status: &RunStatus) -> String {
         );
     }
     if status.reopened_by_hook {
-        out.push_str(
-            "warning:    a hook in the delegate's environment reopened a finished turn. The last\n\
-             \x20           thing the delegate said is NOT the answer — the answer is above the\n\
-             \x20           injection, which is marked in the transcript.\n",
-        );
+        // The same event means opposite things depending on what the run loaded.
+        // Under inheritance it is the documented consequence of what the caller asked for; under
+        // isolation it should have been impossible, and the whole transcript is then suspect.
+        match status.delegate.isolation() {
+            Some(Isolation::Inherit) => out.push_str(
+                "note:       a hook in the account's settings reopened a finished turn, which is\n\
+                 \x20           expected because this run inherited them. The answer is above the\n\
+                 \x20           injection, which is marked in the transcript.\n",
+            ),
+            // `None` means the run predates isolation being recorded, so the safe reading is the
+            // alarming one: it is written out rather than wildcarded so a third mode cannot land
+            // here by default.
+            None | Some(Isolation::Isolated) => out.push_str(
+                "warning:    a hook reopened a finished turn even though this run loaded no\n\
+                 \x20           settings. That should not be possible: treat this transcript as\n\
+                 \x20           untrusted, and re-run with `inherit_settings: false` set\n\
+                 \x20           explicitly. The last thing the delegate said is NOT the answer —\n\
+                 \x20           the answer is above the injection.\n",
+            ),
+        }
     }
     if let Some(drift) = status.unrecognised.summary() {
         let _ = write!(
@@ -213,13 +248,53 @@ pub fn warnings(status: &RunStatus) -> String {
 /// The most valuable case is the one where retrying is exactly wrong: a blocked closing message
 /// means the analysis is already in the transcript and paying for it again would produce the same
 /// block.
-fn recovery_advice(kind: FailureKind, rate_limit: Option<&RateLimit>) -> Cow<'static, str> {
+fn recovery_advice(
+    kind: FailureKind,
+    rate_limit: Option<&RateLimit>,
+    quota: &[AccountQuota],
+    vendor: agentmux::delegate::Vendor,
+    ran_as: Option<&agentmux::delegate::AccountAlias>,
+) -> Cow<'static, str> {
     // A rate limit is the only failure whose advice inverts on a number, so it is decided before
     // the table of fixed answers below.
-    if kind == FailureKind::RateLimited
-        && let Some(limit) = rate_limit
-    {
-        return Cow::Owned(rate_limit_advice(limit));
+    if kind == FailureKind::RateLimited {
+        // A window that has already reopened, or reopens inside what one `start` can wait for,
+        // beats every other remedy: switching accounts spends a different subscription to solve a
+        // problem that is about to solve itself, or has already.
+        if let Some(limit) = rate_limit
+            && limit.reopens_in(Utc::now()).is_none_or(|remaining| {
+                remaining <= std::time::Duration::from_secs(MAX_WAIT_SECONDS)
+            })
+        {
+            return Cow::Owned(rate_limit_advice(limit));
+        }
+        // Otherwise another account of the same vendor that answered is the cheapest remedy, and
+        // advising a vendor switch while listing one two lines below reads as a contradiction the
+        // caller has to resolve.
+        let alternatives = quota
+            .iter()
+            .filter(|entry| {
+                // The vendor is checked here rather than trusted from the caller: the advice names
+                // an alias the caller will pass back as `account`, and an alias from the other
+                // vendor's table resolves to nothing but a paid round trip.
+                entry.vendor == vendor
+                    && entry.account.as_ref() != ran_as
+                    && matches!(entry.observation, Observation::Reported { .. })
+            })
+            .filter_map(|entry| entry.account.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        if !alternatives.is_empty() {
+            return Cow::Owned(format!(
+                "Nothing to fix in your call, and the window is too far off to wait for. Retry \
+                 with a different `account` — you also have {} configured for this vendor, listed \
+                 below with what each has left — or `start` the same question against the other \
+                 vendor.",
+                alternatives.join(", ")
+            ));
+        }
+        if let Some(limit) = rate_limit {
+            return Cow::Owned(rate_limit_advice(limit));
+        }
     }
 
     Cow::Borrowed(fixed_advice(kind))
@@ -456,6 +531,48 @@ pub fn quota(reported: &[AccountQuota]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// This vendor's quota entries, in the order a reader should meet them, with the one that ran
+/// flagged.
+///
+/// The account that just failed goes last: it eats several lines restating what the failure
+/// already said, and a reader skimming the top of the list would otherwise meet the exhausted one
+/// first and conclude nothing is available.
+///
+/// Shared with the CLI so both surfaces order the list the same way; keeping it inline in one of
+/// them is how the two came to disagree.
+/// [`quota_report_labelled`] carries the flag through to the rendered lines, for the same reason.
+#[must_use]
+pub fn ordered_quota<'a>(
+    quota: &'a [AccountQuota],
+    vendor: agentmux::delegate::Vendor,
+    ran_as: Option<&agentmux::delegate::AccountAlias>,
+) -> Vec<(&'a AccountQuota, bool)> {
+    // Only this vendor's accounts: the lead-in offers each as an `account` value, and an alias
+    // from the other vendor's table resolves to nothing but a paid round trip.
+    let (failed, others): (Vec<_>, Vec<_>) = quota
+        .iter()
+        .filter(|entry| entry.vendor == vendor)
+        .partition(|entry| entry.account.as_ref() == ran_as);
+    others
+        .into_iter()
+        .map(|entry| (entry, false))
+        .chain(failed.into_iter().map(|entry| (entry, true)))
+        .collect()
+}
+
+/// One account's quota, with the failed account flagged.
+///
+/// The flag lives here rather than at each call site: the ordering was shared and the label was
+/// not, which is the drift [`ordered_quota`] exists to prevent, one field over.
+#[must_use]
+pub fn quota_report_labelled(entry: &AccountQuota, ran: bool) -> Vec<String> {
+    let mut lines = quota_report(entry);
+    if ran && let Some(first) = lines.first_mut() {
+        first.push_str(" — this consultation");
+    }
+    lines
 }
 
 /// One account's quota, as lines a reader scans.

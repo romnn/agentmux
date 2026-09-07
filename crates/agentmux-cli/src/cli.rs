@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -105,6 +105,22 @@ pub struct DelegateArgs {
     #[arg(long)]
     pub account: Option<String>,
 
+    /// Run the delegate with the account's own settings, hooks and MCP servers.
+    ///
+    /// Off by default: a consultation is a second opinion, not a second copy of your setup.
+    /// Use it when the point is to exercise the tooling that configuration sets up, and accept
+    /// that a hook can then reopen the delegate's finished turn.
+    #[arg(long, conflicts_with = "isolated")]
+    pub inherit_settings: bool,
+
+    /// Load none of the account's settings, hooks or MCP servers.
+    ///
+    /// This is what happens with neither flag, unless the account sets `inherit_settings = true`.
+    /// Pass this to override that for one run, when the answer must not depend on this machine.
+    /// `agentmux accounts` marks which accounts inherit.
+    #[arg(long, conflicts_with = "inherit_settings")]
+    pub isolated: bool,
+
     /// How much of the filesystem the delegate may write, for `--delegate codex`.
     /// Defaults to `read-only`.
     #[arg(long, value_enum)]
@@ -139,6 +155,15 @@ pub enum SandboxArg {
 }
 
 impl DelegateArgs {
+    /// The isolation asked for on the command line, or `None` to let the account decide.
+    fn isolation(&self) -> Option<Isolation> {
+        match (self.inherit_settings, self.isolated) {
+            (true, _) => Some(Isolation::Inherit),
+            (_, true) => Some(Isolation::Isolated),
+            _ => None,
+        }
+    }
+
     /// Validate the account alias, if one was given.
     ///
     /// Existence is not checked here: which aliases are defined depends on the working directory
@@ -175,6 +200,7 @@ impl DelegateArgs {
                     model,
                     effort,
                     account: self.alias()?,
+                    isolation: self.isolation(),
                 })
             }
             VendorArg::Codex => Ok(Delegate::Codex {
@@ -185,6 +211,7 @@ impl DelegateArgs {
                     SandboxArg::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
                 },
                 account: self.alias()?,
+                isolation: self.isolation(),
             }),
         }
     }
@@ -208,7 +235,8 @@ pub struct QuestionArgs {
 
     /// Extra environment for the delegate, as a repeatable `KEY=VALUE` pair.
     ///
-    /// Useful for switching off something in the delegate's own setup for one consultation.
+    /// Only useful with `--inherit-settings`: an isolated delegate loads no settings, hooks or
+    /// MCP servers, so nothing in it reads these.
     /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,

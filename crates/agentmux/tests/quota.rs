@@ -189,3 +189,48 @@ fn a_missing_rollout_yields_nothing_rather_than_a_default() -> Result<()> {
     assert_that!(limits.is_none(), eq(true));
     Ok(())
 }
+
+/// Probing must not create the directory it is pointed at.
+///
+/// Both CLIs create a missing config directory and then report "not logged in".
+/// A probe that let that happen would leave a wrong `config_dir` looking configured, and disarm
+/// the pre-launch check whose whole purpose is to name the path rather than the credentials.
+#[gtest]
+fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let missing = dir.path().join("never-created");
+    let config = config_with(
+        "claude",
+        &[(
+            "gone",
+            Account {
+                config_dir: Some(missing.clone()),
+                ..Account::default()
+            },
+        )],
+    );
+
+    let reported = probe_vendor(
+        Vendor::Claude,
+        &config,
+        &host_env(),
+        &agentmux::quota::SystemProbe,
+    );
+
+    // Asserting the reason, not merely that something was unavailable: without the guard the probe
+    // falls through to reading the cache and reports a missing *file*, which is the same verdict
+    // reached for the wrong reason and after the CLI has been given a chance to create the
+    // directory.
+    let reason = match &reported[0].observation {
+        Observation::Unavailable { reason } => reason.clone(),
+        Observation::Reported { .. } => panic!("a missing directory cannot report figures"),
+    };
+    assert_that!(reason, contains_substring("does not exist"));
+    assert_that!(reason, contains_substring("never been logged in"));
+    assert_that!(
+        missing.exists(),
+        eq(false),
+        "the probe created the account's config directory"
+    );
+    Ok(())
+}

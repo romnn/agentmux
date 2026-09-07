@@ -360,3 +360,19 @@ fn a_project_default_does_not_discard_the_other_vendors() -> Result<()> {
     );
     Ok(())
 }
+
+/// An exported-but-empty `AGENTMUX_CONFIG` means unset, not a path of `""`.
+///
+/// A shell that exports the variable unconditionally is common, and treating that as an explicit
+/// path makes every command fail with "points at , which does not exist".
+#[gtest]
+fn an_empty_config_path_variable_is_treated_as_unset() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let mut host = env(home.path());
+    host.insert("AGENTMUX_CONFIG".to_owned(), String::new());
+
+    let config = Config::load(&host, home.path()).or_fail()?;
+
+    assert_that!(config.source, none());
+    Ok(())
+}

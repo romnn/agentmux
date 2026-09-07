@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use googletest::prelude::*;
 
-/// The eight tools, and nothing else.
+/// The nine tools, and nothing else.
 #[gtest]
 fn the_server_offers_exactly_the_documented_tools() {
     let names: BTreeSet<String> = agentmux_mcp::tool_router()

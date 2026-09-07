@@ -42,6 +42,7 @@
 //!         model: ModelId::parse("claude-opus-5")?,
 //!         effort: Effort::parse("xhigh")?,
 //!         account: None,
+//!         isolation: None,
 //!     },
 //!     question: "Review the merge-base diff for correctness bugs.".to_owned(),
 //!     cwd: std::env::current_dir()?,

@@ -64,6 +64,16 @@ pub enum RunError {
     /// The machine's account configuration could not be loaded.
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
+    /// agentmux is already running as somebody's delegate.
+    ///
+    /// Reachable only when a delegate inherited its account's MCP servers and agentmux is among
+    /// them, which is exactly the case isolation would otherwise have prevented.
+    #[error(
+        "this agentmux is itself running as a delegate, so it will not launch another one. A \
+         delegate that inherits its account's settings also inherits its MCP servers; answer the \
+         question you were asked instead."
+    )]
+    Recursive,
     /// A child could not be launched.
     #[error(transparent)]
     Launch(#[from] LaunchError),
@@ -485,6 +495,16 @@ impl RunStore {
         })
     }
 
+    /// The environment this store resolves configuration and delegates against.
+    ///
+    /// Exposed so that a caller building something environment-dependent, such as the MCP
+    /// server's instructions, resolves against the same snapshot a consultation will rather than
+    /// against whatever the process happens to hold.
+    #[must_use]
+    pub fn host_env(&self) -> &BTreeMap<String, String> {
+        &self.host_env
+    }
+
     /// Install the probe used to ask accounts what they have left.
     #[must_use]
     pub fn with_quota_probe(mut self, probe: Arc<dyn crate::quota::QuotaProbe>) -> Self {
@@ -557,7 +577,7 @@ impl RunStore {
             // actually ran and every later turn resumes as the same one.
             // A configuration edited mid-consultation must not silently move a follow-up to
             // another account, whose session it would then fail to resume.
-            delegate: self.pin_default_account(&request.delegate, &request.cwd),
+            delegate: self.pin_defaults(&request.delegate, &request.cwd),
             cwd: request.cwd.clone(),
             retention: request.retention,
             created_at: Utc::now(),
@@ -568,24 +588,29 @@ impl RunStore {
         self.status(&run_id)
     }
 
-    /// Fill in the configured default account, when the caller named none.
+    /// Fill in whatever the configuration decides, so the record names what actually ran.
+    ///
+    /// Both the account and the isolation are resolved once, here, rather than at each launch.
+    /// A configuration edited mid-consultation would otherwise move a follow-up onto another
+    /// identity — whose session it could not resume — or silently change whether the delegate
+    /// loads hooks, in the middle of one transcript.
     ///
     /// A configuration that cannot be read leaves the delegate as it was: the launch that follows
     /// reads it again and reports the failure with a better message than this could.
-    fn pin_default_account(&self, delegate: &Delegate, cwd: &std::path::Path) -> Delegate {
-        if delegate.account().is_some() {
-            return delegate.clone();
-        }
+    fn pin_defaults(&self, delegate: &Delegate, cwd: &std::path::Path) -> Delegate {
         let Ok(config) = crate::config::Config::load(&self.host_env, cwd) else {
             return delegate.clone();
         };
-        config
-            .default_account(delegate.vendor())
-            .and_then(|name| crate::delegate::AccountAlias::parse(name).ok())
-            .map_or_else(
-                || delegate.clone(),
-                |alias| delegate.clone().with_account(alias),
-            )
+        let mut pinned = delegate.clone();
+        if pinned.account().is_none()
+            && let Some(alias) = config
+                .default_account(pinned.vendor())
+                .and_then(|name| crate::delegate::AccountAlias::parse(name).ok())
+        {
+            pinned = pinned.with_account(alias);
+        }
+        let isolation = pinned.resolved_isolation(&config);
+        pinned.with_isolation(isolation)
     }
 
     /// Continue a consultation with another question, in the delegate's own session.
@@ -637,6 +662,12 @@ impl RunStore {
         self.status(run_id)
     }
 
+    /// Spawn one turn's delegate.
+    ///
+    /// The recursion check lives here rather than in `start` because this is the one place a child
+    /// is actually spawned.
+    /// `follow_up` and anything added later are then covered by construction rather than by
+    /// remembering.
     fn launch_turn(
         &self,
         meta: &Meta,
@@ -644,6 +675,9 @@ impl RunStore {
         question: &str,
         resume: Option<&SessionRef>,
     ) -> Result<(), RunError> {
+        if self.host_env.contains_key(crate::delegate::DELEGATE_MARKER) {
+            return Err(RunError::Recursive);
+        }
         let turn = self.turn_dir(&meta.run_id, index);
         // `create_dir` rather than `create_dir_all`: creating the directory *is* the claim on this
         // turn index, and it has to fail if someone else already made it.
@@ -1275,10 +1309,6 @@ fn tail_of_file(path: &Path, max_bytes: usize) -> String {
     text.get(start..).unwrap_or_default().to_owned()
 }
 
-/// Walk `index` back to the nearest UTF-8 character boundary.
-///
-/// Slicing a rendered transcript by byte offset would otherwise panic on a multi-byte character,
-/// and transcripts routinely contain them.
 /// Walk `index` forward to the nearest UTF-8 character boundary.
 ///
 /// Used only to guarantee forward progress when a page size is smaller than one character.
@@ -1290,6 +1320,10 @@ fn ceil_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
+/// Walk `index` back to the nearest UTF-8 character boundary.
+///
+/// Slicing a rendered transcript by byte offset would otherwise panic on a multi-byte character,
+/// and transcripts routinely contain them.
 fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {

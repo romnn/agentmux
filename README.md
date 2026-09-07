@@ -133,6 +133,8 @@ account = "personal"
 [accounts.claude.personal]
 config_dir = "~/.claude-personal"
 description = "Personal Max subscription"
+# Run this account's delegates with its own settings, hooks and MCP servers.
+inherit_settings = true
 
 # A key kept out of the file, read from the environment at launch.
 [accounts.claude.ci]
@@ -189,11 +191,41 @@ cheerfully, and anything ranking on "least used" would route straight to the bro
 
 Three layers reach the delegate, each overriding the last: the `[launch]` table above, then the
 chosen account's own `env`, then whatever one call asks for — `--env KEY=VALUE` on the CLI, an
-`env` object on the MCP tools. Useful for switching off a hook inside a review.
+`env` object on the MCP tools. Useful when a consultation inherits its account's settings and that
+tooling reads configuration of its own; an isolated delegate loads nothing that would read it.
 
 A per-request `env` may not name a credential or a config directory. Those decide which identity
 pays, and a request arriving from a delegating agent must not be able to redirect that; put them in
 `agentmux.toml`, which no request can reach.
+
+### Isolation, and opting out of it
+
+By default a delegate loads **no** user, project or local settings, no hooks and no MCP servers.
+Three things follow. A blocking `Stop` hook cannot reopen the finished turn and blank its result.
+The delegate cannot re-enter `agentmux` through a configured MCP server and recurse. And what the
+delegate saw does not depend on the machine it ran on.
+
+That default is sometimes wrong. A reviewer meant to exercise the project's own tooling needs that
+tooling, and a hook you want applied to every model you run is not usefully suppressed here. So it
+can be turned off, per account or per consultation:
+
+```bash
+agentmux ask --delegate claude --model claude-opus-5 --effort xhigh \
+  --inherit-settings "Run the project's own checks and tell me what fails."
+
+agentmux ask ... --isolated      # override an account that asks to inherit
+```
+
+The MCP tools take `inherit_settings: true` for the same thing. Isolation is imposed by
+*argument*, not by environment — no variable switches it on or off — so this is the only way to
+change it.
+
+What inheriting does **not** change is what the delegate may do: plan mode and the read-only tool
+list stay, because whose configuration is loaded is a different question from what may be edited.
+
+Every delegate is launched with `AGENTMUX_DELEGATE=1`, and `agentmux` refuses to launch a
+delegate when it sees that variable. An isolated delegate could never reach `agentmux` anyway;
+an inheriting one loads your own MCP servers, and `agentmux` may be among them.
 
 ### What the delegate does and does not see
 

@@ -217,6 +217,21 @@ pub struct SystemProbe;
 
 impl QuotaProbe for SystemProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
+        if let Some(dir) = &request.config_dir
+            && !dir.is_dir()
+        {
+            // Checked before anything spawns, because both CLIs *create* the directory they are
+            // pointed at and then report "not logged in".
+            // A probe that let that happen would leave the account looking configured and disarm
+            // the pre-launch check that names the wrong path.
+            return Observation::Unavailable {
+                reason: format!(
+                    "{} does not exist. That account's `config_dir` is wrong, or it has never \
+                     been logged in on this machine.",
+                    dir.display()
+                ),
+            };
+        }
         if !request.has_own_profile {
             // Reported rather than skipped: a caller comparing accounts needs to see that this one
             // exists and simply has no window, not to find it missing from the list.
