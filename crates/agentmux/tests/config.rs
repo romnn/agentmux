@@ -210,23 +210,87 @@ fn no_config_anywhere_is_not_an_error() -> Result<()> {
     Ok(())
 }
 
-/// A misspelled key is rejected rather than ignored.
+/// A misspelled key is reported, and the rest of the file takes effect.
 ///
 /// A silently dropped `config_dir` would run as the default account while the file says otherwise,
-/// which is the same silent-wrong-identity failure in a different costume.
+/// which is the same silent-wrong-identity failure in a different costume; refusing the file is
+/// no longer the answer, because the same refusal takes out every older agentmux reading a newer
+/// file, so the key is named instead by every reader of the configuration.
 #[gtest]
-fn a_misspelled_key_is_refused() -> Result<()> {
+fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     std::fs::write(
         home.path().join("agentmux.toml"),
-        "[accounts.claude.personal]\nconfigdir = \"/tmp\"\n",
+        indoc::indoc! {r#"
+            [accounts.claude.personal]
+            config_dir = "/tmp"
+            configdir = "/tmp"
+        "#},
     )
     .or_fail()?;
 
-    let error = Config::load(&env(home.path()), home.path()).expect_err("configdir is not a key");
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
-    assert_that!(error.to_string(), contains_substring("not valid"));
-    assert_that!(error.to_string(), contains_substring("configdir"));
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|u| u.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("accounts.claude.personal.configdir")]
+    );
+    Ok(())
+}
+
+/// A file written for a newer agentmux loads on an older one.
+///
+/// The reason the rule is worth the misspelling it lets through: a machine file is edited once and
+/// read by every agentmux on the machine, including the MCP servers that have been running since
+/// before the key existed. Refusing the file takes those servers out entirely — every delegation
+/// fails, over a table that build simply has no use for.
+#[gtest]
+fn a_key_from_a_newer_agentmux_is_reported_and_ignored() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [defaults.claude]
+            account = "work"
+
+            [accounts.claude.work]
+            config_dir = "/tmp"
+
+            [launch]
+            request_env = []
+
+            [some_table_from_the_future]
+            enabled = true
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    // Everything this build does read is in effect.
+    assert_that!(
+        config
+            .default_account(agentmux::delegate::Vendor::Claude)
+            .map(|d| d.alias),
+        some(eq("work"))
+    );
+    // Only the table it does not, and not the empty list serialising would have dropped.
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|u| u.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("some_table_from_the_future")]
+    );
+    assert_that!(
+        config.unknown.first().map(|u| u.file.clone()),
+        some(eq(&home.path().join("agentmux.toml")))
+    );
     Ok(())
 }
 
@@ -275,7 +339,7 @@ fn every_documented_config_example_parses() -> Result<()> {
         if inside && line.trim_start().starts_with("```") {
             inside = false;
             // Only agentmux's own configuration; the README also shows a Codex MCP registration.
-            if ["[accounts.", "[defaults.", "[launch]"]
+            if ["[accounts.", "[defaults.", "[launch]", "[models."]
                 .iter()
                 .any(|marker| block.contains(marker))
             {
@@ -755,5 +819,143 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
             }
         ))
     );
+    Ok(())
+}
+
+/// The machine file says which model a name actually runs, and says it once.
+///
+/// Asking for "fable-5" when what is wanted is whichever point release is current today is a
+/// preference about a machine, not about a consultation, and the caller that types the name is
+/// often an agent working from a prompt written weeks ago.
+/// A name the file says nothing about is untouched, which is what keeps agentmux out of the
+/// business of knowing which models exist.
+#[gtest]
+fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
+    use agentmux::delegate::Vendor;
+
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.claude]
+            "fable-5" = "claude-fable-5-1"
+            # Says nothing, and is allowed to: an operator may spell out that the full name stands.
+            "claude-fable-5-1" = "claude-fable-5-1"
+
+            [models.codex]
+            "gpt-6" = "gpt-6-astra"
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config.rewritten_model(Vendor::Claude, "fable-5"),
+        some(eq("claude-fable-5-1"))
+    );
+    // Released this morning, named by nobody's configuration, launched exactly as asked.
+    assert_that!(
+        config.rewritten_model(Vendor::Claude, "claude-opus-6"),
+        none()
+    );
+    // The rewritten identifier is not itself a name to be rewritten again, and a rule mapping it
+    // to itself is neither a rewrite nor the second link of a chain.
+    assert_that!(
+        config.rewritten_model(Vendor::Claude, "claude-fable-5-1"),
+        none()
+    );
+    // One vendor's rules are not the other's: the same name means different things to each CLI.
+    assert_that!(config.rewritten_model(Vendor::Codex, "fable-5"), none());
+    assert_that!(
+        config.rewritten_model(Vendor::Codex, "gpt-6"),
+        some(eq("gpt-6-astra"))
+    );
+    Ok(())
+}
+
+/// A project file may not decide which model answers.
+///
+/// It arrives with a `git clone`, and a rule that quietly turned every cheap question into an
+/// expensive one — or every careful one into a cheap one — is a change to what the operator pays
+/// and to what they are told, from a file they never wrote.
+#[gtest]
+fn a_project_file_that_rewrites_a_model_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/cloned");
+    std::fs::create_dir_all(&repo).or_fail()?;
+    std::fs::write(
+        repo.join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.claude]
+            "claude-haiku-4-5" = "claude-opus-5[1m]"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), &repo).expect_err("a project file rewrote one");
+
+    assert_that!(
+        error.to_string(),
+        contains_substring("may only select an account")
+    );
+    Ok(())
+}
+
+/// A rewrite whose result is itself rewritten is refused when the file is read.
+///
+/// One substitution is applied, never a chain, so such a file does not do what it reads as.
+/// Refused rather than resolved: either reading is a guess at which of the two lines the operator
+/// meant, and the guess would be made every time a delegate launched.
+#[gtest]
+fn a_rewrite_that_chains_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.claude]
+            "fable-5" = "claude-fable-5-1"
+            "claude-fable-5-1" = "claude-fable-5-2"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), home.path()).expect_err("the rules chain");
+
+    assert_that!(error.to_string(), contains_substring("one substitution"));
+    Ok(())
+}
+
+/// A rewrite the argument parser would refuse is refused when the file is read.
+///
+/// Left in, it would either never match anything a caller could ask for, or reach the child's
+/// argv as something other than a model identifier.
+#[gtest]
+fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    for rule in [
+        r#""fable 5" = "claude-fable-5-1""#,
+        r#""fable-5" = "--dangerously-skip-permissions""#,
+        r#""fable-5" = """#,
+    ] {
+        std::fs::write(
+            home.path().join("agentmux.toml"),
+            indoc::formatdoc! {"
+                [models.claude]
+                {rule}
+            "},
+        )
+        .or_fail()?;
+        assert_that!(
+            Config::load(&env(home.path()), home.path()).map(|_| ()),
+            err(matches_pattern!(
+                agentmux::config::ConfigError::InvalidName {
+                    what: eq(&"the model"),
+                    ..
+                }
+            )),
+            "{rule} was accepted"
+        );
+    }
     Ok(())
 }

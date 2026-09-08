@@ -25,7 +25,11 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(status)?);
         return Ok(());
     }
-    println!("{}  {}", status.run_id, status.delegate.summary());
+    println!(
+        "{}  {}",
+        status.run_id,
+        agentmux_mcp::render::delegate_line(status)
+    );
     println!(
         "  state       {}",
         agentmux_mcp::render::outcome_line(&status.outcome)
@@ -213,10 +217,12 @@ pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print the account aliases this machine defines.
+/// Print the account aliases this machine defines, and the model rewrites it applies.
 ///
 /// The point of the command is discovery: an alias is a name someone has to know, and the error
 /// for guessing wrong is only visible after a consultation has been attempted.
+/// A rewrite is the opposite problem — it needs no knowing to work, and is invisible until a
+/// consultation comes back naming a model nobody asked for.
 ///
 /// # Errors
 ///
@@ -237,7 +243,9 @@ pub fn accounts(
                 "project_source": config.project_source,
                 "accounts": config.accounts,
                 "defaults": config.defaults,
+                "models": config.models,
                 "launch": config.launch,
+                "unknown": config.unknown,
             }))?
         );
         return Ok(());
@@ -258,6 +266,13 @@ pub fn accounts(
     }
     if let Some(path) = &config.project_source {
         println!("project     {} (selects a default only)", path.display());
+    }
+    for unknown in &config.unknown {
+        // A key that does nothing is invisible everywhere else: the file loads, the delegation
+        // runs, and whatever the key was for simply does not happen.
+        // Both causes are named because they need opposite fixes — one is a typo, the other is an
+        // agentmux older than the file it is reading.
+        println!("ignored     {unknown} (a misspelling, or a key newer than this agentmux)");
     }
 
     if !config.launch.is_empty() {
@@ -304,6 +319,13 @@ pub fn accounts(
             }
             Some(default) => println!("{label:<11} default: {}", default.alias),
             None => println!("{label:<11} default: the {vendor} CLI's own login"),
+        }
+        // Printed where the accounts are, because it answers the same kind of question: what this
+        // machine does with a name a caller hands it.
+        let mut heading = "models";
+        for (from, to) in config.model_rewrites(vendor) {
+            println!("  {heading:<14} {from} -> {to}");
+            heading = "";
         }
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {

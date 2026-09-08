@@ -201,11 +201,12 @@ directory instead.
 
 **Two files, two jobs.** A *machine* file — `$AGENTMUX_CONFIG`, `~/.config/agentmux/agentmux.toml`,
 `~/agentmux.toml`, or the platform config directory when it lies under your home — may define
-accounts. `AGENTMUX_CONFIG` must be absolute and is the one way to keep the file anywhere else;
-`XDG_CONFIG_HOME` and `APPDATA` count only when they point under your home, so a container that
-points them at a workspace cannot turn a checkout into a machine file. A *project* file, found by
-walking up from the delegate's working directory to the root of its repository (the nearest
-`.git`), or to just below `$HOME` when it is in none, may only **select** one:
+accounts and model rewrites. `AGENTMUX_CONFIG` must be absolute and is the one way to keep the
+file anywhere else; `XDG_CONFIG_HOME` and `APPDATA` count only when they point under your home, so
+a container that points them at a workspace cannot turn a checkout into a machine file. A
+*project* file, found by walking up from the delegate's working directory to the root of its
+repository (the nearest `.git`), or to just below `$HOME` when it is in none, may only **select**
+an account:
 
 ```toml
 # <repo>/agentmux.toml — safe to commit
@@ -213,13 +214,55 @@ walking up from the delegate's working directory to the root of its repository (
 account = "clientx"
 ```
 
-A project file that tries to define an account, or a `[launch]` table, is refused by name. It has
-to be, because such a file arrives with a `git clone`: were it able to name a `base_url` and an
-`api_key_env`, cloning a repository and asking for one second opinion would send your key to
-whoever wrote it. For the same reason a project file may choose *which* of your accounts pays but
-nothing more: an account it selects runs isolated unless the call says otherwise, and does not
-bring its own `request_env` with it. Either file is read only when you own it and nobody else can
-write it, and a file that cannot be parsed is reported by position, never by quoting the line.
+A project file that tries to define an account, a `[launch]` table or a `[models]` rewrite is
+refused by name. It has to be, because such a file arrives with a `git clone`: were it able to
+name a `base_url` and an `api_key_env`, cloning a repository and asking for one second opinion
+would send your key to whoever wrote it. For the same reason a project file may choose *which* of
+your accounts pays but nothing more: an account it selects runs isolated unless the call says
+otherwise, and does not bring its own `request_env` with it. Either file is read only when you own
+it and nobody else can write it, and a file that cannot be parsed is reported by position, never by
+quoting the line.
+
+**A key agentmux does not know is a warning, not a failure.** One machine file is read by every
+agentmux on the machine, including the MCP servers that have been running since before you added
+the key; refusing the file would take those servers out entirely over a table they have no use for.
+So an unknown key is ignored, named on stderr and listed by `agentmux accounts` as `ignored`, and
+the rest of the file takes effect. The same warning is what a misspelling gets — `configdir` for
+`config_dir` leaves that account on the CLI's own login — so read the `ignored` lines: the two need
+opposite fixes, and only one of them is fixed by upgrading.
+
+### Model rewrites
+
+A caller names the exact model it wants, and the name it names is often one a person wrote into a
+prompt weeks ago — "fable 5", the series rather than whichever point release is current. The
+machine file is where the two are reconciled, so a rule written once outlives every prompt that
+predates it:
+
+```toml
+# ~/.config/agentmux/agentmux.toml
+
+[models.claude]
+# Asked for on the left, launched on the right.
+"fable-5" = "claude-fable-5-1"
+"opus" = "claude-opus-5[1m]"
+
+[models.codex]
+"gpt-6" = "gpt-6-astra"
+```
+
+agentmux still keeps no roster of models: an identifier the file says nothing about reaches the CLI
+untouched, so a model released this morning works this morning and a rewrite for it is one line you
+add when you want it. A rewrite is exactly one substitution — the result is never looked up again,
+and a file whose rules would chain is refused when it is read, so what one line says is what runs.
+Rules are per vendor, matched exactly as the CLI matches them, and pinned at `start`: a file edited
+between two questions cannot answer the second half of one transcript with a different model.
+
+A consultation whose model was rewritten says so wherever it is described — `codex gpt-6-astra …
+(asked for gpt-6)` — because a caller that pinned a model and read a different one back would
+otherwise have no way to tell a rule of its own machine from a pin agentmux ignored. `agentmux
+accounts` lists the rules alongside the accounts. Only a machine file may define one, for the same
+reason only a machine file may define an account: a project file arrives with a `git clone`, and
+which model answers is a decision about what you pay and what you are told.
 
 ### Rate limits
 

@@ -66,7 +66,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::{Delegate, DelegateError, Isolation, SessionRef, TurnPlan, Vendor};
+use crate::delegate::{Delegate, DelegateError, Isolation, ModelId, SessionRef, TurnPlan, Vendor};
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use crate::transcript::{
     FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage, render_turn,
@@ -364,6 +364,25 @@ pub struct Meta {
     /// quietly dropped it would answer from a differently configured delegate.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The model the caller named, when the machine's configuration rewrote it to another.
+    ///
+    /// `delegate` names what ran, as it does for the account.
+    /// The identifier that was asked for is kept beside it rather than thrown away, because a
+    /// caller that pinned a model and reads a different one back has to be able to tell a rule of
+    /// its own machine from agentmux ignoring the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten_from: Option<ModelId>,
+}
+
+/// What the machine's configuration decided about a requested delegate.
+///
+/// A named shape rather than a pair: both halves name a model, and nothing about a positional
+/// pair would say which of the two ran.
+struct Pinned {
+    /// The delegate as it will be launched and recorded.
+    delegate: Delegate,
+    /// The model the caller asked for, when that is not the one in `delegate`.
+    rewritten_from: Option<ModelId>,
 }
 
 /// Where one turn's files live, and what agentmux knows about its child.
@@ -454,6 +473,13 @@ pub struct RunStatus {
     /// two it is looking at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<String>,
+    /// The model the caller named, when this machine's configuration rewrote it to another.
+    ///
+    /// `delegate` names the model that ran.
+    /// Reported so that a caller which pinned a model and reads another back can see that a rule
+    /// of its own machine moved it, rather than reading it as a pin agentmux ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewritten_from: Option<ModelId>,
     /// Event types the parser met but does not model.
     pub unrecognised: UnrecognisedEvents,
     /// What it means that a hook reopened a finished turn, when one did.
@@ -890,15 +916,20 @@ impl RunStore {
             .map_err(RunError::io("resolving the working directory"))?;
         let config = crate::config::Config::load(&self.host_env, &cwd)?;
 
+        // Resolved now rather than at each launch, so the record names the identity that
+        // actually ran and every later turn resumes as the same one.
+        // A configuration edited mid-consultation must not silently move a follow-up to
+        // another account, whose session it would then fail to resume.
+        let Pinned {
+            delegate,
+            rewritten_from,
+        } = Self::pin_defaults(&request.delegate, &config);
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
             env: request.env.clone(),
             run_id: run_id.clone(),
-            // Resolved now rather than at each launch, so the record names the identity that
-            // actually ran and every later turn resumes as the same one.
-            // A configuration edited mid-consultation must not silently move a follow-up to
-            // another account, whose session it would then fail to resume.
-            delegate: Self::pin_defaults(&request.delegate, &config),
+            delegate,
+            rewritten_from,
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -940,16 +971,20 @@ impl RunStore {
 
     /// Fill in whatever the configuration decides, so the record names what actually ran.
     ///
-    /// Both the account and the isolation are resolved once, here, rather than at each launch.
+    /// The account, the isolation and the model are resolved once, here, rather than at each
+    /// launch.
     /// A configuration edited mid-consultation would otherwise move a follow-up onto another
-    /// identity — whose session it could not resume — or silently change whether the delegate
-    /// loads hooks, in the middle of one transcript.
+    /// identity — whose session it could not resume — silently change whether the delegate loads
+    /// hooks, or answer the second half of one transcript with a different model.
     ///
     /// Isolation is resolved before the account is pinned, because the answer depends on which
     /// file chose the account, and a pinned alias no longer says.
     /// A default alias the configuration does not define is left unpinned, so the launch that
     /// follows reports it with the file that selected it.
-    fn pin_defaults(delegate: &Delegate, config: &crate::config::Config) -> Delegate {
+    ///
+    /// A model the file rewrites is exchanged here, once: an identifier the file says nothing
+    /// about is untouched, and the rewritten one is never looked up again.
+    fn pin_defaults(delegate: &Delegate, config: &crate::config::Config) -> Pinned {
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
         if pinned.account().is_none()
@@ -961,7 +996,19 @@ impl RunStore {
         {
             pinned = pinned.with_account(alias);
         }
-        pinned.with_isolation(isolation)
+        // Every rewrite was checked when the file was read, so one that fails to parse here is a
+        // value this build cannot use; what the caller asked for is then what runs.
+        let asked = pinned.model().clone();
+        if let Some(rewritten) = config
+            .rewritten_model(pinned.vendor(), asked.as_str())
+            .and_then(|to| ModelId::parse(to).ok())
+        {
+            pinned = pinned.with_model(rewritten);
+        }
+        Pinned {
+            rewritten_from: (*pinned.model() != asked).then_some(asked),
+            delegate: pinned.with_isolation(isolation),
+        }
     }
 
     /// Continue a consultation with another question, in the delegate's own session.
@@ -1226,6 +1273,7 @@ impl RunStore {
             usage: state.transcript.usage(),
             cost_usd: state.transcript.cost_usd(),
             resolved_model: state.transcript.resolved_model().map(ToOwned::to_owned),
+            rewritten_from: meta.rewritten_from.clone(),
             unrecognised: state.transcript.unrecognised(),
             hook_reopening: HookReopening::of(
                 state.transcript.was_reopened_by_hook(),
@@ -1452,7 +1500,7 @@ impl RunStore {
                     .unwrap_or_default();
                 Some(RunSummary {
                     run_id: meta.run_id,
-                    delegate: meta.delegate.summary(),
+                    delegate: describe_delegate(&meta.delegate, meta.rewritten_from.as_ref()),
                     outcome,
                     created_at: meta.created_at,
                     question,
@@ -1664,7 +1712,7 @@ impl RunStore {
              - working directory: `{}`\n\
              - started: {}\n",
             meta.run_id,
-            meta.delegate.summary(),
+            describe_delegate(&meta.delegate, meta.rewritten_from.as_ref()),
             meta.cwd.display(),
             meta.created_at.to_rfc3339(),
         );
@@ -1981,6 +2029,22 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Run
             path: path.to_owned(),
             source,
         })
+}
+
+/// One line naming the delegate, and the model that was asked for when another one ran.
+///
+/// The one phrasing of a rewrite, so the transcript header, `list` and every front end say the
+/// same thing about it.
+/// A consultation whose model was rewritten is otherwise indistinguishable from one that asked
+/// for the rewritten model outright, and the two are worth different amounts to a reader working
+/// out why an answer looks the way it does.
+#[must_use]
+pub fn describe_delegate(delegate: &Delegate, rewritten_from: Option<&ModelId>) -> String {
+    let summary = delegate.summary();
+    match rewritten_from {
+        Some(asked) => format!("{summary} (asked for {asked})"),
+        None => summary,
+    }
 }
 
 fn first_line(text: &str, max: usize) -> String {

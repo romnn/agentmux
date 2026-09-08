@@ -684,11 +684,16 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
 
 /// Who ran, and what actually answered when that is not what was asked for.
 ///
-/// A vendor may expand a requested identifier into a fuller one — `sonnet` answering as
-/// `claude-sonnet-5` — and the expansion is invisible in a result that echoes only the request.
-/// Two consultations then look like they used the same model when one of them may not have.
-fn delegate_line(status: &RunStatus) -> String {
-    let summary = status.delegate.summary();
+/// Two things can move a model out from under a request, and a caller comparing consultations has
+/// to be able to see both.
+/// The machine's configuration may rewrite the identifier before launch, which
+/// [`agentmux::run::describe_delegate`] names; the vendor may then expand it into a fuller one —
+/// `sonnet` answering as `claude-sonnet-5` — which is invisible in a result that echoes only the
+/// request.
+#[must_use]
+pub fn delegate_line(status: &RunStatus) -> String {
+    let summary =
+        agentmux::run::describe_delegate(&status.delegate, status.rewritten_from.as_ref());
     match &status.resolved_model {
         Some(resolved) if resolved != status.delegate.model().as_str() => {
             format!("{summary} (answered by {resolved})")

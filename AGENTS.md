@@ -18,7 +18,8 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 ## House style
 
 - `indoc!` for every multi-line string literal, prompt scaffolding included; leading indentation
-  would otherwise leak into what the delegate reads.
+  would otherwise leak into what the delegate reads. A literal whose newlines are written `\n` is
+  a multi-line string too — `indoc!` it, and reach for `formatdoc!` where the text interpolates.
 - `googletest` for test assertions: `use googletest::prelude::*;` then
   `assert_that!(actual, eq(expected))`. `std::assert_eq!` is banned in `clippy.toml`.
 - `thiserror` for library error types. `color-eyre` is for `agentmux-cli`, which installs its
@@ -106,6 +107,29 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   sole authority on which values it accepts; when one is wrong, that CLI's own error — which names
   the valid set — is surfaced verbatim. agentmux validates only that the strings are argv-safe:
   non-empty, no control characters, bounded length.
+- **A model rewrite is the operator's file speaking, not a roster.** `[models.<vendor>]` in a
+  machine file maps an identifier a caller asks for to the one launched, which is how "fable-5"
+  keeps meaning the current point release without an agentmux release or a code change; an
+  identifier the file does not name is untouched. Exactly one substitution is applied and a file
+  whose rules would chain is refused at load, because either resolution would be a guess made on
+  every launch. `Config::rewritten_model` is the only reader, `RunStore::pin_defaults` the only
+  caller: the model is frozen with the account and the isolation at `start`, so a file edited
+  mid-consultation cannot answer the second half of one transcript with another model. What was
+  asked for is kept in `Meta::rewritten_from` and rendered by `run::describe_delegate`, since a
+  caller that pinned a model and read back another must be able to tell its own rule from a pin
+  agentmux dropped. Only a machine file may define one — which model answers decides what an
+  operator pays and what they are told.
+- **An unknown configuration key is reported, never refused.** No struct in `config` sets
+  `deny_unknown_fields`: one machine file is read by every agentmux on the machine, and the ones
+  that matter are the long-running MCP servers started before the key was added — refusing the file
+  takes them out of service over a table they have no use for. `Config::unknown_keys` finds them by
+  serialising the parsed config back and diffing it against the file, so the answer cannot drift
+  from the types; it runs before `canonicalise_env_names`, which on Windows rewrites the keys it
+  would be compared against. A key whose value is an empty table or array is passed over, because
+  serialising drops an empty `request_env` and the file would be told its own key is unknown. The
+  cost is that a misspelled `api_key_env` now silently authenticates as the CLI's own login, which
+  is why every reader says the ignored keys out loud: `tracing::warn!` at each load, an `ignored`
+  line in `agentmux accounts`, and an `unknown` array in its `--json`.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 

@@ -12,6 +12,8 @@
 //! # Two files, two jobs
 //!
 //! A **machine** file defines accounts: paths, credentials, endpoints, environment.
+//! It also holds the model rewrites — the machine's answer to "when something asks for *this*
+//! model, run *that* one" — which is the other thing a caller cannot know from where it sits.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
 //! `AGENTMUX_CONFIG` names.
 //!
@@ -76,16 +78,32 @@ pub enum ConfigError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// A project file tried to define an account, or a launch environment, rather than select one.
+    /// A project file tried to define an account, a launch environment or a model rewrite,
+    /// rather than select an account.
     #[error(
-        "{path} defines accounts or a [launch] environment, and a project agentmux.toml may only \
-         select an account with [defaults.<vendor>]. Move the definitions to your machine \
-         configuration: a file that travels with a repository must not be able to name a \
-         credential, an endpoint or an environment variable."
+        "{path} defines accounts, model rewrites or a [launch] environment, and a project \
+         agentmux.toml may only select an account with [defaults.<vendor>]. Move the definitions \
+         to your machine configuration: a file that travels with a repository must not be able to \
+         name a credential, an endpoint, an environment variable, or which model your questions \
+         are answered by."
     )]
-    ProjectFileDefinesAccounts {
+    ProjectFileOversteps {
         /// The offending file.
         path: PathBuf,
+    },
+    /// A model rewrite names a model the same file rewrites again.
+    #[error(
+        "the agentmux config at {path} rewrites the model {from:?} to {to:?}, which it rewrites \
+         again. A rewrite is one substitution, never a chain, so this rule does not do what it \
+         reads as: name the identifier you want run on both lines."
+    )]
+    ChainedRewrite {
+        /// The file.
+        path: PathBuf,
+        /// The identifier a caller would ask for.
+        from: String,
+        /// What it is rewritten to, which is itself rewritten.
+        to: String,
     },
     /// A configuration file another user could have written was found.
     #[error(
@@ -118,6 +136,45 @@ pub enum ConfigError {
         /// The path that was named.
         path: PathBuf,
     },
+}
+
+/// Report every key of `written` that `understood` does not hold, depth first.
+///
+/// A key whose value is an empty table or array is passed over: serialising drops an empty `env`
+/// or `request_env`, so a file that spells one out would otherwise be told its own key is unknown.
+/// Nothing is lost by the exception, because an empty value is what an absent key already means.
+fn collect_unknown_keys(
+    written: &toml::Table,
+    understood: &toml::Table,
+    prefix: &str,
+    found: &mut Vec<String>,
+) {
+    for (key, value) in written {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match understood.get(key) {
+            Some(toml::Value::Table(understood)) => {
+                if let toml::Value::Table(written) = value {
+                    collect_unknown_keys(written, understood, &path, found);
+                }
+            }
+            Some(_) => {}
+            None if is_empty_value(value) => {}
+            None => found.push(path),
+        }
+    }
+}
+
+/// Whether a value says nothing that an absent key would not say.
+fn is_empty_value(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table.is_empty(),
+        toml::Value::Array(array) => array.is_empty(),
+        _ => false,
+    }
 }
 
 /// A parser message with every quoted value blanked.
@@ -192,7 +249,6 @@ impl Serialize for Secret {
 /// heard of, and a user may want to switch off their own hooks for delegate runs.
 /// These fields are the extension point, so agentmux never has to learn what Bedrock is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LaunchEnv {
     /// Variables set to a literal value.
     ///
@@ -320,7 +376,6 @@ pub fn canonical_env_name(name: &str) -> String {
 /// A `config_dir` account authenticates as a logged-in CLI profile; a `base_url` account points the
 /// CLI at some other endpoint, which is how a locally served model is reached.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Account {
     /// The CLI's configuration directory: `CLAUDE_CONFIG_DIR`, or `CODEX_HOME` for Codex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -372,7 +427,6 @@ impl Account {
 
 /// What a file asks for when the caller asks for nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// The account alias to use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -381,7 +435,6 @@ pub struct Defaults {
 
 /// The machine's agentmux configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Accounts by vendor, then by alias.
     ///
@@ -393,6 +446,13 @@ pub struct Config {
     /// Which account to use per vendor when the caller names none.
     #[serde(default)]
     pub defaults: BTreeMap<String, Defaults>,
+    /// Model identifiers to substitute, by vendor, then by the identifier a caller asks for.
+    ///
+    /// Read through [`Config::rewritten_model`].
+    /// Keyed by vendor as [`Self::accounts`] is, and for the same reason: a file naming a vendor
+    /// this build has never heard of loads anyway.
+    #[serde(default)]
+    pub models: BTreeMap<String, BTreeMap<String, String>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -405,6 +465,14 @@ pub struct Config {
     /// Which project file selected a default, when one did.
     #[serde(skip)]
     pub project_source: Option<PathBuf>,
+    /// Keys the files set that this build does not read, in the order they were found.
+    ///
+    /// Empty unless something is wrong: either the file was written for a newer agentmux, or a
+    /// key is misspelled and doing nothing.
+    /// Skipped on the wire for the same reason as [`Self::source`]: it records what a file said,
+    /// not what agentmux understood of it.
+    #[serde(skip)]
+    pub unknown: Vec<UnknownKey>,
     /// The vendors whose default the project file changed.
     ///
     /// Read only through [`Config::default_account`], which is where the answer is typed.
@@ -412,6 +480,28 @@ pub struct Config {
     /// it.
     #[serde(skip)]
     pub project_defaults: BTreeSet<String>,
+}
+
+/// A key a configuration file set that this build does not read.
+///
+/// Reported rather than refused, so that a file written for a newer agentmux still loads on an
+/// older one: a long-running MCP server started before the key existed keeps working, and only
+/// what the key was for is missing.
+/// The cost is that a misspelling is no longer fatal either — `configdir` for `config_dir` leaves
+/// an account authenticating as the CLI's own login — which is why every reader of a
+/// configuration says these out loud.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnknownKey {
+    /// The file that set it.
+    pub file: PathBuf,
+    /// The dotted path to the key, as `accounts.claude.work.configdir`.
+    pub key: String,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} sets {}", self.file.display(), self.key)
+    }
 }
 
 /// Which file chose a default account.
@@ -545,7 +635,7 @@ impl Config {
         }
     }
 
-    /// Load the machine's accounts, plus any project file's choice of which to use.
+    /// Load what the machine offers, plus any project file's choice of which account to use.
     ///
     /// `host_env` is read rather than the process environment so a caller that has already
     /// captured the environment resolves against the same snapshot the delegate will run under.
@@ -561,8 +651,9 @@ impl Config {
     /// there and [`ConfigError::RelativeExplicit`] when it names one relatively;
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
-    /// [`ConfigError::ProjectFileDefinesAccounts`] for a project file that describes an account
-    /// rather than naming one.
+    /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account or a
+    /// model rewrite rather than naming an account, and [`ConfigError::ChainedRewrite`] for a
+    /// rewrite whose result is itself rewritten.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
 
@@ -602,8 +693,11 @@ impl Config {
                 continue;
             }
             let project = Self::read(&path)?;
-            if !project.accounts.is_empty() || !project.launch.is_empty() {
-                return Err(ConfigError::ProjectFileDefinesAccounts { path });
+            if !project.accounts.is_empty()
+                || !project.launch.is_empty()
+                || !project.models.is_empty()
+            {
+                return Err(ConfigError::ProjectFileOversteps { path });
             }
             // Extended, not replaced: a repository pinning its Codex account must not silently
             // drop a machine-wide Claude default, which would spend a different subscription.
@@ -616,9 +710,16 @@ impl Config {
                 config.defaults.insert(vendor, chosen);
             }
             config.project_source = Some(path);
+            config.unknown.extend(project.unknown);
             break;
         }
 
+        for unknown in &config.unknown {
+            // Warned at every load rather than once: this is a file the operator can fix, and the
+            // reader who needs to see it is whoever is looking at a delegation that behaved
+            // unexpectedly, not whoever started the process.
+            tracing::warn!(%unknown, "this agentmux does not read that key, and is ignoring it");
+        }
         Ok(config)
     }
 
@@ -641,10 +742,40 @@ impl Config {
             message: without_quoted_values(source.message()),
             offset: source.span().map(|span| span.start),
         })?;
+        // Before the names are canonicalised: on Windows that rewrites the keys of `env`, and a
+        // comparison against rewritten keys would report the file's own spelling as unknown.
+        config.unknown = config.unknown_keys(&text, path);
         config.validate(path)?;
         config.canonicalise_env_names();
         config.source = Some(path.to_path_buf());
         Ok(config)
+    }
+
+    /// Which of a file's keys this build does not read.
+    ///
+    /// Answered by asking what the parsed configuration serialises back to and comparing that with
+    /// the file, so the answer cannot drift from the types: a field added to a struct is known
+    /// here the moment it exists, and one removed stops being known, with no second list to keep
+    /// in step.
+    ///
+    /// Re-parsing cannot fail — the same text has just parsed as a `Config` — and neither can
+    /// serialising a `Config`; either way round, a build that cannot say what it does not know
+    /// says nothing rather than refusing a file it has already read.
+    fn unknown_keys(&self, text: &str, path: &Path) -> Vec<UnknownKey> {
+        let (Ok(written), Ok(toml::Value::Table(understood))) =
+            (text.parse::<toml::Table>(), toml::Value::try_from(self))
+        else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        collect_unknown_keys(&written, &understood, "", &mut found);
+        found
+            .into_iter()
+            .map(|key| UnknownKey {
+                file: path.to_path_buf(),
+                key,
+            })
+            .collect()
     }
 
     /// Spell every environment name the way the platform will read it.
@@ -710,6 +841,33 @@ impl Config {
                 }
             }
         }
+        for rewrites in self.models.values() {
+            for (from, to) in rewrites {
+                for value in [from, to] {
+                    crate::delegate::ModelId::parse(value).map_err(|_| {
+                        ConfigError::InvalidName {
+                            path: path.to_path_buf(),
+                            what: "the model",
+                            value: value.clone(),
+                            reason: "is not an identifier a delegate CLI could be given",
+                        }
+                    })?;
+                }
+                // A rule naming another rule's key reads as a chain, and one substitution is all
+                // there is; refused here rather than resolved, because either answer would be a
+                // guess at which of the two lines the operator meant.
+                // A rule that maps a name to itself changes nothing, so a rule pointing at it
+                // does not chain.
+                let is_rewritten = |name: &String| rewrites.get(name).is_some_and(|to| to != name);
+                if is_rewritten(from) && is_rewritten(to) {
+                    return Err(ConfigError::ChainedRewrite {
+                        path: path.to_path_buf(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                }
+            }
+        }
         for chosen in self.defaults.values().filter_map(|d| d.account.as_ref()) {
             crate::delegate::AccountAlias::parse(chosen).map_err(|_| ConfigError::InvalidName {
                 path: path.to_path_buf(),
@@ -732,6 +890,37 @@ impl Config {
     #[must_use]
     pub fn account(&self, vendor: Vendor, alias: &str) -> Option<&Account> {
         self.accounts.get(vendor.program())?.get(alias)
+    }
+
+    /// The model rewrites defined for one vendor, which may be none.
+    ///
+    /// For a reader listing what the machine offers; [`Self::rewritten_model`] is what a launch
+    /// asks.
+    #[must_use]
+    pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        self.models.get(vendor.program()).unwrap_or(&NONE)
+    }
+
+    /// What to run when a caller asks for `model`, when this machine rewrites it.
+    ///
+    /// The rewrite is how an operator says once, in one file, that "fable-5" means whichever
+    /// point release they actually want today.
+    /// agentmux keeps no roster of models and this does not become one: an identifier the file
+    /// says nothing about is not touched, so a model released this morning reaches the delegate
+    /// CLI unchanged and without an agentmux release.
+    ///
+    /// The match is exact, because the delegate CLI's own match is, and one substitution is
+    /// applied: the result is never looked up again.
+    /// A rule naming the same identifier on both sides asks for nothing and answers `None`.
+    /// A file whose rules would chain is refused when it is read, so what is written on one line
+    /// is what runs.
+    #[must_use]
+    pub fn rewritten_model(&self, vendor: Vendor, model: &str) -> Option<&str> {
+        self.model_rewrites(vendor)
+            .get(model)
+            .map(String::as_str)
+            .filter(|rewritten| *rewritten != model)
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.

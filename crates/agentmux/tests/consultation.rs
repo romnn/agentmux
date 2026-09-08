@@ -1393,3 +1393,75 @@ async fn a_consultation_whose_child_still_lives_is_not_removed() -> Result<()> {
     assert_that!(h.store.remove(&started.run_id), ok(anything()));
     Ok(())
 }
+
+/// The machine's rewrite decides which model runs, and the record names both.
+///
+/// The name a caller types is often one a person chose weeks ago in a prompt — "fable 5", the
+/// series rather than the point release — and the machine is where the two are reconciled.
+/// What the delegate is launched with, what the transcript header says and what `status` reports
+/// have to agree, because a caller that pinned a model and reads another back has no other way to
+/// tell a rule of its own machine from a pin agentmux dropped.
+#[gtest]
+fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let config = home.path().join("agentmux.toml");
+    std::fs::write(
+        &config,
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-6" = "gpt-6-astra"
+        "#},
+    )?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    let dir = tempfile::tempdir().or_fail()?;
+    let launcher = Arc::new(ScriptedLauncher::new([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ]));
+    let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
+    let asked = Delegate::Codex {
+        model: ModelId::parse("gpt-6").or_fail()?,
+        effort: Effort::parse("high").or_fail()?,
+        sandbox: CodexSandbox::ReadOnly,
+        account: None,
+        isolation: None,
+    };
+
+    let started = store.start(&StartRequest {
+        delegate: asked,
+        question: "q".to_owned(),
+        cwd: home.path().to_path_buf(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+    })?;
+
+    let launch = launcher.launches().into_iter().next().or_fail()?;
+    assert_that!(launch.has_flag_with("--model", "gpt-6-astra"), eq(true));
+    assert_that!(started.delegate.model().as_str(), eq("gpt-6-astra"));
+    assert_that!(
+        started.rewritten_from.as_ref().map(ModelId::as_str),
+        some(eq("gpt-6"))
+    );
+    let page = store.page(&started.run_id, 0, 1_000_000)?;
+    assert_that!(page.text, contains_substring("codex gpt-6-astra"));
+    assert_that!(page.text, contains_substring("(asked for gpt-6)"));
+
+    // The consultation keeps the model it started with: a file edited between two questions must
+    // not answer the second half of one transcript with a different model.
+    std::fs::write(
+        &config,
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-6" = "gpt-5.6-sol"
+        "#},
+    )?;
+    store.follow_up(&started.run_id, "and now?")?;
+    let launches = launcher.launches();
+    let second = launches.get(1).or_fail()?;
+    assert_that!(second.has_flag_with("--model", "gpt-6-astra"), eq(true));
+    Ok(())
+}

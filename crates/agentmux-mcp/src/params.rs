@@ -63,6 +63,8 @@ pub struct DelegateParams {
     /// Use the vendor's full identifier, for example `claude-opus-5` or `claude-fable-5-1` for
     /// `claude`, `gpt-6-astra` or `gpt-5.6-sol` for `codex`.
     /// If the identifier is wrong the vendor's own error comes back and names what it accepts.
+    /// This machine's configuration may rewrite one identifier to another; when it does, the
+    /// result says so and names both.
     pub model: String,
 
     /// Reasoning effort, passed verbatim: usually `high` or `xhigh`.

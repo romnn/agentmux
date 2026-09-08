@@ -378,6 +378,65 @@ fn a_model_the_vendor_expanded_is_reported_beside_the_one_requested() -> Result<
     Ok(())
 }
 
+/// A model this machine rewrote is named beside the one that ran, in the same line as the
+/// vendor's own expansion.
+///
+/// The calling agent pinned a model and is reading back another. Told nothing, its next move is to
+/// pin harder or to report agentmux as ignoring its arguments; told which of its own machine's
+/// rules moved it, there is nothing to debug.
+#[gtest]
+fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.claude]
+            "sonnet" = "claude-opus-5"
+        "#},
+    )
+    .or_fail()?;
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [
+        ("PATH".to_owned(), "/usr/bin".to_owned()),
+        (
+            "HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::completed(
+            agentmux::testing::fixtures::CLAUDE_TOOL_USE,
+        )])),
+        env,
+    )
+    .or_fail()?;
+    let status = store
+        .start(&StartRequest {
+            delegate: Delegate::Claude {
+                model: ModelId::parse("sonnet").or_fail()?,
+                effort: Effort::parse("high").or_fail()?,
+                account: None,
+                isolation: None,
+            },
+            question: "Review the diff for correctness bugs.".to_owned(),
+            cwd: home.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+        })
+        .or_fail()?;
+
+    let rendered = agentmux_mcp::render::status(&status);
+
+    // What ran, what was asked for, and what the stream said actually answered.
+    assert_that!(rendered, contains_substring("claude claude-opus-5"));
+    assert_that!(rendered, contains_substring("(asked for sonnet)"));
+    assert_that!(rendered, contains_substring("answered by claude-sonnet-5"));
+    Ok(())
+}
+
 /// A model that answered as asked adds nothing, because there is no ambiguity to resolve.
 #[gtest]
 fn a_model_that_matches_the_request_is_not_repeated() -> Result<()> {

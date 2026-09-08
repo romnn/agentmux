@@ -69,7 +69,8 @@ pub enum Command {
     /// Delete consultations past their retention, or one by id.
     Prune(PruneArgs),
 
-    /// List the account aliases this machine defines, and where they came from.
+    /// List the account aliases and model rewrites this machine defines, and where they came
+    /// from.
     Accounts,
 
     /// Report what each configured account has left of its usage windows.
@@ -105,6 +106,8 @@ pub struct DelegateArgs {
     /// Model identifier, passed to the delegate CLI verbatim, for example `claude-opus-5` or
     /// `gpt-6-astra`.
     /// agentmux keeps no roster; the delegate CLI decides what is valid.
+    /// A `[models]` rule in `agentmux.toml` may rewrite one identifier to another, which
+    /// `agentmux accounts` lists and every report of the consultation names.
     #[arg(long)]
     pub model: String,
 

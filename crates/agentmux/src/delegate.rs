@@ -16,6 +16,11 @@
 //! requires an agentmux release.
 //! The delegate CLI is the sole authority on which values it accepts, and its rejection — which
 //! names the valid set — reaches the caller verbatim.
+//!
+//! One identifier may still be exchanged for another before it is launched, when the machine's
+//! configuration says so — see [`crate::config::Config::rewritten_model`].
+//! That is a substitution the operator wrote down in a file, not a roster this crate keeps: the
+//! set of models agentmux knows about is still empty.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -584,6 +589,19 @@ impl Delegate {
     pub fn with_account(mut self, alias: AccountAlias) -> Self {
         match &mut self {
             Self::Claude { account, .. } | Self::Codex { account, .. } => *account = Some(alias),
+        }
+        self
+    }
+
+    /// The same delegate, with its model identifier replaced.
+    ///
+    /// Used where the machine's configuration rewrites the identifier a caller asked for, so that
+    /// every later reader of the record — the launch, the transcript, the status — names the model
+    /// that actually ran.
+    #[must_use]
+    pub fn with_model(mut self, replacement: ModelId) -> Self {
+        match &mut self {
+            Self::Claude { model, .. } | Self::Codex { model, .. } => *model = replacement,
         }
         self
     }
