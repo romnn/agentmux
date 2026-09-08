@@ -217,7 +217,8 @@ pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print the account aliases this machine defines, and the model rewrites it applies.
+/// Print the account aliases this machine defines, the model rewrites it applies and the efforts
+/// it falls back to.
 ///
 /// The point of the command is discovery: an alias is a name someone has to know, and the error
 /// for guessing wrong is only visible after a consultation has been attempted.
@@ -244,6 +245,7 @@ pub fn accounts(
                 "accounts": config.accounts,
                 "defaults": config.defaults,
                 "models": config.models,
+                "efforts": config.efforts,
                 "launch": config.launch,
                 "unknown": config.unknown,
             }))?
@@ -325,6 +327,12 @@ pub fn accounts(
         let mut heading = "models";
         for (from, to) in config.model_rewrites(vendor) {
             println!("  {heading:<14} {from} -> {to}");
+            heading = "";
+        }
+        // Keyed by the model that runs, which the `->` above may have chosen.
+        let mut heading = "efforts";
+        for (model, effort) in config.effort_defaults(vendor) {
+            println!("  {heading:<14} {model} defaults to {effort}");
             heading = "";
         }
         let accounts = config.accounts(vendor);

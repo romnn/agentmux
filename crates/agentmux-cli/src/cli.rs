@@ -69,8 +69,8 @@ pub enum Command {
     /// Delete consultations past their retention, or one by id.
     Prune(PruneArgs),
 
-    /// List the account aliases and model rewrites this machine defines, and where they came
-    /// from.
+    /// List the account aliases, model rewrites and default efforts this machine defines, and
+    /// where they came from.
     Accounts,
 
     /// Report what each configured account has left of its usage windows.
@@ -112,9 +112,10 @@ pub struct DelegateArgs {
     pub model: String,
 
     /// Reasoning effort, passed verbatim, for example `xhigh`.
-    /// Always pinned explicitly rather than inherited from the delegate's configured default.
+    /// Omitted, an `[efforts]` rule in `agentmux.toml` for the model that runs decides, and
+    /// failing that the delegate CLI's own default.
     #[arg(long)]
-    pub effort: String,
+    pub effort: Option<String>,
 
     /// Which configured account to authenticate as, for either vendor.
     ///
@@ -221,7 +222,7 @@ impl DelegateArgs {
         Delegate::from_parts(
             self.delegate.into(),
             &self.model,
-            &self.effort,
+            self.effort.as_deref(),
             self.account.as_deref(),
             self.isolation(),
             self.sandbox.map(CodexSandbox::from),

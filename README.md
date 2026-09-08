@@ -264,6 +264,31 @@ accounts` lists the rules alongside the accounts. Only a machine file may define
 reason only a machine file may define an account: a project file arrives with a `git clone`, and
 which model answers is a decision about what you pay and what you are told.
 
+### Default efforts
+
+Most callers pin the reasoning effort, and should: a review left to a default is how it silently
+runs at the wrong depth. For the ones that leave it out, the machine file names an effort per
+model, keyed by the identifier that runs — after any rewrite above — so every consultation of that
+model shares it whatever name it asked by:
+
+```toml
+# ~/.config/agentmux/agentmux.toml
+
+[efforts.claude]
+"claude-fable-5-1" = "high"
+
+[efforts.codex]
+"gpt-6-astra" = "medium"
+```
+
+A fallback only: an effort the caller names is never overridden, and a model the file says nothing
+about runs with no effort passed at all, at the CLI's own default. Both columns are plain strings
+that reach the CLI verbatim, like the rewrites, so a vendor's new effort vocabulary is a line in
+this file and never an `agentmux` release. A default keyed by a model the same file rewrites away
+is refused when the file is read, because it could never apply and would read as though it did.
+Every description of a consultation names the effort that ran, and `agentmux accounts` lists the
+defaults under `efforts`.
+
 ### Rate limits
 
 Every consultation records the usage window its vendor reported, and a rate-limited failure says

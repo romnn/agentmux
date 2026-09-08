@@ -339,9 +339,15 @@ fn every_documented_config_example_parses() -> Result<()> {
         if inside && line.trim_start().starts_with("```") {
             inside = false;
             // Only agentmux's own configuration; the README also shows a Codex MCP registration.
-            if ["[accounts.", "[defaults.", "[launch]", "[models."]
-                .iter()
-                .any(|marker| block.contains(marker))
+            if [
+                "[accounts.",
+                "[defaults.",
+                "[launch]",
+                "[models.",
+                "[efforts.",
+            ]
+            .iter()
+            .any(|marker| block.contains(marker))
             {
                 examples += 1;
                 let parsed = toml::from_str::<agentmux::config::Config>(&block);
@@ -560,7 +566,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
 
     let chosen_by_the_checkout = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
-        effort: Effort::parse("xhigh").or_fail()?,
+        effort: Some(Effort::parse("xhigh").or_fail()?),
         account: None,
         isolation: None,
     };
@@ -572,7 +578,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     // Named by the caller, the account's own preference stands.
     let named = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
-        effort: Effort::parse("xhigh").or_fail()?,
+        effort: Some(Effort::parse("xhigh").or_fail()?),
         account: Some(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     };
@@ -951,6 +957,139 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
             err(matches_pattern!(
                 agentmux::config::ConfigError::InvalidName {
                     what: eq(&"the model"),
+                    ..
+                }
+            )),
+            "{rule} was accepted"
+        );
+    }
+    Ok(())
+}
+
+/// The machine file names the effort a model runs at when the caller names none.
+///
+/// Keyed by the model that runs, because that is the one identifier every consultation of the
+/// model shares whatever name it asked by; a model the file says nothing about has no default,
+/// and the CLI's own is what runs.
+#[gtest]
+fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
+    use agentmux::delegate::Vendor;
+
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [efforts.claude]
+            "claude-fable-5-1" = "high"
+
+            [efforts.codex]
+            "gpt-6-astra" = "medium"
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config.default_effort(Vendor::Claude, "claude-fable-5-1"),
+        some(eq("high"))
+    );
+    assert_that!(
+        config.default_effort(Vendor::Codex, "gpt-6-astra"),
+        some(eq("medium"))
+    );
+    // Named by nobody's configuration: no effort, and the CLI decides.
+    assert_that!(
+        config.default_effort(Vendor::Claude, "claude-opus-5"),
+        none()
+    );
+    // One vendor's defaults are not the other's.
+    assert_that!(
+        config.default_effort(Vendor::Codex, "claude-fable-5-1"),
+        none()
+    );
+    Ok(())
+}
+
+/// A project file may not decide how hard a model thinks.
+///
+/// It arrives with a `git clone`, and an effort is a decision about what a consultation costs and
+/// how careful its answer is — the operator's to make, not the repository's.
+#[gtest]
+fn a_project_file_that_names_a_default_effort_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/cloned");
+    std::fs::create_dir_all(&repo).or_fail()?;
+    std::fs::write(
+        repo.join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [efforts.claude]
+            "claude-fable-5-1" = "low"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), &repo).expect_err("a project file set an effort");
+
+    assert_that!(
+        error.to_string(),
+        contains_substring("may only select an account")
+    );
+    Ok(())
+}
+
+/// A default effort keyed by a model the same file rewrites away is refused when the file is read.
+///
+/// The default is looked up by the model that runs, so this rule could never apply; left in, it
+/// would read as though it did, and the consultation would quietly run at the CLI's own default.
+#[gtest]
+fn a_default_effort_keyed_by_a_rewritten_model_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.claude]
+            "fable-5" = "claude-fable-5-1"
+
+            [efforts.claude]
+            "fable-5" = "high"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), home.path()).expect_err("the key is rewritten");
+
+    assert_that!(error.to_string(), contains_substring("would never apply"));
+    assert_that!(error.to_string(), contains_substring("claude-fable-5-1"));
+    Ok(())
+}
+
+/// A default effort the argument parser would refuse is refused when the file is read.
+///
+/// On either side: a key that is not a model identifier can never match, and a value that is not
+/// an effort would reach the child's argv as something else.
+#[gtest]
+fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    for (rule, what) in [
+        (r#""fable 5" = "high""#, "the model"),
+        (r#""claude-fable-5-1" = "very high""#, "the effort"),
+        (r#""claude-fable-5-1" = "--verbose""#, "the effort"),
+        (r#""claude-fable-5-1" = """#, "the effort"),
+    ] {
+        std::fs::write(
+            home.path().join("agentmux.toml"),
+            indoc::formatdoc! {"
+                [efforts.claude]
+                {rule}
+            "},
+        )
+        .or_fail()?;
+        assert_that!(
+            Config::load(&env(home.path()), home.path()).map(|_| ()),
+            err(matches_pattern!(
+                agentmux::config::ConfigError::InvalidName {
+                    what: eq(&what),
                     ..
                 }
             )),

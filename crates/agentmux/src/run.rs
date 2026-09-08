@@ -66,7 +66,9 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::{Delegate, DelegateError, Isolation, ModelId, SessionRef, TurnPlan, Vendor};
+use crate::delegate::{
+    Delegate, DelegateError, Effort, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
+};
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use crate::transcript::{
     FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage, render_turn,
@@ -984,6 +986,8 @@ impl RunStore {
     ///
     /// A model the file rewrites is exchanged here, once: an identifier the file says nothing
     /// about is untouched, and the rewritten one is never looked up again.
+    /// An effort the caller left unnamed is then filled from the file's default for the model
+    /// that runs, and stays unnamed — the CLI's own default — when the file has none.
     fn pin_defaults(delegate: &Delegate, config: &crate::config::Config) -> Pinned {
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
@@ -1004,6 +1008,16 @@ impl RunStore {
             .and_then(|to| ModelId::parse(to).ok())
         {
             pinned = pinned.with_model(rewritten);
+        }
+        // After the rewrite, because the default is keyed by the model that runs.
+        // Checked at load like the rewrites, so the parse cannot fail here; if it did, the caller
+        // named no effort and the CLI's own default is what they get.
+        if pinned.effort().is_none()
+            && let Some(effort) = config
+                .default_effort(pinned.vendor(), pinned.model().as_str())
+                .and_then(|effort| Effort::parse(effort).ok())
+        {
+            pinned = pinned.with_effort(effort);
         }
         Pinned {
             rewritten_from: (*pinned.model() != asked).then_some(asked),

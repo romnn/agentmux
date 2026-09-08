@@ -68,9 +68,13 @@ pub struct DelegateParams {
     pub model: String,
 
     /// Reasoning effort, passed verbatim: usually `high` or `xhigh`.
-    /// Always set it deliberately; leaving it to the delegate's configured default is how a review
+    /// Set it deliberately for anything that matters; a review left to a default is how it
     /// silently runs at the wrong depth.
-    pub effort: String,
+    /// Omitted, the effort this machine's configuration names for the model that runs is used,
+    /// and where it names none the CLI's own default runs; the result names what was used.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub effort: Option<String>,
 
     /// Which configured account to authenticate as, for either vendor.
     ///
@@ -135,7 +139,7 @@ impl DelegateParams {
         Delegate::from_parts(
             self.delegate,
             &self.model,
-            &self.effort,
+            self.effort.as_deref(),
             self.account.as_deref(),
             self.isolation(),
             self.sandbox,

@@ -130,15 +130,16 @@ fn the_required_arguments_are_the_unguessable_ones() {
     let set =
         |names: &[&str]| -> BTreeSet<String> { names.iter().map(|s| (*s).to_owned()).collect() };
 
-    // Who to ask, how hard to think, and what to ask.
-    // Everything else has a sane default.
+    // Who to ask, and what to ask.
+    // Everything else has a sane default — including the effort, since the machine file may name
+    // one per model and the CLI has its own when it does not.
     assert_that!(
         required("ask"),
-        eq(&set(&["delegate", "model", "effort", "question"]))
+        eq(&set(&["delegate", "model", "question"]))
     );
     assert_that!(
         required("start"),
-        eq(&set(&["delegate", "model", "effort", "question"]))
+        eq(&set(&["delegate", "model", "question"]))
     );
     assert_that!(required("follow_up"), eq(&set(&["run_id", "question"])));
     for name in ["status", "tail", "result", "cancel"] {

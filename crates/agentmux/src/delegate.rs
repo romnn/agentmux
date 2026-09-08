@@ -21,6 +21,9 @@
 //! configuration says so — see [`crate::config::Config::rewritten_model`].
 //! That is a substitution the operator wrote down in a file, not a roster this crate keeps: the
 //! set of models agentmux knows about is still empty.
+//! The same file may name a reasoning effort for a model, used only when the caller named none —
+//! see [`crate::config::Config::default_effort`] — and when neither did, no effort is passed and
+//! the CLI's own default runs.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -108,6 +111,11 @@ pub enum DelegateError {
 /// which both read `default` cannot answer that question.
 fn describe_account(alias: Option<&AccountAlias>) -> &str {
     alias.map_or("cli-default", AccountAlias::as_str)
+}
+
+/// Name the effort, or say that the CLI is choosing it, in the same words as for an account.
+fn describe_effort(effort: Option<&Effort>) -> &str {
+    effort.map_or("cli-default", Effort::as_str)
 }
 
 /// Name the file that chose an alias the caller did not ask for.
@@ -460,8 +468,9 @@ pub enum Delegate {
     Claude {
         /// Model identifier, forwarded verbatim.
         model: ModelId,
-        /// Reasoning effort, forwarded verbatim.
-        effort: Effort,
+        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
         /// Which configured account to authenticate as, or the CLI's own default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<AccountAlias>,
@@ -473,8 +482,9 @@ pub enum Delegate {
     Codex {
         /// Model identifier, forwarded verbatim.
         model: ModelId,
-        /// Reasoning effort, forwarded verbatim.
-        effort: Effort,
+        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
         /// How much the delegate may write.
         #[serde(default)]
         sandbox: CodexSandbox,
@@ -500,13 +510,13 @@ impl Delegate {
     pub fn from_parts(
         vendor: Vendor,
         model: &str,
-        effort: &str,
+        effort: Option<&str>,
         account: Option<&str>,
         isolation: Option<Isolation>,
         sandbox: Option<CodexSandbox>,
     ) -> Result<Self, DelegateError> {
         let model = ModelId::parse(model)?;
-        let effort = Effort::parse(effort)?;
+        let effort = effort.map(Effort::parse).transpose()?;
         let account = account.map(AccountAlias::parse).transpose()?;
         match vendor {
             Vendor::Claude => {
@@ -606,6 +616,18 @@ impl Delegate {
         self
     }
 
+    /// The same delegate, with a reasoning effort filled in.
+    ///
+    /// Used where the caller named none and the machine's configuration names one for the model
+    /// that runs, so the record says what the CLI was actually given.
+    #[must_use]
+    pub fn with_effort(mut self, chosen: Effort) -> Self {
+        match &mut self {
+            Self::Claude { effort, .. } | Self::Codex { effort, .. } => *effort = Some(chosen),
+        }
+        self
+    }
+
     /// The configured account this delegate authenticates as, if one was named.
     #[must_use]
     pub fn account(&self) -> Option<&AccountAlias> {
@@ -622,11 +644,14 @@ impl Delegate {
         }
     }
 
-    /// The reasoning effort being requested.
+    /// The reasoning effort being requested, when one is.
+    ///
+    /// `None` once the record is pinned means neither the caller nor the machine's configuration
+    /// named one, and the CLI's own default runs.
     #[must_use]
-    pub fn effort(&self) -> &Effort {
+    pub fn effort(&self) -> Option<&Effort> {
         match self {
-            Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort,
+            Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort.as_ref(),
         }
     }
 
@@ -641,7 +666,8 @@ impl Delegate {
                 isolation,
             } => {
                 format!(
-                    "claude {model} effort={effort} account={}{}",
+                    "claude {model} effort={} account={}{}",
+                    describe_effort(effort.as_ref()),
                     describe_account(account.as_ref()),
                     describe_isolation(*isolation)
                 )
@@ -654,7 +680,8 @@ impl Delegate {
                 isolation,
             } => {
                 format!(
-                    "codex {model} effort={effort} sandbox={} account={}{}",
+                    "codex {model} effort={} sandbox={} account={}{}",
+                    describe_effort(effort.as_ref()),
                     sandbox.as_str(),
                     describe_account(account.as_ref()),
                     describe_isolation(*isolation)
@@ -868,13 +895,15 @@ impl Delegate {
         let isolation = self.resolved_isolation(config);
 
         let args = match self {
-            Self::Claude { model, effort, .. } => claude_args(model, effort, plan, isolation),
+            Self::Claude { model, effort, .. } => {
+                claude_args(model, effort.as_ref(), plan, isolation)
+            }
             Self::Codex {
                 model,
                 effort,
                 sandbox,
                 ..
-            } => codex_args(model, effort, *sandbox, plan, isolation),
+            } => codex_args(model, effort.as_ref(), *sandbox, plan, isolation),
         };
 
         // An account's own `request_env` counts only when the account was the machine's choice
@@ -1310,7 +1339,7 @@ fn secret_value(
 ///   It defeats `--resume`, and a consultation must stay open to a follow-up.
 fn claude_args(
     model: &ModelId,
-    effort: &Effort,
+    effort: Option<&Effort>,
     plan: &TurnPlan<'_>,
     isolation: Isolation,
 ) -> Vec<String> {
@@ -1322,8 +1351,12 @@ fn claude_args(
     }
     args.push("--model".to_owned());
     args.push(model.as_str().to_owned());
-    args.push("--effort".to_owned());
-    args.push(effort.as_str().to_owned());
+    // Absent when nobody named one: the flag would otherwise have to carry a value agentmux made
+    // up, and the CLI's own default is the one thing that is never out of date.
+    if let Some(effort) = effort {
+        args.push("--effort".to_owned());
+        args.push(effort.as_str().to_owned());
+    }
     args.push("--permission-mode".to_owned());
     args.push("plan".to_owned());
     args.push("--tools".to_owned());
@@ -1370,7 +1403,7 @@ fn claude_args(
 ///   a very new model; that arrives as an advisory item rather than a failure.
 fn codex_args(
     model: &ModelId,
-    effort: &Effort,
+    effort: Option<&Effort>,
     sandbox: CodexSandbox,
     plan: &TurnPlan<'_>,
     isolation: Isolation,
@@ -1387,8 +1420,11 @@ fn codex_args(
     args.push(model.as_str().to_owned());
     // `Effort` and the sandbox literals are validated to contain no quote or backslash, so a
     // bare TOML basic string needs no escaping.
-    args.push("--config".to_owned());
-    args.push(format!("model_reasoning_effort=\"{effort}\""));
+    // Absent when nobody named one, for the same reason as Claude's `--effort`.
+    if let Some(effort) = effort {
+        args.push("--config".to_owned());
+        args.push(format!("model_reasoning_effort=\"{effort}\""));
+    }
     if !isolation.inherits() {
         args.push("--ignore-user-config".to_owned());
         // Redundant with `--ignore-user-config` for config-file hooks, and cheap insurance against

@@ -23,7 +23,7 @@ fn env() -> BTreeMap<String, String> {
 fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
-        effort: Effort::parse("xhigh").or_fail()?,
+        effort: Some(Effort::parse("xhigh").or_fail()?),
         account: None,
         isolation: None,
     })
@@ -32,7 +32,7 @@ fn claude() -> Result<Delegate> {
 fn codex() -> Result<Delegate> {
     Ok(Delegate::Codex {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
-        effort: Effort::parse("high").or_fail()?,
+        effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::ReadOnly,
         account: None,
         isolation: None,
@@ -848,7 +848,7 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     let refused = h.store.start(&request(
         Delegate::Claude {
             model: ModelId::parse("claude-opus-5").or_fail()?,
-            effort: Effort::parse("xhigh").or_fail()?,
+            effort: Some(Effort::parse("xhigh").or_fail()?),
             account: Some(AccountAlias::parse("nobody").or_fail()?),
             isolation: None,
         },
@@ -1100,7 +1100,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
         .start(&StartRequest {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
                 // The caller names neither the account nor the isolation.
                 account: None,
                 isolation: None,
@@ -1263,7 +1263,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
         Ok(StartRequest {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: account.map(AccountAlias::parse).transpose().or_fail()?,
                 isolation: None,
             },
@@ -1425,7 +1425,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
     let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
     let asked = Delegate::Codex {
         model: ModelId::parse("gpt-6").or_fail()?,
-        effort: Effort::parse("high").or_fail()?,
+        effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::ReadOnly,
         account: None,
         isolation: None,
@@ -1463,5 +1463,102 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
     let launches = launcher.launches();
     let second = launches.get(1).or_fail()?;
     assert_that!(second.has_flag_with("--model", "gpt-6-astra"), eq(true));
+    Ok(())
+}
+
+/// The machine's default effort fills in only what the caller left out, keyed by the model that
+/// runs.
+///
+/// Three consultations against one file: a caller naming no effort gets the file's default for
+/// the model its request was rewritten to; a caller naming one keeps it; and a model the file says
+/// nothing about is launched with no effort at all, so the CLI's own default runs rather than a
+/// value agentmux made up.
+/// In every case the record names what the CLI was actually given.
+#[gtest]
+fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    std::fs::write(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-6" = "gpt-6-astra"
+
+            [efforts.codex]
+            "gpt-6-astra" = "medium"
+        "#},
+    )?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    let dir = tempfile::tempdir().or_fail()?;
+    let launcher = Arc::new(ScriptedLauncher::new([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ]));
+    let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
+    let codex = |model: &str, effort: Option<&str>| -> Result<Delegate> {
+        Ok(Delegate::Codex {
+            model: ModelId::parse(model).or_fail()?,
+            effort: effort.map(Effort::parse).transpose().or_fail()?,
+            sandbox: CodexSandbox::ReadOnly,
+            account: None,
+            isolation: None,
+        })
+    };
+    let start = |delegate: Delegate| {
+        store.start(&StartRequest {
+            delegate,
+            question: "q".to_owned(),
+            cwd: home.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+        })
+    };
+    let reasoning = |effort: &str| format!("model_reasoning_effort=\"{effort}\"");
+
+    // Asked by the name the file rewrites, with no effort: the default for the model that runs.
+    let defaulted = start(codex("gpt-6", None)?)?;
+    // The caller's own effort is never overridden.
+    let pinned = start(codex("gpt-6", Some("high"))?)?;
+    // A model the file names no effort for: nothing is passed, and the CLI decides.
+    let unnamed = start(codex("gpt-5.6-sol", None)?)?;
+
+    let launches = launcher.launches();
+    let [first, second, third] = launches.as_slice() else {
+        return fail!("expected three launches, saw {}", launches.len());
+    };
+    assert_that!(
+        first.has_flag_with("--config", &reasoning("medium")),
+        eq(true)
+    );
+    assert_that!(
+        defaulted.delegate.effort().map(Effort::as_str),
+        some(eq("medium"))
+    );
+    assert_that!(
+        second.has_flag_with("--config", &reasoning("high")),
+        eq(true)
+    );
+    assert_that!(
+        pinned.delegate.effort().map(Effort::as_str),
+        some(eq("high"))
+    );
+    assert_that!(
+        third
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("model_reasoning_effort=")),
+        eq(false),
+        "an effort nobody named reached the argv: {:?}",
+        third.args
+    );
+    assert_that!(unnamed.delegate.effort(), none());
+    assert_that!(
+        unnamed.delegate.summary(),
+        contains_substring("effort=cli-default")
+    );
     Ok(())
 }

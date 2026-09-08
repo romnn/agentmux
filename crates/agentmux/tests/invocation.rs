@@ -27,26 +27,26 @@ fn every_delegate() -> Result<Vec<Delegate>> {
     Ok(vec![
         Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         },
         Delegate::Claude {
             model: model("claude-fable-5-1")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: Some(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-6-astra")?,
-            effort: effort("high")?,
+            effort: Some(effort("high")?),
             sandbox: CodexSandbox::ReadOnly,
             account: None,
             isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-5.6-sol")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             sandbox: CodexSandbox::WorkspaceWrite,
             account: None,
             isolation: None,
@@ -224,9 +224,9 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
             eq(true),
             "{label}"
         );
+        let effort = delegate.effort().or_fail()?;
         assert_that!(
-            args.iter()
-                .any(|arg| arg.contains(delegate.effort().as_str())),
+            args.iter().any(|arg| arg.contains(effort.as_str())),
             eq(true),
             "{label} did not pin its reasoning effort"
         );
@@ -310,7 +310,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
     let personal = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: Some(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
@@ -327,7 +327,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
     let default = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         },
@@ -361,7 +361,7 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
 
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: Some(AccountAlias::parse("work").or_fail()?),
         isolation: None,
     }
@@ -395,7 +395,7 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
 
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: Some(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     }
@@ -442,7 +442,7 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
 
     let invocation = Delegate::Codex {
         model: model("qwen3-coder")?,
-        effort: effort("high")?,
+        effort: Some(effort("high")?),
         sandbox: CodexSandbox::ReadOnly,
         account: Some(AccountAlias::parse("local").or_fail()?),
         isolation: None,
@@ -469,7 +469,7 @@ fn a_codex_resume_passes_its_sandbox_as_config_not_as_a_flag() -> Result<()> {
     let session = SessionRef::parse("01a0784a-915b-7d92-a381-b53d765296c4").or_fail()?;
     let delegate = Delegate::Codex {
         model: model("gpt-6-astra")?,
-        effort: effort("high")?,
+        effort: Some(effort("high")?),
         sandbox: CodexSandbox::ReadOnly,
         account: None,
         isolation: None,
@@ -497,7 +497,7 @@ fn a_claude_resume_reopens_the_delegates_session() -> Result<()> {
     let resumed = build(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         },
@@ -616,7 +616,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
         };
         let result = Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         }
@@ -651,7 +651,7 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
 
     let invocation = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: None,
         isolation: None,
     }
@@ -685,7 +685,7 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
 
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: None,
         isolation: None,
     }
@@ -717,7 +717,7 @@ fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()>
     let invocation = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: Some(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
@@ -774,7 +774,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
 
     let invocation = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: Some(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     }
@@ -816,7 +816,7 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
     let invocation = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         },
@@ -860,7 +860,7 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
 
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: None,
         isolation: None,
     }
@@ -884,7 +884,7 @@ fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
     let inherited = build(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: Some(Isolation::Inherit),
         },
@@ -909,7 +909,7 @@ fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
     let isolated = build(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: None,
             isolation: None,
         },
@@ -932,7 +932,7 @@ fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
     let (model, effort) = (model("gpt-6-astra")?, effort("high")?);
     let delegate = |isolation| Delegate::Codex {
         model: model.clone(),
-        effort: effort.clone(),
+        effort: Some(effort.clone()),
         sandbox: CodexSandbox::ReadOnly,
         account: None,
         isolation,
@@ -972,7 +972,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
     let invocation = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: Some(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
@@ -989,7 +989,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
     let forced = build_with(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
-            effort: effort("xhigh")?,
+            effort: Some(effort("xhigh")?),
             account: Some(AccountAlias::parse("personal").or_fail()?),
             isolation: Some(Isolation::Isolated),
         },
@@ -1064,7 +1064,7 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
     };
     let delegate = Delegate::Claude {
         model: model("claude-opus-5")?,
-        effort: effort("xhigh")?,
+        effort: Some(effort("xhigh")?),
         account: None,
         isolation: None,
     };

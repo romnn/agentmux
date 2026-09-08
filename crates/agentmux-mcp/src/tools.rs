@@ -674,8 +674,10 @@ Choose a delegate by naming `delegate` (`claude` or `codex`), the exact `model` 
 vendor's CLI spells, and an `effort`. agentmux keeps no model list and checks neither: it forwards
 both verbatim and hands you the CLI's own refusal, which names what it does accept. The machine's
 own configuration may rewrite one model identifier to another, and a result whose model was
-rewritten names both. Pin them every time — inheriting a default is how an expensive question
-reaches a cheap model.
+rewritten names both. Pin the model every time — inheriting a default is how an expensive question
+reaches a cheap model. Pin the effort too for anything that matters: left out, the machine's
+configured default for that model is used, or the CLI's own when it has none, and the result says
+which effort ran.
 
 Write the question for a stranger. The delegate shares no conversation with you and cannot ask you
 anything: name the paths it should read and the shape of the answer you want. It reads your project

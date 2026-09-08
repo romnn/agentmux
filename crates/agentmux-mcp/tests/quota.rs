@@ -32,7 +32,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
         .start(&StartRequest {
             delegate: Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
                 account: None,
                 isolation: None,

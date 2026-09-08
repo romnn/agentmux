@@ -63,7 +63,7 @@ async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
     let (store, status) = consult(
         Delegate::Claude {
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
-            effort: Effort::parse("low").or_fail()?,
+            effort: Some(Effort::parse("low").or_fail()?),
             account: None,
             isolation: None,
         },
@@ -90,7 +90,7 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
     let (store, status) = consult(
         Delegate::Codex {
             model: ModelId::parse(CODEX_MODEL).or_fail()?,
-            effort: Effort::parse("low").or_fail()?,
+            effort: Some(Effort::parse("low").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
             account: None,
             isolation: None,
@@ -133,7 +133,7 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
     let (_store, status) = consult(
         Delegate::Claude {
             model: ModelId::parse("does-not-exist-9000").or_fail()?,
-            effort: Effort::parse("low").or_fail()?,
+            effort: Some(Effort::parse("low").or_fail()?),
             account: None,
             isolation: None,
         },

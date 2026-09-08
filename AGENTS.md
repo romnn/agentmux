@@ -119,6 +119,15 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   caller that pinned a model and read back another must be able to tell its own rule from a pin
   agentmux dropped. Only a machine file may define one — which model answers decides what an
   operator pays and what they are told.
+- **A default effort is a fallback keyed by the model that runs, and no effort at all is a valid
+  answer.** `Delegate::effort` is an `Option`; `[efforts.<vendor>]` in a machine file fills it in
+  `pin_defaults`, after the model rewrite and only when the caller named none, and a model the file
+  says nothing about launches with no `--effort` and no `model_reasoning_effort` at all, so the
+  CLI's own default runs rather than a value agentmux invented. A default keyed by a model the
+  same file rewrites away is refused at load (`ConfigError::EffortForRewrittenModel`): it could
+  never match and reads as if it did. Both sides are plain strings, because effort vocabularies
+  change with models. The schema no longer requires `effort`, and the record and every summary
+  name the effort that ran, or `cli-default`.
 - **An unknown configuration key is reported, never refused.** No struct in `config` sets
   `deny_unknown_fields`: one machine file is read by every agentmux on the machine, and the ones
   that matter are the long-running MCP servers started before the key was added — refusing the file

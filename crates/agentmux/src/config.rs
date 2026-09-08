@@ -13,7 +13,8 @@
 //!
 //! A **machine** file defines accounts: paths, credentials, endpoints, environment.
 //! It also holds the model rewrites — the machine's answer to "when something asks for *this*
-//! model, run *that* one" — which is the other thing a caller cannot know from where it sits.
+//! model, run *that* one" — and the reasoning effort to use for a model when a caller names none,
+//! which are the other things a caller cannot know from where it sits.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
 //! `AGENTMUX_CONFIG` names.
 //!
@@ -78,14 +79,14 @@ pub enum ConfigError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// A project file tried to define an account, a launch environment or a model rewrite,
-    /// rather than select an account.
+    /// A project file tried to define an account, a launch environment, a model rewrite or a
+    /// default effort, rather than select an account.
     #[error(
-        "{path} defines accounts, model rewrites or a [launch] environment, and a project \
-         agentmux.toml may only select an account with [defaults.<vendor>]. Move the definitions \
-         to your machine configuration: a file that travels with a repository must not be able to \
-         name a credential, an endpoint, an environment variable, or which model your questions \
-         are answered by."
+        "{path} defines accounts, model rewrites, default efforts or a [launch] environment, and \
+         a project agentmux.toml may only select an account with [defaults.<vendor>]. Move the \
+         definitions to your machine configuration: a file that travels with a repository must \
+         not be able to name a credential, an endpoint, an environment variable, or which model \
+         answers your questions and how hard it thinks."
     )]
     ProjectFileOversteps {
         /// The offending file.
@@ -103,6 +104,20 @@ pub enum ConfigError {
         /// The identifier a caller would ask for.
         from: String,
         /// What it is rewritten to, which is itself rewritten.
+        to: String,
+    },
+    /// A default effort is keyed by a model the same file rewrites to another.
+    #[error(
+        "the agentmux config at {path} sets a default effort for the model {model:?}, but \
+         rewrites that model to {to:?}, and a default effort is looked up by the model that runs. \
+         This rule would never apply: key it by {to:?}."
+    )]
+    EffortForRewrittenModel {
+        /// The file.
+        path: PathBuf,
+        /// The model the effort is keyed by.
+        model: String,
+        /// What the same file rewrites it to.
         to: String,
     },
     /// A configuration file another user could have written was found.
@@ -453,6 +468,15 @@ pub struct Config {
     /// this build has never heard of loads anyway.
     #[serde(default)]
     pub models: BTreeMap<String, BTreeMap<String, String>>,
+    /// Reasoning efforts to use when a caller names none, by vendor, then by the model that runs.
+    ///
+    /// Read through [`Config::default_effort`].
+    /// Keyed by the identifier that is launched, after any rewrite in [`Self::models`]: it is
+    /// the one identifier every consultation of that model shares, whatever name it asked by.
+    /// Both sides are plain strings, as the rewrites are, so a vendor's new effort vocabulary is a
+    /// line in this file and never an agentmux release.
+    #[serde(default)]
+    pub efforts: BTreeMap<String, BTreeMap<String, String>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -651,9 +675,11 @@ impl Config {
     /// there and [`ConfigError::RelativeExplicit`] when it names one relatively;
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
-    /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account or a
-    /// model rewrite rather than naming an account, and [`ConfigError::ChainedRewrite`] for a
-    /// rewrite whose result is itself rewritten.
+    /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account, a
+    /// model rewrite or a default effort rather than naming an account,
+    /// [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten, and
+    /// [`ConfigError::EffortForRewrittenModel`] for a default effort keyed by a model the same
+    /// file rewrites away.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
 
@@ -696,6 +722,7 @@ impl Config {
             if !project.accounts.is_empty()
                 || !project.launch.is_empty()
                 || !project.models.is_empty()
+                || !project.efforts.is_empty()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
@@ -868,6 +895,37 @@ impl Config {
                 }
             }
         }
+        for (vendor, efforts) in &self.efforts {
+            for (model, effort) in efforts {
+                crate::delegate::ModelId::parse(model).map_err(|_| ConfigError::InvalidName {
+                    path: path.to_path_buf(),
+                    what: "the model",
+                    value: model.clone(),
+                    reason: "is not an identifier a delegate CLI could be given",
+                })?;
+                crate::delegate::Effort::parse(effort).map_err(|_| ConfigError::InvalidName {
+                    path: path.to_path_buf(),
+                    what: "the effort",
+                    value: effort.clone(),
+                    reason: "is not a reasoning effort a delegate CLI could be given",
+                })?;
+                // Looked up by the model that runs, so a key the file rewrites away can never be
+                // met; refused rather than left in, because a rule that does nothing reads as one
+                // that does.
+                if let Some(to) = self
+                    .models
+                    .get(vendor)
+                    .and_then(|rewrites| rewrites.get(model))
+                    .filter(|to| *to != model)
+                {
+                    return Err(ConfigError::EffortForRewrittenModel {
+                        path: path.to_path_buf(),
+                        model: model.clone(),
+                        to: to.clone(),
+                    });
+                }
+            }
+        }
         for chosen in self.defaults.values().filter_map(|d| d.account.as_ref()) {
             crate::delegate::AccountAlias::parse(chosen).map_err(|_| ConfigError::InvalidName {
                 path: path.to_path_buf(),
@@ -921,6 +979,27 @@ impl Config {
             .get(model)
             .map(String::as_str)
             .filter(|rewritten| *rewritten != model)
+    }
+
+    /// The default efforts defined for one vendor, by model, which may be none.
+    ///
+    /// For a reader listing what the machine offers; [`Self::default_effort`] is what a launch
+    /// asks.
+    #[must_use]
+    pub fn effort_defaults(&self, vendor: Vendor) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        self.efforts.get(vendor.program()).unwrap_or(&NONE)
+    }
+
+    /// The reasoning effort to run `model` at when the caller named none, if this machine says.
+    ///
+    /// `model` is the identifier that runs — after [`Self::rewritten_model`] — because that is the
+    /// one every consultation of the model shares.
+    /// A fallback only: an effort the caller names is never overridden, and a model the file says
+    /// nothing about runs at the CLI's own default, with no effort passed at all.
+    #[must_use]
+    pub fn default_effort(&self, vendor: Vendor, model: &str) -> Option<&str> {
+        self.effort_defaults(vendor).get(model).map(String::as_str)
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.

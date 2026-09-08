@@ -22,7 +22,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
         events,
         Delegate::Codex {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
-            effort: Effort::parse("xhigh").or_fail()?,
+            effort: Some(Effort::parse("xhigh").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
             account: None,
             isolation: None,
@@ -39,7 +39,7 @@ fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tem
         events,
         Delegate::Claude {
             model: ModelId::parse(model).or_fail()?,
-            effort: Effort::parse("high").or_fail()?,
+            effort: Some(Effort::parse("high").or_fail()?),
             account: None,
             isolation: None,
         },
@@ -169,7 +169,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
         .start(&StartRequest {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: None,
                 isolation: None,
             },
@@ -239,7 +239,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
         .start(&StartRequest {
             delegate: Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
-                effort: Effort::parse("xhigh").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
                 account: None,
                 isolation: None,
@@ -417,7 +417,7 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
         .start(&StartRequest {
             delegate: Delegate::Claude {
                 model: ModelId::parse("sonnet").or_fail()?,
-                effort: Effort::parse("high").or_fail()?,
+                effort: Some(Effort::parse("high").or_fail()?),
                 account: None,
                 isolation: None,
             },

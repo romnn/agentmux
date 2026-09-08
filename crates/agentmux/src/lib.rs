@@ -44,7 +44,7 @@
 //! let status = store.start(&StartRequest {
 //!     delegate: Delegate::Claude {
 //!         model: ModelId::parse("claude-opus-5")?,
-//!         effort: Effort::parse("xhigh")?,
+//!         effort: Some(Effort::parse("xhigh")?),
 //!         account: None,
 //!         isolation: None,
 //!     },
