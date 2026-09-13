@@ -49,6 +49,12 @@ pub(super) struct FoldedTurn {
     pub(super) session: Option<SessionRef>,
     /// The newest write to any of this turn's capture files.
     pub(super) last_activity: Option<SystemTime>,
+    /// Whether the outcome came from the exit record rather than the stream.
+    ///
+    /// An outcome the record settled already quotes the stderr tail the record froze; a reader
+    /// that would quote stderr again asks this rather than the disk, which may have gained a
+    /// record since the fold.
+    pub(super) settled_by_record: bool,
 }
 
 /// What one observation of a child that had gone established.
@@ -152,28 +158,17 @@ fn read_text(path: &std::path::Path) -> Result<Option<String>, RunError> {
 /// wearing a follow-up's clothes.
 /// A resumed turn that announced no session at all is counted as drift: the field the evidence
 /// lives in has moved, and continuity can no longer be checked.
-fn note_continuity(
-    dir: &TurnDir,
-    opened: Option<&SessionRef>,
-    turn: &mut Turn,
-) -> Result<(), RunError> {
-    // The first turn never resumes anything, so its invocation record is not worth reading.
-    if turn.index == 0 {
-        return Ok(());
-    }
-    let Some(asked_for) =
-        read_json::<InvocationRecord>(&dir.invocation())?.and_then(|record| record.resumed_from)
-    else {
-        return Ok(());
+fn note_continuity(asked_for: Option<&SessionRef>, opened: Option<&SessionRef>, turn: &mut Turn) {
+    let Some(asked_for) = asked_for else {
+        return;
     };
     match opened {
-        Some(opened) if *opened != asked_for => turn.broke_continuity = true,
+        Some(opened) if opened != asked_for => turn.broke_continuity = true,
         None if turn.outcome.is_terminal() => {
             turn.unrecognised.record("session.<not announced>");
         }
         _ => {}
     }
-    Ok(())
 }
 
 /// The newest modification time among a turn's capture files.
@@ -211,10 +206,7 @@ impl RunStore {
     fn codex_rate_limit(&self, meta: &Meta, thread_id: &str) -> Option<RateLimit> {
         let config = crate::config::Config::load(&self.host_env, &meta.cwd).ok()?;
         let env = meta.delegate.identity_env(&self.host_env, &config).ok()?;
-        let codex_home = env
-            .get("CODEX_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| crate::config::home_dir(&self.host_env).map(|home| home.join(".codex")))?;
+        let codex_home = Vendor::Codex.config_dir(&env)?;
 
         let limits = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
@@ -247,6 +239,7 @@ impl RunStore {
         let mut transcript = Transcript::default();
         let mut session = None;
         let mut newest_turn_index = 0;
+        let mut newest_settled_by_record = false;
         let mut last_activity: Option<SystemTime> = None;
 
         let turns = self.turn_files(&meta.run_id)?;
@@ -254,6 +247,7 @@ impl RunStore {
         for files in turns {
             let folded = self.fold_turn(meta, &files, Some(files.index) == newest_index)?;
             newest_turn_index = files.index;
+            newest_settled_by_record = folded.settled_by_record;
             if folded.session.is_some() {
                 session = folded.session;
             }
@@ -267,6 +261,7 @@ impl RunStore {
             transcript,
             session,
             newest_turn_index,
+            newest_settled_by_record,
             last_activity,
         })
     }
@@ -365,11 +360,19 @@ impl RunStore {
             mut turn,
             session: turn_session,
         } = fold;
+        let settled_by_record = record.is_some();
         if let Some(record) = &record {
             turn.outcome = Self::outcome_of(dir, record, vendor);
         }
 
-        note_continuity(dir, turn_session.as_ref(), &mut turn)?;
+        // What the launch recorded before the spawn: which session it asked to resume, and
+        // whether the child was ever going to be able to save its own.
+        let invocation = read_json::<InvocationRecord>(&dir.invocation())?;
+        let (asked_for, unsaved_session_store) = invocation
+            .map(|record| (record.resumed_from, record.unsaved_session_store))
+            .unwrap_or_default();
+        turn.unsaved_session_store = unsaved_session_store;
+        note_continuity(asked_for.as_ref(), turn_session.as_ref(), &mut turn);
 
         // Codex says nothing about usage on the stream agentmux captures, but records it in the
         // session rollout it writes anyway.
@@ -391,6 +394,7 @@ impl RunStore {
             turn,
             session: turn_session,
             last_activity: last_write(dir),
+            settled_by_record,
         })
     }
 

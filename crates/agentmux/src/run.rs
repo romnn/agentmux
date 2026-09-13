@@ -71,7 +71,8 @@ use crate::delegate::{
 };
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use crate::transcript::{
-    FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage, render_turn,
+    FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage,
+    describe_unsaved_session_store, render_turn,
 };
 
 /// Anything that can go wrong while running a consultation.
@@ -241,6 +242,20 @@ pub enum NotResumable {
     Cancelled {
         /// Which consultation.
         run_id: RunId,
+    },
+
+    /// The delegate could not save its session when the newest turn was launched.
+    #[error(
+        "consultation {run_id} cannot be continued: {}. Launching from an agent's sandboxed shell \
+         does that, because the delegate inherits the sandbox; start a new consultation through \
+         the agentmux MCP server, which runs outside the sandbox.",
+        describe_unsaved_session_store(.store)
+    )]
+    SessionNotSaved {
+        /// Which consultation.
+        run_id: RunId,
+        /// Where the session would have been saved.
+        store: PathBuf,
     },
 }
 
@@ -482,6 +497,21 @@ pub struct RunStatus {
     /// of its own machine moved it, rather than reading it as a pin agentmux ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rewritten_from: Option<ModelId>,
+    /// The directory the delegate CLI saves its sessions in, when agentmux could not write to it
+    /// as the newest turn was launched, which means the delegate could not save its session either.
+    ///
+    /// Carried so every reader says it: the answer is unaffected, but no follow-up can resume the
+    /// consultation, which is also why `resumable` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsaved_session_store: Option<PathBuf>,
+    /// What the delegate CLI wrote to stderr, when the newest turn failed and its failure detail
+    /// does not already quote it.
+    ///
+    /// A CLI often explains a refusal only there: a resume that finds no saved conversation says so
+    /// on stderr and hands the stream nothing but a bare error.
+    /// This is a snapshot, so reading a file that may still grow moves nothing already published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegate_stderr: Option<String>,
     /// Event types the parser met but does not model.
     pub unrecognised: UnrecognisedEvents,
     /// What it means that a hook reopened a finished turn, when one did.
@@ -1063,6 +1093,9 @@ impl RunStore {
     /// paused, and its session is still there to continue.
     /// A reply the CLI wrote out late is only ever recovered into the newest turn, so allowing a
     /// follow-up here cannot let one land above the turn that followed it.
+    ///
+    /// A session the delegate could not save is not continued either: the CLI would be asked to
+    /// resume a conversation it never wrote down.
     fn resumable_session(run_id: &RunId, state: &RunState) -> Result<SessionRef, NotResumable> {
         let outcome = state.transcript.outcome();
         if !outcome.is_terminal() {
@@ -1073,6 +1106,12 @@ impl RunStore {
         if outcome == Outcome::Cancelled {
             return Err(NotResumable::Cancelled {
                 run_id: run_id.clone(),
+            });
+        }
+        if let Some(store) = state.unsaved_session_store() {
+            return Err(NotResumable::SessionNotSaved {
+                run_id: run_id.clone(),
+                store: store.to_path_buf(),
             });
         }
         if !state.transcript.has_delegate_content() {
@@ -1166,8 +1205,26 @@ impl RunStore {
             self.root.to_string_lossy().into_owned(),
         );
 
+        // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
+        // confines this process, so a session store this process cannot write to is one the
+        // delegate cannot save into, and a follow-up would resume a session that was never kept.
+        let unsaved_session_store = meta
+            .delegate
+            .vendor()
+            .session_store(&invocation.env)
+            .filter(|store| !can_create_files_in(store));
+        if let Some(store) = &unsaved_session_store {
+            tracing::warn!(
+                run_id = %meta.run_id,
+                turn = index,
+                store = %store.display(),
+                "the delegate cannot save its session there, so this consultation cannot be followed up",
+            );
+        }
+
         // Recorded before the spawn so a launch that fails still leaves evidence of what was
-        // tried, and so a later fold can tell whether a resume opened the session it asked for.
+        // tried, and so a later fold can tell whether a resume opened the session it asked for
+        // and whether the child could keep the session it opened.
         write_json(
             &turn.invocation(),
             &InvocationRecord {
@@ -1176,6 +1233,7 @@ impl RunStore {
                 env_keys: invocation.env.keys().cloned().collect(),
                 cwd: meta.cwd.clone(),
                 resumed_from: resume.cloned(),
+                unsaved_session_store,
             },
         )?;
 
@@ -1275,6 +1333,17 @@ impl RunStore {
         let turn = self.turn_dir(run_id, newest);
         let outcome = state.transcript.outcome();
         let quota = self.quota_for_failure(run_id, &meta, &outcome);
+        // Only a failure the stream reported: one settled by its exit record already quotes the
+        // tail that record froze, and repeating it here would say the same thing twice.
+        let delegate_stderr = match &outcome {
+            Outcome::Failed { .. } if !state.newest_settled_by_record => {
+                tail_of_file(&turn.stderr(), STATUS_STDERR_TAIL)
+                    .ok()
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+            }
+            _ => None,
+        };
 
         let status = RunStatus {
             run_id: run_id.clone(),
@@ -1288,6 +1357,8 @@ impl RunStore {
             cost_usd: state.transcript.cost_usd(),
             resolved_model: state.transcript.resolved_model().map(ToOwned::to_owned),
             rewritten_from: meta.rewritten_from.clone(),
+            unsaved_session_store: state.unsaved_session_store().map(Path::to_path_buf),
+            delegate_stderr,
             unrecognised: state.transcript.unrecognised(),
             hook_reopening: HookReopening::of(
                 state.transcript.was_reopened_by_hook(),
@@ -1699,7 +1770,22 @@ pub(super) struct RunState {
     pub(super) transcript: Transcript,
     pub(super) session: Option<SessionRef>,
     pub(super) newest_turn_index: u32,
+    /// Whether the newest turn's outcome came from its exit record rather than its stream.
+    pub(super) newest_settled_by_record: bool,
     pub(super) last_activity: Option<SystemTime>,
+}
+
+impl RunState {
+    /// Where the newest turn's delegate could not save its session, when it could not.
+    ///
+    /// The newest turn decides: it is the one a follow-up would resume, and a turn that was not
+    /// kept leaves nothing for the CLI to continue from, whatever the earlier turns saved.
+    fn unsaved_session_store(&self) -> Option<&Path> {
+        self.transcript
+            .turns
+            .last()
+            .and_then(|turn| turn.unsaved_session_store.as_deref())
+    }
 }
 
 impl RunStore {
@@ -1842,7 +1928,15 @@ pub(super) struct InvocationRecord {
     env_keys: Vec<String>,
     cwd: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
-    resumed_from: Option<SessionRef>,
+    pub(super) resumed_from: Option<SessionRef>,
+    /// Where the delegate CLI saves its sessions, when this process could not write there as the
+    /// turn was launched, which means the child could not either.
+    ///
+    /// Probed at every launch, because each turn inherits the confinement of whoever launched it:
+    /// a consultation begun through an unconfined server can be continued from a sandboxed shell.
+    /// A store that becomes writable later still holds nothing to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) unsaved_session_store: Option<PathBuf>,
 }
 
 /// Claim a turn index by creating its directory.
@@ -2072,6 +2166,50 @@ fn first_line(text: &str, max: usize) -> String {
     }
     let cut: String = line.chars().take(max).collect();
     format!("{cut}…")
+}
+
+/// How much of a failed turn's stderr a status carries.
+///
+/// Half of what an exit record keeps: a status is read on every poll and shown inline, the few
+/// lines a CLI explains a refusal in fit, and the whole file is named beside it.
+const STATUS_STDERR_TAIL: usize = 1000;
+
+/// Whether this process can create files where a delegate would save its session.
+///
+/// Asked the way the CLI will: by creating a file in the store when it is there, and the store
+/// itself when the CLI has not made it yet — a sandbox that grants the store alone must pass,
+/// and probing the directory above it would refuse exactly that grant. A store whose parent does
+/// not exist says nothing about confinement, because the CLI is simply not set up there, and
+/// neither does any failure other than a permission or read-only refusal, so only those count as
+/// "no". Whatever the probe creates is removed at once, and its name says who left it should
+/// that ever fail.
+fn can_create_files_in(store: &Path) -> bool {
+    let attempt = if store.is_dir() {
+        let probe = store.join(format!(
+            ".agentmux-write-probe-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map(|file| {
+                drop(file);
+                let _ = std::fs::remove_file(&probe);
+            })
+    } else {
+        std::fs::create_dir(store).map(|()| {
+            let _ = std::fs::remove_dir(store);
+        })
+    };
+    match attempt {
+        Ok(()) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ),
+    }
 }
 
 /// The last `max_bytes` of a text file, or nothing for a file that is not there.

@@ -34,6 +34,20 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         "  state       {}",
         agentmux_mcp::render::outcome_line(&status.outcome)
     );
+    if let Some(stderr) = &status.delegate_stderr {
+        let last = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(stderr);
+        println!("  stderr      {last}");
+    }
+    if let Some(store) = &status.unsaved_session_store {
+        println!(
+            "  WARNING     {}",
+            agentmux::transcript::describe_unsaved_session_store(store)
+        );
+    }
     if let Some((turn, kind)) = status.earlier_failure {
         println!(
             "  EARLIER     turn {} failed: {} — see the transcript",

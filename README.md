@@ -289,6 +289,24 @@ is refused when the file is read, because it could never apply and would read as
 Every description of a consultation names the effort that ran, and `agentmux accounts` lists the
 defaults under `efforts`.
 
+### Launching from a sandboxed agent
+
+A delegate runs with whatever confines the process that launched it. Run `agentmux start` or
+`agentmux follow-up` from the shell tool of a sandboxed agent, such as Codex in `workspace-write`
+mode, and the delegate inherits that sandbox. If the sandbox cannot write the directory where the
+delegate CLI saves its sessions, the question is still answered, but the session is lost and every
+follow-up fails.
+
+agentmux checks for this every time it launches a turn. When it cannot write there, the turn in the
+transcript and every status say the consultation cannot be followed up, and `follow-up` refuses with
+the reason instead of paying for a resume that cannot work. Two ways to avoid it:
+
+- **Launch through the MCP server.** A host runs its MCP servers outside its sandbox.
+- **Grant write access to the session directory alone:** `~/.claude/projects` for Claude,
+  `~/.codex/sessions` for Codex. The rest of each configuration directory holds settings and hooks.
+
+A turn that fails for a reason its CLI printed only to stderr has that reason quoted by `status`.
+
 ### Rate limits
 
 Every consultation records the usage window its vendor reported, and a rate-limited failure says

@@ -469,3 +469,48 @@ fn cost_says_which_kind_of_number_it_is() -> Result<()> {
     assert_that!(unpriced, contains_substring("no cost reported"));
     Ok(())
 }
+
+/// A failure the stream leaves unexplained quotes the delegate CLI's stderr.
+///
+/// The resume refusal the claude CLI emits carries nothing but `is_error`; the reason is on
+/// stderr, and a caller told only that the delegate reported an error has nothing to act on.
+#[gtest]
+fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::exited(
+            indoc::indoc! {r#"
+                {"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0}
+            "#},
+            indoc::indoc! {"
+                No conversation found with session ID: 9f1c21f8-1b3d-4a7e-9a0c-2d6f4b8e5c10
+            "},
+            1,
+        )])),
+        BTreeMap::new(),
+    )
+    .or_fail()?;
+    let status = store
+        .start(&StartRequest {
+            delegate: Delegate::Claude {
+                model: ModelId::parse("claude-opus-5").or_fail()?,
+                effort: Some(Effort::parse("high").or_fail()?),
+                account: None,
+                isolation: None,
+            },
+            question: "q".to_owned(),
+            cwd: dir.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+        })
+        .or_fail()?;
+
+    let rendered = agentmux_mcp::render::status(&status);
+
+    assert_that!(
+        rendered,
+        contains_substring("Its CLI wrote to stderr: No conversation found")
+    );
+    Ok(())
+}

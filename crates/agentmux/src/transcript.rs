@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -373,6 +374,13 @@ pub struct Turn {
     /// a cursor, so this renders last, after everything whose content is final at the terminal
     /// event.
     pub recovered: Option<String>,
+    /// Where the delegate CLI saves its sessions, when it could not write there as this turn was
+    /// launched, so the session this turn ran in was never kept.
+    ///
+    /// Known before the child is spawned — it is the launcher's own confinement, inherited — so
+    /// it renders directly under the question, ahead of anything the stream adds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsaved_session_store: Option<PathBuf>,
 }
 
 impl Turn {
@@ -396,6 +404,7 @@ impl Turn {
             resolved_model: None,
             broke_continuity: false,
             recovered: None,
+            unsaved_session_store: None,
         }
     }
 
@@ -558,6 +567,40 @@ impl Transcript {
     }
 }
 
+/// One sentence saying that a session could not be saved, and where.
+///
+/// The one phrasing of it, so the transcript, every status and the follow-up refusal say the same
+/// thing. Only the fact: a front end that has room adds why it happens and what to do instead.
+#[must_use]
+pub fn describe_unsaved_session_store(store: &Path) -> String {
+    format!(
+        "agentmux could not write to `{}`, where the delegate CLI saves its sessions, so the \
+         delegate could not save this session and no follow-up can resume it",
+        store.display()
+    )
+}
+
+/// The heading a turn opens with, and everything known about the turn before its child ran.
+///
+/// Only what was fixed at the launch may go here: this is rendered under the first fold of the
+/// turn, and anything added later would move every byte below it.
+fn render_question(turn: &Turn) -> String {
+    let mut out = format!(
+        "\n## Turn {} — question\n\n{}\n",
+        turn.index.saturating_add(1),
+        turn.question.trim_end()
+    );
+    if let Some(store) = &turn.unsaved_session_store {
+        let _ = write!(
+            out,
+            "\n> [!WARNING]\n\
+             > **This turn's session was not saved.** {}.\n",
+            describe_unsaved_session_store(store)
+        );
+    }
+    out
+}
+
 /// Render one turn as Markdown.
 ///
 /// The result is **append-only with respect to the event prefix it was folded from**: appending
@@ -566,14 +609,8 @@ impl Transcript {
 /// running-turn footer is therefore written only once the outcome is terminal.
 #[must_use]
 pub fn render_turn(turn: &Turn) -> String {
-    let mut out = String::new();
+    let mut out = render_question(turn);
     let number = turn.index.saturating_add(1);
-
-    let _ = write!(
-        out,
-        "\n## Turn {number} — question\n\n{}\n",
-        turn.question.trim_end()
-    );
 
     let mut reopened = false;
     for message in &turn.messages {

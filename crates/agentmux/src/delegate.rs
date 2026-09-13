@@ -446,6 +446,42 @@ impl Vendor {
             Self::Codex => "codex",
         }
     }
+
+    /// This vendor's configuration directory, as its CLI resolves it from `env`.
+    ///
+    /// The directory the vendor's own variable names — `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — or the
+    /// CLI's default under the home directory when the variable is unset or empty.
+    /// `None` when neither is known, which is a child with no home at all.
+    #[must_use]
+    pub(crate) fn config_dir(self, env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+        let configured = env
+            .get(credential_vars(self).config_dir)
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from);
+        let default_dir = match self {
+            Self::Claude => ".claude",
+            Self::Codex => ".codex",
+        };
+        configured.or_else(|| Some(crate::config::home_dir(env)?.join(default_dir)))
+    }
+
+    /// Where this vendor's CLI saves a session for a later resume, as it resolves it from `env`.
+    ///
+    /// Claude keeps a transcript per session under `projects` in its configuration directory, and
+    /// Codex a rollout under `sessions` in `CODEX_HOME`; a resume reads that file back.
+    /// Nothing is read from it here: the directory is only named, so agentmux can ask whether the
+    /// child will be able to write into it.
+    #[must_use]
+    pub(crate) fn session_store(
+        self,
+        env: &BTreeMap<String, String>,
+    ) -> Option<std::path::PathBuf> {
+        let store = match self {
+            Self::Claude => "projects",
+            Self::Codex => "sessions",
+        };
+        Some(self.config_dir(env)?.join(store))
+    }
 }
 
 impl std::fmt::Display for Vendor {

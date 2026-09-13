@@ -139,6 +139,26 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   cost is that a misspelled `api_key_env` now silently authenticates as the CLI's own login, which
   is why every reader says the ignored keys out loud: `tracing::warn!` at each load, an `ignored`
   line in `agentmux accounts`, and an `unknown` array in its `--json`.
+- **A delegate inherits whatever confines agentmux, so a session it cannot save is caught at
+  every launch.** Run from an agent's sandboxed shell — Codex's `workspace-write` exec, say —
+  agentmux hands that sandbox to its child. Measured with claude 2.1.270 under Codex's Seatbelt
+  profile: the delegate answers, the kernel denies its transcript write under `~/.claude/projects`,
+  print mode says nothing, and every follow-up fails with "No conversation found". `launch_into`,
+  the one place a child is spawned, therefore probes the vendor's session store —
+  `Vendor::session_store`, resolved from the environment the child gets, request names included —
+  by creating and removing a file in it, or the store itself when the CLI has not made it yet,
+  because a sandbox that grants the store alone must pass. Only a permission or read-only refusal
+  counts, and a configuration directory that does not exist is not probed, because a CLI that is
+  not set up there says nothing about confinement. A refusal is recorded in the turn's invocation
+  record, before the launch record that makes the directory a turn, so the fold always sees it
+  from the turn's first render: it becomes `Turn::unsaved_session_store`, rendered under the
+  question ahead of anything the stream adds, and the newest turn's is
+  `RunStatus::unsaved_session_store`. `resumable_session` refuses a follow-up with
+  `NotResumable::SessionNotSaved` rather than let the CLI fail after being paid for, and
+  `describe_unsaved_session_store` is the one phrasing every reader uses. Separately,
+  `RunStatus::delegate_stderr` quotes a failed newest turn's stderr when the fold says no exit
+  record settled it (`RunState::newest_settled_by_record`), so it never repeats the tail the
+  record froze. It is a snapshot, so the append-only transcript is untouched.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 

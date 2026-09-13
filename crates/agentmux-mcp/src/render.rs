@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, RunStatus, RunSummary, TranscriptPage};
-use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use agentmux::transcript::{FailureKind, Outcome, RateLimit, describe_unsaved_session_store};
 use chrono::Utc;
 
 use crate::tools::MAX_WAIT_SECONDS;
@@ -166,10 +166,29 @@ pub fn warnings(status: &RunStatus) -> String {
             ),
             summarise(detail, 600),
         );
+        if let Some(stderr) = &status.delegate_stderr {
+            // Where a CLI explains what its stream only calls an error.
+            let _ = writeln!(
+                out,
+                "\x20           Its CLI wrote to stderr: {}",
+                summarise(stderr, 600)
+            );
+        }
         // The alternatives, where the failure itself made them worth fetching.
         for line in quota_block(status) {
             let _ = writeln!(out, "\x20           {line}");
         }
+    }
+    if let Some(store) = &status.unsaved_session_store {
+        out.push_str(&indoc::formatdoc! {"
+            warning:    this consultation cannot be followed up: {fact}.
+                        Launching from an agent's sandboxed shell does that, because the delegate
+                        inherits the sandbox. The answer is unaffected; for a follow-up, start a
+                        new consultation through the agentmux MCP server, which runs outside the
+                        sandbox.
+            ",
+            fact = describe_unsaved_session_store(store),
+        });
     }
     if status.broke_continuity {
         out.push_str(

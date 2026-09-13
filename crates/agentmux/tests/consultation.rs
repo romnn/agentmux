@@ -1,7 +1,7 @@
 //! A consultation end to end, through the scripted launcher: no credentials, no network.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1560,5 +1560,239 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
         unnamed.delegate.summary(),
         contains_substring("effort=cli-default")
     );
+    Ok(())
+}
+
+/// A failed turn's status quotes what its CLI wrote to stderr when the stream said nothing more.
+///
+/// Measured against the claude CLI: a resume against a conversation it no longer holds emits one
+/// bare `result` error and explains itself only on stderr, so every reader was told "delegate
+/// reported an error" and nothing about why.
+#[gtest]
+fn a_failed_follow_up_quotes_what_its_cli_wrote_to_stderr() -> Result<()> {
+    let session = fixtures::CLAUDE_HAPPY
+        .split("\"session_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .or_fail()?;
+    let refusal = indoc::formatdoc! {r#"
+        {{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"{session}"}}
+    "#};
+    let h = harness([
+        Script::completed(fixtures::CLAUDE_HAPPY),
+        Script::exited(
+            refusal,
+            indoc::formatdoc! {"
+                No conversation found with session ID: {session}
+            "},
+            1,
+        ),
+    ])?;
+
+    let started = h.store.start(&request(claude()?, "q"))?;
+    let followed = h.store.follow_up(&started.run_id, "and now?")?;
+
+    // A turn that did not fail has nothing to quote.
+    assert_that!(started.delegate_stderr, none());
+    assert_that!(followed.outcome, matches_pattern!(Outcome::Failed { .. }));
+    assert_that!(
+        followed.delegate_stderr.as_deref(),
+        some(contains_substring("No conversation found"))
+    );
+    Ok(())
+}
+
+/// A failure settled by its exit record already quotes stderr in its detail, so it is not repeated.
+#[gtest]
+fn a_failure_whose_detail_quotes_stderr_does_not_repeat_it() -> Result<()> {
+    let h = harness([Script::exited(
+        indoc::indoc! {r#"
+            {"type":"thread.started","thread_id":"01a0"}
+        "#},
+        indoc::indoc! {"
+            boom: the first word
+        "},
+        2,
+    )])?;
+
+    let started = h.store.start(&request(codex()?, "q"))?;
+
+    let Outcome::Failed { detail, .. } = &started.outcome else {
+        return fail!("expected a failure, got {:?}", started.outcome);
+    };
+    assert_that!(detail.as_str(), contains_substring("the first word"));
+    assert_that!(started.delegate_stderr, none());
+    Ok(())
+}
+
+/// A store whose home is `home`, ready to launch one happy Claude consultation.
+fn store_with_home(home: &Path) -> Result<Harness> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut host = env();
+    host.insert("HOME".to_owned(), home.to_string_lossy().into_owned());
+    let launcher = Arc::new(ScriptedLauncher::new([Script::completed(
+        fixtures::CLAUDE_HAPPY,
+    )]));
+    let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
+    Ok(Harness {
+        store,
+        launcher,
+        _dir: dir,
+    })
+}
+
+/// A delegate that will not be able to save its session is reported when the consultation begins,
+/// and no follow-up is offered or accepted.
+///
+/// Measured: agentmux run from Codex's sandboxed shell hands that sandbox to its Claude delegate,
+/// which answers, cannot write its transcript under `~/.claude/projects`, and says nothing; every
+/// follow-up then fails with "No conversation found". A directory this test cannot write stands in
+/// for the sandbox.
+#[cfg(unix)]
+#[gtest]
+fn a_session_store_agentmux_cannot_write_is_reported_and_not_followed_up() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().or_fail()?;
+    let projects = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects)?;
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o555))?;
+    // Root writes through any mode bits, so there would be no refusal to observe.
+    let refused = std::fs::File::create(projects.join("probe")).is_err();
+    let checked = refused.then(|| -> Result<()> {
+        let h = store_with_home(home.path())?;
+
+        let started = h.store.start(&request(claude()?, "q"))?;
+
+        verify_that!(started.unsaved_session_store, some(eq(&projects)))?;
+        verify_that!(started.resumable, eq(false))?;
+        let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+        verify_that!(
+            page.text,
+            contains_substring("**This turn's session was not saved.**")
+        )?;
+        verify_that!(
+            h.store.follow_up(&started.run_id, "and now?").map(|_| ()),
+            err(displays_as(contains_substring("could not write to")))
+        )
+    });
+    // Restored whatever happened above, or the temporary directory cannot be removed.
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755))?;
+    checked.unwrap_or(Ok(()))
+}
+
+/// A follow-up launched from a confined shell is caught too, however the consultation began.
+///
+/// Each turn inherits the confinement of whoever launched it: a consultation started through an
+/// unconfined MCP server and continued with `agentmux follow-up` from a sandboxed shell hands
+/// that sandbox to the resume, which answers and cannot append to the session. The refusal is the
+/// newest turn's, so the earlier turn stays as it was rendered and the next follow-up is refused.
+#[cfg(unix)]
+#[gtest]
+fn a_follow_up_launched_from_a_confined_shell_is_caught_too() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().or_fail()?;
+    let projects = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects)?;
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([
+            Script::completed(fixtures::CLAUDE_HAPPY),
+            Script::completed(fixtures::CLAUDE_HAPPY),
+        ])),
+        host,
+    )
+    .or_fail()?;
+    let started = store.start(&request(claude()?, "q"))?;
+    let first_render = store.page(&started.run_id, 0, 1_000_000)?.text;
+
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o555))?;
+    let refused = std::fs::File::create(projects.join("probe")).is_err();
+    let checked = refused.then(|| -> Result<()> {
+        let followed = store.follow_up(&started.run_id, "and now?")?;
+
+        verify_that!(started.unsaved_session_store, none())?;
+        verify_that!(followed.unsaved_session_store, some(eq(&projects)))?;
+        verify_that!(followed.resumable, eq(false))?;
+        let page = store.page(&started.run_id, 0, 1_000_000)?;
+        verify_that!(page.text, starts_with(first_render.as_str()))?;
+        verify_that!(
+            page.text
+                .matches("**This turn's session was not saved.**")
+                .count(),
+            eq(1)
+        )?;
+        verify_that!(
+            store.follow_up(&started.run_id, "again?").map(|_| ()),
+            err(displays_as(contains_substring("could not write to")))
+        )
+    });
+    std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755))?;
+    checked.unwrap_or(Ok(()))
+}
+
+/// A store the CLI has not created yet is probed by creating it, as the CLI would.
+///
+/// A sandbox that grants the store alone, which is the narrowest grant that keeps a session,
+/// refuses a write beside it in the configuration directory; probing there would report a
+/// refusal the CLI never meets.
+#[cfg(unix)]
+#[gtest]
+fn a_session_store_that_does_not_exist_yet_is_probed_where_the_cli_would_create_it() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().or_fail()?;
+    let config_dir = home.path().join(".claude");
+    std::fs::create_dir(&config_dir)?;
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555))?;
+    let refused = std::fs::File::create(config_dir.join("probe")).is_err();
+    let checked = refused.then(|| -> Result<()> {
+        let h = store_with_home(home.path())?;
+
+        let started = h.store.start(&request(claude()?, "q"))?;
+
+        verify_that!(
+            started.unsaved_session_store,
+            some(eq(&config_dir.join("projects")))
+        )
+    });
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755))?;
+    checked.unwrap_or(Ok(()))
+}
+
+/// A configuration directory that is not there says nothing about confinement.
+#[gtest]
+fn a_missing_configuration_directory_raises_nothing() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let h = store_with_home(home.path())?;
+
+    let started = h.store.start(&request(claude()?, "q"))?;
+
+    assert_that!(started.unsaved_session_store, none());
+    assert_that!(started.resumable, eq(true));
+    assert_that!(home.path().join(".claude").exists(), eq(false));
+    Ok(())
+}
+
+/// A session store agentmux can write raises nothing, and the probe leaves nothing behind in it.
+#[gtest]
+fn a_session_store_agentmux_can_write_raises_nothing_and_keeps_nothing() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let projects = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects)?;
+    let h = store_with_home(home.path())?;
+
+    let started = h.store.start(&request(claude()?, "q"))?;
+
+    assert_that!(started.unsaved_session_store, none());
+    assert_that!(started.resumable, eq(true));
+    assert_that!(std::fs::read_dir(&projects)?.count(), eq(0));
     Ok(())
 }
