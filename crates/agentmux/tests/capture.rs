@@ -677,16 +677,18 @@ fn the_announced_session_outranks_the_one_the_result_echoes() {
 
 /// Backgrounded-task and heartbeat events are named, so a slow tool call is not reported as drift.
 ///
-/// All three were met in real captures. None carries any part of the answer — a task's output
-/// comes back as an ordinary `tool_result` — but an event type nobody names is counted, and a
-/// consultation that merely ran a long command would tell its caller that agentmux's model of the
-/// stream had moved.
+/// Every one was met in a real capture. None carries any part of the answer — a task's output
+/// comes back as an ordinary `tool_result`, and the rest are status patches, task lists and
+/// elapsed times — but an event type nobody names is counted, and a consultation that merely ran a
+/// long command would tell its caller that agentmux's model of the stream had moved.
 #[gtest]
 fn task_lifecycle_and_progress_events_are_named_and_silent() {
     let stream = indoc::indoc! {r#"
         {"type":"system","subtype":"init","session_id":"33333333-3333-4333-8333-333333333333"}
         {"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Diff stat","task_type":"local_bash","is_backgrounded":false}
+        {"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_bash","description":"Diff stat"}]}
         {"type":"tool_progress","tool_use_id":"toolu_1-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_1","elapsed_time_seconds":30,"heartbeat":true}
+        {"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed","end_time":1789306550116}}
         {"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","output_file":"","summary":"Diff stat"}
         {"type":"assistant","message":{"model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"ANSWER"}]}}
         {"type":"result","subtype":"success","is_error":false}

@@ -57,6 +57,10 @@ const KNOWN_SYSTEM_SUBTYPES: &[&str] = &[
     // part of the answer: what the task actually produced arrives as an ordinary `tool_result`.
     "task_started",
     "task_notification",
+    // The same task's status changing, and the set of running background tasks changing. A
+    // status patch and a task list; still nothing a reader of the answer needs.
+    "task_updated",
+    "background_tasks_changed",
 ];
 
 #[derive(Debug, Deserialize)]
