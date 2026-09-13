@@ -629,3 +629,79 @@ fn an_infrastructure_error_is_not_classified_as_a_refusal() {
         })
     );
 }
+
+/// A resume against a session the CLI no longer holds still says which session it meant.
+///
+/// Measured: `claude --resume <id>` against an expired conversation writes
+/// `No conversation found with session ID: <id>` to stderr and emits exactly one event, a
+/// `result` with `subtype: "error_during_execution"` — no `system`/`init` at all.
+/// That event carries `session_id`, so the turn is not one whose continuity is unknowable; read
+/// only from `init`, it looked like one, and the run was reported as drift ("session.<not
+/// announced>") on top of the failure it already was.
+#[gtest]
+fn a_resume_whose_session_is_gone_still_names_the_session() {
+    let stream = indoc::indoc! {r#"
+        {"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"9f1c21f8-1b3d-4a7e-9a0c-2d6f4b8e5c10","total_cost_usd":0}
+    "#};
+
+    let Fold { turn, session } = stream::fold(Vendor::Claude, 1, "q", stream);
+
+    assert_that!(
+        session.map(|s| s.as_str().to_owned()),
+        some(eq("9f1c21f8-1b3d-4a7e-9a0c-2d6f4b8e5c10")),
+        "the only event carrying the session was not read"
+    );
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Failed { .. }));
+    // The failure is the whole story: nothing about the stream was unrecognised.
+    assert_that!(turn.unrecognised.summary(), none());
+}
+
+/// An `init` that announced a session outranks the one the terminal event echoes.
+///
+/// They agree on a healthy turn, so the fallback must not be able to change which conversation a
+/// follow-up resumes when both are present.
+#[gtest]
+fn the_announced_session_outranks_the_one_the_result_echoes() {
+    let stream = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"11111111-1111-4111-8111-111111111111"}
+        {"type":"result","subtype":"success","is_error":false,"session_id":"22222222-2222-4222-8222-222222222222"}
+    "#};
+
+    let Fold { session, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
+
+    assert_that!(
+        session.map(|s| s.as_str().to_owned()),
+        some(eq("11111111-1111-4111-8111-111111111111"))
+    );
+}
+
+/// Backgrounded-task and heartbeat events are named, so a slow tool call is not reported as drift.
+///
+/// All three were met in real captures. None carries any part of the answer — a task's output
+/// comes back as an ordinary `tool_result` — but an event type nobody names is counted, and a
+/// consultation that merely ran a long command would tell its caller that agentmux's model of the
+/// stream had moved.
+#[gtest]
+fn task_lifecycle_and_progress_events_are_named_and_silent() {
+    let stream = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"33333333-3333-4333-8333-333333333333"}
+        {"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Diff stat","task_type":"local_bash","is_backgrounded":false}
+        {"type":"tool_progress","tool_use_id":"toolu_1-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_1","elapsed_time_seconds":30,"heartbeat":true}
+        {"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","output_file":"","summary":"Diff stat"}
+        {"type":"assistant","message":{"model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"ANSWER"}]}}
+        {"type":"result","subtype":"success","is_error":false}
+    "#};
+
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
+
+    assert_that!(turn.unrecognised.summary(), none());
+    // Named, not merely tolerated: none of them is allowed to become transcript content.
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|m| m.is_report_content())
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("ANSWER")]
+    );
+}

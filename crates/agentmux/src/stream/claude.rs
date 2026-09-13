@@ -53,6 +53,10 @@ const KNOWN_SYSTEM_SUBTYPES: &[&str] = &[
     "notification",
     "hook_started",
     "hook_response",
+    // A backgrounded tool starting and finishing. Both carry a description and a status and no
+    // part of the answer: what the task actually produced arrives as an ordinary `tool_result`.
+    "task_started",
+    "task_notification",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +178,13 @@ struct ResultEvent {
     /// Read only as failure detail, never as the answer.
     #[serde(default)]
     result: Option<String>,
+    /// The session this turn belonged to.
+    ///
+    /// Read only when no `system`/`init` announced one, which is what a resume against a session
+    /// the CLI no longer holds looks like: it fails before the init event and this is the sole
+    /// remaining evidence of which conversation was meant.
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     usage: Option<ClaudeUsage>,
     #[serde(default)]
@@ -351,12 +362,26 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                         });
                 }
             }
+            // A heartbeat while a tool runs, carrying only how long it has been going. It says
+            // nothing the transcript keeps, but it has to be named: an event type nobody names is
+            // reported as drift, and a turn that merely ran a slow command would report some.
+            "tool_progress" => {}
             "rate_limit_event" => fold_rate_limit(&mut turn, line),
             "result" => {
                 let Ok(event) = serde_json::from_str::<ResultEvent>(line) else {
                     turn.unrecognised.record("result.<unparsable>");
                     continue;
                 };
+                // A turn that failed before announcing a session still names one here, and
+                // without it the fold reports a turn whose continuity cannot be checked — drift,
+                // for a stream that in fact said which conversation it meant.
+                // `init` stays authoritative: this only fills a gap it left.
+                if session.is_none()
+                    && let Some(id) = event.session_id.as_deref()
+                    && let Ok(parsed) = SessionRef::parse(id)
+                {
+                    session = Some(parsed);
+                }
                 turn.outcome = outcome_of(&event, reopened);
                 // Nothing may follow a terminal event.
                 // Stopping here keeps the rendered transcript strictly append-only, which is what
