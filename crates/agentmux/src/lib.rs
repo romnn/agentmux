@@ -68,6 +68,7 @@ pub mod appserver;
 pub mod config;
 pub mod delegate;
 pub mod launch;
+mod once;
 pub mod quota;
 pub mod run;
 pub mod stream;

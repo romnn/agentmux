@@ -1,26 +1,28 @@
 //! The files a steered message travels through, between whoever steers and the driver.
 //!
-//! One message is one file name stem, and its suffix is its state:
+//! One message is one file name stem, and its suffix is its part:
 //!
 //! ```text
-//! <stem>.request.json    written by the caller, whole, by renaming a temporary file into place
-//! <stem>.claimed.json    renamed from the request by the driver, which then sends `turn/steer`
-//! <stem>.withdrawn.json  renamed from the request by a caller that stopped waiting
-//! <stem>.reply.json      written by the driver, whole, once the server has answered
+//! <stem>.request.json   written by the caller, whole, by renaming a temporary file into place
+//! <stem>.decision.json  claimed by the driver, which then sends `turn/steer`, or withdrawn by a
+//!                       caller that stopped waiting; created exactly once
+//! <stem>.reply.json     written by the driver, whole, once the server has answered
 //! ```
 //!
-//! Claiming and withdrawing are both a rename of the one request file, so exactly one of them
-//! succeeds: a message the caller withdrew is never sent, and a message the driver claimed is
-//! answered as accepted, rejected, or, when it was sent and the server never said, unconfirmed.
+//! Claiming and withdrawing both create the one decision file, so exactly one of them succeeds:
+//! a message the caller withdrew is never sent, and a message the driver claimed is answered as
+//! accepted, rejected, or, when it was sent and the server never said, unconfirmed.
 //! Stems sort by the time they were submitted, so the driver sends them in that order.
+//!
+//! The decision is created with [`crate::once::create_once`], which says why a rename could not
+//! arbitrate it.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 const REQUEST: &str = "request.json";
-const CLAIMED: &str = "claimed.json";
-const WITHDRAWN: &str = "withdrawn.json";
+const DECISION: &str = "decision.json";
 const REPLY: &str = "reply.json";
 
 /// A turn's mailbox directory.
@@ -67,6 +69,16 @@ struct Request {
     text: String,
 }
 
+/// Who took a message out of the request state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Decision {
+    /// The driver, which sends it.
+    Claimed,
+    /// Its sender, which stopped waiting; it is never sent.
+    Withdrawn,
+}
+
 impl Mailbox {
     /// The mailbox in `dir`, which need not exist yet.
     #[must_use]
@@ -98,11 +110,26 @@ impl Mailbox {
         Ok(Letter { stem })
     }
 
-    /// Whether the driver has taken this letter: it is no longer waiting as a request, and the
-    /// sender did not withdraw it.
+    /// Whether the driver has taken this letter.
+    ///
+    /// A decision that cannot be read counts as not claimed: it is created whole, so only a
+    /// mailbox damaged from outside has one.
     #[must_use]
     pub fn is_claimed(&self, letter: &Letter) -> bool {
-        !self.path(&letter.stem, REQUEST).exists() && !self.path(&letter.stem, WITHDRAWN).exists()
+        self.decision(&letter.stem) == Some(Decision::Claimed)
+    }
+
+    fn decision(&self, stem: &str) -> Option<Decision> {
+        let text = std::fs::read_to_string(self.path(stem, DECISION)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Make the one decision about a message.
+    ///
+    /// Returns `false` when it was already made, by anyone.
+    fn decide(&self, stem: &str, decision: Decision) -> std::io::Result<bool> {
+        let body = serde_json::to_string(&decision).map_err(std::io::Error::other)?;
+        crate::once::create_once(&self.path(stem, DECISION), body.as_bytes())
     }
 
     /// The driver's reply to a letter, once there is one.
@@ -126,16 +153,9 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// Returns an error when the rename fails for any reason but the request being gone.
+    /// Returns an error when the decision cannot be written.
     pub fn withdraw(&self, letter: &Letter) -> std::io::Result<bool> {
-        match std::fs::rename(
-            self.path(&letter.stem, REQUEST),
-            self.path(&letter.stem, WITHDRAWN),
-        ) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        self.decide(&letter.stem, Decision::Withdrawn)
     }
 
     /// Claim every waiting request, oldest first.
@@ -162,12 +182,20 @@ impl Mailbox {
 
         let mut claims = Vec::new();
         for stem in stems {
-            let claimed = self.path(&stem, CLAIMED);
-            if std::fs::rename(self.path(&stem, REQUEST), &claimed).is_err() {
-                // Withdrawn in the meantime.
+            // Decided already, by an earlier claim or by its sender.
+            if self.path(&stem, DECISION).exists() {
                 continue;
             }
-            let request = std::fs::read_to_string(&claimed)
+            match self.decide(&stem, Decision::Claimed) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                // Left waiting, for a later claim or for its sender to withdraw.
+                Err(err) => {
+                    tracing::warn!(?err, %stem, "cannot claim a steer");
+                    continue;
+                }
+            }
+            let request = std::fs::read_to_string(self.path(&stem, REQUEST))
                 .map_err(|error| error.to_string())
                 .and_then(|text| {
                     serde_json::from_str::<Request>(&text).map_err(|error| error.to_string())
@@ -206,8 +234,10 @@ impl Mailbox {
 }
 
 /// Write a file so that a reader sees all of it or none of it.
+///
+/// Only one writer ever writes `path`, so the rename has nothing to arbitrate.
 fn write_whole(path: &Path, body: &str) -> std::io::Result<()> {
-    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temp = crate::once::temporary(path);
     std::fs::write(&temp, body)?;
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);

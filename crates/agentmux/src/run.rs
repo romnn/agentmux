@@ -2438,33 +2438,21 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunError> {
 ///
 /// When another caller got there first, its record is returned rather than overwritten, so two
 /// observers of one departure settle on one story.
-/// The record is complete before it is visible: it is written beside its final name and linked
-/// into place, and the link is what fails when the name is taken.
-/// A filesystem without hard links gets an exclusive create instead, which still keeps the
-/// first record but can let a reader glimpse a partial one — loudly, as a record that cannot be
-/// parsed, never quietly as one that is not there.
+/// [`crate::once::create_once`] says how: on a filesystem without hard links a reader can glimpse
+/// a partial record — loudly, as one that cannot be parsed, never quietly as one that is not
+/// there.
 fn write_json_once<T: Serialize + for<'de> Deserialize<'de>>(
     path: &Path,
     value: &T,
 ) -> Result<T, RunError> {
-    let temp = write_json_temp(path, value)?;
-    let placed = match std::fs::hard_link(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Err(source),
-        Err(_) => std::fs::read(&temp).and_then(|text| {
-            use std::io::Write as _;
-            File::create_new(path)?.write_all(&text)
-        }),
-    };
-    let _ = std::fs::remove_file(&temp);
-    match placed {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(source) => Err(RunError::Io {
-            context: format!("writing {}", path.display()),
-            source,
-        }),
-    }?;
+    let text = serde_json::to_string_pretty(value).map_err(|source| RunError::Io {
+        context: format!("serialising {}", path.display()),
+        source: std::io::Error::other(source),
+    })?;
+    crate::once::create_once(path, text.as_bytes()).map_err(|source| RunError::Io {
+        context: format!("writing {}", path.display()),
+        source,
+    })?;
     read_json(path)?.ok_or_else(|| RunError::Io {
         context: format!("reading back {}", path.display()),
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -2477,7 +2465,7 @@ fn write_json_temp<T: Serialize>(path: &Path, value: &T) -> Result<PathBuf, RunE
         context: format!("serialising {}", path.display()),
         source: std::io::Error::other(source),
     })?;
-    let temp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temp = crate::once::temporary(path);
     std::fs::write(&temp, text).map_err(|source| RunError::Io {
         context: format!("writing {}", temp.display()),
         source,
