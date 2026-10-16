@@ -4,6 +4,12 @@ members = [
 	"crates/agentmux",
 	"crates/agentmux-mcp",
 	"crates/agentmux-cli",
+	"crates/codex-app-server-protocol",
+]
+# The protocol's generator is a workspace of its own, so building agentmux never compiles it; see
+# its manifest.
+exclude = [
+	"crates/codex-app-server-codegen",
 ]
 default-members = [
 	"crates/agentmux-cli",

@@ -14,18 +14,18 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
+use codex_app_server_protocol::envelope::{
+    INTERNAL_ERROR, METHOD_NOT_FOUND, Message, RequestId, RpcError,
+};
+use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::{ClientRequest, Notification as _, Request as _};
 use serde_json::Value;
 
 use super::Plan;
 use super::mailbox::{Claim, Mailbox, Reply};
-use super::protocol::{self, Incoming, Request, decode, wire};
+use super::protocol;
 use super::translate::{self, Finish, Translator};
 use crate::delegate::{Billing, scrub_billing_env};
-
-/// How long one setup request may go unanswered.
-///
-/// Generous, because resuming a long thread reads its whole rollout before it answers.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the cancel marker, the mailbox and the server process are looked at while a turn
 /// runs.
@@ -37,7 +37,8 @@ const TICK: Duration = Duration::from_millis(100);
 /// how the turn ended.
 const EXIT_DRAIN: Duration = TICK.saturating_mul(3);
 
-/// How long an interrupted turn is given to close before the driver leaves anyway.
+/// How long an interrupted turn is given to close before the driver leaves anyway, unless its
+/// [`Deadlines`] say otherwise.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(8);
 
 /// How long the server is given to exit once its stdin is closed.
@@ -59,8 +60,32 @@ pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
     .saturating_add(SERVER_EXIT_GRACE)
     .saturating_add(SWEEP_GRACE);
 
-/// How long, once the turn has ended, a steer the server has not answered yet is waited for.
-const SETTLE_GRACE: Duration = Duration::from_secs(2);
+/// How long the driver waits on the server at each point where it waits for an answer.
+///
+/// [`Deadlines::default`] is what every driven turn runs with; a test shortens them to reach the
+/// paths a deadline ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadlines {
+    /// How long one setup request may go unanswered.
+    ///
+    /// Generous, because resuming a long thread reads its whole rollout before it answers.
+    pub setup: Duration,
+    /// How long an interrupted turn, or a cancelled one still being started, is given to close
+    /// before the driver leaves anyway.
+    pub interrupt: Duration,
+    /// How long, once the turn has ended, a steer the server has not answered yet is waited for.
+    pub settle: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Self {
+            setup: Duration::from_secs(120),
+            interrupt: INTERRUPT_GRACE,
+            settle: Duration::from_secs(2),
+        }
+    }
+}
 
 /// How a driven turn ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +173,7 @@ pub fn drive(plan_path: &Path) -> i32 {
         to_server,
         BufReader::new(from_server),
         &mut || !matches!(child.try_wait(), Ok(None)),
+        Deadlines::default(),
     );
     let seen = watch.map(Watch::stop).unwrap_or_default();
     stop_server(&mut child, input, seen);
@@ -172,6 +198,7 @@ pub fn drive_with(
     to_server: impl Write + Send + 'static,
     from_server: impl BufRead + Send + 'static,
     server_exited: &mut dyn FnMut() -> bool,
+    deadlines: Deadlines,
 ) -> Ending {
     let (inbox, events) = channel();
     let boundary = inbox.clone();
@@ -195,6 +222,7 @@ pub fn drive_with(
         server_probed_at: Instant::now(),
         server_gone_since: None,
         last_message_kept: false,
+        deadlines,
     };
     let ending = match session.set_up(question) {
         Ok(thread_id) => session.run_turn(&thread_id),
@@ -230,7 +258,7 @@ fn read_server(mut from_server: impl BufRead, inbox: &Sender<Event>) {
             }
             Ok(_) => {
                 // A line that is not JSON-RPC is the server's to explain, on its stderr.
-                if let Some(message) = protocol::parse(line.trim_end())
+                if let Some(message) = Message::parse(line.trim_end())
                     && inbox.send(Event::Message(message)).is_err()
                 {
                     return;
@@ -258,7 +286,7 @@ fn write_server(mut to_server: impl Write, queue: &Receiver<String>) {
 
 /// What the server-reading thread hands over.
 enum Event {
-    Message(Incoming),
+    Message(Message),
     /// The server's stdout ended, with what the read said about why.
     Closed(String),
     /// Everything read before the server was seen gone has been handed over; the driver queues
@@ -297,10 +325,10 @@ struct Session<'a> {
     out: &'a mut dyn Write,
     outbox: Sender<String>,
     events: Receiver<Event>,
-    next_id: u64,
+    next_id: i64,
     translator: Translator,
     mailbox: Mailbox,
-    pending: HashMap<u64, Pending>,
+    pending: HashMap<RequestId, Pending>,
     finished: Option<Finished>,
     /// When the driver first saw the caller's cancellation.
     cancelled_at: Option<Instant>,
@@ -313,6 +341,7 @@ struct Session<'a> {
     boundary: Option<Sender<Event>>,
     /// Whether the closing message is already where a reader finds it.
     last_message_kept: bool,
+    deadlines: Deadlines,
 }
 
 impl Session<'_> {
@@ -329,16 +358,18 @@ impl Session<'_> {
             .map_err(|error| format!("cannot write the event capture: {error}"))
     }
 
-    fn send(&self, line: String) -> Result<(), String> {
+    fn send(&self, message: &Message) -> Result<(), String> {
         self.outbox
-            .send(line)
+            .send(message.to_line())
             .map_err(|_| "codex app-server closed its input".to_owned())
     }
 
-    fn request<P: Request>(&mut self, params: &P) -> Result<u64, String> {
+    fn request<M: ClientRequest>(&mut self, params: &M::Params) -> Result<RequestId, String> {
         self.next_id += 1;
-        let id = self.next_id;
-        self.send(protocol::request(id, params)?)?;
+        let id = RequestId::Integer(self.next_id);
+        let request = Message::request::<M>(id.clone(), params)
+            .map_err(|err| format!("{err}: {}", err.source))?;
+        self.send(&request)?;
         Ok(id)
     }
 
@@ -392,18 +423,22 @@ impl Session<'_> {
     /// Answer a request from the server: an approval is declined, anything else refused.
     ///
     /// Said in the capture as well, because a refused action changes what the delegate did next.
-    fn decline(&mut self, id: &Value, method: &str) -> Result<(), String> {
-        let line = match protocol::decline(method) {
-            Some(Ok(answer)) => protocol::result(id, &answer),
-            Some(Err(reason)) => protocol::error(id, protocol::INTERNAL_ERROR, &reason),
-            None => protocol::error(
-                id,
-                protocol::METHOD_NOT_FOUND,
+    fn decline(&mut self, id: &RequestId, method: &str) -> Result<(), String> {
+        let answer = match protocol::decline(id, method) {
+            Some(Ok(answer)) => answer,
+            Some(Err(err)) => Message::error(
+                id.clone(),
+                INTERNAL_ERROR,
+                &format!("{err}: {}", err.source),
+            ),
+            None => Message::error(
+                id.clone(),
+                METHOD_NOT_FOUND,
                 "agentmux runs consultations unattended and answers no requests of this kind",
             ),
         };
         // A server that has gone cannot be answered, and its departure is reported on its own.
-        let _ = self.send(line);
+        let _ = self.send(&answer);
         self.record(&[translate::note(&format!(
             "agentmux declined codex's `{method}` request: a consultation runs with nobody to \
              approve or answer it"
@@ -441,14 +476,14 @@ impl Session<'_> {
     /// `turn/start` is over as soon as the turn is known — from `turn/started`, or from an end the
     /// server reported — whether or not it was answered, because a running turn takes steers and
     /// a finished one is written at once.
-    fn call<P: Request>(&mut self, params: &P) -> Result<Value, Setup> {
-        let method = P::METHOD;
-        let starts_the_turn = method == <wire::TurnStartParams as Request>::METHOD;
+    fn call<M: ClientRequest>(&mut self, params: &M::Params) -> Result<Value, Setup> {
+        let method = M::METHOD;
+        let starts_the_turn = method == m::TurnStart::METHOD;
         if self.cancel_requested() {
             return Err(Setup::Cancelled);
         }
-        let id = self.request(params).map_err(Setup::Failed)?;
-        let mut deadline = Instant::now() + SETUP_TIMEOUT;
+        let id = self.request::<M>(params).map_err(Setup::Failed)?;
+        let mut deadline = Instant::now() + self.deadlines.setup;
         loop {
             if starts_the_turn && (self.translator.turn_id().is_some() || self.finished.is_some()) {
                 return Err(Setup::Started);
@@ -458,7 +493,7 @@ impl Session<'_> {
                     return Err(Setup::Cancelled);
                 }
                 if let Some(at) = self.cancelled_at {
-                    deadline = deadline.min(at + INTERRUPT_GRACE);
+                    deadline = deadline.min(at + self.deadlines.interrupt);
                 }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -467,23 +502,26 @@ impl Session<'_> {
             }
             if remaining.is_zero() {
                 return Err(Setup::Failed(format!(
-                    "codex app-server did not answer `{method}` within {}s",
-                    SETUP_TIMEOUT.as_secs()
+                    "codex app-server did not answer `{method}` within {:?}",
+                    self.deadlines.setup
                 )));
             }
             match self.receive(remaining.min(TICK)) {
-                Ok(Event::Message(Incoming::Response { id: got, outcome })) if got == id => {
-                    return outcome.map_err(|reason| {
-                        Setup::Failed(format!("codex app-server refused `{method}`: {reason}"))
+                Ok(Event::Message(Message::Response { id: got, outcome })) if got == id => {
+                    return outcome.map_err(|error| {
+                        Setup::Failed(format!(
+                            "codex app-server refused `{method}`: {}",
+                            refusal(&error)
+                        ))
                     });
                 }
-                Ok(Event::Message(Incoming::Response { .. })) | Err(RecvTimeoutError::Timeout) => {}
-                Ok(Event::Message(Incoming::Notification { method, params })) => {
+                Ok(Event::Message(Message::Response { .. })) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(Event::Message(Message::Notification { method, params })) => {
                     let cancelling = self.cancel_requested();
                     self.notify(&method, &params, cancelling)
                         .map_err(Setup::Failed)?;
                 }
-                Ok(Event::Message(Incoming::Request { id, method })) => {
+                Ok(Event::Message(Message::Request { id, method, .. })) => {
                     self.decline(&id, &method).map_err(Setup::Failed)?;
                 }
                 Ok(Event::Closed(why)) => {
@@ -505,9 +543,10 @@ impl Session<'_> {
     /// Returns the thread id.
     fn set_up(&mut self, question: &str) -> Result<String, Setup> {
         // The answer says nothing the driver needs; the handshake is what counts.
-        self.call(&protocol::initialize_params())?;
-        self.send(protocol::notification("initialized"))
-            .map_err(Setup::Failed)?;
+        self.call::<m::Initialize>(&protocol::initialize_params())?;
+        let initialized = Message::notification::<m::Initialized>(&())
+            .map_err(|err| Setup::Failed(format!("{err}: {}", err.source)))?;
+        self.send(&initialized).map_err(Setup::Failed)?;
 
         let settings = &self.plan.settings;
         let cwd = self.plan.cwd.to_string_lossy().into_owned();
@@ -515,20 +554,27 @@ impl Session<'_> {
         let sandbox = settings.sandbox;
         let (method, opened) = if let Some(session) = &self.plan.resume {
             let params = protocol::thread_resume_params(session.as_str(), &model, &cwd, sandbox);
-            ("thread/resume", self.call(&params)?)
+            (
+                m::ThreadResume::METHOD,
+                self.call::<m::ThreadResume>(&params)?,
+            )
         } else {
             let params = protocol::thread_start_params(&model, &cwd, sandbox);
-            ("thread/start", self.call(&params)?)
+            (
+                m::ThreadStart::METHOD,
+                self.call::<m::ThreadStart>(&params)?,
+            )
         };
         // Both answers carry the thread in the same place.
         let typed = if self.plan.resume.is_some() {
-            decode::<wire::ThreadResumeResponse>(&opened).map(|resumed| resumed.thread.id)
+            m::ThreadResume::response(&opened).map(|resumed| resumed.thread.id)
         } else {
-            decode::<wire::ThreadStartResponse>(&opened).map(|started| started.thread.id)
+            m::ThreadStart::response(&opened).map(|started| started.thread.id)
         };
         let thread_id = match typed {
             Ok(thread_id) => thread_id,
             Err(reason) => {
+                let reason = reason.to_string();
                 self.record(&[translate::undecoded(method, &reason, &opened)])
                     .map_err(Setup::Failed)?;
                 opened
@@ -546,14 +592,15 @@ impl Session<'_> {
         self.record(&[announced]).map_err(Setup::Failed)?;
 
         let start = protocol::turn_start_params(&thread_id, question).map_err(Setup::Failed)?;
-        let started = match self.call(&start) {
+        let started = match self.call::<m::TurnStart>(&start) {
             Ok(started) => started,
             Err(Setup::Started) => return Ok(thread_id),
             Err(other) => return Err(other),
         };
-        let turn_id = match decode::<wire::TurnStartResponse>(&started) {
+        let turn_id = match m::TurnStart::response(&started) {
             Ok(started) => started.turn.id,
             Err(reason) => {
+                let reason = reason.to_string();
                 self.record(&[translate::undecoded("turn/start", &reason, &started)])
                     .map_err(Setup::Failed)?;
                 started
@@ -592,17 +639,17 @@ impl Session<'_> {
                 return self.close(&finished);
             }
             match self.receive(TICK) {
-                Ok(Event::Message(Incoming::Notification { method, params })) => {
+                Ok(Event::Message(Message::Notification { method, params })) => {
                     let cancelling = self.cancelled_at.is_some()
-                        || (method == "turn/completed" && self.cancel_requested());
+                        || (method == m::TurnCompleted::METHOD && self.cancel_requested());
                     self.notify(&method, &params, cancelling)?;
                 }
-                Ok(Event::Message(Incoming::Response { id, outcome })) => {
+                Ok(Event::Message(Message::Response { id, outcome })) => {
                     if let Some(request) = self.pending.remove(&id) {
                         self.resolve(request, outcome)?;
                     }
                 }
-                Ok(Event::Message(Incoming::Request { id, method })) => {
+                Ok(Event::Message(Message::Request { id, method, .. })) => {
                     self.decline(&id, &method)?;
                 }
                 Ok(Event::Closed(why)) => {
@@ -630,7 +677,7 @@ impl Session<'_> {
             if self.notice_cancellation() {
                 if self
                     .cancelled_at
-                    .is_some_and(|at| at.elapsed() >= INTERRUPT_GRACE)
+                    .is_some_and(|at| at.elapsed() >= self.deadlines.interrupt)
                 {
                     self.abandon("the turn was cancelled before codex answered it");
                     let _ = self.keep_last_message();
@@ -648,9 +695,8 @@ impl Session<'_> {
                             },
                         );
                     }
-                    if let Ok(id) =
-                        self.request(&protocol::turn_interrupt_params(thread_id, &turn_id))
-                    {
+                    let interrupt = protocol::turn_interrupt_params(thread_id, &turn_id);
+                    if let Ok(id) = self.request::<m::TurnInterrupt>(&interrupt) {
                         self.pending.insert(id, Pending::Interrupt);
                     }
                 }
@@ -658,7 +704,7 @@ impl Session<'_> {
             }
             for claim in self.mailbox.claim_all() {
                 let sent = protocol::turn_steer_params(thread_id, &turn_id, &claim.text)
-                    .and_then(|params| self.request(&params));
+                    .and_then(|params| self.request::<m::TurnSteer>(&params));
                 match sent {
                     Ok(id) => {
                         self.pending.insert(id, Pending::Steer(claim));
@@ -671,7 +717,7 @@ impl Session<'_> {
 
     /// Settle the steers still in flight, then write the end of the turn.
     fn close(&mut self, finished: &Finished) -> Result<Ending, String> {
-        let deadline = Instant::now() + SETTLE_GRACE;
+        let deadline = Instant::now() + self.deadlines.settle;
         while self
             .pending
             .values()
@@ -682,15 +728,15 @@ impl Session<'_> {
                 break;
             }
             match self.events.recv_timeout(remaining) {
-                Ok(Event::Message(Incoming::Response { id, outcome })) => {
+                Ok(Event::Message(Message::Response { id, outcome })) => {
                     if let Some(request) = self.pending.remove(&id) {
                         self.resolve(request, outcome)?;
                     }
                 }
-                Ok(Event::Message(Incoming::Request { id, method })) => {
+                Ok(Event::Message(Message::Request { id, method, .. })) => {
                     self.decline(&id, &method)?;
                 }
-                Ok(Event::Message(Incoming::Notification { .. })) => {}
+                Ok(Event::Message(Message::Notification { .. })) => {}
                 Ok(Event::Closed(_) | Event::Boundary) | Err(_) => break,
             }
         }
@@ -704,8 +750,12 @@ impl Session<'_> {
     }
 
     /// Act on the server's answer to one of the driver's own requests.
-    fn resolve(&mut self, request: Pending, outcome: Result<Value, String>) -> Result<(), String> {
-        match (request, outcome) {
+    fn resolve(
+        &mut self,
+        request: Pending,
+        outcome: Result<Value, RpcError>,
+    ) -> Result<(), String> {
+        match (request, outcome.map_err(|error| refusal(&error))) {
             (Pending::Steer(claim), Ok(_)) => {
                 // Recorded before the sender hears of it, so a transcript read after a
                 // successful `steer` always holds the instruction.
@@ -785,6 +835,15 @@ impl Session<'_> {
         if let Err(error) = self.mailbox.answer(claim, reply) {
             eprintln!("agentmux: cannot answer a steered message: {error}");
         }
+    }
+}
+
+/// What the server said when it refused a request, as the transcript and the caller are told.
+fn refusal(error: &RpcError) -> String {
+    if error.message.is_empty() {
+        "the server gave no reason".to_owned()
+    } else {
+        error.message.clone()
     }
 }
 

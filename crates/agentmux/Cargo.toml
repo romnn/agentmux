@@ -18,6 +18,7 @@ keywords = ["agent", "llm", "mcp", "review"]
 workspace = true
 
 [dependencies]
+codex-app-server-protocol = { path = "../codex-app-server-protocol" }
 chrono = { workspace = true, features = ["serde"] }
 directories.workspace = true
 serde.workspace = true

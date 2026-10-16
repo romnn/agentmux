@@ -35,10 +35,10 @@
 //! moved away from the generated types is loud rather than lossy, the raw capture still holds what
 //! it said, a reply is still kept, and a turn that ended is still ended.
 
+use codex_app_server_protocol::methods::{self as m, SERVER_NOTIFICATIONS};
+use codex_app_server_protocol::{Notification as _, types as wire};
 use serde_json::{Value, json};
 
-use super::protocol::{decode, wire};
-use super::schema::SERVER_NOTIFICATIONS;
 use crate::stream::codex::STEER_EVENT;
 
 /// The event written in place of a notification that does not match the generated types.
@@ -203,37 +203,39 @@ impl Translator {
         let mut out = Translated::default();
         // Configuration warnings concern the whole server, and `exec` reports them whoever they
         // name.
-        let global = matches!(method, "configWarning" | "deprecationNotice");
+        let global = matches!(
+            method,
+            m::ConfigWarning::METHOD | m::DeprecationNotice::METHOD
+        );
         if !global && !self.concerns_this_turn(params) {
             return out;
         }
         let result = match method {
-            "turn/started" => decode::<wire::TurnStartedNotification>(params).map(|started| {
+            m::TurnStarted::METHOD => m::TurnStarted::params(params).map(|started| {
                 out.lines.extend(self.turn_began(&started.turn.id));
             }),
-            "item/completed" => {
+            m::ItemCompleted::METHOD => {
                 self.item_completed(params, &mut out);
                 Ok(())
             }
-            "error" => decode::<wire::ErrorNotification>(params).map(|error| {
+            m::Error::METHOD => m::Error::params(params).map(|error| {
                 let message = with_details(error.error.message, error.error.additional_details);
                 out.lines
                     .push(json!({"type": "error", "message": message}).to_string());
                 self.last_error = Some(message);
             }),
-            "warning" => decode::<wire::WarningNotification>(params)
-                .map(|warning| out.lines.push(note(&warning.message))),
-            "configWarning" => decode::<wire::ConfigWarningNotification>(params).map(|warning| {
+            m::Warning::METHOD => {
+                m::Warning::params(params).map(|warning| out.lines.push(note(&warning.message)))
+            }
+            m::ConfigWarning::METHOD => m::ConfigWarning::params(params).map(|warning| {
                 out.lines
                     .push(note(&with_details(warning.summary, warning.details)));
             }),
-            "deprecationNotice" => {
-                decode::<wire::DeprecationNoticeNotification>(params).map(|notice| {
-                    out.lines
-                        .push(note(&with_details(notice.summary, notice.details)));
-                })
-            }
-            "model/rerouted" => decode::<wire::ModelReroutedNotification>(params).map(|reroute| {
+            m::DeprecationNotice::METHOD => m::DeprecationNotice::params(params).map(|notice| {
+                out.lines
+                    .push(note(&with_details(notice.summary, notice.details)));
+            }),
+            m::ModelRerouted::METHOD => m::ModelRerouted::params(params).map(|reroute| {
                 out.lines.push(note(&format!(
                     "model rerouted: {} -> {} ({})",
                     reroute.from_model,
@@ -241,25 +243,29 @@ impl Translator {
                     reroute.reason.as_str()
                 )));
             }),
-            "thread/tokenUsage/updated" => {
-                decode::<wire::ThreadTokenUsageUpdatedNotification>(params)
-                    .map(|update| self.usage = Some(update.token_usage.total))
-            }
-            "turn/completed" => return self.turn_completed(params, cancelling),
+            m::ThreadTokenUsageUpdated::METHOD => m::ThreadTokenUsageUpdated::params(params)
+                .map(|update| self.usage = Some(update.token_usage.total)),
+            m::TurnCompleted::METHOD => return self.turn_completed(params, cancelling),
             known if SERVER_NOTIFICATIONS.contains(&known) => Ok(()),
-            _ => Err(
-                "the codex this driver was generated from sends no such notification".to_owned(),
-            ),
+            _ => {
+                out.lines.push(undecoded(
+                    method,
+                    "the codex this driver was generated from sends no such notification",
+                    params,
+                ));
+                return out;
+            }
         };
         if let Err(reason) = result {
-            out.lines.push(undecoded(method, &reason, params));
+            out.lines
+                .push(undecoded(method, &reason.to_string(), params));
         }
         out
     }
 
     /// Translate `item/completed`, keeping a reply even when the item does not decode.
     fn item_completed(&mut self, params: &Value, out: &mut Translated) {
-        match decode::<wire::ItemCompletedNotification>(params) {
+        match m::ItemCompleted::params(params) {
             Ok(completed) => {
                 if let Some(item) = self.item(completed.item) {
                     out.lines.push(completed_item(&item));
@@ -268,7 +274,9 @@ impl Translator {
             Err(reason) => {
                 // Said as drift first, with the whole payload; then a reply still readable is
                 // written as one, so the transcript keeps the report.
-                out.lines.push(undecoded("item/completed", &reason, params));
+                let reason = reason.to_string();
+                out.lines
+                    .push(undecoded(m::ItemCompleted::METHOD, &reason, params));
                 let raw = params.get("item").unwrap_or(&Value::Null);
                 if raw.get("type").and_then(Value::as_str) == Some("agentMessage")
                     && let Some(text) = raw.get("text").and_then(Value::as_str)
@@ -289,11 +297,13 @@ impl Translator {
     /// Translate `turn/completed`, which ends the turn whether or not it decodes.
     fn turn_completed(&mut self, params: &Value, cancelling: bool) -> Translated {
         let mut out = Translated::default();
-        let completed = match decode::<wire::TurnCompletedNotification>(params) {
+        let completed = match m::TurnCompleted::params(params) {
             Ok(completed) => completed,
             Err(reason) => {
+                let reason = reason.to_string();
                 // The turn is over either way; how it ended is the part that could not be read.
-                out.lines.push(undecoded("turn/completed", &reason, params));
+                out.lines
+                    .push(undecoded(m::TurnCompleted::METHOD, &reason, params));
                 out.lines.push(failed(&format!(
                     "codex ended the turn, but agentmux could not read how: {reason}"
                 )));

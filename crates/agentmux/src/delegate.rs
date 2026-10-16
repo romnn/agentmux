@@ -1143,7 +1143,7 @@ impl Delegate {
     /// merges into the user's tables rather than replacing them, as `codex_args` records.
     /// An isolated delegate therefore always runs over `exec`, where it cannot be steered; why a
     /// private `CODEX_HOME` is no way round that is in [`crate::appserver`].
-    /// `codegen/app-server/generate.sh` refuses the first codex whose app-server takes the flag,
+    /// `codex-app-server-codegen refresh` refuses the first codex whose app-server takes the flag,
     /// which is when to pass it here and let isolated delegates through.
     #[must_use]
     pub fn app_server_settings(&self, config: &Config) -> Option<AppServerSettings> {

@@ -5,6 +5,8 @@
 
 # rust
 /target/
+# The protocol generator is a workspace of its own; see its manifest.
+/crates/codex-app-server-codegen/target/
 
 # goreleaser
 goreleaser-dist/

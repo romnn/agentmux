@@ -1,8 +1,0 @@
-# progeny configuration for the codex app-server protocol types; see `generate.sh`.
-packaging = "module"
-derives = ["clone", "debug", "partial-eq", "default"]
-
-[emit]
-types = true
-client = false
-server = false
