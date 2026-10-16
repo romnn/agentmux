@@ -1,138 +1,133 @@
-//! Renders `methods.rs`: one marker type per manifest entry, bound to its payload types, and the
-//! names of every method the server can send.
-
-use std::collections::BTreeSet;
+//! Renders `methods.rs`: a marker type per method, bound to its payload types, and per direction
+//! an `Any*` enum that classifies an incoming message by its method.
 
 use indoc::{formatdoc, indoc};
 
-use crate::Error;
-use crate::manifest::{Direction, Entry, Manifest};
-
-/// Every method the bundle lists in the server's direction, whether or not the manifest binds it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Catalogue {
-    /// Every notification method the server can send.
-    pub server_notifications: Vec<String>,
-    /// Every request method the server can send.
-    pub server_requests: Vec<String>,
-}
+use crate::methods::{Direction, Method, Params};
 
 /// The source of `methods.rs`, without its header.
-///
-/// # Errors
-///
-/// Returns [`Error::Binding`] when a method cannot be named as a Rust type, or two methods would
-/// share a name.
-pub fn render(
-    manifest: &Manifest,
-    catalogue: &Catalogue,
-    codex_version: &str,
-) -> Result<String, Error> {
+#[must_use]
+pub fn render(methods: &[Method], codex_version: &str) -> String {
     let mut out = indoc! {"
-        //! The methods agentmux exchanges with `codex app-server`, each bound to its payload types.
+        //! Every method of the codex app-server protocol, each bound to its payload types.
         //!
         //! Each marker type stands for one JSON-RPC method: its trait implementations name the wire
         //! method, the type its `params` decode into, and, for a request, the type of its `result`,
         //! so a message cannot be built with one method and another method's payload.
         //! The direction traits say who may send it.
+        //!
+        //! Each `Any*` enum lists every method of one direction, so a receiver that matches on it
+        //! is told by the compiler when a regeneration adds one.
+
+        use serde_json::Value;
 
         use crate::types;
         use crate::{
-            ClientNotification, ClientRequest, Notification, Request, ServerNotification,
-            ServerRequest,
+            ClientNotification, ClientRequest, Method, Notification, Payload, Request,
+            ServerNotification, ServerRequest,
         };
     "}
     .to_owned();
 
-    let mut names = BTreeSet::new();
-    for entry in manifest.entries() {
-        let name = marker(entry.method)?;
-        if !names.insert(name.clone()) {
-            return Err(Error::Binding {
-                method: entry.method.to_owned(),
-                reason: format!("another method is also named `{name}`"),
-            });
-        }
+    for method in methods {
         out.push('\n');
-        out.push_str(&binding(&name, &entry));
+        out.push_str(&binding(method));
     }
-
-    let list = |methods: &[String]| -> String {
-        let lines: Vec<String> = methods
+    for direction in Direction::ALL {
+        let members: Vec<&Method> = methods
             .iter()
-            .map(|method| format!("    {method:?},\n"))
+            .filter(|method| method.direction == direction)
             .collect();
-        lines.concat()
-    };
-    out.push_str(&formatdoc! {"
-
-        /// Every notification method codex-cli {codex_version} can send, whether or not a type here
-        /// binds it.
-        pub const SERVER_NOTIFICATIONS: &[&str] = &[
-        {notifications}];
-
-        /// Every request method codex-cli {codex_version} can send, whether or not a type here binds
-        /// it.
-        pub const SERVER_REQUESTS: &[&str] = &[
-        {requests}];
-        ",
-        notifications = list(&catalogue.server_notifications),
-        requests = list(&catalogue.server_requests),
-    });
-    Ok(out)
+        out.push('\n');
+        out.push_str(&dispatch(direction, &members, codex_version));
+    }
+    out
 }
 
-/// The marker type and trait implementations for one entry.
-fn binding(name: &str, entry: &Entry) -> String {
-    let method = entry.method;
-    let params = entry
-        .params
-        .map_or_else(|| "()".to_owned(), |params| format!("types::{params}"));
-    let (what, base, direction) = match entry.direction {
-        Direction::ClientRequest => ("request", "Request", "ClientRequest"),
-        Direction::ClientNotification => ("notification", "Notification", "ClientNotification"),
-        Direction::ServerRequest => ("request", "Request", "ServerRequest"),
-        Direction::ServerNotification => ("notification", "Notification", "ServerNotification"),
+/// The marker type and trait implementations for one method.
+fn binding(method: &Method) -> String {
+    let Method {
+        wire, name, params, ..
+    } = method;
+    let params = match params {
+        Params::None => "()".to_owned(),
+        Params::Required(schema) => format!("types::{schema}"),
+        Params::Optional(schema) => format!("Option<types::{schema}>"),
     };
-    let response = entry
-        .response
-        .map(|response| format!("    type Response = types::{response};\n"))
-        .unwrap_or_default();
+    let direction = method.direction.union();
+    let (what, kind) = match method.response.as_deref() {
+        Some(response) => (
+            "request",
+            formatdoc! {"
+                impl Request for {name} {{
+                    type Response = types::{response};
+                }}
+            "},
+        ),
+        None => (
+            "notification",
+            format!("impl Notification for {name} {{}}\n"),
+        ),
+    };
     formatdoc! {"
-        /// The `{method}` {what}.
+        /// The `{wire}` {what}.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct {name};
 
-        impl {base} for {name} {{
-            const METHOD: &'static str = {method:?};
+        impl Method for {name} {{
+            const METHOD: &'static str = {wire:?};
             type Params = {params};
-        {response}}}
+        }}
 
+        {kind}
         impl {direction} for {name} {{}}
     "}
 }
 
-/// The marker type's name for a method: each `/`-separated segment capitalised and joined, so
-/// `item/commandExecution/requestApproval` is `ItemCommandExecutionRequestApproval`.
-fn marker(method: &str) -> Result<String, Error> {
-    let name: String = method
-        .split('/')
-        .map(|segment| {
-            let mut chars = segment.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_ascii_uppercase().to_string() + chars.as_str()
-            })
-        })
-        .collect();
-    let identifier = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && name.chars().all(|c| c.is_ascii_alphanumeric());
-    if !identifier {
-        return Err(Error::Binding {
-            method: method.to_owned(),
-            reason: format!("`{name}` is not a Rust type name"),
-        });
-    }
-    Ok(name)
+/// The `Any*` enum of one direction.
+fn dispatch(direction: Direction, members: &[&Method], codex_version: &str) -> String {
+    let union = direction.union();
+    let what = match direction {
+        Direction::ClientRequest => "A request the client sends",
+        Direction::ClientNotification => "A notification the client sends",
+        Direction::ServerRequest => "A request the server sends",
+        Direction::ServerNotification => "A notification the server sends",
+    };
+    let lines = |line: &dyn Fn(&Method) -> String| -> String {
+        members.iter().map(|method| line(method)).collect()
+    };
+    let variants = lines(&|Method { wire, name, .. }| {
+        format!("    /// `{wire}`.\n    {name}(Payload<'a, {name}>),\n")
+    });
+    let classify = lines(&|Method { name, .. }| {
+        format!("            {name}::METHOD => Self::{name}(Payload::new(params)),\n")
+    });
+    let names =
+        lines(&|Method { name, .. }| format!("            Self::{name}(_) => {name}::METHOD,\n"));
+    formatdoc! {"
+        /// {what}, classified by its method, with its parameters not yet decoded.
+        #[derive(Debug, Clone, Copy)]
+        pub enum Any{union}<'a> {{
+        {variants}}}
+
+        impl<'a> Any{union}<'a> {{
+            /// The message of `method` carrying `params`, or `None` when codex-cli {codex_version}
+            /// sends no such method this way.
+            #[must_use]
+            pub fn classify(method: &str, params: &'a Value) -> Option<Self> {{
+                Some(match method {{
+        {classify}            _ => return None,
+                }})
+            }}
+
+            /// Its JSON-RPC method.
+            #[must_use]
+            pub fn method(self) -> &'static str {{
+                match self {{
+        {names}        }}
+            }}
+        }}
+    "}
 }
 
 #[cfg(test)]
@@ -140,44 +135,65 @@ mod tests {
     use googletest::prelude::*;
     use indoc::indoc;
 
-    use super::{Catalogue, marker, render};
-    use crate::manifest::{Manifest, Notification, Request};
+    use super::render;
+    use crate::methods::{Direction, Method, Params};
 
-    /// A method's segments become one type name.
-    #[gtest]
-    fn a_method_is_named_by_its_segments() -> Result<()> {
-        assert_that!(
-            marker("item/commandExecution/requestApproval").or_fail()?,
-            eq("ItemCommandExecutionRequestApproval")
-        );
-        assert_that!(marker("error").or_fail()?, eq("Error"));
-        assert_that!(marker("turn/a-b"), err(anything()));
-        Ok(())
+    fn method(
+        direction: Direction,
+        wire: &str,
+        name: &str,
+        params: Params,
+        response: Option<&str>,
+    ) -> Method {
+        Method {
+            direction,
+            wire: wire.to_owned(),
+            name: name.to_owned(),
+            params,
+            response: response.map(ToOwned::to_owned),
+        }
     }
 
-    /// A request binds its params and response; a notification without params carries `()`.
+    /// A request binds its params and response, a method without params carries `()`, optional
+    /// params an `Option`, and every method is a variant of its direction's enum.
     #[gtest]
-    fn each_entry_becomes_a_marker_bound_to_its_payloads() -> Result<()> {
-        let manifest = Manifest {
-            client_requests: &[Request {
-                method: "turn/start",
-                params: Some("TurnStartParams"),
-                response: "TurnStartResponse",
-            }],
-            client_notifications: &[Notification {
-                method: "initialized",
-                params: None,
-            }],
-            ..Manifest::default()
-        };
-        let source = render(&manifest, &Catalogue::default(), "0.1.0").or_fail()?;
+    fn each_method_becomes_a_marker_bound_to_its_payloads() {
+        let source = render(
+            &[
+                method(
+                    Direction::ClientRequest,
+                    "turn/start",
+                    "TurnStart",
+                    Params::Required("TurnStartParams".to_owned()),
+                    Some("TurnStartResponse"),
+                ),
+                method(
+                    Direction::ClientRequest,
+                    "account/rateLimits/read",
+                    "AccountRateLimitsRead",
+                    Params::Optional("GetAccountRateLimitsParams".to_owned()),
+                    Some("GetAccountRateLimitsResponse"),
+                ),
+                method(
+                    Direction::ClientNotification,
+                    "initialized",
+                    "Initialized",
+                    Params::None,
+                    None,
+                ),
+            ],
+            "0.1.0",
+        );
 
         assert_that!(
             source,
             contains_substring(indoc! {r#"
-                impl Request for TurnStart {
+                impl Method for TurnStart {
                     const METHOD: &'static str = "turn/start";
                     type Params = types::TurnStartParams;
+                }
+
+                impl Request for TurnStart {
                     type Response = types::TurnStartResponse;
                 }
 
@@ -186,35 +202,35 @@ mod tests {
         );
         assert_that!(
             source,
+            contains_substring("type Params = Option<types::GetAccountRateLimitsParams>;")
+        );
+        assert_that!(
+            source,
             contains_substring(indoc! {r#"
-                impl Notification for Initialized {
+                impl Method for Initialized {
                     const METHOD: &'static str = "initialized";
                     type Params = ();
                 }
+
+                impl Notification for Initialized {}
             "#})
         );
-        Ok(())
-    }
-
-    /// Two methods that would share a type name are refused.
-    #[gtest]
-    fn two_methods_with_one_name_are_refused() {
-        let manifest = Manifest {
-            server_notifications: &[
-                Notification {
-                    method: "turn/started",
-                    params: None,
-                },
-                Notification {
-                    method: "turnStarted",
-                    params: None,
-                },
-            ],
-            ..Manifest::default()
-        };
         assert_that!(
-            render(&manifest, &Catalogue::default(), "0.1.0"),
-            err(displays_as(contains_substring("also named")))
+            source,
+            contains_substring(indoc! {"
+                pub enum AnyClientRequest<'a> {
+                    /// `turn/start`.
+                    TurnStart(Payload<'a, TurnStart>),
+                    /// `account/rateLimits/read`.
+                    AccountRateLimitsRead(Payload<'a, AccountRateLimitsRead>),
+                }
+            "})
+        );
+        assert_that!(
+            source,
+            contains_substring(
+                "            TurnStart::METHOD => Self::TurnStart(Payload::new(params)),"
+            )
         );
     }
 }

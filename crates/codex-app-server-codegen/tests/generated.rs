@@ -1,10 +1,11 @@
-//! The checked-in protocol sources are exactly what the vendored schema generates.
+//! The checked-in protocol sources are exactly what the vendored inputs generate.
 //!
-//! Runs without codex and without the network, so a change to the generator, the manifest, the
-//! vendored bundle or the pinned progeny that is not followed by `task codegen:app-server` fails
+//! Runs without codex and without the network, so a change to the generator, the vendored bundle
+//! or responses, or the pinned progeny that is not followed by `task codegen:app-server` fails
 //! here rather than shipping sources nothing can reproduce.
-//! Whether the vendored bundle is what the pinned codex exports is a separate question, which only
-//! `codex-app-server-codegen refresh --check` can answer, because it needs that codex.
+//! Whether the vendored inputs are what the pinned codex exports is a separate question, which
+//! only `codex-app-server-codegen refresh --check` can answer, because it needs that codex and its
+//! source.
 
 use codex_app_server_codegen::{Inputs, Layout, generate};
 use googletest::prelude::*;

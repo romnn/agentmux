@@ -204,12 +204,13 @@ tasks:
       - cargo clippy --manifest-path crates/codex-app-server-codegen/Cargo.toml --all-targets --no-deps -- -D warnings
 
   codegen:app-server:refresh:
-    desc: "re-export the vendored schema from the pinned codex on PATH, then regenerate"
+    desc: "re-export the vendored schema and responses from the pinned codex on PATH and its source, then regenerate"
     cmds:
-      # Needs the codex release named in crates/codex-app-server-codegen/schema/codex-version.
+      # Needs the codex release named in crates/codex-app-server-codegen/schema/codex-version, and
+      # the network, for that release's request definitions on GitHub.
       - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh
 
   codegen:app-server:upstream:
-    desc: "fail if the vendored schema is not what the pinned codex on PATH exports"
+    desc: "fail if the vendored schema and responses are not what the pinned codex on PATH and its source export"
     cmds:
       - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh --check

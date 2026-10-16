@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId, RpcError};
 use codex_app_server_protocol::{
-    ClientNotification, ClientRequest, DecodeError, Notification, Request, ServerNotification,
+    ClientNotification, ClientRequest, DecodeError, Method, Payload, Request, ServerNotification,
     ServerRequest,
 };
 use serde_json::Value;
@@ -104,8 +104,8 @@ impl<M: ClientRequest> Received<M> {
     /// # Errors
     ///
     /// Returns [`PeerError::Undecodable`] when the parameters do not match `M`'s.
-    pub fn decode(id: RequestId, params: &Value) -> Result<Self, PeerError> {
-        let params = M::params(params).map_err(|source| PeerError::Undecodable {
+    pub fn decode(id: RequestId, params: Payload<'_, M>) -> Result<Self, PeerError> {
+        let params = params.decode().map_err(|source| PeerError::Undecodable {
             method: M::METHOD.to_owned(),
             source,
         })?;
@@ -254,8 +254,8 @@ impl Peer {
         self.reader.asked = false;
         self.received.push(line.clone());
         match Message::parse(&line) {
-            Some(message) => Ok(Some(message)),
-            None => Err(self.unexpected("a JSON-RPC message", line)),
+            Ok(message) => Ok(Some(message)),
+            Err(_) => Err(self.unexpected("a JSON-RPC message", line)),
         }
     }
 
@@ -298,7 +298,7 @@ impl Peer {
     pub fn expect<M: ClientRequest>(&mut self) -> Result<Received<M>, PeerError> {
         match self.recv()? {
             Message::Request { id, method, params } if method == M::METHOD => {
-                Received::decode(id, &params)
+                Received::decode(id, Payload::new(&params))
             }
             other => Err(self.unexpected(&format!("a `{}` request", M::METHOD), other)),
         }
@@ -313,7 +313,7 @@ impl Peer {
     pub fn expect_notification<M: ClientNotification>(&mut self) -> Result<M::Params, PeerError> {
         match self.recv()? {
             Message::Notification { method, params } if method == M::METHOD => {
-                <M as Notification>::params(&params)
+                <M as Method>::params(&params)
                     .map_err(|source| PeerError::Undecodable { method, source })
             }
             other => Err(self.unexpected(&format!("a `{}` notification", M::METHOD), other)),
@@ -531,7 +531,7 @@ mod tests {
         answers.read_line(&mut answer).or_fail()?;
         assert_that!(
             Message::parse(&answer),
-            some(matches_pattern!(Message::Response {
+            ok(matches_pattern!(Message::Response {
                 id: eq(&RequestId::Integer(4)),
                 ..
             }))

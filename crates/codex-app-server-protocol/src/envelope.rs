@@ -92,26 +92,29 @@ pub enum Message {
 }
 
 impl Message {
-    /// Classify one line, or `None` for one that is not a JSON-RPC message.
+    /// Classify one line.
     ///
     /// An `id` of `null` counts as absent.
-    /// A line is no message at all when nothing could answer or act on it: an id that is neither
-    /// an integer nor a string, a `method` that is not a string, or an answer that does not carry
-    /// exactly one of a `result` and an `error` object.
-    #[must_use]
-    pub fn parse(line: &str) -> Option<Self> {
-        let message: Value = serde_json::from_str(line).ok()?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError`] for a line that is no message at all, because nothing could
+    /// answer or act on it: one that is not JSON, an id that is neither an integer nor a string, a
+    /// `method` that is not a string, an answer that does not carry exactly one of a `result` and
+    /// an `error` object, or a line with neither an id nor a method.
+    pub fn parse(line: &str) -> Result<Self, EnvelopeError> {
+        let message: Value = serde_json::from_str(line).map_err(EnvelopeError::NotJson)?;
         let id = match message.get("id") {
             None | Some(Value::Null) => None,
-            Some(id) => Some(RequestId::deserialize(id).ok()?),
+            Some(id) => Some(RequestId::deserialize(id).map_err(|_| EnvelopeError::Id)?),
         };
         let method = match message.get("method") {
             None => None,
-            Some(method) => Some(method.as_str()?.to_owned()),
+            Some(method) => Some(method.as_str().ok_or(EnvelopeError::Method)?.to_owned()),
         };
         let params = || message.get("params").cloned().unwrap_or(Value::Null);
         match (id, method) {
-            (Some(id), Some(method)) => Some(Self::Request {
+            (Some(id), Some(method)) => Ok(Self::Request {
                 id,
                 method,
                 params: params(),
@@ -128,15 +131,15 @@ impl Message {
                         data: error.get("data").cloned(),
                     }),
                     (Some(result), None) => Ok(result.clone()),
-                    _ => return None,
+                    _ => return Err(EnvelopeError::Answer),
                 };
-                Some(Self::Response { id, outcome })
+                Ok(Self::Response { id, outcome })
             }
-            (None, Some(method)) => Some(Self::Notification {
+            (None, Some(method)) => Ok(Self::Notification {
                 method,
                 params: params(),
             }),
-            (None, None) => None,
+            (None, None) => Err(EnvelopeError::Neither),
         }
     }
 
@@ -242,6 +245,26 @@ impl Message {
     }
 }
 
+/// Why a line is not a JSON-RPC message.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    /// It is not JSON.
+    #[error("the line is not JSON")]
+    NotJson(#[source] serde_json::Error),
+    /// Its id is neither an integer nor a string.
+    #[error("its id is neither an integer nor a string")]
+    Id,
+    /// Its method is not a string.
+    #[error("its method is not a string")]
+    Method,
+    /// It answers a request without exactly one of a `result` and an `error` object.
+    #[error("it answers a request without exactly one of a result and an error object")]
+    Answer,
+    /// It has neither an id nor a method.
+    #[error("it has neither an id nor a method")]
+    Neither,
+}
+
 /// A payload that could not be encoded as JSON.
 #[derive(Debug, thiserror::Error)]
 #[error("cannot encode the `{method}` payload")]
@@ -300,14 +323,14 @@ mod tests {
     fn messages_are_classified_by_their_members() {
         assert_that!(
             Message::parse(r#"{"id":3,"result":{"turnId":"tu-2"}}"#),
-            some(eq(&Message::Response {
+            ok(eq(&Message::Response {
                 id: RequestId::Integer(3),
                 outcome: Ok(json!({"turnId": "tu-2"})),
             }))
         );
         assert_that!(
             Message::parse(r#"{"id":4,"error":{"code":-32600,"message":"no active turn"}}"#),
-            some(eq(&Message::Response {
+            ok(eq(&Message::Response {
                 id: RequestId::Integer(4),
                 outcome: Err(RpcError {
                     code: -32600,
@@ -318,7 +341,7 @@ mod tests {
         );
         assert_that!(
             Message::parse(r#"{"method":"turn/completed","params":{"threadId":"t"}}"#),
-            some(eq(&Message::Notification {
+            ok(eq(&Message::Notification {
                 method: "turn/completed".to_owned(),
                 params: json!({"threadId": "t"}),
             }))
@@ -327,7 +350,7 @@ mod tests {
             Message::parse(
                 r#"{"jsonrpc":"2.0","id":"srv-1","method":"item/fileChange/requestApproval","params":{}}"#
             ),
-            some(eq(&Message::Request {
+            ok(eq(&Message::Request {
                 id: RequestId::String("srv-1".to_owned()),
                 method: "item/fileChange/requestApproval".to_owned(),
                 params: json!({}),
@@ -336,7 +359,7 @@ mod tests {
         // A null id is no id, so this is a notification.
         assert_that!(
             Message::parse(r#"{"id":null,"method":"warning"}"#),
-            some(eq(&Message::Notification {
+            ok(eq(&Message::Notification {
                 method: "warning".to_owned(),
                 params: Value::Null,
             }))
@@ -344,7 +367,7 @@ mod tests {
         // A result of `null` is still a result.
         assert_that!(
             Message::parse(r#"{"id":5,"result":null}"#),
-            some(eq(&Message::Response {
+            ok(eq(&Message::Response {
                 id: RequestId::Integer(5),
                 outcome: Ok(Value::Null),
             }))
@@ -360,7 +383,7 @@ mod tests {
             r#"{"id":4,"method":5}"#,
             r#"{"method":["turn/completed"]}"#,
         ] {
-            expect_that!(Message::parse(line), none(), "{line}");
+            expect_that!(Message::parse(line), err(anything()), "{line}");
         }
     }
 
@@ -425,7 +448,7 @@ mod tests {
             },
         ];
         for message in messages {
-            expect_that!(Message::parse(&message.to_line()), some(eq(&message)));
+            expect_that!(Message::parse(&message.to_line()), ok(eq(&message)));
         }
     }
 

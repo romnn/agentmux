@@ -1,7 +1,8 @@
-//! Asks the pinned codex CLI for its schema bundle.
+//! Asks the pinned codex release for its schema bundle and its request definitions.
 //!
-//! This is the only part of the generator that needs codex, and it is not part of generation: it
-//! replaces the vendored bundle, which generation then reads like any other checked-in input.
+//! This is the only part of the generator that needs codex or the network, and it is not part of
+//! generation: it replaces the vendored inputs, which generation then reads like any other
+//! checked-in file.
 
 use std::process::Command;
 
@@ -53,6 +54,30 @@ pub fn export(pinned: &str) -> Result<Vec<u8>, Error> {
         path: bundle,
         source,
     })
+}
+
+/// Where codex declares which type answers each request, at release `version`.
+fn definitions_url(version: &str) -> String {
+    format!(
+        "https://raw.githubusercontent.com/openai/codex/rust-v{version}/\
+         codex-rs/app-server-protocol/src/protocol/common.rs"
+    )
+}
+
+/// The source of codex's request definitions at the pinned release, from its git tag.
+///
+/// # Errors
+///
+/// Returns [`Error::Fetch`] when the file cannot be downloaded.
+pub fn definitions(pinned: &str) -> Result<String, Error> {
+    let url = definitions_url(pinned);
+    ureq::get(&url)
+        .call()
+        .and_then(|mut response| response.body_mut().read_to_string())
+        .map_err(|source| Error::Fetch {
+            url,
+            source: Box::new(source),
+        })
 }
 
 /// What a successful codex command wrote.

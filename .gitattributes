@@ -1,0 +1,9 @@
+# Written by crates/codex-app-server-codegen; regenerate with `task codegen:app-server` rather than
+# edit. Marked generated so review tools collapse them in diffs.
+crates/codex-app-server-protocol/src/schema.rs linguist-generated=true
+crates/codex-app-server-protocol/src/methods.rs linguist-generated=true
+
+# codex's own JSON Schema, and which type answers each request as codex's source declares it, both
+# exported from the pinned codex with `task codegen:app-server:refresh`.
+crates/codex-app-server-codegen/schema/codex_app_server_protocol.schemas.json linguist-generated=true linguist-vendored=true
+crates/codex-app-server-codegen/schema/codex_app_server_protocol.responses.json linguist-generated=true linguist-vendored=true

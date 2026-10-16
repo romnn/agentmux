@@ -16,9 +16,8 @@ use std::time::Duration;
 use codex_app_server_mock::fixtures::{self, THREAD, TURN};
 use codex_app_server_mock::scenario::{CONFIG_FILE, Config, Death, HELPER, Scenario};
 use codex_app_server_mock::{Peer, PeerError, Received};
-use codex_app_server_protocol::Request as _;
 use codex_app_server_protocol::envelope::Message;
-use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::methods::{self as m, AnyClientRequest as Any};
 use codex_app_server_protocol::types::TurnStatus;
 
 /// How long a command the fake starts runs unless something stops it.
@@ -163,9 +162,9 @@ impl Server<'_> {
             let Message::Request { id, method, params } = message else {
                 continue;
             };
-            match method.as_str() {
-                m::TurnSteer::METHOD => {
-                    let steer = Received::<m::TurnSteer>::decode(id, &params)?;
+            match Any::classify(&method, &params) {
+                Some(Any::TurnSteer(params)) => {
+                    let steer = Received::decode(id, params)?;
                     let named = &steer.params;
                     if !(running && named.thread_id == THREAD && named.expected_turn_id == TURN) {
                         let refusal = format!("no turn {} is running", named.expected_turn_id);
@@ -182,8 +181,8 @@ impl Server<'_> {
                     self.end_turn(TurnStatus::Completed)?;
                     running = false;
                 }
-                m::TurnInterrupt::METHOD => {
-                    let interrupt = Received::<m::TurnInterrupt>::decode(id, &params)?;
+                Some(Any::TurnInterrupt(params)) => {
+                    let interrupt = Received::decode(id, params)?;
                     let named = &interrupt.params;
                     if !(running && named.thread_id == THREAD && named.turn_id == TURN) {
                         let refusal = format!("no turn {} is running", named.turn_id);

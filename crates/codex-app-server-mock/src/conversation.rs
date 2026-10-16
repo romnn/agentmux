@@ -1,14 +1,13 @@
 //! The steps every conversation with codex takes, answered as codex answers them.
 
-use codex_app_server_protocol::Request as _;
 use codex_app_server_protocol::envelope::Message;
-use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::methods::{self as m, AnyClientRequest as Any};
 use codex_app_server_protocol::types::{
     InitializeParams, ThreadResumeParams, ThreadStartParams, TurnStartParams,
 };
 
 use crate::fixtures;
-use crate::{Peer, PeerError};
+use crate::{Peer, PeerError, Received};
 
 /// What a client asked for as it opened its thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,32 +39,29 @@ impl Peer {
         let initialize = self.expect::<m::Initialize>()?;
         self.reply(&initialize, &fixtures::initialize_response())?;
         self.expect_notification::<m::Initialized>()?;
-        let opened = match self.recv()? {
-            Message::Request { id, method, params } if method == m::ThreadStart::METHOD => {
-                let params = m::ThreadStart::params(&params)
-                    .map_err(|source| PeerError::Undecodable { method, source })?;
-                self.send(&Message::result::<m::ThreadStart>(
-                    id,
-                    &fixtures::thread_start_response(thread),
-                )?)?;
-                OpenedThread::Started(params)
-            }
-            Message::Request { id, method, params } if method == m::ThreadResume::METHOD => {
-                let params = m::ThreadResume::params(&params)
-                    .map_err(|source| PeerError::Undecodable { method, source })?;
-                self.send(&Message::result::<m::ThreadResume>(
-                    id,
-                    &fixtures::thread_resume_response(thread),
-                )?)?;
-                OpenedThread::Resumed(params)
-            }
-            other => {
-                return Err(PeerError::Unexpected {
-                    expected: "a `thread/start` or `thread/resume` request".to_owned(),
-                    got: other.to_line(),
-                    received: self.received().to_vec(),
-                });
-            }
+        let message = self.recv()?;
+        let opened = match &message {
+            Message::Request { id, method, params } => match Any::classify(method, params) {
+                Some(Any::ThreadStart(params)) => {
+                    let start = Received::decode(id.clone(), params)?;
+                    self.reply(&start, &fixtures::thread_start_response(thread))?;
+                    Some(OpenedThread::Started(start.params))
+                }
+                Some(Any::ThreadResume(params)) => {
+                    let resume = Received::decode(id.clone(), params)?;
+                    self.reply(&resume, &fixtures::thread_resume_response(thread))?;
+                    Some(OpenedThread::Resumed(resume.params))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(opened) = opened else {
+            return Err(PeerError::Unexpected {
+                expected: "a `thread/start` or `thread/resume` request".to_owned(),
+                got: message.to_line(),
+                received: self.received().to_vec(),
+            });
         };
         Ok(Opened {
             initialize: initialize.params,

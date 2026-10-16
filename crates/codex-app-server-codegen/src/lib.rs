@@ -4,25 +4,28 @@
 //!
 //! - `schema/codex_app_server_protocol.schemas.json`, the bundle `codex app-server
 //!   generate-json-schema` writes, and `schema/codex-version`, the codex release it came from;
-//! - [`manifest::MANIFEST`], the methods agentmux exchanges and their payload types;
+//! - `schema/codex_app_server_protocol.responses.json`, which type answers each request, read
+//!   from that release's own request definitions ([`responses`]), since the bundle does not say;
 //! - `Cargo.lock`, whose progeny commit renders the types, configured by this crate's code.
 //!
 //! The outputs are `src/schema.rs` (the payload types, rendered by progeny) and `src/methods.rs`
 //! (the method bindings) of `codex-app-server-protocol`, and they are checked in too.
+//! Every method the bundle lists is bound ([`methods`]); nothing is chosen by hand.
 //! Generation needs neither codex nor the network, so a test can regenerate both and fail when
 //! the committed files differ.
-//! Only [`upstream`] runs codex, to replace the bundle with what the pinned release exports.
+//! Only [`upstream`] runs codex and fetches its source, to replace the vendored inputs with what
+//! the pinned release exports.
 
 pub mod bindings;
-pub mod manifest;
+pub mod methods;
 pub mod openapi;
+pub mod responses;
 pub mod upstream;
 
 use std::path::{Path, PathBuf};
 
-use crate::bindings::Catalogue;
-use crate::manifest::MANIFEST;
 use crate::openapi::Schemas;
+use crate::responses::{Responses, Side};
 
 /// Why generation failed.
 #[derive(Debug, thiserror::Error)]
@@ -54,16 +57,28 @@ pub enum Error {
     /// `Cargo.lock` does not say which progeny commit generates.
     #[error("Cargo.lock pins no git commit of progeny")]
     ProgenyCommit,
-    /// A schema the manifest reaches does not exist.
+    /// A schema a method reaches does not exist.
     #[error("codex's schema defines no `{0}`")]
     UnknownSchema(String),
-    /// A manifest entry cannot be bound.
+    /// A method cannot be bound.
     #[error("cannot bind `{method}`: {reason}")]
     Binding {
-        /// The entry's method.
+        /// The method.
         method: String,
         /// Why.
         reason: String,
+    },
+    /// codex's request definitions cannot be read.
+    #[error("codex's request definitions are unusable: {0}")]
+    Definitions(String),
+    /// A file could not be downloaded.
+    #[error("cannot fetch {url}")]
+    Fetch {
+        /// What was asked for.
+        url: String,
+        /// Why.
+        #[source]
+        source: Box<ureq::Error>,
     },
     /// progeny refused the document.
     #[error("progeny refused the document")]
@@ -135,6 +150,14 @@ impl Layout {
             .join("codex_app_server_protocol.schemas.json")
     }
 
+    /// Which type answers each request, from codex's request definitions.
+    #[must_use]
+    pub fn responses(&self) -> PathBuf {
+        self.root
+            .join("schema")
+            .join("codex_app_server_protocol.responses.json")
+    }
+
     /// The codex release the bundle came from.
     #[must_use]
     pub fn codex_version(&self) -> PathBuf {
@@ -172,6 +195,8 @@ impl Layout {
 pub struct Inputs {
     /// The schema bundle codex exported.
     pub bundle: Vec<u8>,
+    /// Which type answers each request.
+    pub responses: Vec<u8>,
     /// The codex release it came from.
     pub codex_version: String,
     /// The progeny commit that renders them.
@@ -188,10 +213,20 @@ impl Inputs {
         let progeny_commit = locked_progeny_commit(&read_text(&layout.lockfile())?)?;
         Ok(Self {
             bundle: read(&layout.bundle())?,
-            codex_version: read_text(&layout.codex_version())?.trim().to_owned(),
+            responses: read(&layout.responses())?,
+            codex_version: pinned_codex_version(layout)?,
             progeny_commit,
         })
     }
+}
+
+/// The codex release the vendored inputs come from, which is all that refreshing them reads.
+///
+/// # Errors
+///
+/// Returns [`Error::Read`] when the pin cannot be read.
+pub fn pinned_codex_version(layout: &Layout) -> Result<String, Error> {
+    Ok(read_text(&layout.codex_version())?.trim().to_owned())
 }
 
 /// One generated file.
@@ -237,15 +272,16 @@ impl File {
 ///
 /// # Errors
 ///
-/// Returns an error when the bundle is unusable, a manifest entry disagrees with it, or progeny
+/// Returns an error when the bundle is unusable, it and the responses disagree, or progeny
 /// refuses the document.
 pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
     let bundle: serde_json::Value =
         serde_json::from_slice(&inputs.bundle).map_err(Error::BundleJson)?;
     let schemas = Schemas::from_bundle(&bundle)?;
-    MANIFEST.verify(&bundle, &schemas)?;
+    let responses = Responses::from_json(&inputs.responses)?;
+    let methods = methods::read(&bundle, &responses, &schemas)?;
 
-    let kept = schemas.closure(MANIFEST.roots())?;
+    let kept = schemas.closure(methods::roots(&methods))?;
     let document = schemas.document(&kept, &inputs.codex_version);
     let output = progeny::generate(document.to_string().as_bytes(), &progeny_config())
         .map_err(Error::Progeny)?;
@@ -267,11 +303,7 @@ pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
     schema.push('\n');
     schema.push_str(&module);
 
-    let catalogue = Catalogue {
-        server_notifications: openapi::union_methods(&bundle, "ServerNotification")?,
-        server_requests: openapi::union_methods(&bundle, "ServerRequest")?,
-    };
-    let methods = header + "\n" + &bindings::render(&MANIFEST, &catalogue, &inputs.codex_version)?;
+    let bindings = header + "\n" + &bindings::render(&methods, &inputs.codex_version);
 
     Ok(vec![
         File {
@@ -280,7 +312,7 @@ pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
         },
         File {
             path: layout.methods_source(),
-            contents: methods,
+            contents: bindings,
         },
     ])
 }
@@ -341,6 +373,23 @@ fn locked_progeny_commit(lockfile: &str) -> Result<String, Error> {
                 .map(|(_, commit)| commit.to_owned())
         })
         .ok_or(Error::ProgenyCommit)
+}
+
+/// Which type answers each request the bundle lists, read from codex's request definitions.
+///
+/// # Errors
+///
+/// Returns an error when the bundle is unusable or the definitions cannot be read.
+pub fn vendored_responses(bundle: &[u8], definitions: &str) -> Result<Responses, Error> {
+    let bundle: serde_json::Value = serde_json::from_slice(bundle).map_err(Error::BundleJson)?;
+    let client = methods::requests_sent_by(&bundle, Side::Client)?;
+    let server = methods::requests_sent_by(&bundle, Side::Server)?;
+    Ok(
+        Responses::parse(definitions)?.retain(|side, method| match side {
+            Side::Client => client.contains(method),
+            Side::Server => server.contains(method),
+        }),
+    )
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, Error> {

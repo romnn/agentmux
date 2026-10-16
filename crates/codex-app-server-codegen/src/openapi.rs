@@ -5,8 +5,7 @@
 //! progeny reads `components/schemas` of an OpenAPI document, so the two are merged into one
 //! namespace, where a v2 schema replaces a top-level one of the same name, and every reference is
 //! rewritten to point there.
-//! Only the schemas the roots reach are kept, so the generated module carries the types agentmux
-//! exchanges rather than all 700 of the protocol's.
+//! Only the schemas the roots reach are kept, so a type no method carries is not generated.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -184,47 +183,12 @@ fn references(value: &Value) -> Vec<String> {
     found
 }
 
-/// The method of every branch of the bundle's union `union`, sorted and without duplicates.
-///
-/// # Errors
-///
-/// Returns [`Error::Bundle`] when the bundle has no such union.
-pub fn union_methods(bundle: &Value, union: &str) -> Result<Vec<String>, Error> {
-    let Some(schema) = bundle.pointer(&format!("/definitions/{union}")) else {
-        return Err(Error::Bundle(format!("it defines no `{union}`")));
-    };
-    let mut methods = BTreeSet::new();
-    let mut pending = vec![schema];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Object(members) => {
-                if let Some(names) = members
-                    .get("method")
-                    .and_then(|method| method.get("enum"))
-                    .and_then(Value::as_array)
-                {
-                    methods.extend(
-                        names
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    );
-                }
-                pending.extend(members.values());
-            }
-            Value::Array(items) => pending.extend(items),
-            _ => {}
-        }
-    }
-    Ok(methods.into_iter().collect())
-}
-
 #[cfg(test)]
 mod tests {
     use googletest::prelude::*;
     use serde_json::json;
 
-    use super::{Schemas, union_methods};
+    use super::Schemas;
 
     /// A v2 schema replaces a top-level one of the same name, and references to either
     /// namespace land in the merged one.
@@ -285,21 +249,6 @@ mod tests {
     fn an_unknown_root_is_refused() -> Result<()> {
         let schemas = Schemas::from_bundle(&json!({"definitions": {}})).or_fail()?;
         assert_that!(schemas.closure(["Missing"]), err(anything()));
-        Ok(())
-    }
-
-    /// Every branch's method is listed once, in order.
-    #[gtest]
-    fn a_unions_methods_are_listed_once_in_order() -> Result<()> {
-        let bundle = json!({"definitions": {"ServerNotification": {"oneOf": [
-            {"properties": {"method": {"enum": ["turn/started"]}}},
-            {"properties": {"method": {"enum": ["error"]}}},
-            {"properties": {"method": {"enum": ["turn/started"]}}},
-        ]}}});
-        assert_that!(
-            union_methods(&bundle, "ServerNotification").or_fail()?,
-            elements_are![eq("error"), eq("turn/started")]
-        );
         Ok(())
     }
 }
