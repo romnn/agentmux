@@ -390,6 +390,8 @@ pub fn canonical_env_name(name: &str) -> String {
 /// Every field is optional and at least one must be set.
 /// A `config_dir` account authenticates as a logged-in CLI profile; a `base_url` account points the
 /// CLI at some other endpoint, which is how a locally served model is reached.
+/// Any account that names a key, a token or an endpoint must also set `billing = "api"`, or no
+/// delegate is launched from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     /// The CLI's configuration directory: `CLAUDE_CONFIG_DIR`, or `CODEX_HOME` for Codex.
@@ -413,6 +415,15 @@ pub struct Account {
     /// An alternative API endpoint, such as a local server or a gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Which pricing a delegate on this account may run on; `subscription` when absent.
+    ///
+    /// `api` is the one way onto per-token pricing, and it is honoured only from a machine file
+    /// and only when no checkout's file selected the account.
+    /// Under `subscription` every key and endpoint variable is removed from the delegate's
+    /// environment and the fields above that name one are refused; see
+    /// [`crate::delegate::Billing`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<crate::delegate::Billing>,
     /// Run delegates on this account with its own settings, hooks and MCP servers.
     ///
     /// Off unless set.
@@ -437,6 +448,21 @@ impl Account {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The first field that names a key, a token or an endpoint, which only an account on API
+    /// pricing may use.
+    #[must_use]
+    pub fn api_credential_field(&self) -> Option<&'static str> {
+        [
+            ("api_key", self.api_key.is_some()),
+            ("api_key_env", self.api_key_env.is_some()),
+            ("auth_token", self.auth_token.is_some()),
+            ("auth_token_env", self.auth_token_env.is_some()),
+            ("base_url", self.base_url.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(field, set)| set.then_some(field))
     }
 }
 
@@ -1085,9 +1111,10 @@ fn refuse_if_untrusted(path: &Path, file: &std::fs::File) -> Result<(), ConfigEr
 /// only `HOME` would leave discovery finding nothing there.
 #[must_use]
 pub fn home_dir(host_env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    host_env
-        .get("HOME")
-        .or_else(|| host_env.get("USERPROFILE"))
+    // An empty value names no directory; read as one, it would be the current directory.
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|name| host_env.get(*name).filter(|home| !home.is_empty()))
         .map(PathBuf::from)
 }
 

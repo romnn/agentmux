@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agentmux::config::{Account, Config, Defaults};
-use agentmux::delegate::{AccountAlias, Vendor};
+use agentmux::delegate::{AccountAlias, Billing, Vendor};
 use agentmux::quota::{
     AccountQuota, Observation, Origin, ProbeRequest, ProbeTarget, QuotaProbe, SystemProbe,
     probe_vendor,
@@ -114,6 +114,7 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
             "local",
             Account {
                 base_url: Some("http://localhost:11434/v1".to_owned()),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
@@ -137,14 +138,19 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
 /// spending them.
 /// Codex does not, which is why this is a Claude account and not a shared rule.
 #[gtest]
-fn a_profile_that_also_supplies_a_key_reports_no_window() {
+fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
+    // A profile that exists and a key that is set, so nothing but the key decides.
+    let profile = tempfile::tempdir().or_fail()?;
+    let mut env = host_env();
+    env.insert("CI_ANTHROPIC_KEY".to_owned(), "sk-ci".to_owned());
     let config = config_with(
         "claude",
         &[(
             "ci",
             Account {
-                config_dir: Some(PathBuf::from("/home/dev/.claude-ci")),
+                config_dir: Some(profile.path().to_path_buf()),
                 api_key_env: Some("CI_ANTHROPIC_KEY".to_owned()),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
@@ -153,12 +159,19 @@ fn a_profile_that_also_supplies_a_key_reports_no_window() {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
 
-    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
-
+    let alias = AccountAlias::parse("ci").or_fail()?;
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &env),
+        ok(eq(&ProbeTarget::Credential))
+    );
+    let reported = probe_vendor(Vendor::Claude, &config, &env, &probe);
     assert_that!(
         reported[0].observation,
-        matches_pattern!(Observation::Unavailable { .. })
+        matches_pattern!(Observation::Unavailable {
+            reason: eq("custom endpoint")
+        })
     );
+    Ok(())
 }
 
 /// With no account named, the probe reads exactly the login a delegate without an account runs
@@ -190,15 +203,18 @@ fn the_default_target_reads_the_login_a_delegate_would_run_as() {
     );
 }
 
-/// A key the host exports, or the machine's launch layer forwards, is what a no-account delegate
-/// authenticates with — so the probe must not report the subscription window it would not spend.
+/// A key the host exports, or the machine's launch layer forwards, never reaches a no-account
+/// delegate, so the identity it spends is still the subscription window the probe reads.
+///
+/// The probe classifies the environment the delegate would actually get, and a delegate whose
+/// account did not opt into API pricing gets no key.
 #[gtest]
-fn a_forwarded_key_makes_the_default_identity_a_credential() {
+fn a_forwarded_key_leaves_the_default_identity_on_its_window() {
     let mut env = host_env();
     env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-host".to_owned());
     assert_that!(
         ProbeTarget::of(Vendor::Claude, None, &Config::default(), &env),
-        ok(eq(&ProbeTarget::Credential))
+        ok(matches_pattern!(ProbeTarget::Window { .. }))
     );
 
     let mut config = Config::default();
@@ -208,7 +224,7 @@ fn a_forwarded_key_makes_the_default_identity_a_credential() {
     );
     assert_that!(
         ProbeTarget::of(Vendor::Codex, None, &config, &host_env()),
-        ok(eq(&ProbeTarget::Credential))
+        ok(matches_pattern!(ProbeTarget::Window { .. }))
     );
 }
 
@@ -392,6 +408,7 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
                 config_dir: Some(home.path().to_path_buf()),
                 api_key_env: Some("OPENAI_API_KEY".to_owned()),
                 base_url: base_url.map(str::to_owned),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
@@ -582,4 +599,67 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
         },
         host_env: &env,
     }))
+}
+
+/// A probe's child is given no key and no billing override, whatever the host exported, and
+/// keeps what it needs to reach the vendor.
+///
+/// Observed by the child itself: each vendor's fake CLI writes its environment and exits, which
+/// the probe then reports as a failed refresh or an unanswered request.
+#[cfg(unix)]
+#[gtest]
+fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for vendor in [Vendor::Claude, Vendor::Codex] {
+        let root = tempfile::tempdir().or_fail()?;
+        let config_dir = root.path().join("config");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&config_dir).or_fail()?;
+        std::fs::create_dir_all(&bin).or_fail()?;
+        // Stale, so the Claude probe refreshes it by running its CLI.
+        std::fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"cachedUsageUtilization":{"fetchedAtMs":1000,"utilization":{"limits":[]}}}"#,
+        )
+        .or_fail()?;
+        let dump = root.path().join("env.txt");
+        let program = bin.join(vendor.program());
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nenv > '{}'\nexit 1\n", dump.display()),
+        )
+        .or_fail()?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+
+        let mut env = host_env();
+        for (key, value) in [
+            ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+            ("HTTPS_PROXY", "http://proxy.example:3128".to_owned()),
+            ("OPENAI_API_KEY", "sk-SENTINEL-1".to_owned()),
+            ("CODEX_API_KEY", "sk-SENTINEL-2".to_owned()),
+            ("ANTHROPIC_API_KEY", "sk-SENTINEL-3".to_owned()),
+            ("ANTHROPIC_AUTH_TOKEN", "SENTINEL-4".to_owned()),
+            ("OPENAI_BASE_URL", "https://SENTINEL-5.example".to_owned()),
+            ("CLAUDE_CODE_USE_BEDROCK", "SENTINEL-6".to_owned()),
+        ] {
+            env.insert(key.to_owned(), value);
+        }
+        let _ = SystemProbe.probe(&ProbeRequest {
+            vendor,
+            target: ProbeTarget::Window {
+                config_dir: Some(config_dir),
+            },
+            host_env: &env,
+        });
+
+        let seen = std::fs::read_to_string(&dump).or_fail()?;
+        expect_that!(seen, not(contains_substring("SENTINEL")), "{vendor:?}");
+        expect_that!(
+            seen,
+            contains_substring("HTTPS_PROXY=http://proxy.example:3128"),
+            "{vendor:?}"
+        );
+    }
+    Ok(())
 }

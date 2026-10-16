@@ -42,7 +42,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::Invocation;
+use crate::delegate::{Billing, Invocation, scrub_billing_env};
 
 /// A child process could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -340,6 +340,13 @@ impl Launcher for ProcessLauncher {
         let stdout = open_append(spec.events)?;
         let stderr = open_append(spec.stderr)?;
 
+        // The guarantee is kept here, where the child is made, rather than trusted to every layer
+        // that built the environment: a subscription delegate is never handed a key.
+        let mut env = spec.invocation.env.clone();
+        if spec.invocation.billing == Billing::Subscription {
+            scrub_billing_env(&mut env);
+        }
+
         let spawn = |program: &str| -> Result<Child, LaunchError> {
             let clone = |file: &File, path: &Path| {
                 file.try_clone().map_err(|source| LaunchError::Io {
@@ -358,7 +365,7 @@ impl Launcher for ProcessLauncher {
             // Never a denylist: the host that launched agentmux is itself an agent session, and
             // its environment carries that session's identity.
             command.env_clear();
-            for (key, value) in &spec.invocation.env {
+            for (key, value) in &env {
                 command.env(key, value);
             }
             #[cfg(unix)]
@@ -369,7 +376,7 @@ impl Launcher for ProcessLauncher {
             })
         };
 
-        let program = spec.invocation.program;
+        let program = spec.invocation.program.as_str();
         let child = match spawn(program) {
             Ok(child) => child,
             // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find

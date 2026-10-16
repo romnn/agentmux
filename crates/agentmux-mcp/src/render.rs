@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+use agentmux::delegate::Billing;
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, RunStatus, RunSummary, TranscriptPage};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit, describe_unsaved_session_store};
@@ -113,6 +114,12 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
         // Said rather than left blank, because a vendor that reports no figure and a turn that
         // cost nothing render identically otherwise.
         let _ = write!(out, " · no cost reported");
+    }
+    if status.steerable {
+        let _ = write!(
+            out,
+            "\nsteerable:  yes — `steer` adds an instruction to the running turn"
+        );
     }
     let _ = writeln!(out, "\ntranscript: {}", status.transcript_path.display());
 
@@ -225,6 +232,13 @@ pub fn warnings(status: &RunStatus) -> String {
             status.unrecognised.total(),
             status.events_path.display(),
         );
+        if speaks_another_protocol(status) {
+            let _ = writeln!(
+                out,
+                "            codex sent messages agentmux could not read: {}.",
+                agentmux::appserver::EXEC_FALLBACK_HINT
+            );
+        }
     }
     // Measured: `--setting-sources ""` stops hooks and settings but does not stop the Claude CLI
     // reading a project's instruction file, and it searches up the directory tree rather than
@@ -250,6 +264,16 @@ pub fn warnings(status: &RunStatus) -> String {
 /// The most valuable case is the one where retrying is exactly wrong: a blocked closing message
 /// means the analysis is already in the transcript and paying for it again would produce the same
 /// block.
+/// Whether codex sent app-server messages agentmux could not read, which is when running the
+/// consultation with `codex exec` is the way round it.
+#[must_use]
+pub fn speaks_another_protocol(status: &RunStatus) -> bool {
+    status
+        .unrecognised
+        .iter()
+        .any(|(kind, _)| kind == agentmux::appserver::UNDECODED_EVENT)
+}
+
 fn recovery_advice(
     kind: FailureKind,
     rate_limit: Option<&RateLimit>,
@@ -433,14 +457,32 @@ pub fn next_steps(status: &RunStatus) -> String {
         out
     } else {
         let cursor = status.transcript_bytes;
-        indoc::formatdoc! {r#"
+        let mut out = indoc::formatdoc! {r#"
 
             Still working. The delegate is detached and survives an agentmux restart.
             next:       tail {{"run_id": "{id}", "cursor": {cursor}}} — new output only
                         result {{"run_id": "{id}", "wait_seconds": 45}} — block for the answer
                         cancel {{"run_id": "{id}"}} — stop it, keeping what was collected
-        "#}
+        "#};
+        // Offered only where it would be accepted, because a caller that takes the suggestion
+        // otherwise spends a call on a refusal.
+        if status.steerable {
+            out.push_str(&indoc::formatdoc! {r#"
+                            steer {{"run_id": "{id}", "message": "…"}} — redirect the running turn
+            "#});
+        }
+        out
     }
+}
+
+/// What `steer` returns: the confirmation, then the consultation's state.
+#[must_use]
+pub fn steered(status: &RunStatus) -> String {
+    format!(
+        "steered:    the delegate accepted the message into its running turn; the transcript \
+         records it as `### user (steer)`\n{}",
+        self::status(status)
+    )
 }
 
 /// A consultation's state, with no transcript text.
@@ -709,15 +751,22 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
 /// [`agentmux::run::describe_delegate`] names; the vendor may then expand it into a fuller one —
 /// `sonnet` answering as `claude-sonnet-5` — which is invisible in a result that echoes only the
 /// request.
+///
+/// A turn on API pricing says so here, on the one line every result opens with, because which
+/// pricing a consultation runs on is decided by the account and invisible from the request.
 #[must_use]
 pub fn delegate_line(status: &RunStatus) -> String {
     let summary =
         agentmux::run::describe_delegate(&status.delegate, status.rewritten_from.as_ref());
-    match &status.resolved_model {
+    let line = match &status.resolved_model {
         Some(resolved) if resolved != status.delegate.model().as_str() => {
             format!("{summary} (answered by {resolved})")
         }
         _ => summary,
+    };
+    match status.billing {
+        Some(Billing::Api) => format!("{line} billing=api"),
+        Some(Billing::Subscription) | None => line,
     }
 }
 

@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config, home_dir};
-use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars};
+use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars, scrub_billing_env};
 
 /// How long a single account's probe may take before it is abandoned.
 ///
@@ -225,7 +225,7 @@ impl ProbeTarget {
         config: &Config,
         host_env: &BTreeMap<String, String>,
     ) -> Result<Self, crate::delegate::DelegateError> {
-        let env = crate::delegate::resolve_identity(vendor, alias, config, host_env)?.env;
+        let env = crate::delegate::resolve_identity(vendor, alias, config, host_env, None)?.env;
         let vars = credential_vars(vendor);
         let config_dir = env.get(vars.config_dir).map(PathBuf::from);
         // An endpoint of the identity's own is not the vendor's window whatever the login says,
@@ -399,10 +399,16 @@ impl QuotaProbe for SystemProbe {
 ///
 /// The same base as a delegate, so a probe on a managed network has the proxy and CA settings a
 /// delegate has, and a probe on Windows has what a process there needs to start at all.
+///
+/// A probe reads a usage window and never needs a key, so its environment is scrubbed of every
+/// billing variable whatever the account says: the probe of an account on API pricing is never
+/// spawned at all, because [`ProbeTarget::Credential`] is answered without one.
 fn probe_command(request: &ProbeRequest<'_>, program: &str) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     command.env_clear();
-    for (key, value) in base_env(request.host_env) {
+    let mut env = base_env(request.host_env);
+    scrub_billing_env(&mut env);
+    for (key, value) in env {
         command.env(key, value);
     }
     if let Some(dir) = request.target.config_dir() {

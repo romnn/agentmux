@@ -11,7 +11,7 @@
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use agentmux::delegate::{CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
+use agentmux::delegate::{Billing, CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -40,6 +40,13 @@ fn string_choice(description: &str, values: &[&str]) -> Schema {
 
 fn vendor_schema(_generator: &mut SchemaGenerator) -> Schema {
     string_choice("Which delegate CLI to run.", &["claude", "codex"])
+}
+
+fn billing_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_choice(
+        "The pricing to run on: `subscription` or `api`.",
+        &["subscription", "api"],
+    )
 }
 
 fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -111,6 +118,28 @@ pub struct DelegateParams {
     #[serde(default)]
     #[schemars(schema_with = "sandbox_schema")]
     pub sandbox: Option<CodexSandbox>,
+
+    /// Whether the delegate's environment may carry an API key; omit it and the account decides.
+    ///
+    /// No key from the environment reaches a delegate unless this machine's `agentmux.toml` marks
+    /// its account `billing = "api"`, which the account list in these instructions shows.
+    /// `api` is refused for any other account, so it cannot switch API pricing on; it only makes a
+    /// consultation meant to use the account's key fail rather than run without it.
+    /// `subscription` withholds the key even from an account that allows one, and is refused for
+    /// one that authenticates only with a key.
+    /// Follow-ups keep whatever the first turn was allowed.
+    #[serde(default)]
+    #[schemars(schema_with = "billing_schema")]
+    pub billing: Option<Billing>,
+
+    /// Set to `true` to run a Codex consultation with `codex exec` rather than over
+    /// `codex app-server`; its follow-ups keep it.
+    ///
+    /// A consultation run this way cannot be steered.
+    /// Use it when an earlier Codex consultation failed with a protocol error, which means the
+    /// installed codex no longer speaks the app-server protocol this agentmux was built for.
+    #[serde(default)]
+    pub codex_exec: bool,
 }
 
 impl DelegateParams {

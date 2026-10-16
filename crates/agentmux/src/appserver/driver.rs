@@ -1,0 +1,1101 @@
+//! The driver: one turn over `codex app-server`, written out as `codex exec --json` would write it.
+//!
+//! See [`super`] for where it sits and why it is a process of its own.
+//!
+//! Two threads move bytes and the driver's own thread decides everything: one reads the server's
+//! stdout into a channel, one writes the queued lines to its stdin.
+//! A server that stops reading therefore never blocks the driver, which keeps watching the cancel
+//! marker and its own deadlines whatever the pipes do.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, PipeWriter, Read as _, Write};
+use std::path::Path;
+use std::process::{Child, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use super::Plan;
+use super::mailbox::{Claim, Mailbox, Reply};
+use super::protocol::{self, Incoming, Request, decode, wire};
+use super::translate::{self, Finish, Translator};
+use crate::delegate::{Billing, scrub_billing_env};
+
+/// How long one setup request may go unanswered.
+///
+/// Generous, because resuming a long thread reads its whole rollout before it answers.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the cancel marker, the mailbox and the server process are looked at while a turn
+/// runs.
+const TICK: Duration = Duration::from_millis(100);
+
+/// How long output is still waited for once the server is seen to have exited.
+///
+/// What it wrote last may still be on its way through the pipe, and a terminal event among it is
+/// how the turn ended.
+const EXIT_DRAIN: Duration = TICK.saturating_mul(3);
+
+/// How long an interrupted turn is given to close before the driver leaves anyway.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(8);
+
+/// How long the server is given to exit once its stdin is closed.
+///
+/// It writes the thread's rollout on the way out, which a follow-up resumes from, so it is asked
+/// to leave by end of input and only then by signal.
+const SERVER_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long what the server left running is given between the polite signal and the forceful one.
+const SWEEP_GRACE: Duration = Duration::from_secs(2);
+
+/// The longest a cancelled driver takes to leave once it has seen the cancellation: the
+/// interrupt, which covers waiting for a turn being started, the server's own exit, and the sweep
+/// of whatever it left behind.
+///
+/// The store's `cancel` waits longer than this before it signals the driver, so a driver that
+/// honours the cancellation is never killed in the middle of cleaning up.
+pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
+    .saturating_add(SERVER_EXIT_GRACE)
+    .saturating_add(SWEEP_GRACE);
+
+/// How long, once the turn has ended, a steer the server has not answered yet is waited for.
+const SETTLE_GRACE: Duration = Duration::from_secs(2);
+
+/// How a driven turn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ending {
+    /// The turn closed and the capture ends in the terminal event that says how.
+    Finished,
+    /// The caller cancelled the turn; the capture carries no terminal event, so the store's own
+    /// record of the cancellation decides it.
+    Cancelled,
+    /// The turn never reached an end the capture could record: the server could not be started,
+    /// refused to set the turn up, went away part-way through, or the capture could not be
+    /// written.
+    Broken(String),
+}
+
+impl Ending {
+    /// The driver's exit status: zero when the capture or the store says how the turn ended,
+    /// non-zero when only stderr does.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Finished | Self::Cancelled => 0,
+            Self::Broken(_) => 1,
+        }
+    }
+}
+
+/// Run the turn a plan describes, as the `codex-app-server` subcommand.
+///
+/// The question is read from stdin and the capture is written to stdout, which the launcher has
+/// pointed at the turn's files; a turn that breaks says why on stderr.
+/// Returns the process's exit status.
+#[must_use]
+pub fn drive(plan_path: &Path) -> i32 {
+    let plan = match Plan::read(plan_path) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!(
+                "agentmux: cannot read the app-server plan at {}: {error}",
+                plan_path.display()
+            );
+            return 2;
+        }
+    };
+    let mut question = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut question) {
+        eprintln!("agentmux: cannot read the question: {error}");
+        return 2;
+    }
+
+    let adopting = adopt_orphans();
+    contain_descendants();
+    let (mut child, to_server) = match spawn_server(&plan) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            eprintln!(
+                "agentmux: cannot run `{} app-server`: {error}. Is it installed and on PATH? \
+                 Otherwise, {}.",
+                plan.settings.program,
+                super::EXEC_FALLBACK_HINT
+            );
+            return 1;
+        }
+    };
+    // Nothing to watch on Windows, where the job object stops what the driver leaves behind.
+    let watch = (!cfg!(windows)).then(|| Watch::start(child.id(), adopting));
+    // The server's input stays open through a second handle until `stop_server` has read what
+    // the server left running: closed earlier, the server could exit first and orphan it.
+    let (Some(from_server), Ok(input)) = (child.stdout.take(), to_server.try_clone()) else {
+        stop_server(
+            &mut child,
+            to_server,
+            watch.map(Watch::stop).unwrap_or_default(),
+        );
+        eprintln!("agentmux: codex app-server did not offer stdio");
+        return 1;
+    };
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let ending = drive_with(
+        &plan,
+        &question,
+        &mut out,
+        to_server,
+        BufReader::new(from_server),
+        &mut || !matches!(child.try_wait(), Ok(None)),
+    );
+    let seen = watch.map(Watch::stop).unwrap_or_default();
+    stop_server(&mut child, input, seen);
+    if let Ending::Broken(reason) = &ending {
+        eprintln!("agentmux: {reason}");
+        eprintln!("agentmux: {}.", super::EXEC_FALLBACK_HINT);
+    }
+    ending.exit_code()
+}
+
+/// Run one turn against a server already connected through `to_server` and `from_server`.
+///
+/// This is all of [`drive`] but the process: a test drives it against an in-process server.
+/// `to_server` is closed once everything queued for it is written after the turn, which is what
+/// tells a real server to exit.
+/// `server_exited` says whether the server process has gone, which its output alone cannot say
+/// while something it started still holds that output open.
+pub fn drive_with(
+    plan: &Plan,
+    question: &str,
+    out: &mut dyn Write,
+    to_server: impl Write + Send + 'static,
+    from_server: impl BufRead + Send + 'static,
+    server_exited: &mut dyn FnMut() -> bool,
+) -> Ending {
+    let (inbox, events) = channel();
+    let boundary = inbox.clone();
+    std::thread::spawn(move || read_server(from_server, &inbox));
+    let (outbox, queue) = channel::<String>();
+    std::thread::spawn(move || write_server(to_server, &queue));
+
+    let mut session = Session {
+        plan,
+        out,
+        outbox,
+        events,
+        boundary: Some(boundary),
+        next_id: 0,
+        translator: Translator::default(),
+        mailbox: Mailbox::new(&plan.mailbox),
+        pending: HashMap::new(),
+        finished: None,
+        cancelled_at: None,
+        server_exited,
+        server_probed_at: Instant::now(),
+        server_gone_since: None,
+        last_message_kept: false,
+    };
+    let ending = match session.set_up(question) {
+        Ok(thread_id) => session.run_turn(&thread_id),
+        // `set_up` hands a started turn to the running loop itself.
+        Err(Setup::Cancelled | Setup::Started) => {
+            // A turn that ends this way records no end, so there is nothing left to refuse.
+            let _ = session.keep_last_message();
+            Ending::Cancelled
+        }
+        // An end the server already reported is how the turn ended, whatever broke after it.
+        Err(Setup::Failed(reason)) => match session.finished.take() {
+            Some(finished) => session.close(&finished).unwrap_or_else(Ending::Broken),
+            None => Ending::Broken(reason),
+        },
+    };
+    // A turn that broke after its answer arrived still leaves it where a failed turn's reply is
+    // recovered from.
+    if matches!(ending, Ending::Broken(_)) {
+        let _ = session.keep_last_message();
+    }
+    ending
+}
+
+/// Hand every JSON-RPC message the server writes to the driver, then say why it stopped.
+fn read_server(mut from_server: impl BufRead, inbox: &Sender<Event>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match from_server.read_line(&mut line) {
+            Ok(0) => {
+                let _ = inbox.send(Event::Closed(String::new()));
+                return;
+            }
+            Ok(_) => {
+                // A line that is not JSON-RPC is the server's to explain, on its stderr.
+                if let Some(message) = protocol::parse(line.trim_end())
+                    && inbox.send(Event::Message(message)).is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = inbox.send(Event::Closed(format!(": {error}")));
+                return;
+            }
+        }
+    }
+}
+
+/// Write each queued line to the server, and close its input once the queue is closed and empty.
+fn write_server(mut to_server: impl Write, queue: &Receiver<String>) {
+    for line in queue {
+        if writeln!(to_server, "{line}")
+            .and_then(|()| to_server.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// What the server-reading thread hands over.
+enum Event {
+    Message(Incoming),
+    /// The server's stdout ended, with what the read said about why.
+    Closed(String),
+    /// Everything read before the server was seen gone has been handed over; the driver queues
+    /// it itself, behind that output.
+    Boundary,
+}
+
+/// Why setting a turn up stopped.
+enum Setup {
+    /// The caller cancelled before the turn started, or before its id could be learned.
+    Cancelled,
+    /// The turn is running, or already over, before `turn/start` was answered: `turn/started`
+    /// named it, or the server reported its end.
+    /// The running loop takes it from there, so a steer or a cancellation is served and a
+    /// finished turn is written without waiting for the answer.
+    Started,
+    /// The server could not be asked, or refused, or the capture could not be written.
+    Failed(String),
+}
+
+/// A request of the driver's that the server has not answered yet.
+enum Pending {
+    Steer(Claim),
+    Interrupt,
+}
+
+/// The end of the turn, as the server reported it, held until the steers still in flight are
+/// settled, so that an accepted one is recorded before the event the fold stops at.
+struct Finished {
+    finish: Finish,
+    lines: Vec<String>,
+}
+
+struct Session<'a> {
+    plan: &'a Plan,
+    out: &'a mut dyn Write,
+    outbox: Sender<String>,
+    events: Receiver<Event>,
+    next_id: u64,
+    translator: Translator,
+    mailbox: Mailbox,
+    pending: HashMap<u64, Pending>,
+    finished: Option<Finished>,
+    /// When the driver first saw the caller's cancellation.
+    cancelled_at: Option<Instant>,
+    server_exited: &'a mut dyn FnMut() -> bool,
+    /// When `server_exited` was last asked.
+    server_probed_at: Instant,
+    /// When the driver first found the server gone.
+    server_gone_since: Option<Instant>,
+    /// Queues [`Event::Boundary`] behind the server's output, once.
+    boundary: Option<Sender<Event>>,
+    /// Whether the closing message is already where a reader finds it.
+    last_message_kept: bool,
+}
+
+impl Session<'_> {
+    /// Append lines to the capture.
+    ///
+    /// Flushed at once: the capture is what every reader folds, and a line held in a buffer is a
+    /// line a `tail` cannot see.
+    /// A capture that cannot be written ends the turn, because the transcript is the deliverable.
+    fn record(&mut self, lines: &[String]) -> Result<(), String> {
+        lines
+            .iter()
+            .try_for_each(|line| writeln!(self.out, "{line}"))
+            .and_then(|()| self.out.flush())
+            .map_err(|error| format!("cannot write the event capture: {error}"))
+    }
+
+    fn send(&self, line: String) -> Result<(), String> {
+        self.outbox
+            .send(line)
+            .map_err(|_| "codex app-server closed its input".to_owned())
+    }
+
+    fn request<P: Request>(&mut self, params: &P) -> Result<u64, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(protocol::request(id, params)?)?;
+        Ok(id)
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.plan.cancel_marker.exists()
+    }
+
+    /// The next message from the server, waiting up to `wait` for one.
+    ///
+    /// Once the server has been gone for [`EXIT_DRAIN`], [`Event::Boundary`] is queued behind what
+    /// has been read so far, and the caller reads it as the server's departure.
+    /// So a completion the server wrote before it left still ends the turn, however long the
+    /// messages ahead of it take to record, while something it started that keeps writing to its
+    /// output cannot push the boundary back.
+    fn receive(&mut self, wait: Duration) -> Result<Event, RecvTimeoutError> {
+        if self.server_gone()
+            && let Some(boundary) = self.boundary.take()
+        {
+            let _ = boundary.send(Event::Boundary);
+        }
+        self.events.recv_timeout(wait)
+    }
+
+    /// Whether the server has gone and what it wrote before leaving has had time to arrive.
+    ///
+    /// Asked before every message as well as when none arrives, and answered from the process on
+    /// a clock: something the server started can hold its output open and keep writing to it
+    /// after the server has gone, and a turn whose server is gone has ended all the same.
+    fn server_gone(&mut self) -> bool {
+        if let Some(since) = self.server_gone_since {
+            return since.elapsed() >= EXIT_DRAIN;
+        }
+        if self.server_probed_at.elapsed() >= TICK {
+            self.server_probed_at = Instant::now();
+            if (self.server_exited)() {
+                self.server_gone_since = Some(Instant::now());
+            }
+        }
+        false
+    }
+
+    /// Whether the caller has cancelled, remembering when the driver first saw it, which is when
+    /// the interrupt's grace starts however far the turn had got.
+    fn notice_cancellation(&mut self) -> bool {
+        if self.cancelled_at.is_none() && self.cancel_requested() {
+            self.cancelled_at = Some(Instant::now());
+        }
+        self.cancelled_at.is_some()
+    }
+
+    /// Answer a request from the server: an approval is declined, anything else refused.
+    ///
+    /// Said in the capture as well, because a refused action changes what the delegate did next.
+    fn decline(&mut self, id: &Value, method: &str) -> Result<(), String> {
+        let line = match protocol::decline(method) {
+            Some(Ok(answer)) => protocol::result(id, &answer),
+            Some(Err(reason)) => protocol::error(id, protocol::INTERNAL_ERROR, &reason),
+            None => protocol::error(
+                id,
+                protocol::METHOD_NOT_FOUND,
+                "agentmux runs consultations unattended and answers no requests of this kind",
+            ),
+        };
+        // A server that has gone cannot be answered, and its departure is reported on its own.
+        let _ = self.send(line);
+        self.record(&[translate::note(&format!(
+            "agentmux declined codex's `{method}` request: a consultation runs with nobody to \
+             approve or answer it"
+        ))])
+    }
+
+    /// Translate one notification into the capture, holding back the end of the turn.
+    ///
+    /// Whatever the server says after the turn ended is not part of it, and is not even
+    /// translated, so it cannot change the closing message either.
+    fn notify(&mut self, method: &str, params: &Value, cancelling: bool) -> Result<(), String> {
+        if self.finished.is_some() {
+            return Ok(());
+        }
+        let translated = self.translator.notification(method, params, cancelling);
+        match translated.finish {
+            Some(finish) => {
+                self.finished = Some(Finished {
+                    finish,
+                    lines: translated.lines,
+                });
+                Ok(())
+            }
+            None => self.record(&translated.lines),
+        }
+    }
+
+    /// Send a setup request and wait for its answer, recording whatever the server says
+    /// meanwhile.
+    ///
+    /// Nothing new is sent once the caller has cancelled.
+    /// A cancellation while the answer is awaited ends the setup at once, except for `turn/start`:
+    /// that turn may already be running, so the setup goes on until the turn's id is known, and
+    /// the running loop interrupts it, but for no longer than an interrupt itself is given.
+    /// `turn/start` is over as soon as the turn is known — from `turn/started`, or from an end the
+    /// server reported — whether or not it was answered, because a running turn takes steers and
+    /// a finished one is written at once.
+    fn call<P: Request>(&mut self, params: &P) -> Result<Value, Setup> {
+        let method = P::METHOD;
+        let starts_the_turn = method == <wire::TurnStartParams as Request>::METHOD;
+        if self.cancel_requested() {
+            return Err(Setup::Cancelled);
+        }
+        let id = self.request(params).map_err(Setup::Failed)?;
+        let mut deadline = Instant::now() + SETUP_TIMEOUT;
+        loop {
+            if starts_the_turn && (self.translator.turn_id().is_some() || self.finished.is_some()) {
+                return Err(Setup::Started);
+            }
+            if self.notice_cancellation() {
+                if !starts_the_turn {
+                    return Err(Setup::Cancelled);
+                }
+                if let Some(at) = self.cancelled_at {
+                    deadline = deadline.min(at + INTERRUPT_GRACE);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() && self.cancelled_at.is_some() {
+                return Err(Setup::Cancelled);
+            }
+            if remaining.is_zero() {
+                return Err(Setup::Failed(format!(
+                    "codex app-server did not answer `{method}` within {}s",
+                    SETUP_TIMEOUT.as_secs()
+                )));
+            }
+            match self.receive(remaining.min(TICK)) {
+                Ok(Event::Message(Incoming::Response { id: got, outcome })) if got == id => {
+                    return outcome.map_err(|reason| {
+                        Setup::Failed(format!("codex app-server refused `{method}`: {reason}"))
+                    });
+                }
+                Ok(Event::Message(Incoming::Response { .. })) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(Event::Message(Incoming::Notification { method, params })) => {
+                    let cancelling = self.cancel_requested();
+                    self.notify(&method, &params, cancelling)
+                        .map_err(Setup::Failed)?;
+                }
+                Ok(Event::Message(Incoming::Request { id, method })) => {
+                    self.decline(&id, &method).map_err(Setup::Failed)?;
+                }
+                Ok(Event::Closed(why)) => {
+                    return Err(Setup::Failed(format!(
+                        "codex app-server exited before it answered `{method}`{why}"
+                    )));
+                }
+                Ok(Event::Boundary) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Setup::Failed(format!(
+                        "codex app-server exited before it answered `{method}`"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Handshake, open or resume the thread, and start the turn.
+    ///
+    /// Returns the thread id.
+    fn set_up(&mut self, question: &str) -> Result<String, Setup> {
+        // The answer says nothing the driver needs; the handshake is what counts.
+        self.call(&protocol::initialize_params())?;
+        self.send(protocol::notification("initialized"))
+            .map_err(Setup::Failed)?;
+
+        let settings = &self.plan.settings;
+        let cwd = self.plan.cwd.to_string_lossy().into_owned();
+        let model = settings.model.as_str().to_owned();
+        let sandbox = settings.sandbox;
+        let (method, opened) = if let Some(session) = &self.plan.resume {
+            let params = protocol::thread_resume_params(session.as_str(), &model, &cwd, sandbox);
+            ("thread/resume", self.call(&params)?)
+        } else {
+            let params = protocol::thread_start_params(&model, &cwd, sandbox);
+            ("thread/start", self.call(&params)?)
+        };
+        // Both answers carry the thread in the same place.
+        let typed = if self.plan.resume.is_some() {
+            decode::<wire::ThreadResumeResponse>(&opened).map(|resumed| resumed.thread.id)
+        } else {
+            decode::<wire::ThreadStartResponse>(&opened).map(|started| started.thread.id)
+        };
+        let thread_id = match typed {
+            Ok(thread_id) => thread_id,
+            Err(reason) => {
+                self.record(&[translate::undecoded(method, &reason, &opened)])
+                    .map_err(Setup::Failed)?;
+                opened
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        Setup::Failed(format!(
+                            "codex app-server answered `{method}` with no thread id: {reason}"
+                        ))
+                    })?
+            }
+        };
+        let announced = self.translator.thread_began(&thread_id);
+        self.record(&[announced]).map_err(Setup::Failed)?;
+
+        let start = protocol::turn_start_params(&thread_id, question).map_err(Setup::Failed)?;
+        let started = match self.call(&start) {
+            Ok(started) => started,
+            Err(Setup::Started) => return Ok(thread_id),
+            Err(other) => return Err(other),
+        };
+        let turn_id = match decode::<wire::TurnStartResponse>(&started) {
+            Ok(started) => started.turn.id,
+            Err(reason) => {
+                self.record(&[translate::undecoded("turn/start", &reason, &started)])
+                    .map_err(Setup::Failed)?;
+                started
+                    .pointer("/turn/id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        Setup::Failed(format!(
+                            "codex app-server answered `turn/start` with no turn id: {reason}"
+                        ))
+                    })?
+            }
+        };
+        if let Some(line) = self.translator.turn_began(&turn_id) {
+            self.record(&[line]).map_err(Setup::Failed)?;
+        }
+        Ok(thread_id)
+    }
+
+    /// Follow the running turn to its end, delivering steers and honouring a cancellation.
+    fn run_turn(&mut self, thread_id: &str) -> Ending {
+        match self.follow(thread_id) {
+            Ok(ending) => ending,
+            Err(reason) => {
+                self.abandon("the turn ended before codex answered it");
+                Ending::Broken(reason)
+            }
+        }
+    }
+
+    fn follow(&mut self, thread_id: &str) -> Result<Ending, String> {
+        let mut interrupted = false;
+        let mut looked_at = Instant::now();
+        loop {
+            if let Some(finished) = self.finished.take() {
+                return self.close(&finished);
+            }
+            match self.receive(TICK) {
+                Ok(Event::Message(Incoming::Notification { method, params })) => {
+                    let cancelling = self.cancelled_at.is_some()
+                        || (method == "turn/completed" && self.cancel_requested());
+                    self.notify(&method, &params, cancelling)?;
+                }
+                Ok(Event::Message(Incoming::Response { id, outcome })) => {
+                    if let Some(request) = self.pending.remove(&id) {
+                        self.resolve(request, outcome)?;
+                    }
+                }
+                Ok(Event::Message(Incoming::Request { id, method })) => {
+                    self.decline(&id, &method)?;
+                }
+                Ok(Event::Closed(why)) => {
+                    return Err(format!(
+                        "codex app-server exited while the turn was still running{why}"
+                    ));
+                }
+                Ok(Event::Boundary) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(
+                        "codex app-server exited while the turn was still running".to_owned()
+                    );
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+
+            // The files are looked at on a clock rather than per message, so a chatty turn does
+            // not stat the cancel marker hundreds of times a second.
+            if looked_at.elapsed() < TICK || self.finished.is_some() {
+                continue;
+            }
+            looked_at = Instant::now();
+            let Some(turn_id) = self.translator.turn_id().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if self.notice_cancellation() {
+                if self
+                    .cancelled_at
+                    .is_some_and(|at| at.elapsed() >= INTERRUPT_GRACE)
+                {
+                    self.abandon("the turn was cancelled before codex answered it");
+                    let _ = self.keep_last_message();
+                    return Ok(Ending::Cancelled);
+                }
+                if !interrupted {
+                    interrupted = true;
+                    // Steers still waiting were never sent, and are not sent into a turn that is
+                    // being stopped.
+                    for claim in self.mailbox.claim_all() {
+                        self.answer(
+                            &claim,
+                            &Reply::Rejected {
+                                reason: "the consultation is being cancelled".to_owned(),
+                            },
+                        );
+                    }
+                    if let Ok(id) =
+                        self.request(&protocol::turn_interrupt_params(thread_id, &turn_id))
+                    {
+                        self.pending.insert(id, Pending::Interrupt);
+                    }
+                }
+                continue;
+            }
+            for claim in self.mailbox.claim_all() {
+                let sent = protocol::turn_steer_params(thread_id, &turn_id, &claim.text)
+                    .and_then(|params| self.request(&params));
+                match sent {
+                    Ok(id) => {
+                        self.pending.insert(id, Pending::Steer(claim));
+                    }
+                    Err(reason) => self.answer(&claim, &Reply::Rejected { reason }),
+                }
+            }
+        }
+    }
+
+    /// Settle the steers still in flight, then write the end of the turn.
+    fn close(&mut self, finished: &Finished) -> Result<Ending, String> {
+        let deadline = Instant::now() + SETTLE_GRACE;
+        while self
+            .pending
+            .values()
+            .any(|request| matches!(request, Pending::Steer(_)))
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.events.recv_timeout(remaining) {
+                Ok(Event::Message(Incoming::Response { id, outcome })) => {
+                    if let Some(request) = self.pending.remove(&id) {
+                        self.resolve(request, outcome)?;
+                    }
+                }
+                Ok(Event::Message(Incoming::Request { id, method })) => {
+                    self.decline(&id, &method)?;
+                }
+                Ok(Event::Message(Incoming::Notification { .. })) => {}
+                Ok(Event::Closed(_) | Event::Boundary) | Err(_) => break,
+            }
+        }
+        self.abandon("the turn ended before codex answered it");
+        self.keep_last_message()?;
+        self.record(&finished.lines)?;
+        Ok(match finished.finish {
+            Finish::Interrupted => Ending::Cancelled,
+            Finish::Completed | Finish::Failed => Ending::Finished,
+        })
+    }
+
+    /// Act on the server's answer to one of the driver's own requests.
+    fn resolve(&mut self, request: Pending, outcome: Result<Value, String>) -> Result<(), String> {
+        match (request, outcome) {
+            (Pending::Steer(claim), Ok(_)) => {
+                // Recorded before the sender hears of it, so a transcript read after a
+                // successful `steer` always holds the instruction.
+                if let Err(reason) = self.record(&[translate::steer(&claim.text)]) {
+                    self.answer(
+                        &claim,
+                        &Reply::Unconfirmed {
+                            reason: format!(
+                                "codex accepted it, but agentmux could not record it: {reason}"
+                            ),
+                        },
+                    );
+                    return Err(reason);
+                }
+                self.answer(&claim, &Reply::Accepted);
+                Ok(())
+            }
+            (Pending::Steer(claim), Err(reason)) => {
+                self.answer(&claim, &Reply::Rejected { reason });
+                Ok(())
+            }
+            (Pending::Interrupt, Ok(_)) => Ok(()),
+            (Pending::Interrupt, Err(reason)) => self.record(&[translate::note(&format!(
+                "codex refused to interrupt the turn: {reason}"
+            ))]),
+        }
+    }
+
+    /// Write the turn's closing message to the file a reply is recovered from.
+    ///
+    /// Written before the terminal event: a turn whose only answer is a plan has no reply in the
+    /// capture, and a reader that sees the turn end must find the plan already there, or a
+    /// follow-up started in between leaves it unrecoverable.
+    /// When the file cannot be written, a plan is written into the capture as the reply instead,
+    /// because nothing else would keep it; a reply is already there.
+    /// Fails when neither could keep the plan, so the turn is not recorded as answered without
+    /// it.
+    /// Once kept, it is not kept again, so a plan written into the capture appears there once.
+    fn keep_last_message(&mut self) -> Result<(), String> {
+        if self.last_message_kept {
+            return Ok(());
+        }
+        let Some(text) = self.translator.last_message() else {
+            return Ok(());
+        };
+        if let Err(error) = std::fs::write(&self.plan.last_message, text) {
+            eprintln!(
+                "agentmux: cannot write the closing message to {}: {error}",
+                self.plan.last_message.display()
+            );
+            if let Some(plan) = self.translator.uncaptured_last_message() {
+                let kept = translate::reply(plan);
+                self.record(&[kept])?;
+            }
+        }
+        self.last_message_kept = true;
+        Ok(())
+    }
+
+    /// Answer every steer sent but never answered: codex may have taken it, so neither delivery
+    /// nor refusal can be claimed.
+    fn abandon(&mut self, why: &str) {
+        let pending = std::mem::take(&mut self.pending);
+        for request in pending.into_values() {
+            if let Pending::Steer(claim) = request {
+                self.answer(
+                    &claim,
+                    &Reply::Unconfirmed {
+                        reason: why.to_owned(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn answer(&self, claim: &Claim, reply: &Reply) {
+        if let Err(error) = self.mailbox.answer(claim, reply) {
+            eprintln!("agentmux: cannot answer a steered message: {error}");
+        }
+    }
+}
+
+/// Start `codex app-server` for the plan, in the turn's working directory.
+///
+/// Its stderr is the driver's own, which is the turn's `stderr.log`.
+/// The environment is the driver's, which the launcher built; under a subscription it is
+/// scrubbed again here, because this is where the process that could spend money is made.
+/// It stays in the driver's process group, so a driver the store has to signal takes the server
+/// with it.
+/// Returns the server and the write end of its input, a pipe of the driver's own so the driver
+/// can hold the input open through a second handle.
+fn spawn_server(plan: &Plan) -> std::io::Result<(Child, PipeWriter)> {
+    let mut env: std::collections::BTreeMap<String, String> = crate::host_env();
+    if plan.billing == Billing::Subscription {
+        scrub_billing_env(&mut env);
+    }
+    let spawn = |program: &str| -> std::io::Result<(Child, PipeWriter)> {
+        let (input, to_server) = std::io::pipe()?;
+        let child = std::process::Command::new(program)
+            .args(&plan.settings.args)
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok((child, to_server))
+    };
+    let program = plan.settings.program.as_str();
+    match spawn(program) {
+        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
+        // bare name.
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            spawn(&format!("{program}.cmd")).map_err(|_| error)
+        }
+        spawned => spawned,
+    }
+}
+
+/// Close the server's input, wait for it to leave, and stop whatever it left running.
+///
+/// The commands a turn runs are the server's descendants, and codex's sandbox starts each in a
+/// session of its own, which no process-group signal reaches and which outlives the server as an
+/// orphan.
+/// So what runs below the driver is read while `input` still holds the server open, and read
+/// again until nothing is left; `earlier` is what [`Watch`] recorded while the turn ran, which
+/// reaches a command whose server crashed before then.
+/// On Linux the driver adopts the server's orphans (see [`adopt_orphans`]), so such a command, or
+/// one a command started while it was being stopped, is still found below it.
+/// Each process is asked to stop and then made to, recognised by its pid and start time so a pid
+/// reused meanwhile is left alone.
+/// Elsewhere an orphan neither reading saw is out of reach: one a crashed server's command
+/// started after the last record.
+fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<(u32, u64)>) {
+    let driver = std::process::id();
+    let mut seen = earlier;
+    for process in descendants(driver) {
+        if !seen.contains(&process) {
+            seen.push(process);
+        }
+    }
+    // The server is stopped and waited for through `child`; once waited for, its pid is free
+    // for another process, which a start time to the second cannot tell apart.
+    let server = child.id();
+    seen.retain(|&(pid, _)| pid != server);
+    drop(input);
+    let deadline = Instant::now() + SERVER_EXIT_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let deadline = Instant::now() + SWEEP_GRACE;
+    let mut asked: Vec<(u32, u64)> = Vec::new();
+    loop {
+        let mut left = descendants(driver);
+        for earlier in seen.iter().chain(&asked) {
+            if !left.contains(earlier) {
+                left.push(*earlier);
+            }
+        }
+        if !survivors(&left, None) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            survivors(&left, Some(sysinfo::Signal::Kill));
+            return;
+        }
+        let fresh: Vec<(u32, u64)> = left
+            .into_iter()
+            .filter(|process| !asked.contains(process))
+            .collect();
+        survivors(&fresh, Some(sysinfo::Signal::Term));
+        asked.extend(fresh);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Make the driver the parent of whatever its descendants orphan, so [`stop_server`] can still
+/// find a command whose server exited before it.
+///
+/// Linux only, where the kernel offers it; elsewhere an orphan goes to the system, and nothing
+/// below the driver says it was there.
+/// Returns whether the driver now adopts.
+fn adopt_orphans() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    match nix::sys::prctl::set_child_subreaper(true) {
+        Ok(()) => return true,
+        Err(error) => {
+            eprintln!("agentmux: cannot adopt what codex app-server orphans: {error}");
+        }
+    }
+    false
+}
+
+/// Watches what runs below the driver while the turn runs.
+///
+/// Where the driver cannot adopt, it records the driver's descendants every few ticks, so the
+/// sweep in [`stop_server`] can still stop a command whose server crashed and left it to the
+/// system.
+/// Where it adopts, such a command stays below the driver, and the watch instead waits for each
+/// adopted orphan as it exits: an exited process
+/// stays in the process table until its parent waits for it, and a long turn whose commands keep
+/// forking short-lived helpers would otherwise fill that table with them, until the consultation
+/// can start no process at all.
+/// The server is never waited for here, so its exit status stays where `Child` reads it.
+/// Stopped before the sweep: an orphan nobody waited for keeps its pid, so the pid the sweep read
+/// cannot pass to another process before it is signalled.
+struct Watch {
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<Vec<(u32, u64)>>,
+}
+
+impl Watch {
+    /// How many ticks pass between two records of the driver's descendants.
+    const RECORD_EVERY: u32 = 10;
+
+    fn start(server: u32, adopting: bool) -> Self {
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stopping);
+        let driver = std::process::id();
+        let thread = std::thread::spawn(move || {
+            let mut seen: Vec<(u32, u64)> = Vec::new();
+            let mut ticks = 0_u32;
+            while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                if adopting {
+                    reap_exited_orphans(server);
+                } else if ticks.is_multiple_of(Self::RECORD_EVERY) {
+                    for process in descendants(driver) {
+                        if !seen.contains(&process) {
+                            seen.push(process);
+                        }
+                    }
+                }
+                ticks = ticks.wrapping_add(1);
+                std::thread::sleep(TICK);
+            }
+            seen
+        });
+        Self { stopping, thread }
+    }
+
+    /// Stop watching, and return every descendant it recorded.
+    fn stop(self) -> Vec<(u32, u64)> {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.thread.join().unwrap_or_default()
+    }
+}
+
+/// Wait for every child of the driver's that has exited, except the server.
+///
+/// An exited child is looked at before it is waited for, so the server's own exit is left
+/// alone; an orphan behind an exited server is left for the system, which waits for it once the
+/// driver, which leaves soon after its server, has gone.
+fn reap_exited_orphans(server: u32) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use nix::sys::wait::{Id, WaitPidFlag, waitid, waitpid};
+
+        let Ok(server) = i32::try_from(server).map(nix::unistd::Pid::from_raw) else {
+            return;
+        };
+        let exited = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        while let Ok(status) = waitid(Id::All, exited)
+            && let Some(pid) = status.pid()
+            && pid != server
+        {
+            let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = server;
+}
+
+/// On Windows, put the driver into a job object that kills everything still in it when the
+/// driver exits, so what the server leaves running goes with it.
+///
+/// Every process the driver or its descendants start joins the job, and none is ever looked up
+/// by its parent: Windows keeps the parent pid a process was created with after that parent has
+/// gone, and a pid of ours that reuses it would claim someone else's process.
+/// A process codex deliberately starts outside its own job is let go, as codex intends.
+/// The handle is never closed by hand, so the job outlives everything the driver does and ends
+/// with its process.
+/// A driver that cannot make the job says so on stderr, and stops only the server itself.
+fn contain_descendants() {
+    #[cfg(windows)]
+    {
+        let mut limits = win32job::ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close().limit_breakaway_ok();
+        let contained = win32job::Job::create_with_limit_info(&limits)
+            .and_then(|job| job.assign_current_process().map(|()| job.into_handle()));
+        if let Err(error) = contained {
+            eprintln!("agentmux: cannot hold what codex app-server starts in a job: {error}");
+        }
+    }
+}
+
+/// A fresh read of the process table, with each process's parent and start time: of `pids`, or
+/// of every process when `pids` is `None`.
+///
+/// Threads are left out: Linux lists each as a child of its process, and a signal to one is a
+/// signal to the whole process — the driver's own included.
+fn process_table(pids: Option<&[sysinfo::Pid]>) -> sysinfo::System {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        pids.map_or(
+            sysinfo::ProcessesToUpdate::All,
+            sysinfo::ProcessesToUpdate::Some,
+        ),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().without_tasks(),
+    );
+    system
+}
+
+/// Every process below `root`, with the start time that tells it apart from a later holder of
+/// its pid.
+///
+/// A process counts as a child only if it started no earlier than its parent, so a pid reused
+/// since cannot claim an older process.
+/// Always empty on Windows, where the job object of [`contain_descendants`] stops them instead
+/// and a recorded parent pid proves nothing.
+fn descendants(root: u32) -> Vec<(u32, u64)> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let system = process_table(None);
+    let Some(root_started) = system
+        .process(sysinfo::Pid::from_u32(root))
+        .map(sysinfo::Process::start_time)
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u32, u64)> = Vec::new();
+    let mut parents = vec![(root, root_started)];
+    while let Some((parent, parent_started)) = parents.pop() {
+        for (pid, process) in system.processes() {
+            let pid = pid.as_u32();
+            let started = process.start_time();
+            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent)
+                && started >= parent_started
+                && pid != root
+                && !found.iter().any(|&(known, _)| known == pid)
+            {
+                found.push((pid, started));
+                parents.push((pid, started));
+            }
+        }
+    }
+    found
+}
+
+/// Whether any process of `tree` is still the process it was, sending each one `signal` if given.
+///
+/// A pid whose start time no longer matches belongs to someone else and is left alone, and a
+/// platform without the polite signal gets the forceful one.
+fn survivors(tree: &[(u32, u64)], signal: Option<sysinfo::Signal>) -> bool {
+    if tree.is_empty() {
+        return false;
+    }
+    let pids: Vec<sysinfo::Pid> = tree
+        .iter()
+        .map(|&(pid, _)| sysinfo::Pid::from_u32(pid))
+        .collect();
+    let system = process_table(Some(&pids));
+    let mut any = false;
+    for &(pid, started) in tree {
+        let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) else {
+            continue;
+        };
+        let exited = matches!(
+            process.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        );
+        if process.start_time() != started || exited {
+            continue;
+        }
+        any = true;
+        if let Some(signal) = signal
+            && process.kill_with(signal).is_none()
+        {
+            process.kill();
+        }
+    }
+    any
+}

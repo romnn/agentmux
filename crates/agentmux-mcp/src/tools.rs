@@ -1,4 +1,4 @@
-//! The nine tools.
+//! The ten tools.
 //!
 //! Changes when the tool API changes.
 
@@ -191,6 +191,20 @@ pub struct FollowUpParams {
     pub max_bytes: Option<usize>,
 }
 
+/// Arguments for `steer`: which running consultation, and what to tell it.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SteerParams {
+    /// The consultation id, from `ask`, `start` or `list`.
+    /// Its turn must still be running; a finished consultation takes `follow_up` instead.
+    pub run_id: String,
+
+    /// The instruction to add to the running turn, as self-contained as a follow-up question.
+    /// The delegate reads it before its next model call and carries on from where it is, so say
+    /// what to change — a correction, a narrower scope, "stop and report what you have so far" —
+    /// rather than restating the brief.
+    pub message: String,
+}
+
 /// Arguments for `list`: how many consultations to show.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListParams {
@@ -260,6 +274,8 @@ impl AgentMux {
                 cwd: params.question.working_dir()?,
                 retention: params.question.retention(),
                 env: params.question.environment(),
+                billing: params.delegate.billing,
+                codex_exec: params.delegate.codex_exec,
             })
             .map_err(|error| run_error(&error))?;
 
@@ -291,6 +307,8 @@ impl AgentMux {
                 cwd: params.question.working_dir()?,
                 retention: params.question.retention(),
                 env: params.question.environment(),
+                billing: params.delegate.billing,
+                codex_exec: params.delegate.codex_exec,
             })
             .map_err(|error| run_error(&error))?;
         Ok(text(render::status(&status)))
@@ -409,11 +427,34 @@ impl AgentMux {
     }
 
     #[tool(
+        description = "Add an instruction to a consultation whose turn is still running — a \
+                       correction, a narrower scope, \"stop and report what you have\" — which \
+                       the delegate sees before its next model call, without waiting for the turn \
+                       to end. Only a turn launched over Codex's app-server takes one, which \
+                       `status` shows as `steerable: yes`; anything else is refused with the \
+                       reason, and a finished consultation takes `follow_up` instead. Returns \
+                       once the delegate has accepted the message, which the transcript then \
+                       records as a `### user (steer)` section where it arrived."
+    )]
+    async fn steer(
+        &self,
+        Parameters(params): Parameters<SteerParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let status = self
+            .store
+            .steer(&run_id(&params.run_id)?, &params.message)
+            .await
+            .map_err(|error| run_error(&error))?;
+        Ok(text(render::steered(&status)))
+    }
+
+    #[tool(
         description = "Stop a running consultation. Everything the delegate said before the stop \
                        is kept and still readable with `result`. Returns once the delegate has \
-                       actually stopped, which takes a few seconds at most. Calling it on a \
-                       consultation that has already finished changes nothing and simply reports \
-                       its state."
+                       actually stopped: a few seconds, or up to about twenty for a turn driven \
+                       over Codex's app-server, which is first interrupted over its protocol. \
+                       Calling it on a consultation that has already finished changes nothing and \
+                       simply reports its state."
     )]
     async fn cancel(
         &self,
@@ -496,6 +537,9 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         RunError::NotFound(_)
         | RunError::BadRunId(_)
         | RunError::NotResumable(_)
+        // Whether a steer was refused, withdrawn or left unconfirmed, the message says what the
+        // caller can do next.
+        | RunError::Steer(_)
         | RunError::TurnAlreadyClaimed { .. }
         | RunError::StillRunning { .. }
         | RunError::Delegate(_)
@@ -602,6 +646,10 @@ fn instructions(
                     notes
                         .push("INHERITS this machine's settings, hooks and MCP servers".to_owned());
                 }
+                // The other property a caller must not be surprised by: whether a key reaches it.
+                if account.billing == Some(agentmux::delegate::Billing::Api) {
+                    notes.push("may use an API key".to_owned());
+                }
                 if notes.is_empty() {
                     format!("`{alias}`")
                 } else {
@@ -644,6 +692,12 @@ fn instructions(
         inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
         exercise the tooling that configuration sets up, `false` when the answer must not depend
         on this machine, and `env` to set variables the account's own tooling reads.
+
+        No API key or endpoint override from the environment reaches a delegate unless its account
+        is marked above as one that may use an API key: agentmux removes them from its environment
+        and refuses one passed in `env`. Pass `billing` as `api` to insist on the account's key,
+        which only such an account accepts, or as `subscription` to withhold it even there;
+        follow-ups keep what the first turn ran on.
     "}
 }
 
@@ -662,7 +716,10 @@ transcript text — about once a minute; a review at high effort takes five to f
 and `cancel` to stop one while keeping what it collected. `ask` is `start` plus a 45-second wait,
 for a question you expect answered quickly; a review is not that. A call that comes back "still
 running" has lost nothing, and `list` recovers an id you did not keep. `follow_up` continues the
-delegate's own session, so ask only the new thing.
+delegate's own session, so ask only the new thing. `steer` adds an instruction to a turn that is
+still running, which the delegate sees before its next model call; only a turn `status` reports as
+`steerable: yes` takes one, which today means a `codex` consultation that inherits its account's
+settings, because only those are launched over Codex's app-server.
 
 The transcript is the deliverable and the last message is not the answer. No tool returns "the
 answer", deliberately: a delegate's report is routinely followed by wrap-up, a warning, or a turn
@@ -696,5 +753,134 @@ impl ServerHandler for AgentMux {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("agentmux", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.instructions.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use agentmux::appserver::Plan;
+    use agentmux::appserver::mailbox::{Mailbox, Reply};
+    use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
+    use agentmux::run::{Retention, RunStore, StartRequest};
+    use agentmux::testing::{Script, ScriptedLauncher};
+    use googletest::prelude::*;
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::ErrorCode;
+
+    use super::{AgentMux, SteerParams};
+
+    /// A steerable consultation behind an MCP server, and the thread playing its driver.
+    struct Steering {
+        server: AgentMux,
+        run_id: String,
+        driver: std::thread::JoinHandle<Option<String>>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A server over a store whose one Codex turn is running, driven over the app-server, with
+    /// a thread playing the driver: it answers the first steer with `reply`, and hands back the
+    /// text it claimed.
+    fn steering(reply: Reply) -> Result<Steering> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([Script::running(
+            "{\"type\":\"thread.started\",\"thread_id\":\"th\"}\n{\"type\":\"turn.started\"}\n",
+        )]));
+        let env = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let store = RunStore::open(dir.path(), launcher.clone(), env)
+            .or_fail()?
+            .with_codex_app_server("/opt/agentmux");
+        let started = store.start(&StartRequest {
+            delegate: Delegate::Codex {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: Some(Effort::parse("high").or_fail()?),
+                sandbox: CodexSandbox::ReadOnly,
+                account: None,
+                isolation: Some(Isolation::Inherit),
+            },
+            question: "q".to_owned(),
+            cwd: dir.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
+        })?;
+        // The mailbox the driver was pointed at, from the plan it was launched with.
+        let launch = launcher.launches().into_iter().next().or_fail()?;
+        let plan = Plan::read(Path::new(launch.args.get(1).or_fail()?)).or_fail()?;
+        let mailbox = Mailbox::new(plan.mailbox);
+        let driver = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Some(claim) = mailbox.claim_all().into_iter().next() {
+                    let _ = mailbox.answer(&claim, &reply);
+                    return Some(claim.text);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        });
+        Ok(Steering {
+            server: AgentMux::new(Arc::new(store)),
+            run_id: started.run_id.to_string(),
+            driver,
+            _dir: dir,
+        })
+    }
+
+    fn params(run_id: &str, message: &str) -> Parameters<SteerParams> {
+        Parameters(SteerParams {
+            run_id: run_id.to_owned(),
+            message: message.to_owned(),
+        })
+    }
+
+    /// The tool hands the driver the caller's message exactly, returns once the delegate
+    /// accepted it, and says where it was recorded.
+    #[gtest]
+    #[tokio::test]
+    async fn the_steer_tool_delivers_the_whole_message() -> Result<()> {
+        let s = steering(Reply::Accepted)?;
+        let message = "Narrow it to «auth»,\nand leave the tests alone.";
+
+        let answered = s.server.steer(params(&s.run_id, message)).await;
+
+        assert_that!(s.driver.join().ok().flatten(), some(eq(message)));
+        let text = format!("{:?}", answered.or_fail()?.content);
+        assert_that!(text, contains_substring("### user (steer)"));
+        Ok(())
+    }
+
+    /// A refusal is the caller's to act on, so it comes back as invalid parameters with the
+    /// store's own reason, and a malformed id is refused before anything is sent.
+    #[gtest]
+    #[tokio::test]
+    async fn the_steer_tool_reports_a_refusal_as_invalid_parameters() -> Result<()> {
+        let s = steering(Reply::Rejected {
+            reason: "no active turn".to_owned(),
+        })?;
+        let server = &s.server;
+
+        let refused = server.steer(params(&s.run_id, "too late")).await;
+        let refused = refused.err().or_fail()?;
+        assert_that!(refused.code, eq(ErrorCode::INVALID_PARAMS));
+        assert_that!(
+            refused.message.as_ref(),
+            contains_substring("no active turn")
+        );
+
+        let malformed = server.steer(params("not-an-id", "x")).await;
+        assert_that!(
+            malformed.err().map(|e| e.code),
+            some(eq(ErrorCode::INVALID_PARAMS))
+        );
+        Ok(())
     }
 }

@@ -76,6 +76,11 @@ pub enum MessageSource {
     /// It differs in what it means for the reader — the delegate's later messages are still the
     /// answer — so it is kept apart rather than collapsed into [`Self::HookInjection`].
     HookContext,
+    /// Sent by the caller into a turn that was still running, through `steer`.
+    ///
+    /// A genuine user instruction, unlike a hook's, but not the question the turn opened with:
+    /// it arrived part-way through, so what the delegate said above it was said without it.
+    Steer,
     /// Written by agentmux to record something the event stream implied but did not say.
     Synthetic,
 }
@@ -119,6 +124,16 @@ impl Message {
             role: Role::User,
             text: text.into(),
             source: MessageSource::HookContext,
+        }
+    }
+
+    /// A `user` instruction the caller steered into the running turn.
+    #[must_use]
+    pub fn steer(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            text: text.into(),
+            source: MessageSource::Steer,
         }
     }
 
@@ -381,6 +396,13 @@ pub struct Turn {
     /// it renders directly under the question, ahead of anything the stream adds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsaved_session_store: Option<PathBuf>,
+    /// The pricing this turn's delegate was launched on, or `None` for a turn recorded before
+    /// agentmux kept it.
+    ///
+    /// Decided before the child is spawned, so like [`Self::unsaved_session_store`] it renders
+    /// under the question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<crate::delegate::Billing>,
 }
 
 impl Turn {
@@ -405,6 +427,7 @@ impl Turn {
             broke_continuity: false,
             recovered: None,
             unsaved_session_store: None,
+            billing: None,
         }
     }
 
@@ -598,6 +621,15 @@ fn render_question(turn: &Turn) -> String {
             describe_unsaved_session_store(store)
         );
     }
+    // Only the exception is said: a note on every subscription turn would teach a reader to skip
+    // the one that is not.
+    if turn.billing == Some(crate::delegate::Billing::Api) {
+        out.push_str(
+            "\n> [!NOTE]\n\
+             > **This turn may be billed at API prices.** Its account opts into \
+             `billing = \"api\"`, so the key, token or endpoint it names reached the delegate.\n",
+        );
+    }
     out
 }
 
@@ -637,6 +669,9 @@ pub fn render_turn(turn: &Turn) -> String {
                      > Injected text: {}\n",
                     single_line(&message.text)
                 );
+            }
+            MessageSource::Steer => {
+                let _ = write!(out, "\n### user (steer)\n\n{}\n", message.text.trim_end());
             }
             MessageSource::Synthetic => {
                 let _ = write!(out, "\n> [!NOTE]\n> {}\n", single_line(&message.text));

@@ -11,7 +11,7 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 
 | Crate                 | What it is                                                                    |
 | --------------------- | ----------------------------------------------------------------------------- |
-| `crates/agentmux`     | library: `config`, `delegate`, `stream/{claude,codex}`, `transcript`, `launch`, `quota`, `run` |
+| `crates/agentmux`     | library: `config`, `delegate`, `stream/{claude,codex}`, `transcript`, `launch`, `quota`, `run`, `appserver` |
 | `crates/agentmux-mcp` | library: the `rmcp` stdio server and its tools                                 |
 | `crates/agentmux-cli` | binary `agentmux`: `agentmux mcp` serves, the other subcommands are a unified CLI over both vendors |
 
@@ -159,6 +159,68 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `RunStatus::delegate_stderr` quotes a failed newest turn's stderr when the fold says no exit
   record settled it (`RunState::newest_settled_by_record`), so it never repeats the tail the
   record froze. It is a snapshot, so the append-only transcript is untouched.
+- **No key from the environment reaches a delegate unless a machine file opted its account in.**
+  `Billing::Subscription` is the default and needs no configuration: `delegate::scrub_billing_env`
+  runs over the child's environment when the identity is resolved and again at the spawn
+  (`ProcessLauncher::launch`, and the driver for the server it starts), so no layer — host,
+  `[launch]`, account `env`, request `env` — can bring a key; `apply_request_env` refuses a
+  billing name even when `request_env` lists it; `apply_account` refuses an account whose
+  `Account::api_credential_field` is set under a subscription, and treats an account a project
+  file chose as subscription whatever it says. `is_billing_name` is a rule, not a list — any
+  `*_API_KEY` or `*_API_KEY_FILE`, every vendor namespace's URL, `*_ISSUER` and `*_AUTH_TOKEN`
+  names (a token endpoint override would send a subscription's refresh token elsewhere), plus a
+  few named switches. The rule is about the environment only: what a CLI's own configuration
+  or login says (a provider in `~/.codex/config.toml`, a Codex API-key login, a key in Claude's
+  `settings.json`) is the user's choice for that CLI and is left alone, so no `-c` pin, login
+  check or protocol check stands in for it. A caller may pin the pricing (`StartRequest::billing`,
+  `--billing`, the MCP `billing` parameter) — `Api` only within the account's opt-in,
+  `Subscription` always — and `start` pins whatever the first turn decides in `Meta::billing`,
+  which every follow-up asks for again, so a project-selected account cannot drift onto API pricing
+  when the files change. The pricing surfaces as `RunStatus::billing`, `RunSummary::billing`,
+  `billing=api` in `render::delegate_line` and `list`, and a note under the question.
+- **An inheriting Codex turn is driven over `codex app-server` by agentmux itself, so it can be
+  steered.** The driver (`appserver::drive`) is the delegate as far as the store can tell: this
+  executable run as the hidden `agentmux codex-app-server <plan>`, launched by the same launcher
+  into the same turn directory, reading the question on stdin and writing `codex exec
+  --json`-shaped events to stdout, so `stream::codex` folds both modes and nothing downstream
+  branches on them. What each notification becomes follows codex-cli 0.159.3's own exec client
+  (`EventProcessorWithJsonOutput`), and `KNOWN_ITEM_TYPES` is exactly its `ThreadItemDetails`.
+  One driver runs one turn; a follow-up starts another that resumes the thread with
+  `thread/resume`. Reading and writing the server's pipes happen on two threads, so a server that
+  stops reading cannot stall the driver's deadlines or a cancellation; a turn the server ends
+  before answering `turn/start` is remembered, and the end is written once, after the steers in
+  flight are settled. `steer` and `cancel` reach the driver through files alone, so a restarted
+  agentmux can: the turn's mailbox (a request is claimed or withdrawn by rename, exactly one wins;
+  a claimed one is answered accepted, rejected, or unconfirmed when it was sent and never
+  answered, because codex may have taken it) and the `cancelling` marker, after which the driver
+  sends nothing new and interrupts a started turn. `RunStore::accepts_steers` is the one predicate
+  behind both `RunStatus::steerable` and `steer`'s admission; a turn whose capture does not yet
+  say `turn.started` — which the driver writes once it knows the turn and serves its mailbox,
+  from `turn/started` or the answer to `turn/start`, whichever comes first — is refused as
+  `SteerRefused::Starting`, so a steer never waits on setup. When the turn is over, `stop_server`
+  reads the server's process tree while the driver still holds its input open, then stops what
+  survives the server by pid and start time — codex's sandbox runs commands in sessions of their
+  own, which a process-group signal misses, and on Linux the driver is their subreaper, so even
+  one whose parent died first is still found (macOS records the tree once a second instead, and
+  Windows holds it in a kill-on-close job object, reading no parent pids); the store waits `appserver::STOP_BUDGET` plus a margin
+  before it signals. `Delegate::app_server_settings` is the one place that decides a delegate can
+  run this way — Codex and `Isolation::Inherit` only, because `codex app-server` has no
+  `--ignore-user-config`, and a private `CODEX_HOME` cannot stand in (the design note in
+  `appserver` says why) — and `RunStore::with_codex_app_server` opts a store in; without it every
+  Codex turn is `exec`. The mode is recorded per turn (`LaunchMode`), and a delivered steer is
+  captured as an `agentmux.steer` event that renders as `### user (steer)`.
+- **The app-server payload types are generated, never written by hand.** `appserver/schema.rs` is
+  progeny's output over `codex app-server generate-json-schema`, pruned to the roots in
+  `codegen/app-server/roots.json`, with every notification and request method of the schema
+  appended (`SERVER_NOTIFICATIONS`, `SERVER_REQUESTS`). Its inputs are pinned beside the
+  generator: `codex-version` (the codex on `PATH` must match) and `progeny-rev` (built once into
+  `~/.cache/agentmux` unless `PROGENY` names a binary). Do not edit the file, and nothing edits a
+  pin for you: move a pin deliberately, then run `task codegen:app-server`; fix what its lints flag
+  in the generator. `task codegen:app-server:check` fails when the committed file drifts; the
+  `codegen` workflow runs it when an input or the file changes. The generator also refuses a codex
+  whose app-server accepts `--ignore-user-config`, the cue to let isolated delegates be driven.
+  Only the JSON-RPC envelope in `appserver/protocol.rs` is hand-written, and a request is sent only
+  through its `Request` trait, which binds a method name to its generated params type.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 
@@ -179,6 +241,8 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `task audit`           | advisories against the dependency tree                                |
 | `task unused`          | unused dependencies (nightly)                                         |
 | `task lint:actions`    | actionlint over `.github/workflows`                                   |
+| `task codegen:app-server` | regenerate `appserver/schema.rs` from the pinned codex on `PATH` and progeny (needs `jq`) |
+| `task codegen:app-server:check` | fail when `schema.rs` is not what the pinned codex and progeny generate — CI runs it |
 
 ## Probing accounts
 
@@ -206,6 +270,19 @@ upgrading either CLI:
 ```bash
 cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
 ```
+
+A steered turn over `codex app-server` has a live test of its own in the crate that builds the
+driver, which it runs as the delegate; run it outside any sandbox, so the delegate can save its
+session:
+
+```bash
+AGENTMUX_LIVE_CODEX_ACCOUNT=personal \
+  cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
+```
+
+Otherwise the driver is tested against an in-process fake server
+(`crates/agentmux/tests/appserver.rs`) and a shell-script `codex`
+(`crates/agentmux-cli/tests/steer.rs`) that answer with payloads valid for the pinned schema.
 
 Everything else runs against `agentmux::testing::ScriptedLauncher` and the recorded streams under
 `crates/agentmux/fixtures/`, which were captured from real runs with the exact flags `delegate.rs`

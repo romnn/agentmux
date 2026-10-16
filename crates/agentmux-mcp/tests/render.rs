@@ -69,6 +69,8 @@ fn consult_with(
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -177,6 +179,8 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
 
@@ -223,7 +227,7 @@ fn a_finished_transcript_offers_the_follow_up() -> Result<()> {
 #[gtest]
 fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let env: BTreeMap<String, String> = [("PATH", "/usr/bin")]
+    let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
@@ -248,6 +252,8 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
 
@@ -387,7 +393,7 @@ fn a_model_the_vendor_expanded_is_reported_beside_the_one_requested() -> Result<
 #[gtest]
 fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -425,6 +431,8 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
             cwd: home.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
 
@@ -503,6 +511,8 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
             cwd: dir.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
 
@@ -511,6 +521,37 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
     assert_that!(
         rendered,
         contains_substring("Its CLI wrote to stderr: No conversation found")
+    );
+    Ok(())
+}
+
+/// A Codex turn whose app-server sent something agentmux could not read says how to run the
+/// consultation without the app-server protocol, and other drift does not.
+#[gtest]
+fn protocol_drift_points_at_codex_exec() -> Result<()> {
+    let undecoded = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th"}
+        {"type":"agentmux.undecoded","method":"item/completed","reason":"missing field","payload":{}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+    "#};
+    let (_store, status, _dir) = consult(undecoded)?;
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        contains_substring("`codex_exec: true`")
+    );
+
+    let other = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th"}
+        {"type":"some.future.event"}
+        {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+    "#};
+    let (_store, status, _dir) = consult(other)?;
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        all![
+            contains_substring("did not recognise"),
+            not(contains_substring("codex_exec"))
+        ]
     );
     Ok(())
 }

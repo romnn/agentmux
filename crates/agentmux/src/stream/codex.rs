@@ -9,13 +9,24 @@
 //!   *warning*, and the turn then completes normally.
 //!   Treating it as terminal would fail a consultation that in fact succeeded, so it becomes a
 //!   note in the transcript and nothing more.
-//!   Only `turn.failed` and a top-level `error` end a turn.
+//! - **Neither is a top-level `error`.**
+//!   codex-cli 0.159.3 writes one for every error its server reports, including one it is about
+//!   to retry, after which the turn goes on and may complete.
+//!   It becomes a note where it arrived; only `turn.failed` ends a turn badly.
 //! - One failure arrives as up to three events — an `item.completed` error, a top-level `error`,
 //!   and `turn.failed` — all carrying the same message.
-//!   The first terminal event ends the fold, so they fold into one outcome.
+//!   The first two are notes, and the terminal one ends the fold with the outcome.
 //! - Unknown `item.type` values are counted, not skipped.
 //!   If a future release renamed `agent_message`, a parser that filtered on the name alone would
 //!   silently drop every report.
+//!
+//! # The same stream from `codex app-server`
+//!
+//! A turn driven over `codex app-server` is written in this same shape by
+//! [`crate::appserver`], which translates the server's notifications as they arrive, so one parser
+//! serves both launch modes.
+//! The only event that path writes and `codex exec` never does is [`STEER_EVENT`]: an instruction
+//! the caller steered into the running turn, recorded at the moment the server accepted it.
 
 use serde::Deserialize;
 
@@ -23,26 +34,40 @@ use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines, probe};
 use crate::transcript::{Message, Outcome, Role, Turn, Usage};
 
-/// `item.type` values that have been observed with the exact flags [`crate::delegate`] builds.
+/// `item.type` values `codex exec --json` writes: the variants of `ThreadItemDetails` in the
+/// pinned codex-cli 0.159.3 (`codex-rs/exec/src/exec_events.rs`), which the app-server translation
+/// writes too.
 ///
-/// Only `agent_message` carries the answer.
-/// `command_execution`, `mcp_tool_call` and `web_search` are the delegate narrating its own work,
-/// and `error` is advisory.
-/// The last two were added after a real `gpt-6-astra` run at `effort=xhigh` reported them as
-/// drift, which is the counter working: a reviewing delegate searches the web and calls tools that
-/// a one-line fixture never does.
-/// The list is deliberately short: every name here is drift the counter will never report, so
-/// naming a type on a guess is a hole in the guarantee.
+/// Only `agent_message` carries the answer, and `error` is advisory.
+/// The rest are the delegate narrating its own work — commands, file edits, tool and sub-agent
+/// calls, web searches, its reasoning summary and its to-do list — kept in the capture and, like
+/// all narration, not rendered.
+/// The list is the CLI's own and nothing more: every name here is drift the counter will never
+/// report, so naming a type on a guess is a hole in the guarantee.
 /// A type that turns up later is counted, which is a loud note in `status` rather than a failure —
 /// and if a future release renames `agent_message`, that count is the only thing standing between
 /// a silently empty report and a caller who notices.
 const KNOWN_ITEM_TYPES: &[&str] = &[
     "agent_message",
+    "reasoning",
     "command_execution",
+    "file_change",
     "mcp_tool_call",
+    "collab_tool_call",
     "web_search",
+    "todo_list",
     "error",
 ];
+
+/// The event agentmux writes into a Codex capture when a steered instruction was accepted.
+///
+/// Namespaced so that no event the CLI itself emits can ever be read as one.
+pub const STEER_EVENT: &str = "agentmux.steer";
+
+#[derive(Debug, Deserialize)]
+struct SteerEvent {
+    text: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct ThreadStarted {
@@ -113,6 +138,7 @@ struct TurnFailed {
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn = Turn::new(index, question);
     let mut session = None;
+    let mut turn_started = false;
 
     for line in complete_lines(events) {
         let Some(kind) = probe(line) else {
@@ -129,7 +155,12 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     session = Some(parsed);
                 }
             }
-            "turn.started" | "item.started" | "item.updated" => {}
+            "turn.started" => turn_started = true,
+            "item.started" | "item.updated" => {}
+            STEER_EVENT => match serde_json::from_str::<SteerEvent>(line) {
+                Ok(event) => turn.messages.push(Message::steer(event.text)),
+                Err(_) => turn.unrecognised.record("agentmux.steer.<unparsable>"),
+            },
             "item.completed" => {
                 let Ok(event) = serde_json::from_str::<ItemEvent>(line) else {
                     turn.unrecognised.record("item.completed.<unparsable>");
@@ -178,19 +209,16 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 // rendered transcript can only ever grow at its end.
                 break;
             }
+            // Advisory, not terminal.
+            // See the module docs.
             "error" => {
                 let message = serde_json::from_str::<ErrorEvent>(line)
                     .ok()
                     .and_then(|event| event.message)
+                    .filter(|message| !message.trim().is_empty())
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
-                turn.outcome = Outcome::Failed {
-                    kind: classify(&message),
-                    detail: message,
-                };
-                // Terminal, like `turn.failed` below: the `turn.failed` that follows carries the
-                // same text, and reading on past a terminal event is what would let a later line
-                // land above a footer already handed out.
-                break;
+                turn.messages
+                    .push(Message::synthetic(format!("delegate error: {message}")));
             }
             "turn.failed" => {
                 let message = serde_json::from_str::<TurnFailed>(line)
@@ -208,5 +236,9 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         }
     }
 
-    Fold { turn, session }
+    Fold {
+        turn,
+        session,
+        turn_started,
+    }
 }

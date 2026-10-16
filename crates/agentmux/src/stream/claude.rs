@@ -67,6 +67,15 @@ const KNOWN_SYSTEM_SUBTYPES: &[&str] = &[
 struct SystemEvent {
     subtype: Option<String>,
     session_id: Option<String>,
+    /// Where the CLI found an API key, on `init`; `"none"` when it runs on a logged-in
+    /// subscription.
+    ///
+    /// The environment agentmux hands a subscription delegate carries no key, but the CLI has
+    /// other sources an inheriting delegate may load — a settings file's `env` table or its
+    /// `apiKeyHelper`, or a login made with a Console key — and this is the CLI's own report of
+    /// which one it used.
+    #[serde(default, rename = "apiKeySource")]
+    api_key_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +286,37 @@ fn fold_rate_limit(turn: &mut Turn, line: &str) {
     }
 }
 
+/// Fold one `system` event: the session it announces on `init`, the key it authenticated with,
+/// and a subtype the parser does not name.
+fn fold_system(line: &str, turn: &mut Turn, session: &mut Option<SessionRef>) {
+    let Ok(event) = serde_json::from_str::<SystemEvent>(line) else {
+        turn.unrecognised.record("system.<unparsable>");
+        return;
+    };
+    let subtype = event.subtype.as_deref().unwrap_or("");
+    if subtype == "init"
+        && let Some(id) = event.session_id.as_deref()
+        && let Ok(parsed) = SessionRef::parse(id)
+    {
+        *session = Some(parsed);
+    }
+    // Said in the transcript rather than refused, because by the time the stream says it the CLI
+    // has already chosen; a reader comparing it with the turn's billing note sees whether that was
+    // the account's own opt-in.
+    if subtype == "init"
+        && let Some(source) = event.api_key_source.as_deref()
+        && !source.eq_ignore_ascii_case("none")
+    {
+        turn.messages.push(Message::synthetic(format!(
+            "the delegate authenticated with an API key (apiKeySource: {source}), so this turn is \
+             charged at API prices rather than to a subscription"
+        )));
+    }
+    if !KNOWN_SYSTEM_SUBTYPES.contains(&subtype) {
+        turn.unrecognised.record(format!("system.{subtype}"));
+    }
+}
+
 /// Fold a Claude `stream-json` stream into a turn.
 #[must_use]
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
@@ -294,21 +334,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         };
 
         match kind.as_str() {
-            "system" => match serde_json::from_str::<SystemEvent>(line) {
-                Ok(event) => {
-                    let subtype = event.subtype.as_deref().unwrap_or("");
-                    if subtype == "init"
-                        && let Some(id) = event.session_id.as_deref()
-                        && let Ok(parsed) = SessionRef::parse(id)
-                    {
-                        session = Some(parsed);
-                    }
-                    if !KNOWN_SYSTEM_SUBTYPES.contains(&subtype) {
-                        turn.unrecognised.record(format!("system.{subtype}"));
-                    }
-                }
-                Err(_) => turn.unrecognised.record("system.<unparsable>"),
-            },
+            "system" => fold_system(line, &mut turn, &mut session),
             "assistant" => {
                 let Ok(event) = serde_json::from_str::<MessageEvent>(line) else {
                     turn.unrecognised.record("assistant.<unparsable>");
@@ -396,7 +422,11 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         }
     }
 
-    Fold { turn, session }
+    Fold {
+        turn,
+        session,
+        turn_started: false,
+    }
 }
 
 /// What the delegate was doing when a `user` text message arrived.

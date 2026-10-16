@@ -2,8 +2,10 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same nine verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! The same ten verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
+//! One more, `codex-app-server`, is hidden: it is the driver the run store launches for a Codex
+//! turn it runs over `codex app-server`.
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
@@ -11,7 +13,7 @@ use std::path::PathBuf;
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Isolation, Vendor};
+use agentmux::delegate::{Billing, CodexSandbox, Delegate, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -28,6 +30,22 @@ pub struct Cli {
     /// Print machine-readable JSON instead of prose.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// How a Codex turn that can be steered is launched.
+    ///
+    /// `app-server` drives a Codex consultation that inherits its account's settings over
+    /// `codex app-server`, which is what lets `steer` reach its running turn; an isolated one runs
+    /// over `codex exec` either way.
+    /// `exec` launches every Codex turn with `codex exec`, for a codex CLI whose app-server
+    /// cannot run these turns; no Codex turn can then be steered.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "AGENTMUX_CODEX_LAUNCH",
+        default_value_t = CodexLaunchArg::AppServer
+    )]
+    pub codex_launch: CodexLaunchArg,
 
     #[command(subcommand)]
     pub command: Command,
@@ -60,6 +78,13 @@ pub enum Command {
     #[command(name = "follow-up", alias = "followup")]
     FollowUp(FollowUpArgs),
 
+    /// Add an instruction to a consultation's running turn, which the delegate sees before its
+    /// next model call.
+    ///
+    /// Only a turn launched over `codex app-server` takes one; `status` says whether the running
+    /// turn is steerable.
+    Steer(SteerArgs),
+
     /// Stop a running consultation, keeping everything collected so far.
     Cancel(RunArgs),
 
@@ -78,6 +103,28 @@ pub enum Command {
 
     /// Serve the tools over stdio, for an MCP host to launch.
     Mcp(McpArgs),
+
+    /// Drive one Codex turn over `codex app-server`.
+    ///
+    /// Launched by the run store as a consultation's delegate, never by hand.
+    #[command(name = "codex-app-server", hide = true)]
+    CodexAppServer(CodexAppServerArgs),
+}
+
+/// How a Codex turn that can be steered is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CodexLaunchArg {
+    /// Over `codex app-server`, driven by this executable, so the turn can be steered.
+    AppServer,
+    /// With `codex exec`, which reads its question once.
+    Exec,
+}
+
+/// The plan a driven Codex turn runs under.
+#[derive(Debug, Args)]
+pub struct CodexAppServerArgs {
+    /// The plan the run store wrote into the turn's directory.
+    pub plan: PathBuf,
 }
 
 /// How the server is served.
@@ -146,6 +193,34 @@ pub struct DelegateArgs {
     /// Defaults to `read-only`.
     #[arg(long, value_enum)]
     pub sandbox: Option<SandboxArg>,
+
+    /// Whether the delegate's environment may carry an API key; omitted, the account decides.
+    ///
+    /// No key from the environment reaches a delegate unless `agentmux.toml` marks its account
+    /// `billing = "api"`, which `agentmux accounts` shows.
+    /// `api` is refused for any other account: it insists on the permission, it cannot grant it.
+    /// `subscription` withholds the key even from an account that allows one.
+    /// Follow-ups keep whatever the first turn was allowed.
+    #[arg(long, value_enum)]
+    pub billing: Option<BillingArg>,
+}
+
+/// Which pricing a consultation runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BillingArg {
+    /// The CLI's logged-in subscription.
+    Subscription,
+    /// Per-token API pricing, for an account `agentmux.toml` opts in.
+    Api,
+}
+
+impl From<BillingArg> for Billing {
+    fn from(billing: BillingArg) -> Self {
+        match billing {
+            BillingArg::Subscription => Self::Subscription,
+            BillingArg::Api => Self::Api,
+        }
+    }
 }
 
 /// Which CLI to consult.
@@ -452,6 +527,39 @@ impl FollowUpArgs {
         QuestionArgs {
             env: Vec::new(),
             question: self.question.clone(),
+            file: self.file.clone(),
+            cwd: None,
+            keep: false,
+        }
+        .text()
+    }
+}
+
+/// Arguments for `agentmux steer`: which consultation, and what to tell its running turn.
+#[derive(Debug, Args)]
+pub struct SteerArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// The instruction.
+    /// Omit it to read from stdin.
+    pub message: Option<String>,
+
+    /// Read the instruction from a file instead.
+    #[arg(long, short = 'f', conflicts_with = "message")]
+    pub file: Option<PathBuf>,
+}
+
+impl SteerArgs {
+    /// Read the instruction from wherever it was supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file or stdin cannot be read, or the instruction is empty.
+    pub fn text(&self) -> Result<String> {
+        QuestionArgs {
+            env: Vec::new(),
+            question: self.message.clone(),
             file: self.file.clone(),
             cwd: None,
             keep: false,

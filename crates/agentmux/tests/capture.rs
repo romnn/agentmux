@@ -185,7 +185,7 @@ fn three_codex_failure_events_fold_into_one_outcome() {
 /// Folding this into a failure would fail a consultation that in fact delivered its answer.
 #[gtest]
 fn a_codex_item_error_is_a_warning_not_a_failure() {
-    let Fold { turn, session } = stream::fold(
+    let Fold { turn, session, .. } = stream::fold(
         Vendor::Codex,
         1,
         "What was the secret word?",
@@ -232,7 +232,7 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
         (Vendor::Claude, fixtures::CLAUDE_HAPPY),
         (Vendor::Codex, fixtures::CODEX_HAPPY),
     ] {
-        let Fold { turn, session } = stream::fold(vendor, 0, "q", fixture);
+        let Fold { turn, session, .. } = stream::fold(vendor, 0, "q", fixture);
         assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
         assert_that!(
             turn.messages
@@ -457,7 +457,7 @@ fn the_final_message_falls_back_to_a_recovered_reply() {
 /// it was asked to resume.
 #[gtest]
 fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
-    let Fold { turn, session } = stream::fold(
+    let Fold { turn, session, .. } = stream::fold(
         Vendor::Claude,
         1,
         "What was the word?",
@@ -514,28 +514,69 @@ fn every_fixture_renders_monotonically_over_its_prefixes() {
     }
 }
 
-/// A top-level Codex `error` ends the fold, as every other terminal event does.
+/// A top-level Codex `error` is a note where it arrived, not the end of the turn.
 ///
-/// Reading on would let a later line land above a footer already handed out, and the
-/// `turn.failed` that follows carries the same text anyway.
+/// codex-cli 0.159.3 writes one for every error its server reports, including one it retries
+/// (`codex-rs/exec/src/event_processor_with_jsonl_output.rs`), and the turn then goes on: ending
+/// the fold there would freeze a failure over a turn that went on to answer.
 #[gtest]
-fn a_codex_top_level_error_ends_the_fold() {
-    let stream = indoc::indoc! {r#"
+fn a_codex_top_level_error_is_a_note_and_the_turn_goes_on() {
+    let retried = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion)"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the answer"}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", retried);
+
+    // The turn completed, the answer is kept, and the retry is said once, before it.
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+    let said: Vec<&str> = turn.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_that!(
+        said,
+        elements_are![
+            contains_substring("stream disconnected before completion"),
+            eq(&"the answer")
+        ]
+    );
+
+    // A turn that fails after an error ends with the failure `turn.failed` reports.
+    let failing = indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"error","message":"stream disconnected before completion"}
-        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"after the failure"}}
-        {"type":"turn.failed","error":{"message":"a different message"}}
+        {"type":"turn.failed","error":{"message":"the final word"}}
     "#};
-    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
-
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", failing);
     assert_that!(
         turn.outcome,
         matches_pattern!(Outcome::Failed {
             kind: anything(),
-            detail: eq("stream disconnected before completion"),
+            detail: eq("the final word"),
         })
     );
-    assert_that!(turn.messages, is_empty());
+}
+
+/// A sub-agent tool call, as codex-cli 0.159.3's `codex exec --json` writes it, is narration the
+/// fold recognises, while an item kind no codex release names is still counted as drift.
+///
+/// The event is copied from a real consultation's capture.
+#[gtest]
+fn a_codex_collab_tool_call_is_recognised_and_an_unknown_kind_is_still_counted() {
+    let stream = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.started","item":{"id":"item_47","type":"collab_tool_call","tool":"wait","sender_thread_id":"01a0f977-00af-7a03-8eac-0e28ec77013d","receiver_thread_ids":[],"prompt":null,"agents_states":{},"status":"in_progress"}}
+        {"type":"item.completed","item":{"id":"item_47","type":"collab_tool_call","tool":"wait","sender_thread_id":"01a0f977-00af-7a03-8eac-0e28ec77013d","receiver_thread_ids":[],"prompt":null,"agents_states":{},"status":"completed"}}
+        {"type":"item.completed","item":{"id":"item_48","type":"telepathy","status":"completed"}}
+        {"type":"item.completed","item":{"id":"item_49","type":"agent_message","text":"done"}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
+
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(
+        turn.unrecognised.summary(),
+        some(eq("item.completed.telepathy x1"))
+    );
 }
 
 /// A text block whose payload field was renamed is counted, not read as an empty message.
@@ -644,7 +685,7 @@ fn a_resume_whose_session_is_gone_still_names_the_session() {
         {"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"9f1c21f8-1b3d-4a7e-9a0c-2d6f4b8e5c10","total_cost_usd":0}
     "#};
 
-    let Fold { turn, session } = stream::fold(Vendor::Claude, 1, "q", stream);
+    let Fold { turn, session, .. } = stream::fold(Vendor::Claude, 1, "q", stream);
 
     assert_that!(
         session.map(|s| s.as_str().to_owned()),
@@ -706,4 +747,36 @@ fn task_lifecycle_and_progress_events_are_named_and_silent() {
             .collect::<Vec<_>>(),
         elements_are![eq("ANSWER")]
     );
+}
+
+/// A Claude delegate that authenticated with an API key says so in its own transcript.
+///
+/// agentmux hands a subscription delegate no key, but the CLI has sources of its own — a
+/// settings file an inheriting delegate loads, or a login made with a Console key — and its `init`
+/// event is its own report of which one it used.
+/// A logged-in subscription reports `none`, and says nothing.
+#[gtest]
+fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
+    let keyed = indoc::indoc! {r#"
+        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814","apiKeySource":"ANTHROPIC_API_KEY"}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", keyed);
+    assert_that!(
+        turn.messages.iter().map(|m| m.source).collect::<Vec<_>>(),
+        elements_are![eq(&MessageSource::Synthetic)]
+    );
+    assert_that!(
+        agentmux::transcript::render_turn(&turn),
+        contains_substring("apiKeySource: ANTHROPIC_API_KEY")
+    );
+
+    // Every committed fixture ran on a subscription, and none of them carries the note.
+    for (vendor, name, fixture) in fixtures::all() {
+        let Fold { turn, .. } = stream::fold(vendor, 0, "q", fixture);
+        assert_that!(
+            agentmux::transcript::render_turn(&turn),
+            not(contains_substring("apiKeySource")),
+            "{name}"
+        );
+    }
 }

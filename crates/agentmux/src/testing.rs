@@ -99,6 +99,28 @@ impl Script {
     }
 }
 
+/// Write a configuration file that only its owner can write, whatever the umask.
+///
+/// `Config::load` refuses a file other users could write, and a shell with `umask 002` would
+/// otherwise make every file a test writes one of those.
+///
+/// # Errors
+///
+/// Whatever writing the file or setting its permissions fails with.
+pub fn write_config_file(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// What a scripted launcher was actually asked to run.
 #[derive(Debug, Clone)]
 pub struct RecordedLaunch {
@@ -159,6 +181,17 @@ impl ScriptedLauncher {
     #[must_use]
     pub fn launches(&self) -> Vec<RecordedLaunch> {
         lock(&self.launches).clone()
+    }
+
+    /// The handle a scripted launcher returns for its `index`th launch, counting from zero, so a
+    /// test can stop that child as a real one would stop.
+    #[must_use]
+    pub fn launched(index: usize) -> Launched {
+        Launched {
+            pid: FAKE_PID_BASE.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)),
+            process_group: None,
+            started: None,
+        }
     }
 
     /// The pids the launcher was asked to terminate.
@@ -224,7 +257,7 @@ impl Launcher for ScriptedLauncher {
         })?;
 
         launches.push(RecordedLaunch {
-            program: spec.invocation.program.to_owned(),
+            program: spec.invocation.program.clone(),
             args: spec.invocation.args.clone(),
             env: spec.invocation.env.clone(),
             cwd: spec.cwd.to_owned(),

@@ -44,6 +44,8 @@ async fn consult(
             cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             retention: Retention::UntilReleased,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
     store

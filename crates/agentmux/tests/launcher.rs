@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::Invocation;
+use agentmux::delegate::{Billing, Invocation};
 use agentmux::launch::{LaunchSpec, Launched, Launcher, Liveness, ProcessLauncher};
 use googletest::prelude::*;
 
@@ -30,14 +30,25 @@ impl Fixture {
 
     /// Run `script` under `sh -c`, the way agentmux runs a delegate: detached, capture to files.
     fn launch(&self, script: &str) -> Result<Launched> {
-        let question = self.dir.path().join("question.md");
-        std::fs::write(&question, "q").or_fail()?;
         let env: BTreeMap<String, String> =
             std::env::vars().filter(|(key, _)| key == "PATH").collect();
+        self.launch_with(script, env, Billing::Subscription)
+    }
+
+    /// Run `script` with exactly `env` and on `billing`, capturing to files.
+    fn launch_with(
+        &self,
+        script: &str,
+        env: BTreeMap<String, String>,
+        billing: Billing,
+    ) -> Result<Launched> {
+        let question = self.dir.path().join("question.md");
+        std::fs::write(&question, "q").or_fail()?;
         let invocation = Invocation {
-            program: "sh",
+            program: "sh".to_owned(),
             args: vec!["-c".to_owned(), script.to_owned()],
             env,
+            billing,
         };
         self.launcher
             .launch(&LaunchSpec {
@@ -169,9 +180,10 @@ fn a_missing_working_directory_is_named() -> Result<()> {
     let question = f.dir.path().join("question.md");
     std::fs::write(&question, "q").or_fail()?;
     let invocation = Invocation {
-        program: "sh",
+        program: "sh".to_owned(),
         args: vec![],
         env: BTreeMap::new(),
+        billing: Billing::Subscription,
     };
     let error = f
         .launcher
@@ -214,5 +226,68 @@ fn a_finished_child_is_collected_when_the_next_is_launched() -> Result<()> {
 
     f.launcher.kill(second);
     assert_that!(f.gone_within(second, Duration::from_secs(5)), eq(true));
+    Ok(())
+}
+
+/// The spawn itself withholds every key from a subscription child, whatever reached the
+/// invocation.
+///
+/// The invocation here is built by hand with the keys in it, which no path through
+/// `Delegate::invocation` produces: this is the last line of the guarantee, so it is tested as if
+/// every layer before it had failed.
+/// The child is a fake delegate that prints its own environment into the capture.
+#[gtest]
+fn a_subscription_child_never_receives_a_key() -> Result<()> {
+    let f = Fixture::new()?;
+    let keys = [
+        ("ANTHROPIC_API_KEY", "sk-ant-leak"),
+        ("ANTHROPIC_AUTH_TOKEN", "tok-leak"),
+        ("ANTHROPIC_BASE_URL", "https://gateway.example"),
+        ("CLAUDE_CODE_USE_BEDROCK", "bedrock-switch-leak"),
+        ("OPENAI_API_KEY", "sk-openai-leak"),
+        ("OPENAI_BASE_URL", "https://proxy.example/v1"),
+        ("CODEX_API_KEY", "sk-codex-leak"),
+        ("AZURE_OPENAI_API_KEY", "az-leak"),
+    ];
+    let mut env: BTreeMap<String, String> =
+        std::env::vars().filter(|(key, _)| key == "PATH").collect();
+    env.extend(keys.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+    env.insert("CODEX_HOME".to_owned(), "/home/dev/.codex".to_owned());
+
+    let launched = f.launch_with("env", env, Billing::Subscription)?;
+    assert_that!(f.gone_within(launched, Duration::from_secs(10)), eq(true));
+    let printed = std::fs::read_to_string(f.dir.path().join("events.jsonl")).or_fail()?;
+
+    // Not one key, token, endpoint or provider switch reached the child.
+    for (name, value) in keys {
+        assert_that!(
+            printed,
+            not(contains_substring(name)),
+            "{name} reached the child"
+        );
+        assert_that!(
+            printed,
+            not(contains_substring(value)),
+            "{name}'s value reached the child"
+        );
+    }
+    // What selects the login is not a key, and still arrives.
+    assert_that!(printed, contains_substring("CODEX_HOME=/home/dev/.codex"));
+    Ok(())
+}
+
+/// A child an account opted into API pricing keeps the keys its invocation carries.
+#[gtest]
+fn an_api_child_keeps_its_key() -> Result<()> {
+    let f = Fixture::new()?;
+    let mut env: BTreeMap<String, String> =
+        std::env::vars().filter(|(key, _)| key == "PATH").collect();
+    env.insert("OPENAI_API_KEY".to_owned(), "sk-opted-in".to_owned());
+
+    let launched = f.launch_with("env", env, Billing::Api)?;
+    assert_that!(f.gone_within(launched, Duration::from_secs(10)), eq(true));
+    let printed = std::fs::read_to_string(f.dir.path().join("events.jsonl")).or_fail()?;
+
+    assert_that!(printed, contains_substring("OPENAI_API_KEY=sk-opted-in"));
     Ok(())
 }

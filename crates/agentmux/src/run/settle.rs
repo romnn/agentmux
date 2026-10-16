@@ -30,8 +30,8 @@
 use std::time::SystemTime;
 
 use super::{
-    ExitRecord, InvocationRecord, Meta, RunError, RunState, RunStore, TurnDir, TurnFiles,
-    read_complete_records, read_json, tail_of_file, write_json, write_json_once,
+    ExitRecord, InvocationRecord, LaunchMode, Meta, RunError, RunState, RunStore, TurnDir,
+    TurnFiles, read_complete_records, read_json, tail_of_file, write_json, write_json_once,
 };
 use crate::delegate::{SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
@@ -55,6 +55,10 @@ pub(super) struct FoldedTurn {
     /// that would quote stderr again asks this rather than the disk, which may have gained a
     /// record since the fold.
     pub(super) settled_by_record: bool,
+    /// How the turn's delegate was launched.
+    pub(super) mode: LaunchMode,
+    /// Whether the turn's capture says the turn itself began.
+    pub(super) turn_started: bool,
 }
 
 /// What one observation of a child that had gone established.
@@ -240,6 +244,8 @@ impl RunStore {
         let mut session = None;
         let mut newest_turn_index = 0;
         let mut newest_settled_by_record = false;
+        let mut newest_mode = LaunchMode::Exec;
+        let mut newest_turn_started = false;
         let mut last_activity: Option<SystemTime> = None;
 
         let turns = self.turn_files(&meta.run_id)?;
@@ -248,6 +254,8 @@ impl RunStore {
             let folded = self.fold_turn(meta, &files, Some(files.index) == newest_index)?;
             newest_turn_index = files.index;
             newest_settled_by_record = folded.settled_by_record;
+            newest_mode = folded.mode;
+            newest_turn_started = folded.turn_started;
             if folded.session.is_some() {
                 session = folded.session;
             }
@@ -262,6 +270,8 @@ impl RunStore {
             session,
             newest_turn_index,
             newest_settled_by_record,
+            newest_mode,
+            newest_turn_started,
             last_activity,
         })
     }
@@ -359,6 +369,7 @@ impl RunStore {
         let Fold {
             mut turn,
             session: turn_session,
+            turn_started,
         } = fold;
         let settled_by_record = record.is_some();
         if let Some(record) = &record {
@@ -368,10 +379,18 @@ impl RunStore {
         // What the launch recorded before the spawn: which session it asked to resume, and
         // whether the child was ever going to be able to save its own.
         let invocation = read_json::<InvocationRecord>(&dir.invocation())?;
-        let (asked_for, unsaved_session_store) = invocation
-            .map(|record| (record.resumed_from, record.unsaved_session_store))
+        let (asked_for, unsaved_session_store, mode, billing) = invocation
+            .map(|record| {
+                (
+                    record.resumed_from,
+                    record.unsaved_session_store,
+                    record.mode,
+                    record.billing,
+                )
+            })
             .unwrap_or_default();
         turn.unsaved_session_store = unsaved_session_store;
+        turn.billing = billing;
         note_continuity(asked_for.as_ref(), turn_session.as_ref(), &mut turn);
 
         // Codex says nothing about usage on the stream agentmux captures, but records it in the
@@ -395,6 +414,8 @@ impl RunStore {
             session: turn_session,
             last_activity: last_write(dir),
             settled_by_record,
+            mode,
+            turn_started,
         })
     }
 

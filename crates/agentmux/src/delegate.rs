@@ -101,6 +101,40 @@ pub enum DelegateError {
         /// The directory that is missing.
         path: std::path::PathBuf,
     },
+
+    /// An account supplies a key, a token or an endpoint, and the consultation runs on a
+    /// subscription.
+    ///
+    /// Refused rather than stripped: dropping the field silently would run the delegate as the
+    /// CLI's own login, which is a different identity from the one the account names.
+    #[error(
+        "the {vendor} account `{alias}` sets `{field}`, which would run the delegate on API \
+         pricing or against another endpoint, but this consultation runs on a subscription: \
+         {why}. Name an account that authenticates with a logged-in subscription, or, if API \
+         pricing is meant, mark this account `billing = \"api\"` in the machine's \
+         agentmux.toml."
+    )]
+    ApiBillingNotAllowed {
+        /// Which CLI the account belongs to.
+        vendor: Vendor,
+        /// The alias that was asked for.
+        alias: String,
+        /// The account field that names the credential or endpoint.
+        field: &'static str,
+        /// Why the consultation runs on a subscription.
+        why: &'static str,
+    },
+
+    /// The caller asked for API pricing, which only an account the machine opted in may give.
+    #[error(
+        "this consultation asked for API pricing, but {why}. Leave `billing` unset to run on the \
+         subscription, or name an account the machine's agentmux.toml marks \
+         `billing = \"api\"`."
+    )]
+    ApiBillingNotOptedIn {
+        /// Which account, or the absence of one, stands in the way.
+        why: String,
+    },
 }
 
 /// How an account reads in a one-line summary.
@@ -418,6 +452,43 @@ impl CodexSandbox {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
         }
+    }
+}
+
+/// Whether a delegate's environment may carry billing credentials and endpoint overrides.
+///
+/// `Subscription` is the default and is what every launch gets unless the account it runs as opts
+/// out in the machine's configuration.
+/// Under it, every variable that makes a CLI bill per token or talk to another endpoint is removed
+/// from the child's environment, a request may not set one, and an account that names a key, a
+/// token or an endpoint is refused.
+/// `Api` lifts exactly those restrictions, for an account the operator marked `billing = "api"`.
+/// Neither says what the CLI's own configuration or login then does: that is the user's own
+/// setup, and agentmux leaves it alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    /// The vendor's subscription, through the CLI's logged-in profile.
+    #[default]
+    Subscription,
+    /// Per-token pricing, or an endpoint other than the vendor's own.
+    Api,
+}
+
+impl Billing {
+    /// The name used in configuration and in every report.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Api => "api",
+        }
+    }
+}
+
+impl std::fmt::Display for Billing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -746,6 +817,11 @@ pub struct TurnPlan<'a> {
     /// arriving from a delegating agent must not be able to decide which identity pays, which
     /// program runs, or what that program loads before it reads a single setting.
     pub extra_env: &'a BTreeMap<String, String>,
+    /// The pricing this consultation is pinned to, or `None` to let the account decide.
+    ///
+    /// [`Billing::Api`] is honoured only for an account the machine's configuration opts in;
+    /// [`Billing::Subscription`] always is.
+    pub billing: Option<Billing>,
 }
 
 /// The delegate CLI's own handle on a conversation, so a later turn can continue it.
@@ -793,12 +869,17 @@ impl std::fmt::Display for SessionRef {
 /// forgotten at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
-    /// Executable name, resolved against the child's `PATH`.
-    pub program: &'static str,
+    /// Executable name, resolved against the child's `PATH`, or a path to it.
+    pub program: String,
     /// The complete argument vector, excluding `argv[0]`.
     pub args: Vec<String>,
     /// The child's entire environment, built as an allowlist from empty.
     pub env: BTreeMap<String, String>,
+    /// The pricing the child may run on.
+    ///
+    /// Under [`Billing::Subscription`] the launcher scrubs the environment once more at the
+    /// spawn itself, so no layer added between here and there can reintroduce a key.
+    pub billing: Billing,
 }
 
 /// Environment variables every delegate needs regardless of vendor.
@@ -865,8 +946,10 @@ pub const DELEGATE_MARKER: &str = "AGENTMUX_DELEGATE";
 
 /// Credential variables the Claude CLI reads.
 ///
-/// Forwarded when no account is named, withheld when one is, so the account authenticates as
-/// itself rather than as whatever key is exported.
+/// Withheld when an account is named, so the account authenticates as itself rather than as
+/// whatever key is exported.
+/// With no account named they are not forwarded either, because every one of them is a
+/// [billing name](is_billing_name) and a delegate without an account runs on its subscription.
 ///
 /// `CLAUDE_CONFIG_DIR` is deliberately not among them, although it is where a login lives.
 /// The process that launches agentmux is usually a Claude Code session, and that variable is how
@@ -884,6 +967,72 @@ const CLAUDE_CREDENTIAL_ALLOWLIST: &[&str] = &[
 
 /// Credential variables the Codex CLI reads, including where its login is kept.
 const CODEX_CREDENTIAL_ALLOWLIST: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"];
+
+/// Variables that make a delegate CLI bill per token or talk to an endpoint other than its
+/// vendor's subscription, beyond what the suffix rules in [`is_billing_name`] already catch.
+///
+/// Each is either a credential the CLI prefers over its logged-in profile, a switch onto a cloud
+/// provider's metered API, or a header or endpoint override that can carry a key of its own.
+const BILLING_NAMES: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CODEX_ACCESS_TOKEN",
+];
+
+/// Namespaces whose endpoint and token names reroute a delegate or authenticate it.
+const BILLING_PREFIXES: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "OPENAI_",
+    "AZURE_OPENAI_",
+    "CODEX_",
+];
+
+/// Whether an environment name can put a delegate on API pricing or another endpoint.
+///
+/// Matched without regard to case, so a spelling a platform would read as the same variable
+/// cannot slip through.
+/// The rule is deliberately wider than either CLI's documented list: any `*_API_KEY` or
+/// `*_API_KEY_FILE` name counts, because Codex reads a model provider's key from whatever name
+/// its configuration gives it.
+/// In every vendor namespace, any name with a `URL` segment counts, and so do `*_ISSUER` and
+/// `*_AUTH_TOKEN`: an endpoint override decides where a login's own tokens are sent, which is how
+/// `CODEX_REFRESH_TOKEN_URL_OVERRIDE` would hand a subscription's refresh token to another host.
+/// A subscription token such as `CLAUDE_CODE_OAUTH_TOKEN` is not among them.
+#[must_use]
+pub fn is_billing_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let in_vendor_namespace = BILLING_PREFIXES
+        .iter()
+        .any(|prefix| upper.starts_with(prefix));
+    BILLING_NAMES.contains(&upper.as_str())
+        || upper.ends_with("_API_KEY")
+        || upper.ends_with("_API_KEY_FILE")
+        || (in_vendor_namespace
+            && (upper.split('_').any(|segment| segment == "URL")
+                || upper.ends_with("_ISSUER")
+                || upper.ends_with("_AUTH_TOKEN")))
+}
+
+/// Remove every variable [`is_billing_name`] matches, and return the names removed.
+///
+/// The one scrub every spawn site applies to a child that runs under [`Billing::Subscription`]:
+/// the delegate launcher, the Codex app-server driver, and both quota probes.
+pub fn scrub_billing_env(env: &mut BTreeMap<String, String>) -> Vec<String> {
+    let removed: Vec<String> = env
+        .keys()
+        .filter(|name| is_billing_name(name))
+        .cloned()
+        .collect();
+    for name in &removed {
+        env.remove(name);
+    }
+    removed
+}
 
 /// The empty MCP configuration handed to the Claude delegate.
 ///
@@ -913,10 +1062,11 @@ impl Delegate {
     ///
     /// Returns [`DelegateError::UnknownAccount`] for an alias the configuration does not define,
     /// [`DelegateError::AccountDirMissing`] for one whose directory is not there,
-    /// [`DelegateError::Environment`] for an account that is empty, reads a secret from a host
-    /// variable that is not set, or is otherwise unusable, and [`DelegateError::Argument`] or
-    /// [`DelegateError::Environment`] for a request environment entry the configuration does not
-    /// allow.
+    /// [`DelegateError::ApiBillingNotAllowed`] for one that names a key, a token or an endpoint
+    /// without opting into API pricing, [`DelegateError::Environment`] for an account
+    /// that is empty, reads a secret from a host variable that is not set, or is otherwise
+    /// unusable, and [`DelegateError::Argument`] or [`DelegateError::Environment`] for a request
+    /// environment entry the configuration does not allow.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
@@ -927,7 +1077,14 @@ impl Delegate {
             mut env,
             account,
             chosen_by_project,
-        } = resolve_identity(self.vendor(), self.account(), config, host_env)?;
+            billing,
+        } = resolve_identity(
+            self.vendor(),
+            self.account(),
+            config,
+            host_env,
+            plan.billing,
+        )?;
         let isolation = self.resolved_isolation(config);
 
         let args = match self {
@@ -959,7 +1116,7 @@ impl Delegate {
             )
             .map(String::as_str)
             .collect();
-        apply_request_env(&mut env, plan.extra_env, &allowed)?;
+        apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
 
         // The recursion guard, set last so no layer can change even its value.
         // An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
@@ -970,11 +1127,62 @@ impl Delegate {
         env.insert(DELEGATE_MARKER.to_owned(), "1".to_owned());
 
         Ok(Invocation {
-            program: self.vendor().program(),
+            program: self.vendor().program().to_owned(),
             args,
             env,
+            billing,
         })
     }
+
+    /// How this delegate's turns run over `codex app-server`, or `None` when they cannot.
+    ///
+    /// Only a Codex delegate that inherits its account's settings qualifies.
+    /// The isolation every other consultation gets rests on `codex exec --ignore-user-config`,
+    /// and `codex app-server` has no equivalent: codex-cli 0.159.3 refuses that flag there, its
+    /// protocol schema has no field that skips `$CODEX_HOME/config.toml`, and a `-c` override
+    /// merges into the user's tables rather than replacing them, as `codex_args` records.
+    /// An isolated delegate therefore always runs over `exec`, where it cannot be steered; why a
+    /// private `CODEX_HOME` is no way round that is in [`crate::appserver`].
+    /// `codegen/app-server/generate.sh` refuses the first codex whose app-server takes the flag,
+    /// which is when to pass it here and let isolated delegates through.
+    #[must_use]
+    pub fn app_server_settings(&self, config: &Config) -> Option<AppServerSettings> {
+        let Self::Codex {
+            model,
+            effort,
+            sandbox,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !self.resolved_isolation(config).inherits() {
+            return None;
+        }
+        Some(AppServerSettings {
+            program: Vendor::Codex.program().to_owned(),
+            args: codex_app_server_args(effort.as_ref()),
+            model: model.clone(),
+            sandbox: *sandbox,
+        })
+    }
+}
+
+/// What a Codex turn driven over `codex app-server` is started with.
+///
+/// The counterpart of the argument vector `codex_args` builds for `codex exec`, with the same
+/// model, effort and sandbox; the rest of the plan — the working directory, the session to
+/// resume, where the turn's files live — belongs to the run store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppServerSettings {
+    /// The executable, resolved against the child's `PATH`.
+    pub program: String,
+    /// The arguments that start the server, effort included.
+    pub args: Vec<String>,
+    /// The model the thread runs, pinned on every turn as `exec` pins it.
+    pub model: ModelId,
+    /// How much the delegate may write.
+    pub sandbox: CodexSandbox,
 }
 
 impl Delegate {
@@ -994,7 +1202,26 @@ impl Delegate {
         host_env: &BTreeMap<String, String>,
         config: &Config,
     ) -> Result<BTreeMap<String, String>, DelegateError> {
-        Ok(resolve_identity(self.vendor(), self.account(), config, host_env)?.env)
+        Ok(resolve_identity(self.vendor(), self.account(), config, host_env, None)?.env)
+    }
+
+    /// The pricing this delegate runs on when a consultation asks for `requested`.
+    ///
+    /// Decided once, when a consultation starts, and pinned for its follow-ups, so a later turn
+    /// cannot run on a pricing the first one was refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns the account errors documented on [`Delegate::invocation`], and
+    /// [`DelegateError::ApiBillingNotOptedIn`] when `requested` is [`Billing::Api`] and no
+    /// account the machine opted in is in play.
+    pub fn billing(
+        &self,
+        requested: Option<Billing>,
+        host_env: &BTreeMap<String, String>,
+        config: &Config,
+    ) -> Result<Billing, DelegateError> {
+        Ok(resolve_identity(self.vendor(), self.account(), config, host_env, requested)?.billing)
     }
 }
 
@@ -1006,6 +1233,8 @@ pub(crate) struct Identity<'c> {
     pub(crate) account: Option<&'c Account>,
     /// Whether that account was the checkout's choice rather than the machine's or the caller's.
     pub(crate) chosen_by_project: bool,
+    /// The pricing the delegate may run on.
+    pub(crate) billing: Billing,
 }
 
 /// Resolve the identity a delegate of one vendor runs as, with or without a named account.
@@ -1018,6 +1247,7 @@ pub(crate) fn resolve_identity<'c>(
     alias: Option<&AccountAlias>,
     config: &'c Config,
     host_env: &BTreeMap<String, String>,
+    requested: Option<Billing>,
 ) -> Result<Identity<'c>, DelegateError> {
     let mut env = base_env(host_env);
     // The machine-wide layer, before any account chooses an identity.
@@ -1035,11 +1265,33 @@ pub(crate) fn resolve_identity<'c>(
             }) if alias == selection.alias.as_str()
         )
     });
-    let account = apply_account(&mut env, vendor, selection, config, host_env)?;
+    let (account, billing) = apply_account(
+        &mut env,
+        vendor,
+        selection,
+        config,
+        host_env,
+        chosen_by_project,
+        requested,
+    )?;
+    // Whatever the machine's or the account's launch layer forwarded or set, a subscription
+    // delegate carries no key and no endpoint override.
+    if billing == Billing::Subscription {
+        let removed = scrub_billing_env(&mut env);
+        if !removed.is_empty() {
+            tracing::warn!(
+                %vendor,
+                ?removed,
+                "withholding variables that would bill per token; the account does not opt into \
+                 `billing = \"api\"`",
+            );
+        }
+    }
     Ok(Identity {
         env,
         account,
         chosen_by_project,
+        billing,
     })
 }
 
@@ -1073,7 +1325,8 @@ pub(crate) fn base_env(host_env: &BTreeMap<String, String>) -> BTreeMap<String, 
 
 /// The environment variables a vendor reads for its identity, in the order they are documented.
 ///
-/// Forwarded from the host only when no account alias was chosen.
+/// Forwarded from the host only when no account alias was chosen, and then only those that are
+/// not [billing names](is_billing_name).
 /// Choosing an alias means "authenticate as this identity", and a key exported in the launching
 /// agent's own shell would otherwise win over it silently — the caller would believe it had
 /// switched accounts while spending the other one.
@@ -1167,23 +1420,36 @@ fn select_alias(
 
 /// Put one account's credentials into the child environment.
 ///
-/// With no alias the host's own credential variables are forwarded and the CLI uses its default
-/// configuration, which is what a machine with a single account of that vendor needs.
-/// Returns the account that was applied, when one was.
+/// With no alias the CLI uses its default configuration, which is what a machine with a single
+/// account of that vendor needs; only the host's pointer to a relocated Codex login is
+/// forwarded, because no account has opted into API pricing and a key would outrank that login.
+/// Returns the account that was applied, when one was, and the pricing the delegate runs on.
 fn apply_account<'c>(
     env: &mut BTreeMap<String, String>,
     vendor: Vendor,
     selection: Option<Selection>,
     config: &'c Config,
     host_env: &BTreeMap<String, String>,
-) -> Result<Option<&'c Account>, DelegateError> {
+    chosen_by_project: bool,
+    requested: Option<Billing>,
+) -> Result<(Option<&'c Account>, Billing), DelegateError> {
     let Some(Selection { alias, chooser }) = selection else {
+        if requested == Some(Billing::Api) {
+            return Err(DelegateError::ApiBillingNotOptedIn {
+                why: format!(
+                    "no {vendor} account is named, and only an account can opt into API pricing"
+                ),
+            });
+        }
         for key in credential_keys(vendor) {
+            if is_billing_name(key) {
+                continue;
+            }
             if let Some(value) = host_env.get(*key) {
                 env.insert((*key).to_owned(), value.clone());
             }
         }
-        return Ok(None);
+        return Ok((None, Billing::Subscription));
     };
     // Withholding is the other half of the forwarding above, not an absence.
     // The machine's `[launch]` layer runs before this and may forward the host's own key; left
@@ -1217,9 +1483,51 @@ fn apply_account<'c>(
         )));
     }
 
+    // The opt-in is the machine file's, for this account, and a checkout that selected the
+    // account does not carry it along: a file that arrives with a clone may say which account
+    // pays, never that it pays per token.
+    // A caller may ask for less than the account allows, never for more.
+    let opted_in = account.billing == Some(Billing::Api);
+    let billing = match (requested, opted_in && !chosen_by_project) {
+        (Some(Billing::Api) | None, true) => Billing::Api,
+        (Some(Billing::Api), false) => {
+            return Err(DelegateError::ApiBillingNotOptedIn {
+                why: if opted_in {
+                    format!(
+                        "the {vendor} account `{alias}` was selected by a checkout's \
+                         agentmux.toml, which never runs on API pricing"
+                    )
+                } else {
+                    format!(
+                        "the {vendor} account `{alias}` does not set `billing = \"api\"` in the \
+                         machine's agentmux.toml"
+                    )
+                },
+            });
+        }
+        (Some(Billing::Subscription), _) | (None, false) => Billing::Subscription,
+    };
+    if billing == Billing::Subscription
+        && let Some(field) = account.api_credential_field()
+    {
+        return Err(DelegateError::ApiBillingNotAllowed {
+            vendor,
+            alias: alias.to_string(),
+            field,
+            why: if requested == Some(Billing::Subscription) && opted_in {
+                "the consultation asked for subscription pricing"
+            } else if opted_in {
+                "a checkout's agentmux.toml selected the account, and that never runs on API \
+                 pricing"
+            } else {
+                "the account does not set `billing = \"api\"` in the machine's agentmux.toml"
+            },
+        });
+    }
+
     apply_credentials(env, vendor, &alias, account, host_env)?;
     account.launch.apply(env, host_env);
-    Ok(Some(account))
+    Ok((Some(account), billing))
 }
 
 /// Map one account's fields onto the variables its CLI reads.
@@ -1296,10 +1604,15 @@ fn apply_credentials(
 /// setting.
 /// No list of names to refuse stays complete against that, so the operator lists the names to
 /// accept instead, in a file no request can reach.
+///
+/// Under [`Billing::Subscription`] a name that would bill per token is refused whatever the
+/// allowlist says, so the machine file's account-level opt-in stays the only way onto API
+/// pricing.
 fn apply_request_env(
     env: &mut BTreeMap<String, String>,
     requested: &BTreeMap<String, String>,
     allowed: &[&str],
+    billing: Billing,
 ) -> Result<(), DelegateError> {
     for (name, value) in requested {
         crate::config::check_env_name(name).map_err(|reason| DelegateError::Argument {
@@ -1313,6 +1626,13 @@ fn apply_request_env(
                 reason: "has a value containing a NUL byte, which no environment can carry",
                 value: name.clone(),
             });
+        }
+        if billing == Billing::Subscription && is_billing_name(name) {
+            return Err(DelegateError::Environment(format!(
+                "`{name}` cannot be set per request: it would run the delegate on API pricing or \
+                 against another endpoint, which agentmux does only for an account the machine's \
+                 agentmux.toml marks `billing = \"api\"`."
+            )));
         }
         // Spelled the way the platform reads it, like every name in the allowlist, so `path`
         // cannot slip past an allowlist that says `PATH` is not on it where the two are one
@@ -1481,5 +1801,21 @@ fn codex_args(
     // Without it Codex still drains stdin looking for extra input and a child whose stdin never
     // closes blocks.
     args.push("-".to_owned());
+    args
+}
+
+/// Argument vector that starts `codex app-server` for one turn.
+///
+/// Only the effort travels as an argument, exactly as `exec` passes it, so it applies to every
+/// request the server handles; the model, the sandbox and the approval policy are fields of the
+/// `thread/start` or `thread/resume` request instead.
+/// There is no isolation flag to pass: see [`Delegate::app_server_settings`] for why only an
+/// inheriting delegate runs this way.
+fn codex_app_server_args(effort: Option<&Effort>) -> Vec<String> {
+    let mut args = vec!["app-server".to_owned()];
+    if let Some(effort) = effort {
+        args.push("--config".to_owned());
+        args.push(format!("model_reasoning_effort=\"{effort}\""));
+    }
     args
 }

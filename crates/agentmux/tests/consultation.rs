@@ -63,6 +63,8 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         cwd: PathBuf::from("/work/project"),
         retention: Retention::Ttl,
         env: BTreeMap::new(),
+        billing: None,
+        codex_exec: false,
     }
 }
 
@@ -1056,7 +1058,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
     let account_dir = home.path().join(".claude-personal");
     std::fs::create_dir_all(&account_dir).or_fail()?;
     let write_config = |inherit: bool| -> Result<()> {
-        std::fs::write(
+        agentmux::testing::write_config_file(
             &config_path,
             indoc::formatdoc! {r#"
                 [defaults.claude]
@@ -1109,6 +1111,8 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
             cwd: home.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
 
@@ -1239,11 +1243,11 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/client");
     std::fs::create_dir_all(&repo)?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [accounts.claude.debug]
-            api_key_env = "DEBUG_KEY"
+            description = "debugging"
             request_env = ["NODE_OPTIONS"]
         "#},
     )?;
@@ -1273,6 +1277,8 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
             env: [("NODE_OPTIONS".to_owned(), "--require /tmp/x.js".to_owned())]
                 .into_iter()
                 .collect(),
+            billing: None,
+            codex_exec: false,
         })
     };
 
@@ -1283,7 +1289,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
     );
 
     // Selected by the checkout: refused, and refused just the same when named outright.
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         "[defaults.claude]\naccount = \"debug\"\n",
     )?;
@@ -1405,7 +1411,7 @@ async fn a_consultation_whose_child_still_lives_is_not_removed() -> Result<()> {
 fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     let config = home.path().join("agentmux.toml");
-    std::fs::write(
+    agentmux::testing::write_config_file(
         &config,
         indoc::indoc! {r#"
             [models.codex]
@@ -1437,6 +1443,8 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
         cwd: home.path().to_path_buf(),
         retention: Retention::Ttl,
         env: BTreeMap::new(),
+        billing: None,
+        codex_exec: false,
     })?;
 
     let launch = launcher.launches().into_iter().next().or_fail()?;
@@ -1477,7 +1485,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
 #[gtest]
 fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.codex]
@@ -1515,6 +1523,8 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
             cwd: home.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
     };
     let reasoning = |effort: &str| format!("model_reasoning_effort=\"{effort}\"");

@@ -123,6 +123,9 @@ nix = "0.31.3"
 # own. A delegate outlives the agentmux that started it, so a pid on disk needs a start time
 # beside it before it can be trusted not to have been recycled.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# A kill-on-close job object holds everything a driven Codex turn starts on Windows, where a
+# process's recorded parent cannot be trusted once that parent has exited.
+win32job = "2.0.3"
 
 # testing
 googletest = "0"

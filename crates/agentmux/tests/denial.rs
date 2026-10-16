@@ -50,6 +50,8 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         cwd: PathBuf::from("/work/project"),
         retention: Retention::Ttl,
         env: BTreeMap::new(),
+        billing: None,
+        codex_exec: false,
     }
 }
 

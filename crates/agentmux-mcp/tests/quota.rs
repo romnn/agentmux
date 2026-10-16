@@ -41,6 +41,8 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))

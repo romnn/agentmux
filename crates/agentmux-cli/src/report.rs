@@ -87,6 +87,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     if let Some(drift) = status.unrecognised.summary() {
         println!("  UNRECOGNISED {drift} — the delegate CLI may have changed its output format");
+        if agentmux_mcp::render::speaks_another_protocol(status) {
+            println!("  FALLBACK    {}", agentmux::appserver::EXEC_FALLBACK_HINT);
+        }
     }
     if status.broke_continuity {
         println!(
@@ -107,6 +110,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     println!("  transcript  {}", status.transcript_path.display());
     println!("  events      {}", status.events_path.display());
+    if status.steerable {
+        println!("  steer       agentmux steer {} '…'", status.run_id);
+    }
     if status.resumable {
         println!("  follow up   agentmux follow-up {} '…'", status.run_id);
     }
@@ -298,7 +304,9 @@ pub fn accounts(
         // A credential name is marked, because a delegate that names an account does not get
         // it: the account's own login must not be outranked by a key meant for the default.
         let withheld = |name: &str| {
-            if agentmux::delegate::is_credential_name(name) {
+            if agentmux::delegate::is_billing_name(name) {
+                "; withheld unless the account sets billing = \"api\""
+            } else if agentmux::delegate::is_credential_name(name) {
                 "; withheld when an account is named"
             } else {
                 ""
@@ -398,6 +406,15 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
     }
     if account.inherit_settings == Some(true) {
         how.push("inherits settings and hooks".to_owned());
+    }
+    // Said only for the exception, like inheritance: the default is a subscription, and a
+    // credential named without the opt-in is refused at launch, which `refused` makes visible here.
+    match (account.billing, account.api_credential_field()) {
+        (Some(agentmux::delegate::Billing::Api), _) => how.push("billing=api".to_owned()),
+        (_, Some(field)) => how.push(format!(
+            "REFUSED at launch: sets {field} without billing = \"api\""
+        )),
+        (_, None) => {}
     }
     how
 }

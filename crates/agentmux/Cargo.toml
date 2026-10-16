@@ -35,10 +35,14 @@ uuid = { workspace = true, features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "user"] }
 
+[target.'cfg(windows)'.dependencies]
+win32job.workspace = true
+
 [dev-dependencies]
 chrono = { workspace = true, features = ["serde"] }
-# The async tests need a runtime; the library itself needs only the timer.
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# The async tests need a runtime, and a clock they can stop; the library itself needs only the
+# timer.
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 googletest.workspace = true
 indoc.workspace = true
 tempfile.workspace = true

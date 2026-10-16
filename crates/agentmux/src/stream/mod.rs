@@ -33,6 +33,11 @@ pub struct Fold {
     /// Without this a follow-up is impossible, so it is recovered on every fold rather than
     /// remembered from the launch.
     pub session: Option<SessionRef>,
+    /// Whether the stream said the turn itself began, which only Codex's `turn.started` says.
+    ///
+    /// Over the app-server it is written by the driver once it follows the turn, which is when
+    /// it delivers a steer.
+    pub turn_started: bool,
 }
 
 /// Counted under [`Turn::unrecognised`] when a line is not JSON at all.

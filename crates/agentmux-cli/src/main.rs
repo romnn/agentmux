@@ -15,13 +15,29 @@ use agentmux::run::{RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
-use crate::cli::{Cli, Command, McpArgs};
+use crate::cli::{Cli, CodexLaunchArg, Command, DelegateArgs, McpArgs, QuestionArgs};
 
 /// musl's allocator serialises enough under the multi-threaded runtime to show up in wall-clock
 /// time, and the Linux release is built against musl so that it runs on any host's glibc.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The consultation `ask` and `start` begin.
+///
+/// `--codex-launch exec` needs no field here: a store that drives nothing records `exec` on every
+/// consultation it starts.
+fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<StartRequest> {
+    Ok(StartRequest {
+        delegate: delegate.build()?,
+        question: question.text()?,
+        cwd: question.working_dir()?,
+        retention: question.retention(),
+        env: question.environment()?,
+        billing: delegate.billing.map(Into::into),
+        codex_exec: false,
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,13 +54,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // The driver is a delegate, not a front end: it opens no store and serves nobody, and its
+    // exit status is what the store reads when the turn's stream says nothing.
+    if let Command::CodexAppServer(args) = &cli.command {
+        std::process::exit(agentmux::appserver::drive(&args.plan));
+    }
+
     let host_env = agentmux::host_env();
     let root = match &cli.state_dir {
         Some(dir) => dir.clone(),
         None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
     };
-    let store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
+    let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe));
+    // This executable is the driver, so a turn it starts is run by the same build that will read
+    // it back.
+    if cli.codex_launch == CodexLaunchArg::AppServer {
+        let driver = std::env::current_exe().wrap_err("locating the agentmux executable")?;
+        store = store.with_codex_app_server(driver);
+    }
 
     match cli.command {
         Command::Accounts => {
@@ -59,26 +87,14 @@ async fn main() -> Result<()> {
         }
         Command::Mcp(args) => serve(store, &args).await,
         Command::Ask(args) => {
-            let status = store.start(&StartRequest {
-                delegate: args.delegate.build()?,
-                question: args.question.text()?,
-                cwd: args.question.working_dir()?,
-                retention: args.question.retention(),
-                env: args.question.environment()?,
-            })?;
+            let status = store.start(&start_request(&args.delegate, &args.question)?)?;
             store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
                 .await?;
             report::answer(&store, &status.run_id, cli.json)
         }
         Command::Start(args) => {
-            let status = store.start(&StartRequest {
-                delegate: args.delegate.build()?,
-                question: args.question.text()?,
-                cwd: args.question.working_dir()?,
-                retention: args.question.retention(),
-                env: args.question.environment()?,
-            })?;
+            let status = store.start(&start_request(&args.delegate, &args.question)?)?;
             report::status(&status, cli.json)
         }
         Command::Status(args) => report::status(&store.status(args.run_id.id())?, cli.json),
@@ -99,8 +115,20 @@ async fn main() -> Result<()> {
                 .await?;
             report::answer(&store, &status.run_id, cli.json)
         }
+        Command::Steer(args) => {
+            let status = store.steer(args.run_id.id(), &args.text()?).await?;
+            if !cli.json {
+                println!(
+                    "steered: the delegate accepted the message into its running turn; the \
+                     transcript records it as `### user (steer)`"
+                );
+            }
+            report::status(&status, cli.json)
+        }
         Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
         Command::List(args) => report::list(&store.list(args.limit)?, cli.json),
+        // Dispatched before the store was opened.
+        Command::CodexAppServer(_) => Ok(()),
         Command::Prune(args) => {
             if let Some(run_id) = args.run_id {
                 store.remove(run_id.id())?;

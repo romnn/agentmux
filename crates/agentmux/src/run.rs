@@ -19,6 +19,8 @@
 //!     recovered.md             that message, once agentmux has rendered it in place of a reply
 //!                              the stream lost
 //!     launch.json              pid, start time and process group, so a later call can check on it
+//!     app-server.json          the plan a turn driven over `codex app-server` runs under
+//!     steer/                   messages steered into such a turn, and the driver's replies
 //!     cancelling               present once a cancellation was asked for
 //!     exit.json                how the child ended and how much it had written, written once and
 //!                              never rewritten
@@ -66,12 +68,13 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::appserver::mailbox::{Mailbox, Reply};
 use crate::delegate::{
-    Delegate, DelegateError, Effort, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
+    Billing, Delegate, DelegateError, Effort, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use crate::transcript::{
-    FailureKind, Outcome, RateLimit, Transcript, UnrecognisedEvents, Usage,
+    FailureKind, Outcome, RateLimit, Transcript, Turn, UnrecognisedEvents, Usage,
     describe_unsaved_session_store, render_turn,
 };
 
@@ -151,6 +154,9 @@ pub enum RunError {
     /// A follow-up was asked of a consultation that cannot take one.
     #[error("{0}")]
     NotResumable(#[from] NotResumable),
+    /// A steer was refused, or could not be confirmed.
+    #[error("{0}")]
+    Steer(#[from] SteerRefused),
     /// Another caller claimed this turn first.
     #[error(
         "consultation {run_id} already has a turn {index}, started by another caller. Only one \
@@ -259,6 +265,105 @@ pub enum NotResumable {
     },
 }
 
+/// Why a message could not be steered into a consultation's running turn.
+///
+/// Kept apart as variants because each leaves the caller something different to do: ask a
+/// follow-up instead, start the consultation differently, or read the transcript to see whether a
+/// message whose delivery could not be confirmed arrived after all.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SteerRefused {
+    /// The message has no content.
+    #[error("the steer message is empty. Say what the delegate should do differently.")]
+    Empty,
+
+    /// No turn is running.
+    #[error(
+        "consultation {run_id} is not running ({state}), so there is no turn to steer. Ask the \
+         next thing with `follow_up`, which continues the delegate's own session."
+    )]
+    NotRunning {
+        /// Which consultation.
+        run_id: RunId,
+        /// How it stands.
+        state: &'static str,
+    },
+
+    /// The running turn was launched in a way that takes no input once it has started.
+    #[error("consultation {run_id} cannot be steered: {reason}")]
+    NotSteerable {
+        /// Which consultation.
+        run_id: RunId,
+        /// Why its delegate offers no channel into a running turn.
+        reason: &'static str,
+    },
+
+    /// The delegate CLI refused the message; it was not delivered.
+    #[error(
+        "the delegate refused the steer for consultation {run_id}: {detail}. The message was not \
+         delivered and is not in the transcript."
+    )]
+    Rejected {
+        /// Which consultation.
+        run_id: RunId,
+        /// The refusal, in the CLI's own words where it gave any.
+        detail: String,
+    },
+
+    /// The turn ended, or its driver did not answer, before the message was picked up; it was
+    /// withdrawn unsent.
+    #[error(
+        "the steer for consultation {run_id} was withdrawn and never sent: {why}. Read the result, \
+         and ask it with `follow_up` if it still matters."
+    )]
+    Withdrawn {
+        /// Which consultation.
+        run_id: RunId,
+        /// What happened instead.
+        why: String,
+    },
+
+    /// The turn's driver is still opening its thread or starting the turn, and takes no message
+    /// until the turn is running.
+    #[error(
+        "consultation {run_id} is still starting its turn, which takes no steer until it is \
+         running. Steer it again in a few seconds."
+    )]
+    Starting {
+        /// Which consultation.
+        run_id: RunId,
+    },
+
+    /// The message was handed to the delegate CLI, which never said whether it took it.
+    #[error(
+        "the steer for consultation {run_id} was handed to the delegate, but whether it arrived \
+         is unknown: {why}. Read the transcript: a delivered steer appears there as \
+         `### user (steer)`. Do not send it again blindly."
+    )]
+    Unconfirmed {
+        /// Which consultation.
+        run_id: RunId,
+        /// What happened instead of an answer.
+        why: String,
+    },
+}
+
+/// How a turn's delegate was launched.
+///
+/// Recorded per turn, because the mode is decided at each launch: a consultation begun from a
+/// store that runs every Codex turn over `exec` can be followed up by one that drives it over the
+/// app-server, and the thread carries over either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMode {
+    /// The delegate CLI was run with the question on stdin: `claude --print` or `codex exec`.
+    ///
+    /// Nothing can reach the turn once it has started.
+    #[default]
+    Exec,
+    /// The turn is driven over `codex app-server` by [`crate::appserver`], and can be steered.
+    AppServer,
+}
+
 /// The identity of a consultation.
 ///
 /// A run id arrives from a language model and is used to open a directory.
@@ -360,6 +465,17 @@ pub struct StartRequest {
     pub retention: Retention,
     /// Extra environment for the delegate, applied over the machine and account layers.
     pub env: BTreeMap<String, String>,
+    /// The pricing the caller asks for, or `None` to let the account decide.
+    ///
+    /// [`Billing::Api`] is refused unless the machine's configuration opts the account in, and
+    /// whatever the first turn runs on is pinned for the consultation's follow-ups.
+    pub billing: Option<Billing>,
+    /// Run every Codex turn of the consultation with `codex exec`, even where this store would
+    /// drive it over `codex app-server`.
+    ///
+    /// For a codex whose app-server protocol no longer matches this agentmux; such a turn cannot
+    /// be steered.
+    pub codex_exec: bool,
 }
 
 /// What agentmux recorded about a consultation when it began.
@@ -389,6 +505,19 @@ pub struct Meta {
     /// its own machine from agentmux ignoring the pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewritten_from: Option<ModelId>,
+    /// The pricing the consultation may run on, decided when it started and asked for again by
+    /// every follow-up.
+    ///
+    /// Pinned like the account, so a follow-up never runs on a pricing its first turn was not
+    /// allowed: a checkout that selected the account, or a caller that asked for a subscription,
+    /// keeps the consultation on one even after the files change.
+    /// `None` only for a consultation recorded before agentmux kept it, whose account decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
+    /// Whether every Codex turn runs with `codex exec`, because the caller asked or the store that
+    /// started the consultation drives none, kept for the follow-ups.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_exec: bool,
 }
 
 /// What the machine's configuration decided about a requested delegate.
@@ -445,8 +574,21 @@ impl TurnDir {
     ///
     /// Whoever then observes the child gone — this caller, or a concurrent `status` — records
     /// the departure as a cancellation rather than as a death, so the two cannot disagree.
+    /// A turn driven over the app-server also watches for it, and interrupts its turn when it
+    /// appears.
     fn cancelling(&self) -> PathBuf {
         self.root.join("cancelling")
+    }
+    /// The plan a turn driven over the app-server runs under.
+    fn app_server_plan(&self) -> PathBuf {
+        self.root.join("app-server.json")
+    }
+    /// Where steered messages wait for the driver of a turn driven over the app-server.
+    fn steer(&self) -> PathBuf {
+        self.root.join("steer")
+    }
+    fn mailbox(&self) -> Mailbox {
+        Mailbox::new(self.steer())
     }
 }
 
@@ -547,6 +689,13 @@ pub struct RunStatus {
     pub transcript_bytes: u64,
     /// Whether a follow-up is possible: the delegate announced a resumable session.
     pub resumable: bool,
+    /// Whether `steer` can reach the newest turn: it is running, and it was launched over
+    /// `codex app-server`.
+    pub steerable: bool,
+    /// The pricing the newest turn was launched on, or `None` for a turn recorded before agentmux
+    /// kept it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
 }
 
 fn whole_seconds<S: serde::Serializer>(
@@ -605,6 +754,10 @@ pub struct RunSummary {
     pub created_at: DateTime<Utc>,
     /// The first line of the question, truncated.
     pub question: String,
+    /// The pricing the newest turn was launched on, or `None` for one recorded before agentmux
+    /// kept it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
 }
 
 /// A slice of the rendered transcript.
@@ -634,6 +787,9 @@ pub struct RunStore {
     /// Whether this process runs inside a delegate, decided once: neither witness can change
     /// while the process lives.
     inside_delegate: OnceLock<bool>,
+    /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
+    /// launches such turns that way.
+    codex_driver: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RunStore {
@@ -669,6 +825,26 @@ impl RunStore {
     /// How often a cancellation checks whether the child has gone.
     const STOP_POLL: Duration = Duration::from_millis(100);
 
+    /// How long a cancelled turn driven over the app-server is given to interrupt itself and
+    /// leave, before it is signalled like any other child.
+    ///
+    /// The driver takes at most [`crate::appserver::STOP_BUDGET`] to interrupt the turn, let the
+    /// server exit and stop what it left running, so this outlasts all of it.
+    const INTERRUPT_GRACE: Duration =
+        crate::appserver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
+
+    /// How long a steered message may wait for the turn's driver to pick it up.
+    ///
+    /// The driver looks every tenth of a second, so this is only ever reached by a driver that has
+    /// stopped looking.
+    const STEER_PICKUP: Duration = Duration::from_secs(15);
+
+    /// How long a picked-up message may wait for the delegate CLI to confirm it.
+    const STEER_CONFIRM: Duration = Duration::from_secs(30);
+
+    /// How often a steer looks for its reply.
+    const STEER_POLL: Duration = Duration::from_millis(100);
+
     /// Open a store rooted at `root`, creating it if needed.
     ///
     /// # Errors
@@ -691,7 +867,24 @@ impl RunStore {
             // Every vendor reachable until an operator says otherwise: a terminal denies none.
             denied: BTreeSet::new(),
             inside_delegate: OnceLock::new(),
+            // `exec` for every Codex turn until a caller names a driver: embedding this library
+            // must not start an executable the embedder did not provide.
+            codex_driver: None,
         })
+    }
+
+    /// Drive every Codex turn that can run over `codex app-server` through `driver`, so it can be
+    /// steered while it runs.
+    ///
+    /// `driver` is an `agentmux` executable: the run store launches it as
+    /// `<driver> codex-app-server <plan>`, and it runs [`crate::appserver::drive`].
+    /// Only a Codex delegate that inherits its account's settings runs this way — see
+    /// [`crate::delegate::Delegate::app_server_settings`] — and every other turn still runs over
+    /// `codex exec` or `claude --print`.
+    #[must_use]
+    pub fn with_codex_app_server(mut self, driver: impl Into<PathBuf>) -> Self {
+        self.codex_driver = Some(driver.into());
+        self
     }
 
     /// The environment this store resolves configuration and delegates against.
@@ -845,12 +1038,12 @@ impl RunStore {
     /// A run's outcome is its newest turn's, and a turn folds from its own files alone, so the
     /// callers that only need to know whether a consultation is over — the poll loop, `list`,
     /// the sweep — do not re-read every settled turn's capture to find out.
-    fn newest_turn_outcome(&self, meta: &Meta) -> Result<Option<Outcome>, RunError> {
+    fn newest_turn(&self, meta: &Meta) -> Result<Option<Turn>, RunError> {
         let turns = self.turn_files(&meta.run_id)?;
         let Some(newest) = turns.last() else {
             return Ok(None);
         };
-        Ok(Some(self.fold_turn(meta, newest, false)?.turn.outcome))
+        Ok(Some(self.fold_turn(meta, newest, false)?.turn))
     }
 
     /// Whether any recorded child of a run is still there.
@@ -956,12 +1149,17 @@ impl RunStore {
             delegate,
             rewritten_from,
         } = Self::pin_defaults(&request.delegate, &config);
+        let billing = delegate.billing(request.billing, &self.host_env, &config)?;
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
             env: request.env.clone(),
             run_id: run_id.clone(),
             delegate,
             rewritten_from,
+            billing: Some(billing),
+            // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
+            // whichever store continues the consultation.
+            codex_exec: request.codex_exec || self.codex_driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -1081,6 +1279,137 @@ impl RunStore {
         self.status(run_id)
     }
 
+    /// Add an instruction to a consultation's running turn, for the delegate to see before its
+    /// next model call.
+    ///
+    /// Only a turn driven over `codex app-server` takes one; the message travels through the
+    /// turn's mailbox to its driver, which hands it to the server as `turn/steer` and records it
+    /// in the capture once the server has accepted it.
+    /// Returns once the delegate CLI has accepted the message, so a transcript read after a
+    /// successful steer holds it, as a `### user (steer)` section.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotFound`] when there is no such consultation, and [`RunError::Steer`]
+    /// when the message is empty, no turn is running, the running turn cannot be steered, the
+    /// delegate CLI refused the message, the turn ended before the message was picked up, or the
+    /// CLI did not confirm it in time.
+    pub async fn steer(&self, run_id: &RunId, message: &str) -> Result<RunStatus, RunError> {
+        if message.trim().is_empty() {
+            return Err(SteerRefused::Empty.into());
+        }
+        let (mailbox, launched) = self.steerable_turn(run_id)?;
+        let letter = mailbox
+            .submit(message)
+            .map_err(RunError::io("submitting the steered message"))?;
+        let submitted = tokio::time::Instant::now();
+        let mut claimed_at: Option<tokio::time::Instant> = None;
+        loop {
+            if let Some(reply) = mailbox
+                .reply(&letter)
+                .map_err(RunError::io("reading the reply to a steered message"))?
+            {
+                return match reply {
+                    Reply::Accepted => self.status(run_id),
+                    Reply::Rejected { reason } => Err(SteerRefused::Rejected {
+                        run_id: run_id.clone(),
+                        detail: reason,
+                    }
+                    .into()),
+                    Reply::Unconfirmed { reason } => Err(SteerRefused::Unconfirmed {
+                        run_id: run_id.clone(),
+                        why: reason,
+                    }
+                    .into()),
+                };
+            }
+            if claimed_at.is_none() && mailbox.is_claimed(&letter) {
+                claimed_at = Some(tokio::time::Instant::now());
+            }
+            let gone = self.launcher.reap(launched).is_some()
+                || self.launcher.liveness(launched) == Liveness::Gone;
+            match claimed_at {
+                // Claimed and then never answered: the driver went, or the CLI is silent.
+                Some(at) if gone || at.elapsed() >= Self::STEER_CONFIRM => {
+                    return Err(SteerRefused::Unconfirmed {
+                        run_id: run_id.clone(),
+                        why: if gone {
+                            "the turn's driver left without answering".to_owned()
+                        } else {
+                            format!(
+                                "the delegate did not confirm it within {}s",
+                                Self::STEER_CONFIRM.as_secs()
+                            )
+                        },
+                    }
+                    .into());
+                }
+                None if gone || submitted.elapsed() >= Self::STEER_PICKUP => {
+                    // Withdrawn under the same rename the driver claims with, so a message that
+                    // was not taken back is one the driver has and will answer.
+                    if mailbox
+                        .withdraw(&letter)
+                        .map_err(RunError::io("withdrawing a steered message"))?
+                    {
+                        return Err(SteerRefused::Withdrawn {
+                            run_id: run_id.clone(),
+                            why: if gone {
+                                "the turn ended before its driver picked it up".to_owned()
+                            } else {
+                                format!(
+                                    "the turn's driver did not pick it up within {}s",
+                                    Self::STEER_PICKUP.as_secs()
+                                )
+                            },
+                        }
+                        .into());
+                    }
+                    claimed_at = Some(tokio::time::Instant::now());
+                }
+                Some(_) | None => {}
+            }
+            tokio::time::sleep(Self::STEER_POLL).await;
+        }
+    }
+
+    /// The mailbox of the consultation's running turn, and its driver, when that turn takes a
+    /// steer now; otherwise why not.
+    fn steerable_turn(&self, run_id: &RunId) -> Result<(Mailbox, Launched), RunError> {
+        let meta = self.meta(run_id)?;
+        let not_running = |state| SteerRefused::NotRunning {
+            run_id: run_id.clone(),
+            state,
+        };
+        let Some(newest) = self.turn_files(run_id)?.into_iter().last() else {
+            return Err(not_running("not yet launched").into());
+        };
+        let folded = self.fold_turn(&meta, &newest, false)?;
+        let outcome = folded.turn.outcome;
+        if outcome.is_terminal() {
+            return Err(not_running(outcome.state()).into());
+        }
+        if folded.mode != LaunchMode::AppServer {
+            return Err(SteerRefused::NotSteerable {
+                run_id: run_id.clone(),
+                reason: why_not_steerable(&meta.delegate),
+            }
+            .into());
+        }
+        if newest.dir.cancelling().exists() {
+            return Err(not_running("cancelling").into());
+        }
+        if !Self::accepts_steers(&outcome, folded.mode, folded.turn_started, &newest.dir) {
+            return Err(SteerRefused::Starting {
+                run_id: run_id.clone(),
+            }
+            .into());
+        }
+        let Some(launched) = newest.launch.as_ref().map(|record| record.launched) else {
+            return Err(not_running("not yet launched").into());
+        };
+        Ok((newest.dir.mailbox(), launched))
+    }
+
     /// The session a follow-up would continue, or why there is none.
     ///
     /// The one predicate behind both `follow_up` and `status.resumable`, so what is advertised
@@ -1176,6 +1505,46 @@ impl RunStore {
         launched
     }
 
+    /// Decide how a turn runs, and point `invocation` at the driver when it is driven.
+    ///
+    /// Decided per turn, from the delegate and this store: the environment, the refusals and the
+    /// billing already in `invocation` are the same either way, and only what is run differs.
+    fn choose_launch(
+        &self,
+        turn: &TurnDir,
+        meta: &Meta,
+        resume: Option<&SessionRef>,
+        config: &crate::config::Config,
+        invocation: &mut crate::delegate::Invocation,
+    ) -> Result<LaunchMode, RunError> {
+        let (Some(driver), Some(settings), false) = (
+            &self.codex_driver,
+            meta.delegate.app_server_settings(config),
+            meta.codex_exec,
+        ) else {
+            return Ok(LaunchMode::Exec);
+        };
+        let plan_path = turn.app_server_plan();
+        write_json(
+            &plan_path,
+            &crate::appserver::Plan {
+                settings,
+                cwd: meta.cwd.clone(),
+                resume: resume.cloned(),
+                billing: invocation.billing,
+                last_message: turn.last_message(),
+                cancel_marker: turn.cancelling(),
+                mailbox: turn.steer(),
+            },
+        )?;
+        invocation.program = driver.to_string_lossy().into_owned();
+        invocation.args = vec![
+            crate::appserver::SUBCOMMAND.to_owned(),
+            plan_path.to_string_lossy().into_owned(),
+        ];
+        Ok(LaunchMode::AppServer)
+    }
+
     /// Everything between claiming a turn directory and recording the running child in it.
     fn launch_into(
         &self,
@@ -1195,6 +1564,7 @@ impl RunStore {
             last_message_path: &last_message,
             resume,
             extra_env: &meta.env,
+            billing: meta.billing,
         };
         let mut invocation = meta.delegate.invocation(&plan, &self.host_env, config)?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
@@ -1204,6 +1574,8 @@ impl RunStore {
             Self::STATE_DIR_ENV.to_owned(),
             self.root.to_string_lossy().into_owned(),
         );
+
+        let mode = self.choose_launch(turn, meta, resume, config, &mut invocation)?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
@@ -1228,12 +1600,14 @@ impl RunStore {
         write_json(
             &turn.invocation(),
             &InvocationRecord {
-                program: invocation.program.to_owned(),
+                program: invocation.program.clone(),
                 args: invocation.args.clone(),
                 env_keys: invocation.env.keys().cloned().collect(),
                 cwd: meta.cwd.clone(),
                 resumed_from: resume.cloned(),
                 unsaved_session_store,
+                mode,
+                billing: Some(invocation.billing),
             },
         )?;
 
@@ -1247,6 +1621,8 @@ impl RunStore {
             args = ?invocation.args,
             cwd = %meta.cwd.display(),
             resumed = resume.is_some(),
+            ?mode,
+            billing = %invocation.billing,
             "launching delegate",
         );
 
@@ -1386,6 +1762,13 @@ impl RunStore {
             // Advertised only when a follow-up would actually work, because `next_steps` turns
             // this into a recommendation and a caller that takes it pays for the turn.
             resumable: Self::resumable_session(run_id, &state).is_ok(),
+            steerable: Self::accepts_steers(
+                &outcome,
+                state.newest_mode,
+                state.newest_turn_started,
+                &turn,
+            ),
+            billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             outcome,
         };
         Ok((status, full))
@@ -1503,6 +1886,16 @@ impl RunStore {
         // Outside the lock: stopping can take seconds, and a `status` in the meantime should
         // not wait on it.
         if let Some(record) = newest.launch.as_ref() {
+            // A driven turn sees the marker and interrupts itself over the protocol, which lets
+            // the server close the turn and save it; it is given the chance before any signal.
+            // A driver whose turn has already ended may still be stopping what its server left
+            // running, and is given the same chance to finish.
+            let driven = read_json::<InvocationRecord>(&newest.dir.invocation())?
+                .is_some_and(|invocation| invocation.mode == LaunchMode::AppServer);
+            if driven {
+                self.wait_for_departure(record.launched, Self::INTERRUPT_GRACE)
+                    .await;
+            }
             self.stop(record.launched).await;
         }
         if cancelling {
@@ -1574,21 +1967,29 @@ impl RunStore {
         Ok(metas
             .into_iter()
             .filter_map(|meta| {
-                // The outcome is the newest turn's, and the question is the first turn's own
-                // file; neither needs the whole consultation folded.
-                let outcome = self
-                    .newest_turn_outcome(&meta)
-                    .ok()?
-                    .unwrap_or(Outcome::Running);
+                // The outcome and the pricing are the newest turn's, as `status` reports them, and
+                // the question is the first turn's own file; none needs the whole consultation
+                // folded.
+                let newest = self.newest_turn(&meta).ok()?;
+                let outcome = newest
+                    .as_ref()
+                    .map_or(Outcome::Running, |turn| turn.outcome.clone());
+                let billing = newest.and_then(|turn| turn.billing);
                 let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
                     .map(|question| first_line(&question, 120))
                     .unwrap_or_default();
+                let mut delegate = describe_delegate(&meta.delegate, meta.rewritten_from.as_ref());
+                // Said where every listing shows it, as the status header says it.
+                if billing == Some(Billing::Api) {
+                    delegate.push_str(" billing=api");
+                }
                 Some(RunSummary {
                     run_id: meta.run_id,
-                    delegate: describe_delegate(&meta.delegate, meta.rewritten_from.as_ref()),
+                    delegate,
                     outcome,
                     created_at: meta.created_at,
                     question,
+                    billing,
                 })
             })
             .collect())
@@ -1635,8 +2036,8 @@ impl RunStore {
             let Ok(_lock) = self.lock(&run_id) else {
                 continue;
             };
-            let finished = match self.newest_turn_outcome(&meta) {
-                Ok(outcome) => outcome.is_none_or(|outcome| outcome.is_terminal()),
+            let finished = match self.newest_turn(&meta) {
+                Ok(turn) => turn.is_none_or(|turn| turn.outcome.is_terminal()),
                 Err(_) => continue,
             };
             if !finished || self.a_child_is_alive(&run_id).unwrap_or(true) {
@@ -1664,8 +2065,8 @@ impl RunStore {
         let _lock = self.lock(run_id)?;
         let meta = self.meta(run_id)?;
         if self
-            .newest_turn_outcome(&meta)?
-            .is_some_and(|outcome| !outcome.is_terminal())
+            .newest_turn(&meta)?
+            .is_some_and(|turn| !turn.outcome.is_terminal())
             || self.a_child_is_alive(run_id)?
         {
             return Err(RunError::StillRunning {
@@ -1727,8 +2128,8 @@ impl RunStore {
         let mut interval = Self::MIN_POLL;
         // A run with no turn at all has nothing to wait for.
         while self
-            .newest_turn_outcome(&meta)?
-            .is_some_and(|outcome| !outcome.is_terminal())
+            .newest_turn(&meta)?
+            .is_some_and(|turn| !turn.outcome.is_terminal())
         {
             let now = tokio::time::Instant::now();
             let sleep = match deadline {
@@ -1772,6 +2173,10 @@ pub(super) struct RunState {
     pub(super) newest_turn_index: u32,
     /// Whether the newest turn's outcome came from its exit record rather than its stream.
     pub(super) newest_settled_by_record: bool,
+    /// How the newest turn's delegate was launched.
+    pub(super) newest_mode: LaunchMode,
+    /// Whether the newest turn's capture says the turn itself began.
+    pub(super) newest_turn_started: bool,
     pub(super) last_activity: Option<SystemTime>,
 }
 
@@ -1937,6 +2342,13 @@ pub(super) struct InvocationRecord {
     /// A store that becomes writable later still holds nothing to resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) unsaved_session_store: Option<PathBuf>,
+    /// How the delegate was run, which decides whether the turn can be steered.
+    #[serde(default)]
+    pub(super) mode: LaunchMode,
+    /// The pricing the delegate was launched on; absent from a record older than agentmux
+    /// keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) billing: Option<Billing>,
 }
 
 /// Claim a turn index by creating its directory.
@@ -2137,6 +2549,47 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Run
             path: path.to_owned(),
             source,
         })
+}
+
+/// Why a turn of this delegate that was not driven over the app-server offers no way in.
+fn why_not_steerable(delegate: &Delegate) -> &'static str {
+    match delegate {
+        Delegate::Claude { .. } => {
+            "its delegate runs as `claude --print`, which reads its question once and offers no \
+             channel into a turn that has started"
+        }
+        Delegate::Codex {
+            isolation: Some(Isolation::Inherit),
+            ..
+        } => {
+            "this agentmux launched it with `codex exec`, which reads its question once; Codex \
+             turns are driven over `codex app-server` only when agentmux runs with \
+             AGENTMUX_CODEX_LAUNCH=app-server, which is the default"
+        }
+        Delegate::Codex { .. } => {
+            "it runs isolated, which takes `codex exec --ignore-user-config`, and `codex exec` \
+             reads its question once. `codex app-server`, the only Codex launch that can be \
+             steered, has no way to skip the account's own configuration, so only a \
+             consultation started with `inherit_settings: true` runs over it"
+        }
+    }
+}
+
+impl RunStore {
+    /// Whether the newest turn takes a steer: it runs, over the app-server, its driver is
+    /// following the turn, and nobody has asked it to stop.
+    ///
+    /// The one answer both `status` and `steer` give, so a turn advertised as steerable is one
+    /// `steer` will not refuse.
+    /// `started` is whether the turn's capture says the turn began, which the driver writes once
+    /// it knows the turn and is about to serve its mailbox: until then a steer would only wait
+    /// there, for as long as opening a long thread or starting the turn takes.
+    fn accepts_steers(outcome: &Outcome, mode: LaunchMode, started: bool, turn: &TurnDir) -> bool {
+        !outcome.is_terminal()
+            && mode == LaunchMode::AppServer
+            && started
+            && !turn.cancelling().exists()
+    }
 }
 
 /// One line naming the delegate, and the model that was asked for when another one ran.
