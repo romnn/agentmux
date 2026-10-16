@@ -14,6 +14,9 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `crates/agentmux`     | library: `config`, `delegate`, `stream/{claude,codex}`, `transcript`, `launch`, `quota`, `run`, `appserver` |
 | `crates/agentmux-mcp` | library: the `rmcp` stdio server and its tools                                 |
 | `crates/agentmux-cli` | binary `agentmux`: `agentmux mcp` serves, the other subcommands are a unified CLI over both vendors |
+| `crates/codex-app-server-protocol` | library: the `codex app-server` protocol — generated payload `types` and `methods` bindings, the hand-written JSON-RPC `envelope` |
+| `crates/codex-app-server-mock` | test support: a scriptable `Peer` playing the server's end, typed `fixtures`, and a `codex` binary that plays a `scenario` as a process |
+| `crates/codex-app-server-codegen` | tool, a workspace of its own: generates the protocol crate's `schema.rs` and `methods.rs` from the vendored codex schema |
 
 ## House style
 
@@ -209,18 +212,27 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `appserver` says why) — and `RunStore::with_codex_app_server` opts a store in; without it every
   Codex turn is `exec`. The mode is recorded per turn (`LaunchMode`), and a delivered steer is
   captured as an `agentmux.steer` event that renders as `### user (steer)`.
-- **The app-server payload types are generated, never written by hand.** `appserver/schema.rs` is
-  progeny's output over `codex app-server generate-json-schema`, pruned to the roots in
-  `codegen/app-server/roots.json`, with every notification and request method of the schema
-  appended (`SERVER_NOTIFICATIONS`, `SERVER_REQUESTS`). Its inputs are pinned beside the
-  generator: `codex-version` (the codex on `PATH` must match) and `progeny-rev` (built once into
-  `~/.cache/agentmux` unless `PROGENY` names a binary). Do not edit the file, and nothing edits a
-  pin for you: move a pin deliberately, then run `task codegen:app-server`; fix what its lints flag
-  in the generator. `task codegen:app-server:check` fails when the committed file drifts; the
-  `codegen` workflow runs it when an input or the file changes. The generator also refuses a codex
-  whose app-server accepts `--ignore-user-config`, the cue to let isolated delegates be driven.
-  Only the JSON-RPC envelope in `appserver/protocol.rs` is hand-written, and a request is sent only
-  through its `Request` trait, which binds a method name to its generated params type.
+- **The app-server protocol is generated, never written by hand, and every message goes through
+  its method binding.** `codex-app-server-protocol`'s `schema.rs` (progeny's types) and
+  `methods.rs` (one marker type per method, plus `SERVER_NOTIFICATIONS` and `SERVER_REQUESTS`) are
+  written by `crates/codex-app-server-codegen` from the vendored
+  `schema/codex_app_server_protocol.schemas.json`, pruned to what its `manifest::MANIFEST` names.
+  A marker's `Request` or `Notification` impl binds the wire method to its params and response
+  types and a direction trait (`ClientRequest`, `ServerNotification`, …) says who sends it, so the
+  driver sends `call::<m::TurnStart>`, matches `m::TurnCompleted::METHOD`, and answers a server
+  request with that method's own response type. The generator is a workspace of its own because
+  progeny turns on `serde_json/arbitrary_precision`, which feature unification would otherwise
+  hand every agentmux test build; its `Cargo.lock` pins progeny, and progeny's configuration is
+  code. Do not edit the generated files: change the manifest or the generator, then
+  `task codegen:app-server`. `task codegen:app-server:check` (the generator's tests, no codex
+  needed) fails when they drift. Moving the codex pin is deliberate: install that codex, write
+  `schema/codex-version`, run `task codegen:app-server:refresh`; `codex-app-server-codegen refresh`
+  refuses a codex other than the pin, and one whose app-server accepts `--ignore-user-config`, the
+  cue to let isolated delegates be driven. The `codegen` workflow runs both checks. Only the
+  JSON-RPC envelope is hand-written: codex leaves out the `"jsonrpc"` member, so a message is
+  classified by which of `id` and `method` it carries, and a payload is decoded separately, so
+  drift is recorded rather than the message lost. agentmux's own side — which settings a thread
+  runs under, how a request is declined — stays in `appserver/protocol.rs`.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 
@@ -241,8 +253,11 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `task audit`           | advisories against the dependency tree                                |
 | `task unused`          | unused dependencies (nightly)                                         |
 | `task lint:actions`    | actionlint over `.github/workflows`                                   |
-| `task codegen:app-server` | regenerate `appserver/schema.rs` from the pinned codex on `PATH` and progeny (needs `jq`) |
-| `task codegen:app-server:check` | fail when `schema.rs` is not what the pinned codex and progeny generate — CI runs it |
+| `task codegen:app-server` | regenerate `codex-app-server-protocol` from the vendored schema |
+| `task codegen:app-server:check` | the generator's tests: fail when the protocol crate is not what the vendored schema generates — CI runs it |
+| `task codegen:app-server:lint` | clippy over the generator, which `lint:fc` does not reach |
+| `task codegen:app-server:refresh` | re-export the vendored schema from the pinned codex on `PATH`, then regenerate |
+| `task codegen:app-server:upstream` | fail when the vendored schema is not what the pinned codex exports — CI runs it |
 
 ## Probing accounts
 
@@ -280,9 +295,15 @@ AGENTMUX_LIVE_CODEX_ACCOUNT=personal \
   cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
 ```
 
-Otherwise the driver is tested against an in-process fake server
-(`crates/agentmux/tests/appserver.rs`) and a shell-script `codex`
-(`crates/agentmux-cli/tests/steer.rs`) that answer with payloads valid for the pinned schema.
+Otherwise the driver is tested against `codex-app-server-mock`. `crates/agentmux/tests/appserver.rs`
+scripts the server's side of each conversation with a `Peer` over real pipes — what it expects,
+what it answers, in order — with payloads built by `fixtures` from the generated types, and
+shortens the driver's `Deadlines` to reach what a deadline ends. A `Peer` reads only when its
+script waits for a message, so a script that stops asking is a server that stops reading.
+`crates/agentmux-cli/tests/steer.rs` runs the real `agentmux` as the driver against the mock's
+`codex` binary, which it builds with `escargot` (nothing else builds another package's binary for
+a test) and configures through `app-server-mock.json` in the turn's codex home, because the
+driver's environment is an allowlist.
 
 Everything else runs against `agentmux::testing::ScriptedLauncher` and the recorded streams under
 `crates/agentmux/fixtures/`, which were captured from real runs with the exact flags `delegate.rs`
