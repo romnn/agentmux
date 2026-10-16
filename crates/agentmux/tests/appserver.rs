@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Letter, Mailbox, Reply};
 use agentmux::appserver::{Deadlines, Ending, Plan, UNDECODED_EVENT, drive_with};
-use agentmux::delegate::{AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor};
+use agentmux::delegate::{
+    AccountChoice, AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor,
+};
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
 use codex_app_server_mock::conformance::{self, Side};
@@ -464,6 +466,50 @@ fn a_steer_the_server_refuses_is_answered_and_not_recorded() -> Result<()> {
     Ok(())
 }
 
+/// A steer whose acceptance does not name the turn it was sent into, or does not decode, is
+/// answered as unconfirmed and never enters the transcript as delivered.
+///
+/// Either answer is a success on the wire, so only the typed response tells it apart from an
+/// acceptance.
+#[gtest]
+fn a_steer_acknowledged_for_another_turn_or_unreadably_is_unconfirmed() -> Result<()> {
+    let answers = [
+        (json!({"turnId": "tu-other"}), "not the turn"),
+        (json!({}), "does not match the schema"),
+    ];
+    for (answer, reason) in answers {
+        let dir = tempfile::tempdir().or_fail()?;
+        let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+        let mut reply = None;
+        let run = run(
+            &plan,
+            move |peer| {
+                peer.open_thread(THREAD)?;
+                peer.start_turn(THREAD, TURN)?;
+                let steer = peer.expect::<m::TurnSteer>()?;
+                peer.send(&Message::Response {
+                    id: steer.id,
+                    outcome: Ok(answer),
+                })?;
+                finish(peer, "done")
+            },
+            |plan| reply = steer(plan, "UNCONFIRMED-SENTINEL"),
+        )?;
+
+        assert_that!(
+            reply,
+            some(matches_pattern!(Reply::Unconfirmed {
+                reason: contains_substring(reason)
+            }))
+        );
+        assert_that!(run.ending, eq(&Ending::Finished));
+        // Never recorded as an instruction the turn took.
+        assert_that!(count(&run.capture, "agentmux.steer"), eq(0));
+    }
+    Ok(())
+}
+
 /// A cancellation interrupts the turn over the protocol and leaves no terminal event behind.
 ///
 /// The store records the cancellation itself once the driver has gone; a terminal event here
@@ -745,14 +791,15 @@ fn a_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
 }
 
 /// A capture that refuses one line: the transcript the deliverable lives in.
-struct RefusesSteers(Vec<u8>);
+/// A capture that refuses any line containing its marker, as a full disk would.
+struct Refuses(&'static str, Vec<u8>);
 
-impl std::io::Write for RefusesSteers {
+impl std::io::Write for Refuses {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if String::from_utf8_lossy(buf).contains("agentmux.steer") {
+        if String::from_utf8_lossy(buf).contains(self.0) {
             return Err(std::io::Error::other("disk full"));
         }
-        self.0.extend_from_slice(buf);
+        self.1.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -771,7 +818,7 @@ fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> 
     let mut reply = None;
     let driven = run_with(
         &plan,
-        Driver::capturing(RefusesSteers(Vec::new())),
+        Driver::capturing(Refuses("agentmux.steer", Vec::new())),
         |peer| {
             peer.open_thread(THREAD)?;
             peer.start_turn(THREAD, TURN)?;
@@ -790,6 +837,69 @@ fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> 
     assert_that!(
         driven.ending,
         matches_pattern!(Ending::Broken(contains_substring("capture")))
+    );
+    Ok(())
+}
+
+/// A steer whose acknowledgement does not decode is answered as unconfirmed even when the capture
+/// cannot record the drift, rather than left for its sender to time out on.
+#[gtest]
+fn an_unreadable_steer_answer_is_replied_to_when_its_drift_cannot_be_recorded() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let mut reply = None;
+    let driven = run_with(
+        &plan,
+        Driver::capturing(Refuses("agentmux.undecoded", Vec::new())),
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.send(&Message::Response {
+                id: steer.id,
+                outcome: Ok(json!({})),
+            })
+        },
+        |plan| reply = steer(plan, "unreadable"),
+    )?;
+
+    assert_that!(
+        reply,
+        some(matches_pattern!(Reply::Unconfirmed {
+            reason: contains_substring("does not match the schema")
+        }))
+    );
+    assert_that!(
+        driven.ending,
+        matches_pattern!(Ending::Broken(contains_substring("capture")))
+    );
+    Ok(())
+}
+
+/// A line from the server that is no JSON-RPC message is kept in the capture as drift, not
+/// dropped, so a transcript shows what arrived when a turn's end could not be read.
+#[gtest]
+fn a_line_that_is_no_message_is_kept_as_drift() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            peer.send_bytes(b"{\"method\":[\"turn/completed\"]}\n")?;
+            finish(peer, "done")
+        },
+        |_| {},
+    )?;
+
+    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(count(&run.capture, "agentmux.undecoded"), eq(1));
+    assert_that!(
+        run.capture,
+        contains_substring("its method is not a string")
     );
     Ok(())
 }
@@ -1257,7 +1367,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: None,
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "q".to_owned(),

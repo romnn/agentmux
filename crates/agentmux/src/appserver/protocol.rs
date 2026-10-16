@@ -6,29 +6,67 @@
 //! thread runs under, and that a consultation declines everything it is asked.
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId};
-use codex_app_server_protocol::methods as m;
-use codex_app_server_protocol::{Request as _, ServerRequest, types as wire};
+use codex_app_server_protocol::methods::{self as m, AnyServerRequest as Any};
+use codex_app_server_protocol::{Method as _, ServerRequest, types as wire};
 
-use crate::delegate::CodexSandbox;
+use crate::delegate::{CodexSandbox, SessionRef};
 
 /// Notifications the driver asks the server not to send.
 ///
 /// Every one of them is a token-by-token delta of something that also arrives whole in
 /// `item/completed`, and the driver writes only whole items.
 pub(super) const OPTED_OUT: &[&str] = &[
-    "item/agentMessage/delta",
-    "item/reasoning/summaryTextDelta",
-    "item/reasoning/summaryPartAdded",
-    "item/reasoning/textDelta",
-    "item/commandExecution/outputDelta",
-    "item/fileChange/outputDelta",
-    "item/plan/delta",
-    "command/exec/outputDelta",
-    "process/outputDelta",
+    m::ItemAgentMessageDelta::METHOD,
+    m::ItemReasoningSummaryTextDelta::METHOD,
+    m::ItemReasoningSummaryPartAdded::METHOD,
+    m::ItemReasoningTextDelta::METHOD,
+    m::ItemCommandExecutionOutputDelta::METHOD,
+    m::ItemFileChangeOutputDelta::METHOD,
+    m::ItemPlanDelta::METHOD,
+    m::CommandExecOutputDelta::METHOD,
+    m::ProcessOutputDelta::METHOD,
 ];
 
-/// `initialize`'s parameters.
-pub(super) fn initialize_params() -> wire::InitializeParams {
+/// codex's id for the thread a consultation runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ThreadId(String);
+
+/// codex's id for one turn of a thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TurnId(String);
+
+macro_rules! wire_id {
+    ($($ty:ident),+) => {$(
+        impl $ty {
+            /// The id as codex sent it.
+            pub(super) fn new(id: impl Into<String>) -> Self {
+                Self(id.into())
+            }
+
+            /// The id as codex reads it.
+            pub(super) fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    )+};
+}
+wire_id!(ThreadId, TurnId);
+
+/// The running turn a steer or an interrupt is sent into.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TurnTarget<'a> {
+    pub(super) thread: &'a ThreadId,
+    pub(super) turn: &'a TurnId,
+}
+
+/// `initialize`'s parameters, which the quota probe sends too.
+pub(crate) fn initialize_params() -> wire::InitializeParams {
     wire::InitializeParams {
         client_info: wire::ClientInfo {
             name: "agentmux".to_owned(),
@@ -92,13 +130,13 @@ pub(super) fn thread_start_params(
 /// The thread's earlier turns are left out of the answer: the delegate has them, and the driver
 /// reads nothing but the thread's id.
 pub(super) fn thread_resume_params(
-    thread_id: &str,
+    session: &SessionRef,
     model: &str,
     cwd: &str,
     sandbox: CodexSandbox,
 ) -> wire::ThreadResumeParams {
     wire::ThreadResumeParams {
-        thread_id: thread_id.to_owned(),
+        thread_id: session.as_str().to_owned(),
         model: Some(model.to_owned()),
         cwd: Some(cwd.to_owned()),
         sandbox: Some(sandbox_mode(sandbox)),
@@ -132,12 +170,12 @@ fn text_input(text: &str) -> Result<Vec<wire::UserInput>, String> {
 
 /// `turn/start`'s parameters.
 pub(super) fn turn_start_params(
-    thread_id: &str,
+    thread: &ThreadId,
     question: &str,
 ) -> Result<wire::TurnStartParams, String> {
     // Everything else is the thread's, which `thread/start` or `thread/resume` already set.
     Ok(wire::TurnStartParams {
-        thread_id: thread_id.to_owned(),
+        thread_id: thread.as_str().to_owned(),
         input: text_input(question)?,
         approval_policy: None,
         approvals_reviewer: None,
@@ -164,36 +202,37 @@ pub(super) fn turn_start_params(
 /// `expectedTurnId` is required, and is what makes a steer that arrives after its turn ended a
 /// refusal rather than the opening of a new turn.
 pub(super) fn turn_steer_params(
-    thread_id: &str,
-    turn_id: &str,
+    target: TurnTarget<'_>,
     text: &str,
 ) -> Result<wire::TurnSteerParams, String> {
     Ok(wire::TurnSteerParams {
-        thread_id: thread_id.to_owned(),
-        expected_turn_id: turn_id.to_owned(),
+        thread_id: target.thread.as_str().to_owned(),
+        expected_turn_id: target.turn.as_str().to_owned(),
         input: text_input(text)?,
         client_user_message_id: None,
     })
 }
 
 /// `turn/interrupt`'s parameters.
-pub(super) fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> wire::TurnInterruptParams {
+pub(super) fn turn_interrupt_params(target: TurnTarget<'_>) -> wire::TurnInterruptParams {
     wire::TurnInterruptParams {
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.to_owned(),
+        thread_id: target.thread.as_str().to_owned(),
+        turn_id: target.turn.as_str().to_owned(),
     }
 }
 
 /// The reason every decline gives.
 const UNATTENDED: &str = "agentmux runs consultations unattended, with nobody to approve this";
 
-/// The answer to request `id`, when its method is an approval or an input request the driver
-/// knows, or `None` for any other.
+/// The answer to request `id`, when it is an approval or an input request, or `None` for a
+/// request a consultation does not answer at all.
 ///
 /// Each answer is the one the schema documents as "denied, and the turn continues", so the model
 /// learns the action was refused rather than the turn ending.
-/// Each is built through the method's own binding, so it is always the type that method expects.
-pub(super) fn decline(id: &RequestId, method: &str) -> Option<Result<Message, EncodeError>> {
+/// Each is built through the method's own binding, so it is always the type that method expects,
+/// and every request codex can send is named, so a regeneration that adds one fails to build
+/// until it is decided here.
+pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message, EncodeError>> {
     fn answer<M: ServerRequest>(
         id: &RequestId,
         response: &M::Response,
@@ -207,8 +246,8 @@ pub(super) fn decline(id: &RequestId, method: &str) -> Option<Result<Message, En
             },
         }))
     };
-    Some(match method {
-        m::ItemCommandExecutionRequestApproval::METHOD => answer::<
+    Some(match request {
+        Any::ItemCommandExecutionRequestApproval(_) => answer::<
             m::ItemCommandExecutionRequestApproval,
         >(
             id,
@@ -218,21 +257,21 @@ pub(super) fn decline(id: &RequestId, method: &str) -> Option<Result<Message, En
                 ),
             },
         ),
-        m::ItemFileChangeRequestApproval::METHOD => answer::<m::ItemFileChangeRequestApproval>(
+        Any::ItemFileChangeRequestApproval(_) => answer::<m::ItemFileChangeRequestApproval>(
             id,
             &wire::FileChangeRequestApprovalResponse {
                 decision: wire::FileChangeApprovalDecision::Decline,
             },
         ),
-        m::ExecCommandApproval::METHOD => answer::<m::ExecCommandApproval>(
+        Any::ExecCommandApproval(_) => answer::<m::ExecCommandApproval>(
             id,
             &wire::ExecCommandApprovalResponse { decision: denied() },
         ),
-        m::ApplyPatchApproval::METHOD => answer::<m::ApplyPatchApproval>(
+        Any::ApplyPatchApproval(_) => answer::<m::ApplyPatchApproval>(
             id,
             &wire::ApplyPatchApprovalResponse { decision: denied() },
         ),
-        m::McpServerElicitationRequest::METHOD => answer::<m::McpServerElicitationRequest>(
+        Any::McpServerElicitationRequest(_) => answer::<m::McpServerElicitationRequest>(
             id,
             &wire::McpServerElicitationRequestResponse {
                 meta: None,
@@ -240,14 +279,14 @@ pub(super) fn decline(id: &RequestId, method: &str) -> Option<Result<Message, En
                 content: None,
             },
         ),
-        m::ItemToolRequestUserInput::METHOD => answer::<m::ItemToolRequestUserInput>(
+        Any::ItemToolRequestUserInput(_) => answer::<m::ItemToolRequestUserInput>(
             id,
             &wire::ToolRequestUserInputResponse {
                 answers: std::collections::BTreeMap::new(),
             },
         ),
         // An empty grant: no file system and no network beyond what the sandbox already allows.
-        m::ItemPermissionsRequestApproval::METHOD => answer::<m::ItemPermissionsRequestApproval>(
+        Any::ItemPermissionsRequestApproval(_) => answer::<m::ItemPermissionsRequestApproval>(
             id,
             &wire::PermissionsRequestApprovalResponse {
                 permissions: wire::GrantedPermissionProfile {
@@ -258,23 +297,31 @@ pub(super) fn decline(id: &RequestId, method: &str) -> Option<Result<Message, En
                 strict_auto_review: None,
             },
         ),
-        _ => return None,
+        // Asks the client for credentials, an attestation, or the result of a tool the client
+        // provides, none of which a consultation has.
+        Any::AccountChatgptAuthTokensRefresh(_)
+        | Any::AttestationGenerate(_)
+        | Any::ItemToolCall(_) => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::envelope::{Message, RequestId};
-    use codex_app_server_protocol::methods as m;
+    use codex_app_server_protocol::methods::{self as m, AnyServerRequest};
     use googletest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::{decline, turn_steer_params};
+    use super::{ThreadId, TurnId, TurnTarget, decline, turn_steer_params};
 
     /// A steer names the turn it is for and carries the instruction as one text input.
     #[gtest]
     fn a_steer_encodes_its_turn_precondition_and_text() -> Result<()> {
-        let params = turn_steer_params("th-1", "tu-2", "only auth").or_fail()?;
+        let target = TurnTarget {
+            thread: &ThreadId::new("th-1"),
+            turn: &TurnId::new("tu-2"),
+        };
+        let params = turn_steer_params(target, "only auth").or_fail()?;
         let line = Message::request::<m::TurnSteer>(RequestId::Integer(7), &params)
             .or_fail()?
             .to_line();
@@ -299,8 +346,9 @@ mod tests {
     /// Every decline is the schema's own "denied, carry on" for its request.
     #[gtest]
     fn approvals_are_declined_in_the_schemas_own_words() -> Result<()> {
+        let request = |method: &str| AnyServerRequest::classify(method, &Value::Null).or_fail();
         let result = |method: &str| -> Result<Value> {
-            match decline(&RequestId::Integer(1), method)
+            match decline(&RequestId::Integer(1), request(method)?)
                 .or_fail()?
                 .or_fail()?
             {
@@ -328,8 +376,11 @@ mod tests {
             result("mcpServer/elicitation/request")?,
             eq(&json!({"action": "decline"}))
         );
-        // A request kind agentmux does not know is not declined: it is refused outright.
-        assert_that!(decline(&RequestId::Integer(1), "item/tool/call"), none());
+        // A request no consultation could answer is not declined: it is refused outright.
+        assert_that!(
+            decline(&RequestId::Integer(1), request("item/tool/call")?),
+            none()
+        );
         Ok(())
     }
 }

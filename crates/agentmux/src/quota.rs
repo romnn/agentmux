@@ -225,7 +225,8 @@ impl ProbeTarget {
         config: &Config,
         host_env: &BTreeMap<String, String>,
     ) -> Result<Self, crate::delegate::DelegateError> {
-        let env = crate::delegate::resolve_identity(vendor, alias, config, host_env, None)?.env;
+        let account = crate::delegate::AccountChoice::from(alias.cloned());
+        let env = crate::delegate::resolve_identity(vendor, &account, config, host_env, None)?.env;
         let vars = credential_vars(vendor);
         let config_dir = env.get(vars.config_dir).map(PathBuf::from);
         // An endpoint of the identity's own is not the vendor's window whatever the login says,
@@ -585,7 +586,6 @@ fn probe_codex(request: &ProbeRequest<'_>) -> Observation {
 
 /// One JSON-RPC exchange with `codex app-server`.
 fn codex_rate_limits(request: &ProbeRequest<'_>) -> Result<serde_json::Value, String> {
-    use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::Stdio;
 
     let mut command = probe_command(request, Vendor::Codex.program());
@@ -606,70 +606,8 @@ fn codex_rate_limits(request: &ProbeRequest<'_>) -> Result<serde_json::Value, St
     // The exchange runs on its own thread so a server that never answers cannot hang the caller.
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut write = || -> std::io::Result<()> {
-            writeln!(
-                stdin,
-                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"clientInfo":{{"name":"agentmux","version":"1"}}}}}}"#
-            )?;
-            writeln!(
-                stdin,
-                r#"{{"jsonrpc":"2.0","method":"initialized","params":{{}}}}"#
-            )?;
-            writeln!(
-                stdin,
-                r#"{{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read","params":{{}}}}"#
-            )?;
-            stdin.flush()
-        };
-        if write().is_err() {
-            let _ = sender.send(Err("codex app-server closed its input".to_owned()));
-            return;
-        }
-        // The server interleaves unsolicited notifications with replies, so the response is found
-        // by matching the request id rather than by taking the next line.
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = sender.send(Err(
-                        "codex app-server ended without answering. That account may not be \
-                         logged in."
-                            .to_owned(),
-                    ));
-                    return;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = sender.send(Err(format!("reading codex app-server: {error}")));
-                    return;
-                }
-            }
-            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if message.get("id").and_then(serde_json::Value::as_i64) != Some(2) {
-                continue;
-            }
-            if let Some(error) = message.get("error") {
-                let _ = sender.send(Err(format!(
-                    "codex app-server refused: {}",
-                    error
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no reason given")
-                )));
-                return;
-            }
-            let _ = sender.send(
-                message
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| "codex app-server answered without a result".to_owned()),
-            );
-            return;
-        }
+        // A caller that stopped waiting has already reported the timeout.
+        let _ = sender.send(exchange_rate_limits(&mut stdin, stdout));
     });
 
     let answer = receiver.recv_timeout(PROBE_TIMEOUT);
@@ -682,6 +620,73 @@ fn codex_rate_limits(request: &ProbeRequest<'_>) -> Result<serde_json::Value, St
             "codex app-server did not answer within {}s",
             PROBE_TIMEOUT.as_secs()
         )),
+    }
+}
+
+/// The handshake and the `account/rateLimits/read` request, over the protocol crate's own
+/// bindings, and the answer to it.
+///
+/// The answer is passed on exactly as it arrived: what a usage figure means depends on the plan
+/// behind it, which agentmux does not know, so it is not decoded into the schema's shape.
+fn exchange_rate_limits(
+    stdin: &mut impl std::io::Write,
+    stdout: impl std::io::Read,
+) -> Result<serde_json::Value, String> {
+    use std::io::BufRead as _;
+
+    use codex_app_server_protocol::envelope::{Message, RequestId};
+    use codex_app_server_protocol::methods as m;
+
+    const INITIALIZE: RequestId = RequestId::Integer(1);
+    const READ: RequestId = RequestId::Integer(2);
+
+    let encoded = [
+        Message::request::<m::Initialize>(INITIALIZE, &crate::appserver::initialize_params()),
+        Message::notification::<m::Initialized>(&()),
+        Message::request::<m::AccountRateLimitsRead>(READ, &None),
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| format!("{err}: {}", err.source))?;
+    encoded
+        .iter()
+        .try_for_each(|message| writeln!(stdin, "{}", message.to_line()))
+        .and_then(|()| stdin.flush())
+        .map_err(|_| "codex app-server closed its input".to_owned())?;
+
+    // The server interleaves unsolicited notifications with replies, so the answers are found by
+    // their request ids rather than by taking the next lines.
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.map_err(|err| format!("reading codex app-server: {err}"))?;
+        let Ok(Message::Response { id, outcome }) = Message::parse(&line) else {
+            continue;
+        };
+        match (id, outcome) {
+            (id, Err(error)) if id == INITIALIZE => {
+                return Err(format!(
+                    "codex app-server refused the handshake: {}",
+                    refusal(&error.message)
+                ));
+            }
+            (id, Err(error)) if id == READ => {
+                return Err(format!(
+                    "codex app-server refused: {}",
+                    refusal(&error.message)
+                ));
+            }
+            (id, Ok(result)) if id == READ => return Ok(result),
+            _ => {}
+        }
+    }
+    Err("codex app-server ended without answering. That account may not be logged in.".to_owned())
+}
+
+/// What a JSON-RPC error said, or that it said nothing.
+fn refusal(message: &str) -> &str {
+    if message.is_empty() {
+        "no reason given"
+    } else {
+        message
     }
 }
 
@@ -748,4 +753,62 @@ fn find_rollout(sessions: &Path, thread_id: &str) -> Option<PathBuf> {
             .find_map(|child| walk(&child, suffix, depth + 1))
     }
     walk(sessions, &format!("-{thread_id}.jsonl"), 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+    use indoc::indoc;
+    use serde_json::{Value, json};
+
+    use super::exchange_rate_limits;
+
+    /// The probe sends the handshake and the read through the protocol's bindings, skips what the
+    /// server says in between, and hands back the answer exactly as it arrived.
+    #[gtest]
+    fn the_answer_to_the_read_is_passed_on_verbatim() -> Result<()> {
+        let server = indoc! {r#"
+            {"id":1,"result":{"userAgent":"codex"}}
+            {"method":"account/rateLimits/updated","params":{}}
+            {"id":2,"result":{"rateLimits":{"primary":{"usedPercent":11}},"someFieldInventedNextYear":1}}
+        "#};
+        let mut sent = Vec::new();
+
+        let answer = exchange_rate_limits(&mut sent, server.as_bytes()).or_fail()?;
+
+        assert_that!(
+            answer,
+            eq(
+                &json!({"rateLimits": {"primary": {"usedPercent": 11}}, "someFieldInventedNextYear": 1})
+            )
+        );
+        let methods: Vec<Value> = String::from_utf8(sent)
+            .or_fail()?
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).map(|message| message["method"].clone())
+            })
+            .collect::<std::result::Result<_, _>>()
+            .or_fail()?;
+        assert_that!(
+            methods,
+            elements_are![
+                eq(&json!("initialize")),
+                eq(&json!("initialized")),
+                eq(&json!("account/rateLimits/read"))
+            ]
+        );
+        Ok(())
+    }
+
+    /// A refused handshake is reported as such at once, not left to look like a server that never
+    /// answered.
+    #[gtest]
+    fn a_refused_handshake_is_reported_as_refused() {
+        let server = r#"{"id":1,"error":{"code":-32600,"message":"not logged in"}}"#;
+        assert_that!(
+            exchange_rate_limits(&mut Vec::new(), server.as_bytes()),
+            err(eq("codex app-server refused the handshake: not logged in"))
+        );
+    }
 }

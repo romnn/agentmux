@@ -35,13 +35,15 @@
 //! moved away from the generated types is loud rather than lossy, the raw capture still holds what
 //! it said, a reply is still kept, and a turn that ended is still ended.
 
-use codex_app_server_protocol::methods::{self as m, SERVER_NOTIFICATIONS};
-use codex_app_server_protocol::{Notification as _, types as wire};
+use codex_app_server_protocol::methods::{self as m, AnyServerNotification as Any};
+use codex_app_server_protocol::{Method as _, Payload, types as wire};
 use serde_json::{Value, json};
 
+use super::protocol::{ThreadId, TurnId};
 use crate::stream::codex::STEER_EVENT;
 
-/// The event written in place of a notification that does not match the generated types.
+/// The event written in place of a message that does not match the generated types, or of a line
+/// that is no message at all.
 pub const UNDECODED_EVENT: &str = "agentmux.undecoded";
 
 /// How the turn ended, as far as the stream says.
@@ -67,8 +69,8 @@ pub(super) struct Translated {
 /// The state one turn's translation carries between notifications.
 #[derive(Debug, Default)]
 pub(super) struct Translator {
-    thread_id: Option<String>,
-    turn_id: Option<String>,
+    thread_id: Option<ThreadId>,
+    turn_id: Option<TurnId>,
     announced: bool,
     usage: Option<wire::TokenUsageBreakdown>,
     last_message: Option<String>,
@@ -95,6 +97,11 @@ pub(super) fn note(text: &str) -> String {
 pub(super) fn undecoded(method: &str, reason: &str, payload: &Value) -> String {
     json!({"type": UNDECODED_EVENT, "method": method, "reason": reason, "payload": payload})
         .to_string()
+}
+
+/// What a line from the server that is no JSON-RPC message becomes, so the capture keeps it.
+pub(super) fn unreadable(line: &str, reason: &str) -> String {
+    json!({"type": UNDECODED_EVENT, "reason": reason, "line": line}).to_string()
 }
 
 /// The terminal event for a turn the server ended badly.
@@ -131,14 +138,14 @@ fn snake(wire: &str) -> String {
 
 impl Translator {
     /// The turn this translation is for, once the server has named it.
-    pub(super) fn turn_id(&self) -> Option<&str> {
-        self.turn_id.as_deref()
+    pub(super) fn turn_id(&self) -> Option<&TurnId> {
+        self.turn_id.as_ref()
     }
 
     /// Learn the thread the consultation runs in, and return `exec`'s announcement of it.
-    pub(super) fn thread_began(&mut self, id: &str) -> String {
-        self.thread_id = Some(id.to_owned());
-        json!({"type": "thread.started", "thread_id": id}).to_string()
+    pub(super) fn thread_began(&mut self, id: &ThreadId) -> String {
+        self.thread_id = Some(id.clone());
+        json!({"type": "thread.started", "thread_id": id.as_str()}).to_string()
     }
 
     /// Whether a notification is about this consultation's own thread and turn, as `exec`
@@ -155,11 +162,13 @@ impl Translator {
             (Some(named), Some(ours)) => named == ours,
             _ => true,
         };
-        matches(named("/threadId"), self.thread_id.as_deref())
-            && matches(
-                named("/turnId").or_else(|| named("/turn/id")),
-                self.turn_id.as_deref(),
-            )
+        matches(
+            named("/threadId"),
+            self.thread_id.as_ref().map(ThreadId::as_str),
+        ) && matches(
+            named("/turnId").or_else(|| named("/turn/id")),
+            self.turn_id.as_ref().map(TurnId::as_str),
+        )
     }
 
     /// Learn the turn's id, from `turn/started` or from the answer to `turn/start`, whichever
@@ -168,9 +177,9 @@ impl Translator {
     /// Returns `exec`'s `turn.started` the first time, for the capture.
     /// The store reads that event as the driver following the turn, which is when it delivers a
     /// steer, so it is written as soon as either source names the turn and never twice.
-    pub(super) fn turn_began(&mut self, id: &str) -> Option<String> {
+    pub(super) fn turn_began(&mut self, id: &TurnId) -> Option<String> {
         if self.turn_id.is_none() {
-            self.turn_id = Some(id.to_owned());
+            self.turn_id = Some(id.clone());
         }
         (!std::mem::replace(&mut self.announced, true))
             .then(|| json!({"type": "turn.started"}).to_string())
@@ -201,41 +210,51 @@ impl Translator {
         cancelling: bool,
     ) -> Translated {
         let mut out = Translated::default();
+        let notification = Any::classify(method, params);
         // Configuration warnings concern the whole server, and `exec` reports them whoever they
         // name.
         let global = matches!(
-            method,
-            m::ConfigWarning::METHOD | m::DeprecationNotice::METHOD
+            notification,
+            Some(Any::ConfigWarning(_) | Any::DeprecationNotice(_))
         );
         if !global && !self.concerns_this_turn(params) {
             return out;
         }
-        let result = match method {
-            m::TurnStarted::METHOD => m::TurnStarted::params(params).map(|started| {
-                out.lines.extend(self.turn_began(&started.turn.id));
+        let Some(notification) = notification else {
+            out.lines.push(undecoded(
+                method,
+                "the codex this driver was generated from sends no such notification",
+                params,
+            ));
+            return out;
+        };
+        let result = match notification {
+            Any::TurnStarted(started) => started.decode().map(|started| {
+                out.lines
+                    .extend(self.turn_began(&TurnId::new(started.turn.id)));
             }),
-            m::ItemCompleted::METHOD => {
-                self.item_completed(params, &mut out);
+            Any::ItemCompleted(completed) => {
+                self.item_completed(completed, &mut out);
                 Ok(())
             }
-            m::Error::METHOD => m::Error::params(params).map(|error| {
+            Any::Error(error) => error.decode().map(|error| {
                 let message = with_details(error.error.message, error.error.additional_details);
                 out.lines
                     .push(json!({"type": "error", "message": message}).to_string());
                 self.last_error = Some(message);
             }),
-            m::Warning::METHOD => {
-                m::Warning::params(params).map(|warning| out.lines.push(note(&warning.message)))
-            }
-            m::ConfigWarning::METHOD => m::ConfigWarning::params(params).map(|warning| {
+            Any::Warning(warning) => warning
+                .decode()
+                .map(|warning| out.lines.push(note(&warning.message))),
+            Any::ConfigWarning(warning) => warning.decode().map(|warning| {
                 out.lines
                     .push(note(&with_details(warning.summary, warning.details)));
             }),
-            m::DeprecationNotice::METHOD => m::DeprecationNotice::params(params).map(|notice| {
+            Any::DeprecationNotice(notice) => notice.decode().map(|notice| {
                 out.lines
                     .push(note(&with_details(notice.summary, notice.details)));
             }),
-            m::ModelRerouted::METHOD => m::ModelRerouted::params(params).map(|reroute| {
+            Any::ModelRerouted(reroute) => reroute.decode().map(|reroute| {
                 out.lines.push(note(&format!(
                     "model rerouted: {} -> {} ({})",
                     reroute.from_model,
@@ -243,29 +262,29 @@ impl Translator {
                     reroute.reason.as_str()
                 )));
             }),
-            m::ThreadTokenUsageUpdated::METHOD => m::ThreadTokenUsageUpdated::params(params)
+            Any::ThreadTokenUsageUpdated(update) => update
+                .decode()
                 .map(|update| self.usage = Some(update.token_usage.total)),
-            m::TurnCompleted::METHOD => return self.turn_completed(params, cancelling),
-            known if SERVER_NOTIFICATIONS.contains(&known) => Ok(()),
-            _ => {
-                out.lines.push(undecoded(
-                    method,
-                    "the codex this driver was generated from sends no such notification",
-                    params,
-                ));
-                return out;
-            }
+            Any::TurnCompleted(completed) => return self.turn_completed(completed, cancelling),
+            // Everything else is either a delta of what `item/completed` delivers whole, or
+            // something `codex exec --json` does not report; it is not decoded, so a payload
+            // codex reshaped there is no drift worth recording.
+            _ => Ok(()),
         };
         if let Err(reason) = result {
-            out.lines
-                .push(undecoded(method, &reason.to_string(), params));
+            out.lines.push(undecoded(
+                notification.method(),
+                &reason.to_string(),
+                params,
+            ));
         }
         out
     }
 
     /// Translate `item/completed`, keeping a reply even when the item does not decode.
-    fn item_completed(&mut self, params: &Value, out: &mut Translated) {
-        match m::ItemCompleted::params(params) {
+    fn item_completed(&mut self, completed: Payload<'_, m::ItemCompleted>, out: &mut Translated) {
+        let params = completed.raw();
+        match completed.decode() {
             Ok(completed) => {
                 if let Some(item) = self.item(completed.item) {
                     out.lines.push(completed_item(&item));
@@ -295,9 +314,14 @@ impl Translator {
     }
 
     /// Translate `turn/completed`, which ends the turn whether or not it decodes.
-    fn turn_completed(&mut self, params: &Value, cancelling: bool) -> Translated {
+    fn turn_completed(
+        &mut self,
+        completed: Payload<'_, m::TurnCompleted>,
+        cancelling: bool,
+    ) -> Translated {
         let mut out = Translated::default();
-        let completed = match m::TurnCompleted::params(params) {
+        let params = completed.raw();
+        let completed = match completed.decode() {
             Ok(completed) => completed,
             Err(reason) => {
                 let reason = reason.to_string();
@@ -500,7 +524,7 @@ mod tests {
     use googletest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::{Finish, Translator, UNDECODED_EVENT};
+    use super::{Finish, Translator, TurnId, UNDECODED_EVENT};
 
     fn lines(translator: &mut Translator, method: &str, params: &Value) -> Vec<Value> {
         translator
@@ -568,7 +592,7 @@ mod tests {
     #[gtest]
     fn a_completed_turn_carries_the_token_total() {
         let mut t = Translator::default();
-        t.turn_began("tu");
+        t.turn_began(&TurnId::new("tu"));
         let usage = lines(
             &mut t,
             "thread/tokenUsage/updated",
@@ -660,7 +684,10 @@ mod tests {
         let started = json!({"type": "turn.started"});
 
         let mut t = Translator::default();
-        assert_that!(t.turn_began("tu"), some(eq(&started.to_string())));
+        assert_that!(
+            t.turn_began(&TurnId::new("tu")),
+            some(eq(&started.to_string()))
+        );
         assert_that!(
             lines(&mut t, "turn/started", &turn("tu", "inProgress")),
             is_empty()
@@ -671,15 +698,15 @@ mod tests {
             lines(&mut t, "turn/started", &turn("tu", "inProgress")),
             elements_are![eq(&started)]
         );
-        assert_that!(t.turn_began("tu"), none());
-        assert_that!(t.turn_id(), some(eq("tu")));
+        assert_that!(t.turn_began(&TurnId::new("tu")), none());
+        assert_that!(t.turn_id().map(TurnId::as_str), some(eq("tu")));
     }
 
     /// Another turn's completion does not end this one.
     #[gtest]
     fn another_turns_completion_is_ignored() {
         let mut t = Translator::default();
-        t.turn_began("tu-1");
+        t.turn_began(&TurnId::new("tu-1"));
         let out = t.notification("turn/completed", &turn("tu-0", "completed"), false);
         assert_that!(out, eq(&super::Translated::default()));
     }

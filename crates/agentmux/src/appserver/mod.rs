@@ -163,6 +163,7 @@ use serde::{Deserialize, Serialize};
 use crate::delegate::{AppServerSettings, Billing, SessionRef};
 
 pub use driver::{Deadlines, Ending, STOP_BUDGET, drive, drive_with};
+pub(crate) use protocol::initialize_params;
 pub use translate::UNDECODED_EVENT;
 
 /// What to do when a driven Codex turn fails or codex sends what agentmux cannot read: run the
