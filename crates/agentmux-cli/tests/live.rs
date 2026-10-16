@@ -52,7 +52,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
             model: ModelId::parse(MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
-            account,
+            account: account.into(),
             isolation: Some(Isolation::Inherit),
         },
         question: "Run the shell command `sleep 20` and wait for it to finish. Then reply with \

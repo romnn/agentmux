@@ -36,6 +36,9 @@ pub struct Script {
     /// Both model a real child flushing the tail of its stream as it exits, which is what makes
     /// the gap between reading the capture file and observing the process a race worth testing.
     pub flush_on_departure: Option<String>,
+    /// Whether the child outlives every request to stop, as one stuck in an uninterruptible
+    /// wait does.
+    pub survives_stop: bool,
 }
 
 impl Script {
@@ -80,6 +83,16 @@ impl Script {
             events: events.into(),
             exit: Some(0.into()),
             flush_on_departure: Some(tail.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A child that emits `events` and keeps running however it is asked to stop.
+    #[must_use]
+    pub fn survives_stop(events: impl Into<String>) -> Self {
+        Self {
+            events: events.into(),
+            survives_stop: true,
             ..Self::default()
         }
     }
@@ -257,9 +270,9 @@ impl Launcher for ScriptedLauncher {
         })?;
 
         launches.push(RecordedLaunch {
-            program: spec.invocation.program.clone(),
-            args: spec.invocation.args.clone(),
-            env: spec.invocation.env.clone(),
+            program: spec.invocation.program().to_owned(),
+            args: spec.invocation.args().to_vec(),
+            env: spec.invocation.env().clone(),
             cwd: spec.cwd.to_owned(),
             events: spec.events.to_owned(),
             question: std::fs::read_to_string(spec.question).unwrap_or_default(),
@@ -277,7 +290,7 @@ impl Launcher for ScriptedLauncher {
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
 
-        if script.exit.is_some() || self.stopped(launched.pid) {
+        if script.exit.is_some() || (self.stopped(launched.pid) && !script.survives_stop) {
             Liveness::Gone
         } else {
             Liveness::Alive
@@ -304,7 +317,7 @@ impl Launcher for ScriptedLauncher {
         self.flush_on_first_observation(launched.pid, index, &script);
         script.exit.or_else(|| {
             // A stopped child reports the signal that stopped it, as a real one would.
-            self.stopped(launched.pid).then_some(ExitStatus {
+            (self.stopped(launched.pid) && !script.survives_stop).then_some(ExitStatus {
                 code: None,
                 signal: Some(15),
             })

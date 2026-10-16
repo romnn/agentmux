@@ -136,7 +136,11 @@ impl World {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                account: account.map(AccountAlias::parse).transpose().or_fail()?,
+                account: account
+                    .map(AccountAlias::parse)
+                    .transpose()
+                    .or_fail()?
+                    .into(),
                 isolation: None,
             },
             question: "q".to_owned(),

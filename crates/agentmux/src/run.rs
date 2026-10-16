@@ -70,7 +70,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::appserver::mailbox::{Mailbox, Reply};
 use crate::delegate::{
-    Billing, Delegate, DelegateError, Effort, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
+    AccountAlias, AccountChoice, Billing, Delegate, DelegateError, Effort, Isolation, ModelId,
+    SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use crate::transcript::{
@@ -1053,15 +1054,23 @@ impl RunStore {
     /// told to stop and would not, by more.
     /// Deleting a run out from under a live child would leave it writing into unlinked files,
     /// billing, and unreachable.
+    ///
+    /// A cancelled turn's child is asked about too: its record says the capture is settled, not
+    /// that the child left, and one that outlived its kill is still running.
+    /// A child whose identity cannot be checked counts as alive, because deleting under it is
+    /// the mistake that cannot be undone.
     fn a_child_is_alive(&self, run_id: &RunId) -> Result<bool, RunError> {
         Ok(self
             .turn_files(run_id)?
             .into_iter()
-            .filter(|turn| turn.exit.is_none())
+            .filter(|turn| match &turn.exit {
+                None | Some(ExitRecord::Cancelled { .. }) => true,
+                Some(ExitRecord::Exited { .. }) => false,
+            })
             .filter_map(|turn| turn.launch)
             .any(|record| {
                 self.launcher.reap(record.launched).is_none()
-                    && self.launcher.liveness(record.launched) == Liveness::Alive
+                    && self.launcher.liveness(record.launched) != Liveness::Gone
             }))
     }
 
@@ -1209,8 +1218,9 @@ impl RunStore {
     ///
     /// Isolation is resolved before the account is pinned, because the answer depends on which
     /// file chose the account, and a pinned alias no longer says.
-    /// A default alias the configuration does not define is left unpinned, so the launch that
-    /// follows reports it with the file that selected it.
+    /// The account always leaves here resolved: the configured default by name, even one the
+    /// configuration does not define, which the launch then refuses, or the CLI's own login when
+    /// there is no default.
     ///
     /// A model the file rewrites is exchanged here, once: an identifier the file says nothing
     /// about is untouched, and the rewritten one is never looked up again.
@@ -1219,14 +1229,18 @@ impl RunStore {
     fn pin_defaults(delegate: &Delegate, config: &crate::config::Config) -> Pinned {
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
-        if pinned.account().is_none()
-            && let Some(alias) = config
-                .default_account(pinned.vendor())
-                .map(|default| default.alias)
-                .filter(|name| config.account(pinned.vendor(), name).is_some())
-                .and_then(|name| crate::delegate::AccountAlias::parse(name).ok())
-        {
-            pinned = pinned.with_account(alias);
+        if *pinned.account() == AccountChoice::Default {
+            // With no default, the CLI's own login, from now on, whatever default is added later.
+            // A default that is not a valid alias was refused when the file was read.
+            let resolved = match config.default_account(pinned.vendor()) {
+                None => Some(AccountChoice::CliLogin),
+                Some(default) => AccountAlias::parse(default.alias)
+                    .ok()
+                    .map(AccountChoice::Named),
+            };
+            if let Some(resolved) = resolved {
+                pinned = pinned.with_account(resolved);
+            }
         }
         // Every rewrite was checked when the file was read, so one that fails to parse here is a
         // value this build cannot use; what the caller asked for is then what runs.
@@ -1531,17 +1545,13 @@ impl RunStore {
                 settings,
                 cwd: meta.cwd.clone(),
                 resume: resume.cloned(),
-                billing: invocation.billing,
+                billing: invocation.billing(),
                 last_message: turn.last_message(),
                 cancel_marker: turn.cancelling(),
                 mailbox: turn.steer(),
             },
         )?;
-        invocation.program = driver.to_string_lossy().into_owned();
-        invocation.args = vec![
-            crate::appserver::SUBCOMMAND.to_owned(),
-            plan_path.to_string_lossy().into_owned(),
-        ];
+        invocation.drive_through(driver, crate::appserver::SUBCOMMAND, &plan_path);
         Ok(LaunchMode::AppServer)
     }
 
@@ -1570,20 +1580,22 @@ impl RunStore {
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
-        invocation.env.insert(
-            Self::STATE_DIR_ENV.to_owned(),
-            self.root.to_string_lossy().into_owned(),
-        );
+        invocation.name_state_dir(Self::STATE_DIR_ENV, &self.root);
 
         let mode = self.choose_launch(turn, meta, resume, config, &mut invocation)?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
         // delegate cannot save into, and a follow-up would resume a session that was never kept.
-        let unsaved_session_store = meta
-            .delegate
-            .vendor()
-            .session_store(&invocation.env)
+        // Both directories are as the child resolves them: a relative one from its own working
+        // directory, not from this process's.
+        let vendor = meta.delegate.vendor();
+        let config_dir = vendor
+            .config_dir(invocation.env())
+            .map(|dir| meta.cwd.join(dir));
+        let unsaved_session_store = vendor
+            .session_store(invocation.env())
+            .map(|store| meta.cwd.join(store))
             .filter(|store| !can_create_files_in(store));
         if let Some(store) = &unsaved_session_store {
             tracing::warn!(
@@ -1600,14 +1612,15 @@ impl RunStore {
         write_json(
             &turn.invocation(),
             &InvocationRecord {
-                program: invocation.program.clone(),
-                args: invocation.args.clone(),
-                env_keys: invocation.env.keys().cloned().collect(),
+                program: invocation.program().to_owned(),
+                args: invocation.args().to_vec(),
+                env_keys: invocation.env().keys().cloned().collect(),
                 cwd: meta.cwd.clone(),
                 resumed_from: resume.cloned(),
                 unsaved_session_store,
                 mode,
-                billing: Some(invocation.billing),
+                billing: Some(invocation.billing()),
+                config_dir,
             },
         )?;
 
@@ -1617,12 +1630,12 @@ impl RunStore {
         tracing::info!(
             run_id = %meta.run_id,
             turn = index,
-            program = invocation.program,
-            args = ?invocation.args,
+            program = invocation.program(),
+            args = ?invocation.args(),
             cwd = %meta.cwd.display(),
             resumed = resume.is_some(),
             ?mode,
-            billing = %invocation.billing,
+            billing = %invocation.billing(),
             "launching delegate",
         );
 
@@ -2010,32 +2023,40 @@ impl RunStore {
     ///
     /// Returns [`RunError::Io`] when the run directory cannot be listed.
     pub fn sweep(&self) -> Result<usize, RunError> {
-        let mut removed = 0;
-        for run_id in self.run_ids()? {
-            let Ok(meta) = self.meta(&run_id) else {
-                continue;
-            };
+        // The clock runs from the last thing the delegate wrote, not from the start: a
+        // consultation that ran for longer than the TTL is not stale the moment it ends.
+        // File times alone decide it, so a young run costs a few stats and no fold.
+        let expired = |run_id: &RunId, meta: &Meta| {
             if meta.retention == Retention::UntilReleased {
-                continue;
+                return false;
             }
-            // The clock runs from the last thing the delegate wrote, not from the start: a
-            // consultation that ran for longer than the TTL is not stale the moment it ends.
-            // File times alone decide it, so a young run costs a few stats and no fold.
             let last = self
-                .turn_dirs(&run_id)
+                .turn_dirs(run_id)
                 .filter_map(|(_, dir)| settle::last_write(&dir))
                 .max()
                 .map_or(meta.created_at, DateTime::<Utc>::from)
                 .max(meta.created_at);
-            let Ok(age) = Utc::now().signed_duration_since(last).to_std() else {
-                continue;
-            };
-            if age < Self::TTL {
+            Utc::now()
+                .signed_duration_since(last)
+                .to_std()
+                .is_ok_and(|age| age >= Self::TTL)
+        };
+        let mut removed = 0;
+        for run_id in self.run_ids()? {
+            if !self.meta(&run_id).is_ok_and(|meta| expired(&run_id, &meta)) {
                 continue;
             }
             let Ok(_lock) = self.lock(&run_id) else {
                 continue;
             };
+            // Asked again under the lock: a follow-up or a `keep` that landed between the first
+            // look and the lock makes the run young or kept again.
+            let Ok(meta) = self.meta(&run_id) else {
+                continue;
+            };
+            if !expired(&run_id, &meta) {
+                continue;
+            }
             let finished = match self.newest_turn(&meta) {
                 Ok(turn) => turn.is_none_or(|turn| turn.outcome.is_terminal()),
                 Err(_) => continue,
@@ -2096,10 +2117,16 @@ impl RunStore {
                 });
             }
         };
-        serde_json::from_str(&text).map_err(|source| RunError::Corrupt {
+        let mut meta: Meta = serde_json::from_str(&text).map_err(|source| RunError::Corrupt {
             run_id: run_id.clone(),
             source,
-        })
+        })?;
+        // Every account is resolved when a consultation starts, so an unresolved one is a record
+        // written before agentmux pinned the CLI login, which is what such a record ran on.
+        if *meta.delegate.account() == AccountChoice::Default {
+            meta.delegate = meta.delegate.with_account(AccountChoice::CliLogin);
+        }
+        Ok(meta)
     }
 
     /// Poll until a consultation reaches a terminal state, or until `timeout` elapses.
@@ -2326,7 +2353,7 @@ pub(super) struct TurnFiles {
 ///
 /// Environment *keys* only.
 /// The values are credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct InvocationRecord {
     program: String,
     args: Vec<String>,
@@ -2349,6 +2376,12 @@ pub(super) struct InvocationRecord {
     /// keeping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) billing: Option<Billing>,
+    /// The vendor's configuration directory, as the environment the child got resolves it:
+    /// where Codex writes the rollout a turn's usage window is recovered from.
+    /// Recorded rather than re-derived, because a request's own environment can move it and
+    /// is not kept; absent from a record older than agentmux keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) config_dir: Option<PathBuf>,
 }
 
 /// Claim a turn index by creating its directory.

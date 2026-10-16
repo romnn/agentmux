@@ -44,12 +44,12 @@ impl Fixture {
     ) -> Result<Launched> {
         let question = self.dir.path().join("question.md");
         std::fs::write(&question, "q").or_fail()?;
-        let invocation = Invocation {
-            program: "sh".to_owned(),
-            args: vec!["-c".to_owned(), script.to_owned()],
+        let invocation = Invocation::for_launcher_test(
+            "sh",
+            vec!["-c".to_owned(), script.to_owned()],
             env,
             billing,
-        };
+        );
         self.launcher
             .launch(&LaunchSpec {
                 invocation: &invocation,
@@ -167,6 +167,13 @@ fn a_recycled_pid_is_not_mistaken_for_the_child() -> Result<()> {
     };
     assert_that!(restarted.liveness(impostor), eq(Liveness::Gone));
     assert_that!(restarted.liveness(launched), eq(Liveness::Alive));
+    // With no start time on record, a process holding the pid cannot be told from the child:
+    // neither alive, which would let it be signalled, nor gone, which would let its run go.
+    let unidentified = Launched {
+        started: None,
+        ..launched
+    };
+    assert_that!(restarted.liveness(unidentified), eq(Liveness::Unknown));
 
     f.launcher.kill(launched);
     assert_that!(f.gone_within(launched, Duration::from_secs(5)), eq(true));
@@ -179,12 +186,8 @@ fn a_missing_working_directory_is_named() -> Result<()> {
     let f = Fixture::new()?;
     let question = f.dir.path().join("question.md");
     std::fs::write(&question, "q").or_fail()?;
-    let invocation = Invocation {
-        program: "sh".to_owned(),
-        args: vec![],
-        env: BTreeMap::new(),
-        billing: Billing::Subscription,
-    };
+    let invocation =
+        Invocation::for_launcher_test("sh", vec![], BTreeMap::new(), Billing::Subscription);
     let error = f
         .launcher
         .launch(&LaunchSpec {

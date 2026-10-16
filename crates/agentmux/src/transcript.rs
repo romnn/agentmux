@@ -263,7 +263,10 @@ impl Outcome {
     /// Whether no further messages can arrive for this turn.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Running)
+        match self {
+            Self::Running => false,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled => true,
+        }
     }
 
     /// A one-word state name, stable enough for a caller to branch on.

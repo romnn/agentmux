@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{
+    AccountAlias, AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+};
 use agentmux::run::{
     HookReopening, NotResumable, Retention, RunError, RunId, RunStore, StartRequest,
 };
@@ -24,7 +26,7 @@ fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     })
 }
@@ -34,7 +36,7 @@ fn codex() -> Result<Delegate> {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::ReadOnly,
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     })
 }
@@ -851,7 +853,7 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
         Delegate::Claude {
             model: ModelId::parse("claude-opus-5").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
-            account: Some(AccountAlias::parse("nobody").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("nobody").or_fail()?),
             isolation: None,
         },
         "q",
@@ -1104,7 +1106,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 // The caller names neither the account nor the isolation.
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "q".to_owned(),
@@ -1135,6 +1137,175 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
         resumed.delegate.isolation(),
         some(eq(Isolation::Inherit)),
         "a follow-up re-resolved isolation against an edited configuration"
+    );
+    Ok(())
+}
+
+/// A consultation started on the CLI's own login stays on it when a default account is added.
+///
+/// "No account" is resolved when the consultation starts and recorded as the CLI login, so a
+/// follow-up does not read a default that appeared since, which would move it onto an identity
+/// whose session it cannot resume.
+#[gtest]
+fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let config_path = home.path().join("agentmux.toml");
+    let account_dir = home.path().join(".claude-personal");
+    std::fs::create_dir_all(&account_dir).or_fail()?;
+    agentmux::testing::write_config_file(&config_path, "")?;
+
+    let dir = tempfile::tempdir().or_fail()?;
+    let host: BTreeMap<String, String> = [
+        ("PATH".to_owned(), "/usr/bin".to_owned()),
+        (
+            "HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "AGENTMUX_CONFIG".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let launcher = Arc::new(ScriptedLauncher::new([
+        Script::completed(fixtures::CLAUDE_HAPPY),
+        Script::completed(fixtures::CLAUDE_RESUME),
+    ]));
+    let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
+
+    let started = store
+        .start(&StartRequest {
+            delegate: Delegate::Claude {
+                model: ModelId::parse("claude-opus-5").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
+                account: AccountChoice::Default,
+                isolation: None,
+            },
+            question: "q".to_owned(),
+            cwd: home.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            codex_exec: false,
+        })
+        .or_fail()?;
+    // With no default configured, the record says the CLI's own login ran.
+    assert_that!(started.delegate.account(), eq(&AccountChoice::CliLogin));
+
+    // A record written before the CLI login was pinned holds no account at all, and reads the
+    // same.
+    let meta_path = dir
+        .path()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+    meta["delegate"]
+        .as_object_mut()
+        .or_fail()?
+        .remove("account")
+        .or_fail()?;
+    std::fs::write(&meta_path, meta.to_string())?;
+
+    // A default account appears mid-consultation.
+    agentmux::testing::write_config_file(
+        &config_path,
+        indoc::formatdoc! {r#"
+            [defaults.claude]
+            account = "personal"
+
+            [accounts.claude.personal]
+            config_dir = {:?}
+        "#, account_dir.display().to_string()},
+    )?;
+    let resumed = store.follow_up(&started.run_id, "again").or_fail()?;
+
+    // The follow-up kept the CLI login: neither the record nor the launch moved to the default.
+    assert_that!(resumed.delegate.account(), eq(&AccountChoice::CliLogin));
+    let launches = launcher.launches();
+    assert_that!(launches.len(), eq(2));
+    assert_that!(
+        launches.last().or_fail()?.env.get("CLAUDE_CONFIG_DIR"),
+        none()
+    );
+    Ok(())
+}
+
+/// A Codex turn's usage window is recovered from the `CODEX_HOME` its child actually got, even
+/// when the request moved it there, relative to the child's working directory, because the
+/// launch records it as the child resolves it.
+///
+/// A request's environment is not kept, so re-deriving the directory from the account would
+/// search the account's own home, find nothing, and cache that.
+#[gtest]
+fn a_rollout_is_found_where_the_requests_environment_sent_the_child() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let config_path = home.path().join("agentmux.toml");
+    agentmux::testing::write_config_file(
+        &config_path,
+        "[launch]\nrequest_env = [\"CODEX_HOME\"]\n",
+    )?;
+    let codex_home = home.path().join("elsewhere");
+    let day = codex_home.join("sessions/2026/09/07");
+    std::fs::create_dir_all(&day)?;
+    std::fs::write(
+        day.join("rollout-2026-09-07T01-53-34-01a0784a-915b-7d92-a381-b53d765296c4.jsonl"),
+        indoc::indoc! {r#"
+            {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1789303382}}}}
+        "#},
+    )?;
+
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    host.insert(
+        "AGENTMUX_CONFIG".to_owned(),
+        config_path.to_string_lossy().into_owned(),
+    );
+    let dir = tempfile::tempdir().or_fail()?;
+    let launcher = Arc::new(ScriptedLauncher::new([Script::completed(
+        fixtures::CODEX_HAPPY,
+    )]));
+    let store = RunStore::open(dir.path(), launcher, host).or_fail()?;
+    // Relative, so it is found only from the child's working directory, which is not this
+    // process's.
+    let mut start = request(codex()?, "q");
+    start.cwd = home.path().to_path_buf();
+    start.env = [("CODEX_HOME".to_owned(), "elsewhere".to_owned())]
+        .into_iter()
+        .collect();
+    let started = store.start(&start).or_fail()?;
+
+    // The window came from the rollout under the request's `CODEX_HOME`.
+    let status = store.status(&started.run_id).or_fail()?;
+    assert_that!(
+        status.rate_limit.map(|limit| limit.window),
+        some(some(eq("codex")))
+    );
+    Ok(())
+}
+
+/// A cancelled consultation whose child outlived its kill is not deleted under it.
+///
+/// The cancellation record settles the capture, not the process, so removal still asks whether
+/// the child is there.
+#[gtest]
+#[tokio::test]
+async fn a_cancelled_run_whose_child_survives_is_not_removed() -> Result<()> {
+    let h = harness([Script::survives_stop(
+        "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
+    )])?;
+    let started = h.store.start(&request(codex()?, "q"))?;
+
+    let cancelled = h.store.cancel(&started.run_id).await?;
+    assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
+
+    assert_that!(
+        h.store.remove(&started.run_id),
+        err(matches_pattern!(RunError::StillRunning { .. }))
     );
     Ok(())
 }
@@ -1268,7 +1439,11 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                account: account.map(AccountAlias::parse).transpose().or_fail()?,
+                account: account
+                    .map(AccountAlias::parse)
+                    .transpose()
+                    .or_fail()?
+                    .into(),
                 isolation: None,
             },
             question: "q".to_owned(),
@@ -1433,7 +1608,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
         model: ModelId::parse("gpt-6").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::ReadOnly,
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     };
 
@@ -1512,7 +1687,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
             model: ModelId::parse(model).or_fail()?,
             effort: effort.map(Effort::parse).transpose().or_fail()?,
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         })
     };

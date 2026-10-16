@@ -27,6 +27,7 @@
 //! Whatever record settles a turn, the turn is rendered from exactly the capture length that
 //! record froze, whichever caller wrote it.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use super::{
@@ -193,24 +194,34 @@ impl RunStore {
         &self,
         dir: &TurnDir,
         meta: &Meta,
+        codex_home: Option<&Path>,
         thread_id: &str,
     ) -> Option<RateLimit> {
         if let Ok(Some(cached)) = read_json::<Option<RateLimit>>(&dir.rate_limit()) {
             return cached;
         }
-        let found = self.codex_rate_limit(meta, thread_id);
+        let found = self.codex_rate_limit(meta, codex_home, thread_id);
         let _ = write_json(&dir.rate_limit(), &found);
         found
     }
 
     /// The usage window Codex recorded while running one turn.
     ///
-    /// Its rollout files live under `CODEX_HOME`, which is found the way the delegate found it:
-    /// from the environment the same account resolves to.
-    fn codex_rate_limit(&self, meta: &Meta, thread_id: &str) -> Option<RateLimit> {
-        let config = crate::config::Config::load(&self.host_env, &meta.cwd).ok()?;
-        let env = meta.delegate.identity_env(&self.host_env, &config).ok()?;
-        let codex_home = Vendor::Codex.config_dir(&env)?;
+    /// Its rollout files live under the `CODEX_HOME` the launch recorded.
+    /// A turn launched before agentmux recorded it is searched where the account resolves now.
+    fn codex_rate_limit(
+        &self,
+        meta: &Meta,
+        codex_home: Option<&Path>,
+        thread_id: &str,
+    ) -> Option<RateLimit> {
+        let codex_home = if let Some(recorded) = codex_home {
+            recorded.to_path_buf()
+        } else {
+            let config = crate::config::Config::load(&self.host_env, &meta.cwd).ok()?;
+            let env = meta.delegate.identity_env(&self.host_env, &config).ok()?;
+            Vendor::Codex.config_dir(&env)?
+        };
 
         let limits = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
@@ -378,20 +389,15 @@ impl RunStore {
 
         // What the launch recorded before the spawn: which session it asked to resume, and
         // whether the child was ever going to be able to save its own.
-        let invocation = read_json::<InvocationRecord>(&dir.invocation())?;
-        let (asked_for, unsaved_session_store, mode, billing) = invocation
-            .map(|record| {
-                (
-                    record.resumed_from,
-                    record.unsaved_session_store,
-                    record.mode,
-                    record.billing,
-                )
-            })
-            .unwrap_or_default();
-        turn.unsaved_session_store = unsaved_session_store;
-        turn.billing = billing;
-        note_continuity(asked_for.as_ref(), turn_session.as_ref(), &mut turn);
+        let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
+        turn.unsaved_session_store = invocation.unsaved_session_store;
+        turn.billing = invocation.billing;
+        let mode = invocation.mode;
+        note_continuity(
+            invocation.resumed_from.as_ref(),
+            turn_session.as_ref(),
+            &mut turn,
+        );
 
         // Codex says nothing about usage on the stream agentmux captures, but records it in the
         // session rollout it writes anyway.
@@ -404,7 +410,12 @@ impl RunStore {
             && turn.outcome.is_terminal()
             && let Some(thread) = turn_session.as_ref()
         {
-            turn.rate_limit = self.cached_codex_rate_limit(dir, meta, thread.as_str());
+            turn.rate_limit = self.cached_codex_rate_limit(
+                dir,
+                meta,
+                invocation.config_dir.as_deref(),
+                thread.as_str(),
+            );
         }
 
         self.recover_from_last_message(meta, files, &mut turn, may_recover)?;

@@ -34,7 +34,7 @@ fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<Sta
         cwd: question.working_dir()?,
         retention: question.retention(),
         env: question.environment()?,
-        billing: delegate.billing.map(Into::into),
+        billing: delegate.billing,
         codex_exec: false,
     })
 }
@@ -82,9 +82,7 @@ async fn main() -> Result<()> {
             let config = agentmux::config::Config::load(store.host_env(), &cwd)?;
             report::accounts(&config, store.host_env(), cli.json)
         }
-        Command::Quota(args) => {
-            report::quota(&store.quota(args.delegate.map(Into::into))?, cli.json)
-        }
+        Command::Quota(args) => report::quota(&store.quota(args.delegate)?, cli.json),
         Command::Mcp(args) => serve(store, &args).await,
         Command::Ask(args) => {
             let status = store.start(&start_request(&args.delegate, &args.question)?)?;
@@ -151,7 +149,7 @@ async fn main() -> Result<()> {
 /// Returns an error when `--deny` leaves no vendor to consult, when this process is itself a
 /// delegate, or when the host does not complete the handshake.
 async fn serve(store: RunStore, args: &McpArgs) -> Result<()> {
-    let denied: BTreeSet<Vendor> = args.deny.iter().copied().map(Vendor::from).collect();
+    let denied: BTreeSet<Vendor> = args.deny.iter().copied().collect();
     // Serving with every vendor denied would refuse every call it accepted.
     // A host surfaces a server that will not start, where it would quietly swallow one that
     // answers nothing.

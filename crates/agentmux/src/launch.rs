@@ -109,7 +109,8 @@ pub struct Launched {
     ///
     /// The pid alone does not identify a process across an agentmux restart: it is recycled, and
     /// a recycled pid that happens to lead a process group of its own passes every other test.
-    /// A process found under this pid is the child only if it also started at this time.
+    /// A process found under this pid is the child only if it also started at this time, and
+    /// without a start time on record, it is never taken to be the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
 }
@@ -342,8 +343,8 @@ impl Launcher for ProcessLauncher {
 
         // The guarantee is kept here, where the child is made, rather than trusted to every layer
         // that built the environment: a subscription delegate is never handed a key.
-        let mut env = spec.invocation.env.clone();
-        if spec.invocation.billing == Billing::Subscription {
+        let mut env = spec.invocation.env().clone();
+        if spec.invocation.billing() == Billing::Subscription {
             scrub_billing_env(&mut env);
         }
 
@@ -356,7 +357,7 @@ impl Launcher for ProcessLauncher {
             };
             let mut command = std::process::Command::new(program);
             command
-                .args(&spec.invocation.args)
+                .args(spec.invocation.args())
                 .current_dir(spec.cwd)
                 .stdin(clone(&stdin, spec.question)?)
                 .stdout(clone(&stdout, spec.events)?)
@@ -376,7 +377,7 @@ impl Launcher for ProcessLauncher {
             })
         };
 
-        let program = spec.invocation.program.as_str();
+        let program = spec.invocation.program();
         let child = match spawn(program) {
             Ok(child) => child,
             // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find
@@ -531,43 +532,13 @@ mod identity {
         }
         // The recorded start time is the identity; a pid handed to a different process since is
         // not this child, however much else it has in common.
+        // Without one, a process holding the pid may or may not be the child, and nothing here
+        // can tell: it is not called alive, so it is never signalled, nor gone, so its run is
+        // never deleted under it.
         match launched.started {
             Some(started) if started == process.start_time() => Liveness::Alive,
             Some(_) => Liveness::Gone,
-            None => platform::same_group(launched),
-        }
-    }
-
-    #[cfg(unix)]
-    mod platform {
-        use nix::unistd::Pid;
-
-        use super::{Launched, Liveness};
-
-        /// With no start time on record, the process group is the next best witness: the child
-        /// leads its own, and a recycled pid that does too is the residual hazard.
-        pub(super) fn same_group(launched: Launched) -> Liveness {
-            let Ok(pid) = i32::try_from(launched.pid) else {
-                return Liveness::Unknown;
-            };
-            match nix::unistd::getpgid(Some(Pid::from_raw(pid))) {
-                Ok(group) => match launched.process_group {
-                    Some(expected) if i32::try_from(expected) != Ok(group.as_raw()) => {
-                        Liveness::Gone
-                    }
-                    _ => Liveness::Alive,
-                },
-                Err(_) => Liveness::Gone,
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    mod platform {
-        use super::{Launched, Liveness};
-
-        pub(super) fn same_group(_launched: Launched) -> Liveness {
-            Liveness::Alive
+            None => Liveness::Unknown,
         }
     }
 }

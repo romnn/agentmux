@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId, Vendor};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId, Vendor};
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
@@ -34,7 +34,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Review the diff.".to_owned(),

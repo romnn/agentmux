@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 use crate::config::{Account, ChosenBy, Config, DefaultAccount, Secret};
 
@@ -143,8 +144,12 @@ pub enum DelegateError {
 /// reader of a surprising result asks first.
 /// "The CLI's own login" and "a configured account" are spelled differently, because a listing in
 /// which both read `default` cannot answer that question.
-fn describe_account(alias: Option<&AccountAlias>) -> &str {
-    alias.map_or("cli-default", AccountAlias::as_str)
+fn describe_account(account: &AccountChoice) -> &str {
+    match account {
+        AccountChoice::Named(alias) => alias.as_str(),
+        AccountChoice::CliLogin => "cli-default",
+        AccountChoice::Default => "default",
+    }
 }
 
 /// Name the effort, or say that the CLI is choosing it, in the same words as for an account.
@@ -173,15 +178,16 @@ fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
 fn resolve_isolation(
     explicit: Option<Isolation>,
     vendor: Vendor,
-    alias: Option<&AccountAlias>,
+    account: &AccountChoice,
     config: &Config,
 ) -> Isolation {
     if let Some(isolation) = explicit {
         return isolation;
     }
-    let alias = match alias {
-        Some(alias) => alias.as_str(),
-        None => match config.default_account(vendor) {
+    let alias = match account {
+        AccountChoice::Named(alias) => alias.as_str(),
+        AccountChoice::CliLogin => return Isolation::Isolated,
+        AccountChoice::Default => match config.default_account(vendor) {
             Some(DefaultAccount {
                 chosen_by: ChosenBy::Project(_),
                 ..
@@ -434,7 +440,8 @@ impl Isolation {
 /// `WorkspaceWrite` exists because a delegate asked to produce a large artefact cannot deliver it
 /// through a read-only sandbox — a read-only delegate told to write its report to a path completes
 /// the work, fails the write, and reports the failure instead of the findings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, VariantArray)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum CodexSandbox {
     /// The delegate may read the working directory and nothing else.
@@ -465,7 +472,8 @@ impl CodexSandbox {
 /// `Api` lifts exactly those restrictions, for an account the operator marked `billing = "api"`.
 /// Neither says what the CLI's own configuration or login then does: that is the user's own
 /// setup, and agentmux leaves it alone.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, VariantArray)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum Billing {
     /// The vendor's subscription, through the CLI's logged-in profile.
@@ -493,10 +501,17 @@ impl std::fmt::Display for Billing {
 }
 
 /// Which CLI a consultation is talking to, without the options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, VariantArray,
+)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum Vendor {
     /// Anthropic's `claude` CLI.
+    ///
+    /// Also spelled `claude-code` on the command line, because the CLI and the harness that runs
+    /// it are named differently, and `--deny` is written while thinking of the harness.
+    #[cfg_attr(feature = "clap", value(alias = "claude-code"))]
     Claude,
     /// The `codex` CLI from `OpenAI`.
     Codex,
@@ -506,7 +521,8 @@ impl Vendor {
     /// Every vendor, for the places that fan out over all of them.
     ///
     /// The one list, so that a third vendor cannot be added to the enum and left out of `quota`,
-    /// `accounts` or the server's roster: those iterate this rather than spelling the set again.
+    /// `accounts` or the server's roster: those iterate this rather than spelling the set again,
+    /// and its length is checked against the enum's own.
     pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
     /// The executable name, as found on `PATH`.
@@ -555,9 +571,98 @@ impl Vendor {
     }
 }
 
+// `Vendor::ALL` names every variant once; a vendor added to the enum and not to it fails here.
+const _: () = assert!(Vendor::ALL.len() == <Vendor as VariantArray>::VARIANTS.len());
+
 impl std::fmt::Display for Vendor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.program())
+    }
+}
+
+/// Which account a delegate authenticates as.
+///
+/// [`AccountChoice::Default`] is what a caller asks for by naming no account, and a consultation
+/// resolves it once, when it starts, into one of the other two: a later configuration change
+/// must not move a follow-up onto another identity, whose session it could not resume.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AccountChoice {
+    /// The account the machine's or the checkout's configuration names as the default, or the
+    /// CLI's own login when it names none.
+    #[default]
+    Default,
+    /// The CLI's own login, with no configured account.
+    CliLogin,
+    /// This configured account.
+    Named(AccountAlias),
+}
+
+impl AccountChoice {
+    /// The configured account, when one is named.
+    #[must_use]
+    pub fn alias(&self) -> Option<&AccountAlias> {
+        match self {
+            Self::Named(alias) => Some(alias),
+            Self::Default | Self::CliLogin => None,
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+impl From<Option<AccountAlias>> for AccountChoice {
+    fn from(alias: Option<AccountAlias>) -> Self {
+        alias.map_or(Self::Default, Self::Named)
+    }
+}
+
+/// How a record keeps an [`AccountChoice`]: absent for the default, the alias itself for a named
+/// account — which is what every record written before the CLI login was pinned holds — and
+/// `{"kind": "cli_login"}` for the CLI's own login, which no alias can spell.
+mod stored_account {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{AccountAlias, AccountChoice};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Named(AccountAlias),
+        Tagged { kind: Kind },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        CliLogin,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        choice: &AccountChoice,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match choice {
+            AccountChoice::Named(alias) => Stored::Named(alias.clone()).serialize(serializer),
+            AccountChoice::CliLogin => Stored::Tagged {
+                kind: Kind::CliLogin,
+            }
+            .serialize(serializer),
+            AccountChoice::Default => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<AccountChoice, D::Error> {
+        Ok(match Option::<Stored>::deserialize(deserializer)? {
+            None => AccountChoice::Default,
+            Some(Stored::Named(alias)) => AccountChoice::Named(alias),
+            Some(Stored::Tagged {
+                kind: Kind::CliLogin,
+            }) => AccountChoice::CliLogin,
+        })
     }
 }
 
@@ -578,9 +683,13 @@ pub enum Delegate {
         /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
-        /// Which configured account to authenticate as, or the CLI's own default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account: Option<AccountAlias>,
+        /// Which account to authenticate as.
+        #[serde(
+            default,
+            skip_serializing_if = "AccountChoice::is_default",
+            with = "stored_account"
+        )]
+        account: AccountChoice,
         /// Whether to load the account's own settings, or the account's preference when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<Isolation>,
@@ -595,9 +704,13 @@ pub enum Delegate {
         /// How much the delegate may write.
         #[serde(default)]
         sandbox: CodexSandbox,
-        /// Which configured account to authenticate as, or the CLI's own default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account: Option<AccountAlias>,
+        /// Which account to authenticate as.
+        #[serde(
+            default,
+            skip_serializing_if = "AccountChoice::is_default",
+            with = "stored_account"
+        )]
+        account: AccountChoice,
         /// Whether to load the account's own settings, or the account's preference when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<Isolation>,
@@ -624,7 +737,7 @@ impl Delegate {
     ) -> Result<Self, DelegateError> {
         let model = ModelId::parse(model)?;
         let effort = effort.map(Effort::parse).transpose()?;
-        let account = account.map(AccountAlias::parse).transpose()?;
+        let account = AccountChoice::from(account.map(AccountAlias::parse).transpose()?);
         match vendor {
             Vendor::Claude => {
                 if sandbox.is_some() {
@@ -689,10 +802,10 @@ impl Delegate {
         match self {
             Self::Claude {
                 account, isolation, ..
-            } => resolve_isolation(*isolation, Vendor::Claude, account.as_ref(), config),
+            } => resolve_isolation(*isolation, Vendor::Claude, account, config),
             Self::Codex {
                 account, isolation, ..
-            } => resolve_isolation(*isolation, Vendor::Codex, account.as_ref(), config),
+            } => resolve_isolation(*isolation, Vendor::Codex, account, config),
         }
     }
 
@@ -703,9 +816,9 @@ impl Delegate {
     /// Without it the record would say the caller named nothing, which is true but does not answer
     /// the question a reader of a surprising result asks: which identity paid for this.
     #[must_use]
-    pub fn with_account(mut self, alias: AccountAlias) -> Self {
+    pub fn with_account(mut self, choice: AccountChoice) -> Self {
         match &mut self {
-            Self::Claude { account, .. } | Self::Codex { account, .. } => *account = Some(alias),
+            Self::Claude { account, .. } | Self::Codex { account, .. } => *account = choice,
         }
         self
     }
@@ -735,11 +848,11 @@ impl Delegate {
         self
     }
 
-    /// The configured account this delegate authenticates as, if one was named.
+    /// Which account this delegate authenticates as.
     #[must_use]
-    pub fn account(&self) -> Option<&AccountAlias> {
+    pub fn account(&self) -> &AccountChoice {
         match self {
-            Self::Claude { account, .. } | Self::Codex { account, .. } => account.as_ref(),
+            Self::Claude { account, .. } | Self::Codex { account, .. } => account,
         }
     }
 
@@ -775,7 +888,7 @@ impl Delegate {
                 format!(
                     "claude {model} effort={} account={}{}",
                     describe_effort(effort.as_ref()),
-                    describe_account(account.as_ref()),
+                    describe_account(account),
                     describe_isolation(*isolation)
                 )
             }
@@ -790,7 +903,7 @@ impl Delegate {
                     "codex {model} effort={} sandbox={} account={}{}",
                     describe_effort(effort.as_ref()),
                     sandbox.as_str(),
-                    describe_account(account.as_ref()),
+                    describe_account(account),
                     describe_isolation(*isolation)
                 )
             }
@@ -828,8 +941,11 @@ pub struct TurnPlan<'a> {
 ///
 /// Claude calls this a session id and Codex calls it a thread id; both are opaque to agentmux and
 /// both are recovered by parsing the delegate's event stream.
+///
+/// Read back from disk through [`SessionRef::parse`] too, so a record edited or corrupted outside
+/// agentmux cannot hand the CLI an identifier `parse` would refuse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct SessionRef(String);
 
 impl SessionRef {
@@ -857,29 +973,78 @@ impl SessionRef {
     }
 }
 
-impl std::fmt::Display for SessionRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+string_newtype_conversions!(SessionRef);
 
 /// A fully prepared child process: what to run, with which arguments, in which environment.
 ///
-/// Produced only by [`Delegate::invocation`], so the flags that make capture correct cannot be
-/// forgotten at a call site.
+/// Produced only by [`Delegate::invocation`], and its fields are private, so the flags that make
+/// capture correct, the recursion marker and the environment allowlist cannot be left out at a
+/// call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    billing: Billing,
+}
+
+impl Invocation {
     /// Executable name, resolved against the child's `PATH`, or a path to it.
-    pub program: String,
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
     /// The complete argument vector, excluding `argv[0]`.
-    pub args: Vec<String>,
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
     /// The child's entire environment, built as an allowlist from empty.
-    pub env: BTreeMap<String, String>,
+    #[must_use]
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
     /// The pricing the child may run on.
     ///
     /// Under [`Billing::Subscription`] the launcher scrubs the environment once more at the
     /// spawn itself, so no layer added between here and there can reintroduce a key.
-    pub billing: Billing,
+    #[must_use]
+    pub fn billing(&self) -> Billing {
+        self.billing
+    }
+
+    /// Tell the child where the run store is, so an agentmux it starts opens the same one.
+    pub(crate) fn name_state_dir(&mut self, name: &str, dir: &Path) {
+        self.env
+            .insert(name.to_owned(), dir.to_string_lossy().into_owned());
+    }
+
+    /// Run this executable's hidden `subcommand` on `plan` in place of the vendor's CLI, with
+    /// the same environment and pricing: the app-server driver that is then the delegate.
+    pub(crate) fn drive_through(&mut self, driver: &Path, subcommand: &str, plan: &Path) {
+        self.program = driver.to_string_lossy().into_owned();
+        self.args = vec![subcommand.to_owned(), plan.to_string_lossy().into_owned()];
+    }
+
+    /// An invocation of anything at all, for a test of the launcher itself.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_launcher_test(
+        program: &str,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        billing: Billing,
+    ) -> Self {
+        Self {
+            program: program.to_owned(),
+            args,
+            env,
+            billing,
+        }
+    }
 }
 
 /// Environment variables every delegate needs regardless of vendor.
@@ -1244,7 +1409,7 @@ pub(crate) struct Identity<'c> {
 /// Returns the account errors documented on [`Delegate::invocation`].
 pub(crate) fn resolve_identity<'c>(
     vendor: Vendor,
-    alias: Option<&AccountAlias>,
+    account: &AccountChoice,
     config: &'c Config,
     host_env: &BTreeMap<String, String>,
     requested: Option<Billing>,
@@ -1252,7 +1417,7 @@ pub(crate) fn resolve_identity<'c>(
     let mut env = base_env(host_env);
     // The machine-wide layer, before any account chooses an identity.
     config.launch.apply(&mut env, host_env);
-    let selection = select_alias(vendor, alias, config)?;
+    let selection = select_alias(vendor, account, config)?;
     // Whether the checkout's file names this alias as the default, whoever else did: a
     // consultation records the alias it resolved to, so a follow-up asks for it by name, and a
     // caller told by the checkout's own instructions to name it is the checkout's choice too.
@@ -1391,31 +1556,40 @@ struct Selection {
     chooser: Chooser,
 }
 
-/// The alias a launch resolves to: the caller's, else the configured default, else none.
+/// The alias a launch resolves to: the one named, else the configured default unless the CLI's
+/// own login was chosen, else none.
 ///
 /// A caller that names no account gets the machine's or the checkout's chosen default, which is
 /// the only thing a project file is allowed to say and therefore the only reason it exists.
 fn select_alias(
     vendor: Vendor,
-    requested: Option<&AccountAlias>,
+    account: &AccountChoice,
     config: &Config,
 ) -> Result<Option<Selection>, DelegateError> {
-    if let Some(alias) = requested {
-        return Ok(Some(Selection {
-            alias: alias.clone(),
-            chooser: Chooser::Caller,
-        }));
-    }
-    let Some(default) = config.default_account(vendor) else {
-        return Ok(None);
+    let default = config.default_account(vendor);
+    let chosen_by = |default: &DefaultAccount| match default.chosen_by {
+        ChosenBy::Machine(_) => Chooser::Machine,
+        ChosenBy::Project(_) => Chooser::Project,
     };
-    Ok(Some(Selection {
-        alias: AccountAlias::parse(default.alias)?,
-        chooser: match default.chosen_by {
-            ChosenBy::Machine(_) => Chooser::Machine,
-            ChosenBy::Project(_) => Chooser::Project,
-        },
-    }))
+    match account {
+        // A consultation records the default it resolved by name, so an alias that is still the
+        // default is the file's choice, and an unknown one is reported against that file.
+        AccountChoice::Named(alias) => Ok(Some(Selection {
+            alias: alias.clone(),
+            chooser: default
+                .filter(|default| default.alias == alias.as_str())
+                .map_or(Chooser::Caller, |default| chosen_by(&default)),
+        })),
+        AccountChoice::CliLogin => Ok(None),
+        AccountChoice::Default => default
+            .map(|default| {
+                Ok(Selection {
+                    alias: AccountAlias::parse(default.alias)?,
+                    chooser: chosen_by(&default),
+                })
+            })
+            .transpose(),
+    }
 }
 
 /// Put one account's credentials into the child environment.

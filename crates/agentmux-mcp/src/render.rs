@@ -169,7 +169,7 @@ pub fn warnings(status: &RunStatus) -> String {
                 status.rate_limit.as_ref(),
                 &status.quota,
                 status.delegate.vendor(),
-                status.delegate.account()
+                status.delegate.account().alias()
             ),
             summarise(detail, 600),
         );
@@ -648,13 +648,13 @@ pub fn quota_block(status: &RunStatus) -> Vec<String> {
     let ordered = ordered_quota(
         &status.quota,
         status.delegate.vendor(),
-        status.delegate.account(),
+        status.delegate.account().alias(),
     );
     if ordered.is_empty() {
         return Vec::new();
     }
     let others_exist = ordered.iter().any(|(_, ran)| !ran);
-    let mut lines = vec![quota_lead_in(status.delegate.account(), others_exist).to_owned()];
+    let mut lines = vec![quota_lead_in(status.delegate.account().alias(), others_exist).to_owned()];
     for (entry, ran) in ordered {
         lines.extend(quota_report_labelled(entry, ran));
     }

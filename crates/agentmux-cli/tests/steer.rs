@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -272,7 +272,7 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
         },
         question: "Review the repository.".to_owned(),

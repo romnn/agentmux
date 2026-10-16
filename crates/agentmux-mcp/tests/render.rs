@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
@@ -24,7 +24,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
     )
@@ -40,7 +40,7 @@ fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tem
         Delegate::Claude {
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
     )
@@ -172,7 +172,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Reply with exactly: THE_REPORT_BODY".to_owned(),
@@ -245,7 +245,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "A long review.".to_owned(),
@@ -424,7 +424,7 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
             delegate: Delegate::Claude {
                 model: ModelId::parse("sonnet").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Review the diff for correctness bugs.".to_owned(),
@@ -504,7 +504,7 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "q".to_owned(),

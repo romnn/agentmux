@@ -140,7 +140,7 @@ pub struct McpArgs {
     /// agentmux is worth paying for across the vendor line, not along it.
     /// Denying both leaves nothing to consult and is refused.
     #[arg(long = "deny", value_enum, value_name = "VENDOR")]
-    pub deny: Vec<VendorArg>,
+    pub deny: Vec<Vendor>,
 }
 
 /// Which delegate to consult, and on what terms.
@@ -148,7 +148,7 @@ pub struct McpArgs {
 pub struct DelegateArgs {
     /// Which CLI to consult: `claude` reaches Anthropic models, `codex` reaches GPT models.
     #[arg(long, value_enum)]
-    pub delegate: VendorArg,
+    pub delegate: Vendor,
 
     /// Model identifier, passed to the delegate CLI verbatim, for example `claude-opus-5` or
     /// `gpt-6-astra`.
@@ -192,7 +192,7 @@ pub struct DelegateArgs {
     /// How much of the filesystem the delegate may write, for `--delegate codex`.
     /// Defaults to `read-only`.
     #[arg(long, value_enum)]
-    pub sandbox: Option<SandboxArg>,
+    pub sandbox: Option<CodexSandbox>,
 
     /// Whether the delegate's environment may carry an API key; omitted, the account decides.
     ///
@@ -202,49 +202,7 @@ pub struct DelegateArgs {
     /// `subscription` withholds the key even from an account that allows one.
     /// Follow-ups keep whatever the first turn was allowed.
     #[arg(long, value_enum)]
-    pub billing: Option<BillingArg>,
-}
-
-/// Which pricing a consultation runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum BillingArg {
-    /// The CLI's logged-in subscription.
-    Subscription,
-    /// Per-token API pricing, for an account `agentmux.toml` opts in.
-    Api,
-}
-
-impl From<BillingArg> for Billing {
-    fn from(billing: BillingArg) -> Self {
-        match billing {
-            BillingArg::Subscription => Self::Subscription,
-            BillingArg::Api => Self::Api,
-        }
-    }
-}
-
-/// Which CLI to consult.
-///
-/// A copy of [`Vendor`] that clap can list in `--help`; the core enum stays free of clap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum VendorArg {
-    /// Anthropic's `claude`.
-    ///
-    /// Aliased to `claude-code` because the CLI and the harness that runs it are spelled
-    /// differently, and `--deny` is written while thinking of the harness.
-    #[value(alias = "claude-code")]
-    Claude,
-    /// The `codex` CLI from `OpenAI`.
-    Codex,
-}
-
-impl From<VendorArg> for Vendor {
-    fn from(vendor: VendorArg) -> Self {
-        match vendor {
-            VendorArg::Claude => Self::Claude,
-            VendorArg::Codex => Self::Codex,
-        }
-    }
+    pub billing: Option<Billing>,
 }
 
 /// Which vendor's accounts to ask about.
@@ -253,25 +211,7 @@ pub struct QuotaArgs {
     /// Ask only this vendor.
     /// Both are asked when omitted.
     #[arg(long, value_enum)]
-    pub delegate: Option<VendorArg>,
-}
-
-/// How much of the filesystem a Codex delegate may write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SandboxArg {
-    /// Read the working directory, write nothing.
-    ReadOnly,
-    /// Also write inside the working directory.
-    WorkspaceWrite,
-}
-
-impl From<SandboxArg> for CodexSandbox {
-    fn from(sandbox: SandboxArg) -> Self {
-        match sandbox {
-            SandboxArg::ReadOnly => Self::ReadOnly,
-            SandboxArg::WorkspaceWrite => Self::WorkspaceWrite,
-        }
-    }
+    pub delegate: Option<Vendor>,
 }
 
 impl DelegateArgs {
@@ -295,12 +235,12 @@ impl DelegateArgs {
     /// vendor-specific option was set for the wrong vendor.
     pub fn build(&self) -> Result<Delegate> {
         Delegate::from_parts(
-            self.delegate.into(),
+            self.delegate,
             &self.model,
             self.effort.as_deref(),
             self.account.as_deref(),
             self.isolation(),
-            self.sandbox.map(CodexSandbox::from),
+            self.sandbox,
         )
         .wrap_err("invalid delegate arguments")
     }

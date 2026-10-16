@@ -15,7 +15,8 @@ use agentmux::delegate::{Billing, CodexSandbox, Delegate, DelegateError, Isolati
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 /// Build the schema for a string-valued choice as a flat `enum`.
 ///
@@ -27,10 +28,13 @@ use serde::Deserialize;
 /// one sentence that tells a caller to pick the vendor they are not.
 /// A flat `{"type": "string", "enum": [...]}` survives all of that.
 ///
-/// The fields carry the core crate's own enums — their `snake_case` serde names are the wire
-/// spellings — and only the *schema* is written by hand here, so the two cannot disagree about
-/// which values exist.
-fn string_choice(description: &str, values: &[&str]) -> Schema {
+/// The fields carry the core crate's own enums, and the values listed are those enums' variants
+/// as serde spells them, so the schema offers exactly what the field deserializes.
+fn string_choice<T: VariantArray + Serialize>(description: &str) -> Schema {
+    let values: Vec<serde_json::Value> = T::VARIANTS
+        .iter()
+        .filter_map(|variant| serde_json::to_value(variant).ok())
+        .collect();
     json_schema!({
         "type": "string",
         "enum": values,
@@ -39,21 +43,15 @@ fn string_choice(description: &str, values: &[&str]) -> Schema {
 }
 
 fn vendor_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice("Which delegate CLI to run.", &["claude", "codex"])
+    string_choice::<Vendor>("Which delegate CLI to run.")
 }
 
 fn billing_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice(
-        "The pricing to run on: `subscription` or `api`.",
-        &["subscription", "api"],
-    )
+    string_choice::<Billing>("The pricing to run on: `subscription` or `api`.")
 }
 
 fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice(
-        "How much of the working directory a Codex delegate may write.",
-        &["read_only", "workspace_write"],
-    )
+    string_choice::<CodexSandbox>("How much of the working directory a Codex delegate may write.")
 }
 
 /// Who to consult, and on what terms.

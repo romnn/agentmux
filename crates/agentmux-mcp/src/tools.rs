@@ -765,7 +765,7 @@ mod tests {
 
     use agentmux::appserver::Plan;
     use agentmux::appserver::mailbox::{Mailbox, Reply};
-    use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
+    use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId};
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
     use googletest::prelude::*;
@@ -802,7 +802,7 @@ mod tests {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: Some(Isolation::Inherit),
             },
             question: "q".to_owned(),

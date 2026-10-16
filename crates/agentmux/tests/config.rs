@@ -543,7 +543,9 @@ fn a_checkout_outside_home_is_walked_up_to_its_repository_root() -> Result<()> {
 /// third way to switch isolation off, from a file the operator never wrote.
 #[gtest]
 fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
-    use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Vendor};
+    use agentmux::delegate::{
+        AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, Vendor,
+    };
 
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/client");
@@ -567,7 +569,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     let chosen_by_the_checkout = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     };
     assert_that!(
@@ -579,7 +581,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     let named = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: Some(AccountAlias::parse("personal").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     };
     assert_that!(named.resolved_isolation(&config), eq(Isolation::Inherit));

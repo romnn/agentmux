@@ -7,10 +7,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentmux::config::{Account, Config, Secret};
+use agentmux::config::{Account, Config, Defaults, Secret};
 use agentmux::delegate::{
-    AccountAlias, Billing, CodexSandbox, Delegate, DelegateError, Effort, Invocation, Isolation,
-    ModelId, SessionRef, TurnPlan,
+    AccountAlias, AccountChoice, Billing, CodexSandbox, Delegate, DelegateError, Effort,
+    Invocation, Isolation, ModelId, SessionRef, TurnPlan,
 };
 use googletest::prelude::*;
 
@@ -28,27 +28,27 @@ fn every_delegate() -> Result<Vec<Delegate>> {
         Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         Delegate::Claude {
             model: model("claude-fable-5-1")?,
             effort: Some(effort("xhigh")?),
-            account: Some(AccountAlias::parse("personal").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: Some(effort("high")?),
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         Delegate::Codex {
             model: model("gpt-5.6-sol")?,
             effort: Some(effort("xhigh")?),
             sandbox: CodexSandbox::WorkspaceWrite,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
     ])
@@ -144,7 +144,7 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
     let config = config_with_personal(dir.path());
     for delegate in every_delegate()? {
         let invocation = build_with(&delegate, None, &config)?;
-        let args = &invocation.args;
+        let args = &invocation.args();
         let label = delegate.summary();
 
         match delegate.vendor() {
@@ -244,7 +244,7 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
         let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
 
-        for key in invocation.env.keys() {
+        for key in invocation.env().keys() {
             assert_that!(
                 key.starts_with("CLAUDE_CODE_"),
                 eq(false),
@@ -276,7 +276,7 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
             // The recursion guard, which is agentmux's own and carries nothing of the host.
             "AGENTMUX_DELEGATE",
         ];
-        for key in invocation.env.keys() {
+        for key in invocation.env().keys() {
             assert_that!(
                 expected.contains(&key.as_str()),
                 eq(true),
@@ -286,7 +286,7 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
 
         // The host's terminal type would make a CLI emit cursor sequences into the capture file.
         assert_that!(
-            invocation.env.get("TERM").map(String::as_str),
+            invocation.env().get("TERM").map(String::as_str),
             some(eq("dumb")),
             "{label}"
         );
@@ -310,16 +310,16 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: Some(AccountAlias::parse("personal").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
         None,
         &config,
     )?;
-    assert_that!(personal.env.get("ANTHROPIC_API_KEY"), none());
-    assert_that!(personal.env.get("ANTHROPIC_AUTH_TOKEN"), none());
+    assert_that!(personal.env().get("ANTHROPIC_API_KEY"), none());
+    assert_that!(personal.env().get("ANTHROPIC_AUTH_TOKEN"), none());
     assert_that!(
-        personal.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        personal.env().get("CLAUDE_CONFIG_DIR").map(String::as_str),
         some(eq(dir.path().to_string_lossy().as_ref()))
     );
 
@@ -327,16 +327,16 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         None,
         &config,
     )?;
-    assert_that!(default.env.get("ANTHROPIC_API_KEY"), none());
-    assert_that!(default.billing, eq(Billing::Subscription));
+    assert_that!(default.env().get("ANTHROPIC_API_KEY"), none());
+    assert_that!(default.billing(), eq(Billing::Subscription));
     // The host's own CLAUDE_CONFIG_DIR must not select the account.
-    assert_that!(default.env.get("CLAUDE_CONFIG_DIR"), none());
+    assert_that!(default.env().get("CLAUDE_CONFIG_DIR"), none());
     Ok(())
 }
 
@@ -360,7 +360,7 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: Some(AccountAlias::parse("work").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("work").or_fail()?),
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
@@ -372,6 +372,46 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
         contains_substring("no claude account named `work`")
     );
     assert_that!(message, contains_substring("personal"));
+    Ok(())
+}
+
+/// A default the machine's file names but does not define is reported against that file, even
+/// once a consultation has recorded it by name.
+///
+/// The caller did not name the alias, so an error pointing only at the call would send them to
+/// look for a mistake they did not make.
+#[gtest]
+fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut config = config_with_personal(dir.path());
+    config.defaults.insert(
+        "claude".to_owned(),
+        Defaults {
+            account: Some("work".to_owned()),
+        },
+    );
+    config.source = Some(dir.path().join("agentmux.toml"));
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0000/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+        billing: None,
+    };
+
+    let error = Delegate::Claude {
+        model: model("claude-opus-5")?,
+        effort: Some(effort("xhigh")?),
+        account: AccountChoice::Named(AccountAlias::parse("work").or_fail()?),
+        isolation: None,
+    }
+    .invocation(&plan, &host_session_env(), &config)
+    .expect_err("`work` is not configured");
+
+    assert_that!(
+        error.to_string(),
+        contains_substring("agentmux.toml selects it as the default")
+    );
     Ok(())
 }
 
@@ -395,7 +435,7 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: Some(AccountAlias::parse("personal").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
@@ -446,24 +486,24 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
         model: model("qwen3-coder")?,
         effort: Some(effort("high")?),
         sandbox: CodexSandbox::ReadOnly,
-        account: Some(AccountAlias::parse("local").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("local").or_fail()?),
         isolation: None,
     }
     .invocation(&plan, &host, &config)
     .or_fail()?;
 
     assert_that!(
-        invocation.env.get("OPENAI_BASE_URL").map(String::as_str),
+        invocation.env().get("OPENAI_BASE_URL").map(String::as_str),
         some(eq("http://localhost:11434/v1"))
     );
     assert_that!(
-        invocation.env.get("OPENAI_API_KEY").map(String::as_str),
+        invocation.env().get("OPENAI_API_KEY").map(String::as_str),
         some(eq("not-a-real-key"))
     );
     // The host's own Codex credentials stay behind: the alias chose the identity.
-    assert_that!(invocation.env.get("CODEX_HOME"), none());
+    assert_that!(invocation.env().get("CODEX_HOME"), none());
     // And the launch says which pricing it runs on, so every report can.
-    assert_that!(invocation.billing, eq(Billing::Api));
+    assert_that!(invocation.billing(), eq(Billing::Api));
     Ok(())
 }
 
@@ -475,22 +515,22 @@ fn a_codex_resume_passes_its_sandbox_as_config_not_as_a_flag() -> Result<()> {
         model: model("gpt-6-astra")?,
         effort: Some(effort("high")?),
         sandbox: CodexSandbox::ReadOnly,
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     };
 
     let fresh = build(&delegate, None)?;
-    assert_that!(has_pair(&fresh.args, "--sandbox", "read-only"), eq(true));
+    assert_that!(has_pair(fresh.args(), "--sandbox", "read-only"), eq(true));
 
     let resumed = build(&delegate, Some(&session))?;
-    assert_that!(resumed.args.contains(&"--sandbox".to_owned()), eq(false));
+    assert_that!(resumed.args().contains(&"--sandbox".to_owned()), eq(false));
     assert_that!(
-        has_pair(&resumed.args, "--config", r#"sandbox_mode="read-only""#),
+        has_pair(resumed.args(), "--config", r#"sandbox_mode="read-only""#),
         eq(true)
     );
-    assert_that!(resumed.args.contains(&"resume".to_owned()), eq(true));
+    assert_that!(resumed.args().contains(&"resume".to_owned()), eq(true));
     // Resume does not inherit the recorded model, so it must be re-pinned every time.
-    assert_that!(has_pair(&resumed.args, "--model", "gpt-6-astra"), eq(true));
+    assert_that!(has_pair(resumed.args(), "--model", "gpt-6-astra"), eq(true));
     Ok(())
 }
 
@@ -502,13 +542,13 @@ fn a_claude_resume_reopens_the_delegates_session() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         Some(&session),
     )?;
     assert_that!(
-        has_pair(&resumed.args, "--resume", session.as_str()),
+        has_pair(resumed.args(), "--resume", session.as_str()),
         eq(true)
     );
     Ok(())
@@ -622,7 +662,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
         let result = Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         }
         .invocation(&plan, &host_session_env(), &config);
@@ -658,14 +698,14 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
     let invocation = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
     .or_fail()?;
 
     assert_that!(
-        invocation.env.get("DISABLE_HOOKS").map(String::as_str),
+        invocation.env().get("DISABLE_HOOKS").map(String::as_str),
         some(eq("true"))
     );
     Ok(())
@@ -693,7 +733,7 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
@@ -725,17 +765,20 @@ fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()>
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: Some(AccountAlias::parse("personal").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
         None,
         &config,
     )?;
 
-    assert_that!(invocation.env.get("ANTHROPIC_API_KEY"), none());
-    assert_that!(invocation.env.get("ANTHROPIC_BASE_URL"), none());
+    assert_that!(invocation.env().get("ANTHROPIC_API_KEY"), none());
+    assert_that!(invocation.env().get("ANTHROPIC_BASE_URL"), none());
     assert_that!(
-        invocation.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        invocation
+            .env()
+            .get("CLAUDE_CONFIG_DIR")
+            .map(String::as_str),
         some(eq(dir.path().to_string_lossy().as_ref()))
     );
     Ok(())
@@ -783,7 +826,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     let invocation = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: Some(AccountAlias::parse("personal").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
@@ -792,14 +835,14 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     // The most specific layer wins.
     assert_that!(
         invocation
-            .env
+            .env()
             .get("DELEGATE_TEST_LAYER")
             .map(String::as_str),
         some(eq("from-request"))
     );
     // A layer that nothing overrides still reaches the delegate.
     assert_that!(
-        invocation.env.get("MACHINE_ONLY").map(String::as_str),
+        invocation.env().get("MACHINE_ONLY").map(String::as_str),
         some(eq("yes"))
     );
     Ok(())
@@ -825,7 +868,7 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         None,
@@ -833,12 +876,15 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
     )?;
 
     assert_that!(
-        invocation.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        invocation
+            .env()
+            .get("CLAUDE_CONFIG_DIR")
+            .map(String::as_str),
         some(eq(dir.path().to_string_lossy().as_ref()))
     );
     // The default is a real account selection, so the host's key is withheld exactly as if the
     // caller had named it.
-    assert_that!(invocation.env.get("ANTHROPIC_API_KEY"), none());
+    assert_that!(invocation.env().get("ANTHROPIC_API_KEY"), none());
     Ok(())
 }
 
@@ -870,7 +916,7 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
     let error = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     }
     .invocation(&plan, &host_session_env(), &config)
@@ -894,42 +940,42 @@ fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
         },
         None,
     )?;
 
     assert_that!(
-        inherited.args.contains(&"--setting-sources".to_owned()),
+        inherited.args().contains(&"--setting-sources".to_owned()),
         eq(false)
     );
     assert_that!(
-        inherited.args.contains(&"--strict-mcp-config".to_owned()),
+        inherited.args().contains(&"--strict-mcp-config".to_owned()),
         eq(false)
     );
     // Still a second opinion rather than an edit.
     assert_that!(
-        has_pair(&inherited.args, "--permission-mode", "plan"),
+        has_pair(inherited.args(), "--permission-mode", "plan"),
         eq(true)
     );
-    assert_that!(inherited.args.contains(&"--tools".to_owned()), eq(true));
+    assert_that!(inherited.args().contains(&"--tools".to_owned()), eq(true));
 
     let isolated = build(
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         None,
     )?;
     assert_that!(
-        isolated.args.contains(&"--setting-sources".to_owned()),
+        isolated.args().contains(&"--setting-sources".to_owned()),
         eq(true)
     );
     assert_that!(
-        isolated.args.contains(&"--strict-mcp-config".to_owned()),
+        isolated.args().contains(&"--strict-mcp-config".to_owned()),
         eq(true)
     );
     Ok(())
@@ -943,23 +989,27 @@ fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
         model: model.clone(),
         effort: Some(effort.clone()),
         sandbox: CodexSandbox::ReadOnly,
-        account: None,
+        account: AccountChoice::Default,
         isolation,
     };
 
     let inherited = build(&delegate(Some(Isolation::Inherit)), None)?;
     assert_that!(
-        inherited.args.contains(&"--ignore-user-config".to_owned()),
+        inherited
+            .args()
+            .contains(&"--ignore-user-config".to_owned()),
         eq(false)
     );
     assert_that!(
-        inherited.args.contains(&"features.hooks=false".to_owned()),
+        inherited
+            .args()
+            .contains(&"features.hooks=false".to_owned()),
         eq(false)
     );
 
     let isolated = build(&delegate(None), None)?;
     assert_that!(
-        isolated.args.contains(&"--ignore-user-config".to_owned()),
+        isolated.args().contains(&"--ignore-user-config".to_owned()),
         eq(true)
     );
     Ok(())
@@ -982,7 +1032,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: Some(AccountAlias::parse("personal").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
             isolation: None,
         },
         None,
@@ -990,7 +1040,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
     )?;
 
     assert_that!(
-        invocation.args.contains(&"--setting-sources".to_owned()),
+        invocation.args().contains(&"--setting-sources".to_owned()),
         eq(false)
     );
 
@@ -999,14 +1049,14 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
         &Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
-            account: Some(AccountAlias::parse("personal").or_fail()?),
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
             isolation: Some(Isolation::Isolated),
         },
         None,
         &config,
     )?;
     assert_that!(
-        forced.args.contains(&"--setting-sources".to_owned()),
+        forced.args().contains(&"--setting-sources".to_owned()),
         eq(true)
     );
     Ok(())
@@ -1023,7 +1073,10 @@ fn every_delegate_is_marked_so_agentmux_cannot_consult_itself() -> Result<()> {
         let dir = tempfile::tempdir().or_fail()?;
         let invocation = build_with(&delegate, None, &config_with_personal(dir.path()))?;
         assert_that!(
-            invocation.env.get("AGENTMUX_DELEGATE").map(String::as_str),
+            invocation
+                .env()
+                .get("AGENTMUX_DELEGATE")
+                .map(String::as_str),
             some(eq("1")),
             "{}",
             delegate.summary()
@@ -1075,7 +1128,7 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
     let delegate = Delegate::Claude {
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     };
 
@@ -1129,7 +1182,7 @@ fn config_with_account(named: &str, account: &Account) -> Config {
 
 /// A delegate of either vendor on the named account.
 fn on_account(vendor: &str, alias: &str) -> Result<Delegate> {
-    let account = Some(AccountAlias::parse(alias).or_fail()?);
+    let account = AccountChoice::Named(AccountAlias::parse(alias).or_fail()?);
     Ok(match vendor {
         "claude" => Delegate::Claude {
             model: model("claude-opus-5")?,
@@ -1181,12 +1234,12 @@ fn a_subscription_delegate_carries_no_billing_variable_from_any_layer() -> Resul
         let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
         let leaked: Vec<&String> = invocation
-            .env
+            .env()
             .keys()
             .filter(|name| agentmux::delegate::is_billing_name(name))
             .collect();
         assert_that!(leaked, is_empty(), "{label} carries a billing variable");
-        assert_that!(invocation.billing, eq(Billing::Subscription), "{label}");
+        assert_that!(invocation.billing(), eq(Billing::Subscription), "{label}");
     }
     Ok(())
 }
@@ -1291,10 +1344,10 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         .invocation(&plan, &host, &config)
         .or_fail()?;
     assert_that!(
-        opted_in.env.get("OPENAI_BASE_URL").map(String::as_str),
+        opted_in.env().get("OPENAI_BASE_URL").map(String::as_str),
         some(eq("http://localhost:8080/v1"))
     );
-    assert_that!(opted_in.billing, eq(Billing::Api));
+    assert_that!(opted_in.billing(), eq(Billing::Api));
     Ok(())
 }
 
@@ -1437,11 +1490,11 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
 
     // The account's opt-in decides when nothing is asked, and a caller may ask for less.
     assert_that!(
-        build_billed(&codex, &allows_api, None).map(|i| i.billing),
+        build_billed(&codex, &allows_api, None).map(|i| i.billing()),
         ok(eq(&Billing::Api))
     );
     assert_that!(
-        build_billed(&codex, &allows_api, Some(Billing::Subscription)).map(|i| i.billing),
+        build_billed(&codex, &allows_api, Some(Billing::Subscription)).map(|i| i.billing()),
         ok(eq(&Billing::Subscription))
     );
     // Asking for more than the account allows, or with no account at all, is refused.
@@ -1469,5 +1522,18 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
             "asked for subscription pricing"
         )))
     );
+    Ok(())
+}
+
+/// A session id read back from a record passes the same check as one parsed from a stream, so a
+/// record edited outside agentmux cannot put an option or a control character on the command line.
+#[gtest]
+fn a_session_id_read_from_disk_is_checked_like_a_parsed_one() -> Result<()> {
+    let session: SessionRef = serde_json::from_str(r#""01a0784a-915b-7d92""#).or_fail()?;
+    assert_that!(session.as_str(), eq("01a0784a-915b-7d92"));
+
+    for refused in [r#""""#, r#""--resume""#, r#""a\nb""#] {
+        assert_that!(serde_json::from_str::<SessionRef>(refused), err(anything()));
+    }
     Ok(())
 }

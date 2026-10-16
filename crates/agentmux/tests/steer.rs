@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Mailbox, Reply};
 use agentmux::appserver::{Plan, STOP_BUDGET};
-use agentmux::delegate::{Billing, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{
+    AccountChoice, Billing, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+};
 use agentmux::launch::Launcher as _;
 use agentmux::run::{Retention, RunError, RunId, RunStore, StartRequest, SteerRefused};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
@@ -37,7 +39,7 @@ fn codex(isolation: Isolation) -> Result<Delegate> {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::WorkspaceWrite,
-        account: None,
+        account: AccountChoice::Default,
         isolation: Some(isolation),
     })
 }
@@ -46,7 +48,7 @@ fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     })
 }

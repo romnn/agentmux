@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -66,7 +66,7 @@ async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
         Delegate::Claude {
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         "Reply with exactly LIVE_CLAUDE_OK and nothing else.",
@@ -94,7 +94,7 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
             model: ModelId::parse(CODEX_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         "Remember the secret word ZEPPELIN. Reply with exactly LIVE_CODEX_OK and nothing else.",
@@ -136,7 +136,7 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
         Delegate::Claude {
             model: ModelId::parse("does-not-exist-9000").or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
         "hello",
