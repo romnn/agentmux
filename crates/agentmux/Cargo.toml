@@ -41,6 +41,7 @@ win32job.workspace = true
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["serde"] }
+codex-app-server-mock = { path = "../codex-app-server-mock" }
 # The async tests need a runtime, and a clock they can stop; the library itself needs only the
 # timer.
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

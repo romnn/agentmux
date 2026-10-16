@@ -1,0 +1,38 @@
+[package]
+name = "codex-app-server-mock"
+description = "A scriptable stand-in for codex app-server, in-process or as a process, for testing a client of its protocol"
+license-file = "../../LICENSE"
+readme = "../../README.md"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Named for what it stands in for, so a test puts its directory on a client's `PATH`.
+# Nothing installs it: the crate is not published, and is no default member of the workspace.
+[[bin]]
+name = "codex"
+path = "src/main.rs"
+
+[dependencies]
+codex-app-server-protocol = { path = "../codex-app-server-protocol" }
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# A command the `codex` binary starts runs in a session of its own, as codex's sandbox runs it.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+googletest.workspace = true
+# Stops what a test's fake left running, on every platform.
+sysinfo.workspace = true
+tempfile.workspace = true

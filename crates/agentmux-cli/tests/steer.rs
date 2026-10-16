@@ -1,13 +1,15 @@
 //! A steered consultation end to end: the real `agentmux` executable as the driver, against a
-//! fake `codex` that speaks just enough of the app-server protocol.
+//! fake `codex` that speaks the app-server protocol.
 //!
 //! Everything between the caller and the server is real here — the `agentmux steer` command, the
 //! detached launch, the driver's handshake, the mailbox, `turn/steer`, the follow-up's
 //! `thread/resume`, and the cancellation that interrupts over the protocol — and nothing reaches
 //! a vendor.
-//! Unix only: the fake is a shell script.
-//! What its turns leave running is checked with `ps`, and a command is put in a session of its
-//! own with Perl's `setsid`, both of which Linux and macOS have.
+//! The fake is `codex-app-server-mock`'s `codex` binary, built for the test run on first use; it
+//! reads its scenario ([`codex_app_server_mock::scenario`]) from codex's home, where the driver
+//! lets codex's own variables through.
+//! Unix only: what a turn leaves running is checked as processes in sessions of their own, which
+//! Windows does not have.
 
 #![cfg(unix)]
 
@@ -20,45 +22,44 @@ use agentmux::delegate::{CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use codex_app_server_mock::scenario::{CONFIG_FILE, Config, Death, HELPER, Scenario};
 use googletest::prelude::*;
 
-/// A fake `codex app-server`: answers each request by method, logs what it was sent, and records
-/// its own environment.
+/// The directory holding the fake `codex`, `codex-app-server-mock`'s binary, built once per test
+/// process with the profile and target the tests run with.
 ///
-/// A turn runs until it is steered, which completes it, or interrupted, which ends it as the real
-/// server does.
-/// Each turn also starts a command in a session of its own, as codex's sandbox does, and leaves it
-/// running whatever happens to the turn, as codex-cli 0.159.3 was seen to do on an interrupt.
-/// `@LOG@`, `@ENV@` and `@CHILDREN@` are replaced with paths in the test's directory.
-const FAKE_CODEX: &str = indoc::indoc! {r#"
-    #!/bin/sh
-    [ "$1" = "app-server" ] || { echo "fake codex: only app-server is faked" >&2; exit 2; }
-    env > '@ENV@'
-    turn=tu-1
-    while IFS= read -r line; do
-      printf '%s\n' "$line" >> '@LOG@'
-      id=$(printf '%s' "$line" | sed -n 's/.*"id" *: *\([0-9][0-9]*\).*/\1/p')
-      method=$(printf '%s' "$line" | sed -n 's/.*"method" *: *"\([^"]*\)".*/\1/p')
-      case "$method" in
-        initialize)
-          printf '{"id":%s,"result":{"codexHome":"/home/dev/.codex","platformFamily":"unix","platformOs":"linux","userAgent":"fake"}}\n' "$id" ;;
-        thread/start|thread/resume)
-          printf '{"id":%s,"result":{"approvalPolicy":"never","approvalsReviewer":"user","cwd":"/work","model":"gpt-6-astra","modelProvider":"openai","sandbox":{"type":"readOnly"},"thread":{"cliVersion":"0.159.3","createdAt":1,"cwd":"/work","ephemeral":false,"id":"th-fake","modelProvider":"openai","preview":"","projectId":null,"sessionId":"se-fake","source":"appServer","status":{"type":"idle"},"turns":[],"updatedAt":1}}}\n' "$id" ;;
-        turn/start)
-          perl -MPOSIX -e 'defined POSIX::setsid() or die "setsid: $!"; exec @ARGV' sleep 300 </dev/null >/dev/null 2>&1 &
-          echo $! >> '@CHILDREN@'
-          printf '{"id":%s,"result":{"turn":{"id":"%s","items":[],"status":"inProgress"}}}\n' "$id" "$turn"
-          printf '{"method":"turn/started","params":{"threadId":"th-fake","turn":{"id":"%s","items":[],"status":"inProgress"}}}\n' "$turn" ;;
-        turn/steer)
-          printf '{"id":%s,"result":{"turnId":"%s"}}\n' "$id" "$turn"
-          printf '{"method":"item/completed","params":{"threadId":"th-fake","turnId":"%s","completedAtMs":1,"item":{"id":"i1","type":"agentMessage","text":"STEERED: auth only"}}}\n' "$turn"
-          printf '{"method":"turn/completed","params":{"threadId":"th-fake","turn":{"id":"%s","items":[],"status":"completed"}}}\n' "$turn" ;;
-        turn/interrupt)
-          printf '{"id":%s,"result":{}}\n' "$id"
-          printf '{"method":"turn/completed","params":{"threadId":"th-fake","turn":{"id":"%s","items":[],"status":"interrupted"}}}\n' "$turn" ;;
-      esac
-    done
-"#};
+/// Built here because nothing else builds it: `cargo test` builds the binaries of the package under
+/// test only.
+fn fake_codex_dir() -> Result<PathBuf> {
+    static BUILT: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+        std::sync::OnceLock::new();
+    let built = BUILT.get_or_init(|| {
+        let run = escargot::CargoBuild::new()
+            .package("codex-app-server-mock")
+            .bin("codex")
+            .current_release()
+            .current_target()
+            .run()
+            .map_err(|err| format!("cannot build the fake codex: {err}"))?;
+        run.path()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "the fake codex was built nowhere".to_owned())
+    });
+    built.clone().or_fail()
+}
+
+/// A `PATH` on which `codex` is the fake.
+fn path_with_fake() -> Result<String> {
+    Ok(format!("{}:/usr/bin:/bin", fake_codex_dir()?.display()))
+}
+
+/// Write the fake's configuration into `codex_home`.
+fn configure(codex_home: &Path, config: &Config) -> Result<()> {
+    std::fs::create_dir_all(codex_home).or_fail()?;
+    let json = serde_json::to_string(config).or_fail()?;
+    std::fs::write(codex_home.join(CONFIG_FILE), json).or_fail()
+}
 
 struct World {
     _root: tempfile::TempDir,
@@ -66,37 +67,41 @@ struct World {
     state: PathBuf,
     host: BTreeMap<String, String>,
     project: PathBuf,
+    /// Every message the fake received, one per line.
     log: PathBuf,
-    env_dump: PathBuf,
-    /// Where the fake records the commands its turns started.
-    children: PathBuf,
+    /// The fake's environment, as it started.
+    environment: PathBuf,
+    /// The pids of the commands the fake's turns started.
+    commands: PathBuf,
 }
 
 /// A store whose Codex turns are driven by the `agentmux` under test, with the fake on `PATH` and
 /// keys for both vendors in the environment agentmux was started with.
+///
+/// Each turn runs until steered, which completes it, or interrupted, and starts a command in a
+/// session of its own that it leaves running however it ends, as codex's sandbox does.
 fn world() -> Result<World> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = tempfile::tempdir().or_fail()?;
-    let bin = root.path().join("bin");
     let home = root.path().join("home");
     let project = root.path().join("project");
-    for dir in [&bin, &home, &project] {
+    for dir in [&home, &project] {
         std::fs::create_dir_all(dir).or_fail()?;
     }
     let log = root.path().join("requests.jsonl");
-    let env_dump = root.path().join("codex-env.txt");
-    let children = root.path().join("children.txt");
-    let codex = bin.join("codex");
-    let script = FAKE_CODEX
-        .replace("@LOG@", &log.to_string_lossy())
-        .replace("@ENV@", &env_dump.to_string_lossy())
-        .replace("@CHILDREN@", &children.to_string_lossy());
-    std::fs::write(&codex, script).or_fail()?;
-    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+    let environment = root.path().join("codex-env.txt");
+    let commands = root.path().join("commands.txt");
+    configure(
+        &home.join(".codex"),
+        &Config {
+            scenario: Scenario::Steerable,
+            log: Some(log.clone()),
+            environment: Some(environment.clone()),
+            commands: commands.clone(),
+        },
+    )?;
 
     let host: BTreeMap<String, String> = [
-        ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+        ("PATH", path_with_fake()?),
         ("HOME", home.display().to_string()),
         ("OPENAI_API_KEY", "sk-must-not-arrive".to_owned()),
         ("CODEX_API_KEY", "sk-must-not-arrive-either".to_owned()),
@@ -115,8 +120,8 @@ fn world() -> Result<World> {
         host,
         project,
         log,
-        env_dump,
-        children,
+        environment,
+        commands,
     })
 }
 
@@ -137,99 +142,97 @@ impl World {
 }
 
 /// The pids of the commands the fake's turns started, in the order they started.
-fn commands(children: &Path) -> Vec<String> {
-    std::fs::read_to_string(children)
+fn commands(file: &Path) -> Vec<u32> {
+    std::fs::read_to_string(file)
         .unwrap_or_default()
         .lines()
-        .map(str::to_owned)
+        .filter_map(|line| line.trim().parse().ok())
         .collect()
 }
 
-/// What `ps` says about `pid` in `column`, or `None` when there is no such process.
-///
-/// `ps` that cannot run, or fails for any other reason than finding no such process, is an
-/// error, so a broken inspection can never read as a process that has gone.
-fn ps(pid: &str, column: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", &format!("{column}="), "-p", pid])
-        .output()
-        .or_fail()?;
-    let said = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    match (
-        output.status.code(),
-        said.is_empty(),
-        output.stderr.is_empty(),
-    ) {
-        (Some(0), false, _) => Ok(Some(said)),
-        // Both procps and BSD `ps` exit 1, printing nothing at all, when no process matches.
-        (Some(1), true, true) => Ok(None),
-        _ => fail!(
-            "ps -p {pid} failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .map(|()| None),
-    }
+/// What the process table says about one process.
+struct Process {
+    /// Whether it runs, rather than having exited without being waited for.
+    running: bool,
+    parent: Option<u32>,
+    command_line: String,
 }
 
-/// Whether `pid` is a running process, rather than gone or a zombie nobody reaped yet.
-fn is_running(pid: &str) -> Result<bool> {
-    Ok(ps(pid, "stat")?.is_some_and(|stat| !stat.starts_with('Z')))
+/// The process `pid`, or `None` when there is none.
+fn process(pid: u32) -> Option<Process> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    system.process(pid).map(|process| Process {
+        running: !matches!(
+            process.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        ),
+        parent: process.parent().map(sysinfo::Pid::as_u32),
+        command_line: process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    })
+}
+
+/// Whether `pid` is a running process, rather than gone or exited and not yet waited for.
+fn is_running(pid: u32) -> bool {
+    process(pid).is_some_and(|process| process.running)
 }
 
 /// Whether the fake's turns have started exactly `count` commands and the newest is running,
 /// waiting a few seconds for it.
-async fn newest_command_is_running(children: &Path, count: usize) -> Result<bool> {
+async fn newest_command_is_running(file: &Path, count: usize) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let pids = commands(children);
-        if pids.len() == count
-            && let Some(pid) = pids.last()
-            && is_running(pid)?
-        {
-            return Ok(true);
+        let pids = commands(file);
+        if pids.len() == count && pids.last().copied().is_some_and(is_running) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(false)
+    false
 }
 
 /// Whether the fake's turns started exactly `count` commands and every one is gone, waiting a
 /// few seconds for them.
-async fn every_command_is_gone(children: &Path, count: usize) -> Result<bool> {
-    let pids = commands(children);
+async fn every_command_is_gone(file: &Path, count: usize) -> bool {
+    let pids = commands(file);
     if pids.len() != count {
-        return Ok(false);
+        return false;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let mut running = false;
-        for pid in &pids {
-            running |= is_running(pid)?;
-        }
-        if !running {
-            return Ok(true);
+        if !pids.iter().copied().any(is_running) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(false)
+    false
 }
 
-/// How many requests of `method` the fake has received.
-fn received(log: &Path, method: &str) -> usize {
+/// The messages of `method` the fake has received, in order.
+fn received(log: &Path, method: &str) -> Vec<serde_json::Value> {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|request| request.get("method").and_then(serde_json::Value::as_str) == Some(method))
-        .count()
+        .collect()
 }
 
 /// Wait for the fake to have received `count` requests of `method`.
 async fn until_received(log: &Path, method: &str, count: usize) -> bool {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if received(log, method) >= count {
+        if received(log, method).len() >= count {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -271,7 +274,7 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     })?;
     let id = started.run_id.clone();
     assert_that!(until_steerable(&w.store, &id).await?, eq(true));
-    assert_that!(newest_command_is_running(&w.children, 1).await?, eq(true));
+    assert_that!(newest_command_is_running(&w.commands, 1).await, eq(true));
 
     // Steer the running turn from the command line; the fake completes the turn when steered.
     let steered = w
@@ -308,23 +311,20 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     let reply_at = page.text.find("STEERED: auth only").or_fail()?;
     assert_that!(steer_at < reply_at, eq(true));
     assert_that!(page.text, not(contains_substring("NEVER-DELIVERED")));
-    assert_that!(received(&w.log, "turn/steer"), eq(1));
+    assert_that!(received(&w.log, "turn/steer").len(), eq(1));
     // The command the finished turn left running went with its server.
-    assert_that!(every_command_is_gone(&w.children, 1).await?, eq(true));
+    assert_that!(every_command_is_gone(&w.commands, 1).await, eq(true));
 
     // The server was asked for no key, and was given none.
-    let server_env = std::fs::read_to_string(&w.env_dump).or_fail()?;
+    let server_env = std::fs::read_to_string(&w.environment).or_fail()?;
     assert_that!(server_env, not(contains_substring("sk-must-not-arrive")));
 
     // A follow-up is a new turn on the same thread.
     let followed = w.store.follow_up(&id, "And the session code?")?;
     assert_that!(followed.turns, eq(2));
     assert_that!(until_received(&w.log, "turn/start", 2).await, eq(true));
-    let resumed: Vec<serde_json::Value> = std::fs::read_to_string(&w.log)
-        .or_fail()?
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|request| request.get("method") == Some(&serde_json::json!("thread/resume")))
+    let resumed: Vec<serde_json::Value> = received(&w.log, "thread/resume")
+        .into_iter()
         .filter_map(|request| request.get("params").cloned())
         .collect();
     assert_that!(
@@ -340,15 +340,15 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     );
 
     // Cancelling interrupts that turn over the protocol, and the store records the cancellation.
-    assert_that!(newest_command_is_running(&w.children, 2).await?, eq(true));
+    assert_that!(newest_command_is_running(&w.commands, 2).await, eq(true));
     let cancelled = w.store.cancel(&id).await?;
     assert_that!(cancelled.outcome, eq(&Outcome::Cancelled));
-    assert_that!(received(&w.log, "turn/interrupt"), eq(1));
+    assert_that!(received(&w.log, "turn/interrupt").len(), eq(1));
     let (_, page) = w.store.view(&id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("_Turn 2 cancelled."));
     // And so did the one the cancelled turn left running, in a session no signal to the driver
     // would have reached.
-    assert_that!(every_command_is_gone(&w.children, 2).await?, eq(true));
+    assert_that!(every_command_is_gone(&w.commands, 2).await, eq(true));
     Ok(())
 }
 
@@ -395,54 +395,13 @@ fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
             .or_fail()?;
         assert_that!(status.success(), eq(true), "{billing}");
 
-        let seen = std::fs::read_to_string(&w.env_dump).or_fail()?;
+        let seen = std::fs::read_to_string(&w.environment).or_fail()?;
         for key in ["sk-must-not-arrive", "tok-direct"] {
             assert_that!(seen.contains(key), eq(expect_key), "{billing}: {key}");
         }
     }
     Ok(())
 }
-
-/// A fake `codex app-server` that answers setup, starts a command when the turn starts, waits
-/// for `@RELEASE@` to exist, and then misbehaves as `@END@` says.
-///
-/// - `crash` never answers `turn/start`, and exits; its command runs in a session of its own.
-/// - `linger` answers, and exits, leaving its command holding the server's output open.
-/// - `chatter` answers, and exits, leaving a command that keeps writing valid notifications to
-///   the server's output.
-///
-/// `@CHILDREN@` records the command.
-const FAKE_DYING_CODEX: &str = indoc::indoc! {r#"
-    #!/bin/sh
-    while IFS= read -r line; do
-      id=$(printf '%s' "$line" | sed -n 's/.*"id" *: *\([0-9][0-9]*\).*/\1/p')
-      method=$(printf '%s' "$line" | sed -n 's/.*"method" *: *"\([^"]*\)".*/\1/p')
-      case "$method" in
-        initialize)
-          printf '{"id":%s,"result":{"codexHome":"/home/dev/.codex","platformFamily":"unix","platformOs":"linux","userAgent":"fake"}}\n' "$id" ;;
-        thread/start)
-          printf '{"id":%s,"result":{"approvalPolicy":"never","approvalsReviewer":"user","cwd":"/work","model":"gpt-6-astra","modelProvider":"openai","sandbox":{"type":"readOnly"},"thread":{"cliVersion":"0.159.3","createdAt":1,"cwd":"/work","ephemeral":false,"id":"th-fake","modelProvider":"openai","preview":"","projectId":null,"sessionId":"se-fake","source":"appServer","status":{"type":"idle"},"turns":[],"updatedAt":1}}}\n' "$id" ;;
-        turn/start)
-          case '@END@' in
-            crash)
-              perl -MPOSIX -e 'defined POSIX::setsid() or die "setsid: $!"; exec @ARGV' sleep 300 </dev/null >/dev/null 2>&1 & ;;
-            linger)
-              printf '{"id":%s,"result":{"turn":{"id":"tu-1","items":[],"status":"inProgress"}}}\n' "$id"
-              sleep 300 & ;;
-            chatter)
-              printf '{"id":%s,"result":{"turn":{"id":"tu-1","items":[],"status":"inProgress"}}}\n' "$id"
-              while :; do
-                printf '{"method":"warning","params":{"threadId":"th-fake","message":"still here"}}\n' || exit 0
-                sleep 0.02
-              done & ;;
-          esac
-          echo $! >> '@CHILDREN@'
-          while [ ! -e '@RELEASE@' ]; do sleep 0.05; done
-          [ '@END@' = crash ] && exit 1
-          exit 0 ;;
-      esac
-    done
-"#};
 
 /// A driver a test started, which leaves nothing running however the test ends.
 ///
@@ -451,54 +410,57 @@ const FAKE_DYING_CODEX: &str = indoc::indoc! {r#"
 /// command it recorded that is still running, for a driver whose cleanup is what broke.
 struct Driven {
     child: std::process::Child,
-    release: PathBuf,
-    children: PathBuf,
+    releases: Vec<PathBuf>,
+    commands: PathBuf,
 }
 
 impl Drop for Driven {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.release, "");
-        let _ = std::fs::write(self.release.with_file_name("release-helper"), "");
+        for release in &self.releases {
+            std::fs::write(release, "").ok();
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill().ok();
+        self.child.wait().ok();
         // Only a process that is still one the fake started: a pid that has since passed to
-        // another process, or that cannot be looked at, is left alone.
-        let dir = self.children.parent().map(Path::to_string_lossy);
-        for pid in commands(&self.children) {
-            let ours = ps(&pid, "args").ok().flatten().is_some_and(|args| {
-                args == "sleep 300" || dir.as_deref().is_some_and(|dir| args.contains(dir))
-            });
-            if ours && is_running(&pid).unwrap_or(false) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &pid])
-                    .status();
+        // another process is left alone.
+        for pid in commands(&self.commands) {
+            if process(pid)
+                .is_some_and(|process| process.running && process.command_line.contains(HELPER))
+            {
+                let mut system = sysinfo::System::new();
+                let pid = sysinfo::Pid::from_u32(pid);
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                if let Some(process) = system.process(pid) {
+                    process.kill();
+                }
             }
         }
     }
 }
 
-/// Run the `codex-app-server` driver directly on a plan for a fresh turn in `dir`, with `fake` as
-/// the `codex` on its `PATH`, and return the driver with the paths the fake reads and writes.
-fn drive_fake(w: &World, dir: &Path, fake: &str) -> Result<(Driven, PathBuf, PathBuf)> {
-    use std::os::unix::fs::PermissionsExt as _;
-
+/// Run the `codex-app-server` driver directly on a plan for a fresh turn in `dir`, against the
+/// fake playing `scenario`, which records its commands' pids in the returned file.
+///
+/// `releases` are the files the scenario waits on, which dropping the driver creates.
+fn drive_fake(w: &World, dir: &Path, scenario: Scenario, releases: Vec<PathBuf>) -> Result<Driven> {
     use agentmux::appserver::Plan;
     use agentmux::delegate::{AppServerSettings, Billing};
 
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).or_fail()?;
-    let children = dir.join("children.txt");
-    let release = dir.join("release");
-    let fake = fake
-        .replace("@CHILDREN@", &children.to_string_lossy())
-        .replace("@RELEASE@", &release.to_string_lossy());
-    std::fs::write(bin.join("codex"), fake).or_fail()?;
-    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
-        .or_fail()?;
+    let codex_home = dir.join("codex-home");
+    let commands = dir.join("commands.txt");
+    configure(
+        &codex_home,
+        &Config {
+            scenario,
+            log: None,
+            environment: None,
+            commands: commands.clone(),
+        },
+    )?;
     let plan = Plan {
         settings: AppServerSettings {
             program: "codex".to_owned(),
@@ -516,21 +478,20 @@ fn drive_fake(w: &World, dir: &Path, fake: &str) -> Result<(Driven, PathBuf, Pat
     let plan_path = dir.join("app-server.json");
     std::fs::write(&plan_path, serde_json::to_string(&plan).or_fail()?).or_fail()?;
 
-    let driver = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"))
         .args(["codex-app-server", &plan_path.to_string_lossy()])
         .env_clear()
         .envs(&w.host)
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("CODEX_HOME", &codex_home)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
         .or_fail()?;
-    let driver = Driven {
-        child: driver,
-        release: release.clone(),
-        children: children.clone(),
-    };
-    Ok((driver, children, release))
+    Ok(Driven {
+        child,
+        releases,
+        commands,
+    })
 }
 
 /// Wait for `driver` to exit, for at most a minute, killing it rather than hanging the test.
@@ -541,8 +502,8 @@ async fn exit_of(driver: &mut std::process::Child) -> Result<std::process::ExitS
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let _ = driver.kill();
-            let _ = driver.wait();
+            driver.kill().ok();
+            driver.wait().ok();
             fail!("the driver did not exit within a minute")?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -556,15 +517,24 @@ async fn exit_of(driver: &mut std::process::Child) -> Result<std::process::ExitS
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_dies_mid_turn_leaves_nothing_running() -> Result<()> {
     let w = world()?;
-    for end in ["crash", "linger", "chatter"] {
-        let dir = w.state.join(format!("dying-{end}"));
-        let (mut driver, children, release) =
-            drive_fake(&w, &dir, &FAKE_DYING_CODEX.replace("@END@", end))?;
+    for death in [Death::Crash, Death::Linger, Death::Chatter] {
+        let dir = w.state.join(format!("dying-{death:?}"));
+        std::fs::create_dir_all(&dir).or_fail()?;
+        let release = dir.join("release");
+        let mut driver = drive_fake(
+            &w,
+            &dir,
+            Scenario::Dying {
+                death,
+                release: release.clone(),
+            },
+            vec![release.clone()],
+        )?;
 
         assert_that!(
-            newest_command_is_running(&children, 1).await?,
+            newest_command_is_running(&driver.commands, 1).await,
             eq(true),
-            "{end}"
+            "{death:?}"
         );
         // Three of the driver's once-a-second records, so it has seen the command, which is what
         // reaches it where the driver cannot adopt the server's orphans.
@@ -573,38 +543,15 @@ async fn a_server_that_dies_mid_turn_leaves_nothing_running() -> Result<()> {
 
         // The turn broke, and said so in its exit status.
         let status = exit_of(&mut driver.child).await?;
-        assert_that!(status.code(), some(eq(1)), "{end}");
+        assert_that!(status.code(), some(eq(1)), "{death:?}");
         assert_that!(
-            every_command_is_gone(&children, 1).await?,
+            every_command_is_gone(&driver.commands, 1).await,
             eq(true),
-            "{end}"
+            "{death:?}"
         );
     }
     Ok(())
 }
-
-/// A fake `codex app-server` whose turn forks a helper that outlives its parent, so the driver
-/// adopts it; the helper exits once `@RELEASE@-helper` exists, and the turn completes once
-/// `@RELEASE@` does.
-#[cfg(target_os = "linux")]
-const FAKE_FORKING_CODEX: &str = indoc::indoc! {r#"
-    #!/bin/sh
-    while IFS= read -r line; do
-      id=$(printf '%s' "$line" | sed -n 's/.*"id" *: *\([0-9][0-9]*\).*/\1/p')
-      method=$(printf '%s' "$line" | sed -n 's/.*"method" *: *"\([^"]*\)".*/\1/p')
-      case "$method" in
-        initialize)
-          printf '{"id":%s,"result":{"codexHome":"/home/dev/.codex","platformFamily":"unix","platformOs":"linux","userAgent":"fake"}}\n' "$id" ;;
-        thread/start)
-          printf '{"id":%s,"result":{"approvalPolicy":"never","approvalsReviewer":"user","cwd":"/work","model":"gpt-6-astra","modelProvider":"openai","sandbox":{"type":"readOnly"},"thread":{"cliVersion":"0.159.3","createdAt":1,"cwd":"/work","ephemeral":false,"id":"th-fake","modelProvider":"openai","preview":"","projectId":null,"sessionId":"se-fake","source":"appServer","status":{"type":"idle"},"turns":[],"updatedAt":1}}}\n' "$id" ;;
-        turn/start)
-          printf '{"id":%s,"result":{"turn":{"id":"tu-1","items":[],"status":"inProgress"}}}\n' "$id"
-          ( sh -c 'echo $$ >> "$0"; while [ ! -e "$1" ]; do sleep 0.05; done' '@CHILDREN@' '@RELEASE@-helper' </dev/null >/dev/null 2>&1 & )
-          while [ ! -e '@RELEASE@' ]; do sleep 0.05; done
-          printf '{"method":"turn/completed","params":{"threadId":"th-fake","turn":{"id":"tu-1","items":[],"status":"completed"}}}\n' ;;
-      esac
-    done
-"#};
 
 /// A helper a turn's command forks and abandons is adopted by the driver and waited for as soon as
 /// it exits, while the turn still runs, rather than left in the process table until the turn ends.
@@ -614,25 +561,43 @@ const FAKE_FORKING_CODEX: &str = indoc::indoc! {r#"
 async fn a_driver_reaps_adopted_children_before_the_turn_ends() -> Result<()> {
     let w = world()?;
     let dir = w.state.join("forking");
-    let (mut driver, children, release) = drive_fake(&w, &dir, FAKE_FORKING_CODEX)?;
+    std::fs::create_dir_all(&dir).or_fail()?;
+    let release = dir.join("release");
+    let helper_release = dir.join("release-helper");
+    let mut driver = drive_fake(
+        &w,
+        &dir,
+        Scenario::Forking {
+            release: release.clone(),
+            helper_release: helper_release.clone(),
+        },
+        vec![helper_release.clone(), release.clone()],
+    )?;
 
-    assert_that!(newest_command_is_running(&children, 1).await?, eq(true));
-    let helper = commands(&children).pop().or_fail()?;
+    assert_that!(
+        newest_command_is_running(&driver.commands, 1).await,
+        eq(true)
+    );
+    let helper = commands(&driver.commands).pop().or_fail()?;
     // The helper's parent goes, and the driver takes its place.
-    let driver_pid = driver.child.id().to_string();
+    let driver_pid = driver.child.id();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while ps(&helper, "ppid")?.as_deref() != Some(driver_pid.as_str()) && Instant::now() < deadline
+    while process(helper).and_then(|process| process.parent) != Some(driver_pid)
+        && Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_that!(ps(&helper, "ppid")?, some(eq(&driver_pid)));
+    assert_that!(
+        process(helper).and_then(|process| process.parent),
+        some(eq(driver_pid))
+    );
     // It exits, and is waited for, while the turn still runs.
-    std::fs::write(dir.join("release-helper"), "").or_fail()?;
+    std::fs::write(&helper_release, "").or_fail()?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while ps(&helper, "stat")?.is_some() && Instant::now() < deadline {
+    while process(helper).is_some() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_that!(ps(&helper, "stat")?, none());
+    assert_that!(process(helper).is_some(), eq(false));
     assert_that!(driver.child.try_wait().or_fail()?, none());
 
     std::fs::write(&release, "").or_fail()?;

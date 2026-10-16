@@ -31,8 +31,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+codex-app-server-mock = { path = "../codex-app-server-mock" }
+escargot.workspace = true
 googletest.workspace = true
-indoc.workspace = true
+# What the tests' fake codex left running, read the way the driver itself reads it.
+sysinfo.workspace = true
 tempfile.workspace = true
 
 # Only the musl builds swap the allocator; see the workspace manifest.

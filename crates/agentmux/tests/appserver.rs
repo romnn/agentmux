@@ -1,130 +1,83 @@
-//! The Codex app-server driver against an in-process JSON-RPC server: no codex, no network.
+//! The Codex app-server driver against a scripted server: no codex, no network.
 //!
-//! Each test scripts what the server answers to each message the driver sends, runs the driver on
-//! a thread exactly as the `codex-app-server` subcommand would — question in, capture out — and
-//! acts on the running turn from outside through the same files the run store uses.
+//! Each test scripts the server's side of the conversation with a [`Peer`] on a thread of its own
+//! — what it expects the driver to send, and what it answers, in order — runs the driver on
+//! another thread exactly as the `codex-app-server` subcommand would, question in and capture out,
+//! and acts on the running turn from outside through the same files the run store uses.
+//! The two are connected by OS pipes, so a server that stops reading fills a real pipe.
 //! The capture is then folded by the ordinary Codex parser, because the point of the driver is
 //! that nothing downstream can tell which launch mode wrote it.
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::BufReader;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Letter, Mailbox, Reply};
-use agentmux::appserver::{Ending, Plan, drive_with};
+use agentmux::appserver::{Deadlines, Ending, Plan, UNDECODED_EVENT, drive_with};
 use agentmux::delegate::{AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor};
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
+use codex_app_server_mock::conformance::{self, Side};
+use codex_app_server_mock::fixtures::{self, THREAD, TURN, Tokens};
+use codex_app_server_mock::{Peer, PeerError};
+use codex_app_server_protocol::envelope::{METHOD_NOT_FOUND, Message, RequestId};
+use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::types::TurnStatus;
 use googletest::prelude::*;
 use serde_json::{Value, json};
 
-const THREAD: &str = "th-fake";
-const TURN: &str = "tu-1";
+/// The question every driven turn is asked.
+const QUESTION: &str = "Review the auth module.";
 
-/// Everything the server received, in order.
-type Requests = Arc<Mutex<Vec<Value>>>;
-
-/// What the server sends back for one message from the driver.
-type Script = Box<dyn FnMut(&Value) -> Vec<Value> + Send>;
+/// A server's side of one conversation.
+type Script<R> = Box<dyn FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send>;
 
 /// One finished run of the driver.
-struct Run {
+struct Run<R = ()> {
     ending: Ending,
     /// The capture the driver wrote, which the store would have folded.
     capture: String,
+    /// Every message the server received, in order.
     requests: Vec<Value>,
+    /// What the script returned.
+    script: R,
 }
 
-fn method(message: &Value) -> &str {
-    message
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+/// How the driver runs, beyond the plan: where it captures to, how it learns the server has
+/// exited, how long it waits, and how much of the server's output it reads at once.
+struct Driver<W> {
+    out: W,
+    exited: Box<dyn FnMut() -> bool + Send>,
+    deadlines: Deadlines,
+    read_capacity: usize,
 }
 
-fn respond(message: &Value, result: &Value) -> Value {
-    json!({"id": message.get("id"), "result": result})
+impl Driver<Vec<u8>> {
+    /// A driver capturing into memory, whose server never exits, on the production deadlines.
+    fn standard() -> Self {
+        Self::capturing(Vec::new())
+    }
 }
 
-fn notify(method: &str, params: &Value) -> Value {
-    json!({"method": method, "params": params})
+impl<W> Driver<W> {
+    fn capturing(out: W) -> Self {
+        Self {
+            out,
+            exited: Box::new(|| false),
+            deadlines: Deadlines::default(),
+            read_capacity: 8 << 10,
+        }
+    }
 }
 
-/// What `thread/start` and `thread/resume` answer: every member codex's schema requires.
-///
-/// Complete, because the driver decodes it into the generated type, and a fake that left members
-/// out would be recorded as protocol drift.
-fn thread_opened() -> Value {
-    json!({
-        "approvalPolicy": "never",
-        "approvalsReviewer": "user",
-        "cwd": "/work/project",
-        "model": "gpt-6-astra",
-        "modelProvider": "openai",
-        "sandbox": {"type": "readOnly"},
-        "thread": {
-            "cliVersion": "0.159.3",
-            "createdAt": 1_790_000_000,
-            "cwd": "/work/project",
-            "ephemeral": false,
-            "id": THREAD,
-            "modelProvider": "openai",
-            "preview": "",
-            "projectId": null,
-            "sessionId": "se-fake",
-            "source": "appServer",
-            "status": {"type": "idle"},
-            "turns": [],
-            "updatedAt": 1_790_000_000,
-        },
-    })
-}
-
-/// How the server answers the setup a driver always goes through, or `None` for anything else.
-fn setup(message: &Value) -> Option<Vec<Value>> {
-    Some(match method(message) {
-        "initialize" => vec![respond(
-            message,
-            &json!({"codexHome": "/home/dev/.codex", "platformFamily": "unix",
-                    "platformOs": "linux", "userAgent": "fake"}),
-        )],
-        "initialized" => Vec::new(),
-        "thread/start" | "thread/resume" => vec![respond(message, &thread_opened())],
-        "turn/start" => vec![
-            respond(
-                message,
-                &json!({"turn": {"id": TURN, "items": [], "status": "inProgress"}}),
-            ),
-            notify("turn/started", &turn_in("inProgress")),
-        ],
-        _ => return None,
-    })
-}
-
-/// The running turn, as `turn/started` and `turn/completed` carry it, in `status`.
-fn turn_in(status: &str) -> Value {
-    json!({"threadId": THREAD, "turn": {"id": TURN, "items": [], "status": status}})
-}
-
-/// A reply, the token total, and the end of the turn.
-fn reply_and_finish(text: &str) -> Vec<Value> {
-    vec![
-        notify(
-            "item/completed",
-            &json!({"threadId": THREAD, "turnId": TURN, "completedAtMs": 1,
-                   "item": {"id": "i-reply", "type": "agentMessage", "text": text}}),
-        ),
-        notify(
-            "thread/tokenUsage/updated",
-            &json!({"threadId": THREAD, "turnId": TURN, "tokenUsage": {
-                "last": {"inputTokens": 10, "cachedInputTokens": 0, "outputTokens": 5,
-                         "reasoningOutputTokens": 0, "totalTokens": 15},
-                "total": {"inputTokens": 900, "cachedInputTokens": 100, "outputTokens": 50,
-                          "reasoningOutputTokens": 7, "totalTokens": 950}}}),
-        ),
-        notify("turn/completed", &turn_in("completed")),
-    ]
+/// One finished run of a [`Driver`], with the capture it was given back.
+struct Driven<W, R> {
+    ending: Ending,
+    out: W,
+    requests: Vec<Value>,
+    script: R,
 }
 
 /// A plan whose files live in `dir`.
@@ -145,73 +98,90 @@ fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<Plan> {
     })
 }
 
-/// Run the driver against `script`, while `during` acts on the running turn from outside.
-fn run(plan: &Plan, script: Script, during: impl FnOnce(&Plan, &Requests)) -> Result<Run> {
-    let (ending, capture, requests) = run_into(plan, script, Vec::new(), during)?;
+/// Run the driver against `script`, capturing into memory, while `during` acts on the running
+/// turn from outside.
+fn run<R: Send + 'static>(
+    plan: &Plan,
+    script: impl FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send + 'static,
+    during: impl FnOnce(&Plan),
+) -> Result<Run<R>> {
+    let driven = run_with(plan, Driver::standard(), script, during)?;
     Ok(Run {
-        ending,
-        capture: String::from_utf8(capture).or_fail()?,
-        requests,
+        ending: driven.ending,
+        capture: String::from_utf8(driven.out).or_fail()?,
+        requests: driven.requests,
+        script: driven.script,
     })
 }
 
-/// [`run`], writing the capture into `out`, which is handed back with what the driver wrote.
-fn run_into<W: std::io::Write + Send + 'static>(
+/// [`run`], with the driver set up as `driver` says.
+///
+/// Once the script is done, the server keeps the conversation open until the driver closes it, as
+/// a server with nothing more to say does; a script that fails closes it at once, so the driver
+/// ends, and the script's failure is the test's.
+/// Every message the driver sent must be one codex's own schema allows.
+fn run_with<W: std::io::Write + Send + 'static, R: Send + 'static>(
     plan: &Plan,
-    script: Script,
-    out: W,
-    during: impl FnOnce(&Plan, &Requests),
-) -> Result<(Ending, W, Vec<Value>)> {
+    driver: Driver<W>,
+    script: impl FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send + 'static,
+    during: impl FnOnce(&Plan),
+) -> Result<Driven<W, R>> {
     let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
-
-    let server = std::thread::spawn({
-        let requests = Arc::clone(&requests);
-        let mut script = script;
-        move || {
-            for line in BufReader::new(server_in).lines() {
-                let Ok(line) = line else { return };
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                requests
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(message.clone());
-                for answer in script(&message) {
-                    if writeln!(server_out, "{answer}").is_err() {
-                        return;
-                    }
-                }
-            }
-        }
+    let (from_server, server_out) = std::io::pipe().or_fail()?;
+    let script: Script<R> = Box::new(script);
+    let server = std::thread::spawn(move || {
+        let mut peer = Peer::new(BufReader::new(server_in), server_out);
+        let outcome = script(&mut peer);
+        let drained = match &outcome {
+            Ok(_) => peer.wait_until_closed(),
+            Err(_) => Ok(()),
+        };
+        let received = peer.received().to_vec();
+        (outcome, drained, received)
     });
-    let driver = std::thread::spawn({
+    let Driver {
+        out,
+        mut exited,
+        deadlines,
+        read_capacity,
+    } = driver;
+    let driving = std::thread::spawn({
         let plan = plan.clone();
         move || {
             let mut out = out;
             let ending = drive_with(
                 &plan,
-                "Review the auth module.",
+                QUESTION,
                 &mut out,
                 to_server,
-                BufReader::new(from_server),
-                &mut || false,
+                BufReader::with_capacity(read_capacity, from_server),
+                &mut exited,
+                deadlines,
             );
             (ending, out)
         }
     });
 
-    during(plan, &requests);
+    during(plan);
 
-    let (ending, out) = finished(driver, "the driver")?;
-    finished(server, "the fake server")?;
-    let requests = requests
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    Ok((ending, out, requests))
+    let (ending, out) = finished(driving, "the driver")?;
+    let (outcome, drained, received) = finished(server, "the scripted server")?;
+    let script = outcome.or_fail()?;
+    drained.or_fail()?;
+    let mut requests = Vec::new();
+    for line in &received {
+        let request: Value = serde_json::from_str(line).or_fail()?;
+        if let Err(reason) = conformance::check(Side::Client, &request) {
+            fail!("the driver sent what codex's schema refuses: {request}\n{reason}")?;
+        }
+        requests.push(request);
+    }
+    Ok(Driven {
+        ending,
+        out,
+        requests,
+        script,
+    })
 }
 
 /// Join `thread`, failing the test rather than hanging it when it has not finished within a
@@ -227,32 +197,6 @@ fn finished<T>(thread: std::thread::JoinHandle<T>, what: &str) -> Result<T> {
     thread.join().ok().or_fail()
 }
 
-/// Run the driver on a thread of its own against pipes a fake server already holds the other
-/// ends of, failing the test rather than hanging it when the driver does not finish within a
-/// minute.
-fn drive_bounded<W: std::io::Write + Send + 'static>(
-    plan: &Plan,
-    out: W,
-    to_server: std::io::PipeWriter,
-    from_server: std::io::PipeReader,
-    mut exited: impl FnMut() -> bool + Send + 'static,
-) -> Result<(Ending, W)> {
-    let plan = plan.clone();
-    let driver = std::thread::spawn(move || {
-        let mut out = out;
-        let ending = drive_with(
-            &plan,
-            "q",
-            &mut out,
-            to_server,
-            BufReader::new(from_server),
-            &mut exited,
-        );
-        (ending, out)
-    });
-    finished(driver, "the driver")
-}
-
 /// Wait for `condition`, for at most ten seconds.
 fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -265,30 +209,39 @@ fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     false
 }
 
+/// Wait for the script to say a point was reached, for at most ten seconds.
+fn reached(signal: &Receiver<()>) -> bool {
+    signal.recv_timeout(Duration::from_secs(10)).is_ok()
+}
+
+/// Say from a script that a point was reached; a test that stopped listening needs no telling.
+fn signal(reached: &Sender<()>) {
+    reached.send(()).ok();
+}
+
 /// Submit a steer and wait for the driver's reply.
 fn steer(plan: &Plan, text: &str) -> Option<Reply> {
     let mailbox = Mailbox::new(&plan.mailbox);
     let letter: Letter = mailbox.submit(text).ok()?;
+    replied(&mailbox, &letter)
+}
+
+/// Wait for the driver's reply to `letter`.
+fn replied(mailbox: &Mailbox, letter: &Letter) -> Option<Reply> {
     let mut reply = None;
     eventually(|| {
-        reply = mailbox.reply(&letter).ok().flatten();
+        reply = mailbox.reply(letter).ok().flatten();
         reply.is_some()
     });
     reply
 }
 
 /// The requests the server received with `name`.
-fn sent<'a>(run: &'a Run, name: &str) -> Vec<&'a Value> {
-    run.requests.iter().filter(|m| method(m) == name).collect()
-}
-
-/// One reply the delegate gives while its turn goes on.
-fn says(id: &str, text: &str) -> Value {
-    notify(
-        "item/completed",
-        &json!({"threadId": THREAD, "turnId": TURN, "completedAtMs": 1,
-               "item": {"id": id, "type": "agentMessage", "text": text}}),
-    )
+fn sent<'a, R>(run: &'a Run<R>, name: &str) -> Vec<&'a Value> {
+    run.requests
+        .iter()
+        .filter(|request| request.get("method").and_then(Value::as_str) == Some(name))
+        .collect()
 }
 
 /// The kinds of the events in a capture, in order.
@@ -300,6 +253,53 @@ fn kinds(capture: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many events of `kind` a capture holds.
+fn count(capture: &str, kind: &str) -> usize {
+    kinds(capture).iter().filter(|seen| *seen == kind).count()
+}
+
+/// One reply the delegate gives while its turn goes on.
+fn says(peer: &mut Peer, id: &str, text: &str) -> std::result::Result<(), PeerError> {
+    peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+        THREAD,
+        TURN,
+        fixtures::agent_message(id, text),
+    ))
+}
+
+/// The delegate's reply, the token total, and the end of the turn, as codex sends them.
+fn finish(peer: &mut Peer, text: &str) -> std::result::Result<(), PeerError> {
+    says(peer, "i-reply", text)?;
+    peer.notify::<m::ThreadTokenUsageUpdated>(&fixtures::token_usage(
+        THREAD,
+        TURN,
+        Tokens {
+            input: 10,
+            output: 5,
+            ..Tokens::default()
+        },
+        Tokens {
+            input: 900,
+            cached_input: 100,
+            output: 50,
+            reasoning_output: 7,
+        },
+    ))?;
+    end(peer, TurnStatus::Completed, Vec::new())
+}
+
+/// The end of the turn, in `status`, with the items the turn records.
+fn end(
+    peer: &mut Peer,
+    status: TurnStatus,
+    items: Vec<codex_app_server_protocol::types::ThreadItem>,
+) -> std::result::Result<(), PeerError> {
+    peer.notify::<m::TurnCompleted>(&fixtures::turn_completed(THREAD, TURN, status, items))
+}
+
+/// A turn that answers only with a plan, carried in `turn/completed`'s items.
+const PLAN: &str = "1. read the auth module\n2. fix the token check";
+
 /// A steer reaches the running turn, is answered, and is recorded where the server accepted it.
 ///
 /// The whole path a steer takes: the caller's request in the mailbox, `turn/steer` naming the
@@ -310,38 +310,28 @@ fn kinds(capture: &str) -> Vec<String> {
 fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).map_or_else(
-            || match method(message) {
-                "turn/steer" => {
-                    let mut answers = vec![respond(message, &json!({"turnId": TURN}))];
-                    answers.extend(reply_and_finish("Narrowed to auth: no findings."));
-                    answers
-                }
-                _ => Vec::new(),
-            },
-            |mut answers| {
-                // Something already said, so the steer has a place to land after it.
-                if method(message) == "turn/start" {
-                    answers.push(says("i-before", "Reading the whole repository."));
-                }
-                answers
-            },
-        )
-    });
+    let (started, turn_running) = channel();
 
     let mut reply = None;
-    let run = run(&plan, script, |plan, requests| {
-        // Steered once the turn has said something, as a caller reading `tail` would.
-        eventually(|| {
-            requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|m| method(m) == "turn/start")
-        });
-        reply = steer(plan, "Only look at the auth module.");
-    })?;
+    let run = run(
+        &plan,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            // Something already said, so the steer has a place to land after it.
+            says(peer, "i-before", "Reading the whole repository.")?;
+            signal(&started);
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
+            finish(peer, "Narrowed to auth: no findings.")
+        },
+        |plan| {
+            // Steered once the turn has said something, as a caller reading `tail` would.
+            if reached(&turn_running) {
+                reply = steer(plan, "Only look at the auth module.");
+            }
+        },
+    )?;
 
     // The caller heard that the instruction was accepted, and the turn then ended normally.
     assert_that!(reply, some(eq(&Reply::Accepted)));
@@ -383,8 +373,7 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
 
     // Folded like any Codex turn: the instruction is a steer between the two replies, and the
     // usage is the server's running total.
-    let Fold { turn, session, .. } =
-        stream::fold(Vendor::Codex, 0, "Review the auth module.", &run.capture);
+    let Fold { turn, session, .. } = stream::fold(Vendor::Codex, 0, QUESTION, &run.capture);
     assert_that!(session.as_ref().map(SessionRef::as_str), some(eq(THREAD)));
     assert_that!(
         turn.messages.iter().map(|m| m.source).collect::<Vec<_>>(),
@@ -444,23 +433,19 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
 fn a_steer_the_server_refuses_is_answered_and_not_recorded() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).unwrap_or_else(|| match method(message) {
-            "turn/steer" => {
-                let refusal =
-                    json!({"code": -32600, "message": "expected turn tu-0 but tu-1 is active"});
-                let mut answers = vec![json!({"id": message.get("id"), "error": refusal})];
-                answers.extend(reply_and_finish("done"));
-                answers
-            }
-            _ => Vec::new(),
-        })
-    });
 
     let mut reply = None;
-    let run = run(&plan, script, |plan, _| {
-        reply = steer(plan, "REFUSED-SENTINEL");
-    })?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.refuse(&steer, -32600, "expected turn tu-0 but tu-1 is active")?;
+            finish(peer, "done")
+        },
+        |plan| reply = steer(plan, "REFUSED-SENTINEL"),
+    )?;
 
     assert_that!(
         reply,
@@ -487,29 +472,25 @@ fn a_steer_the_server_refuses_is_answered_and_not_recorded() -> Result<()> {
 fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).unwrap_or_else(|| match method(message) {
-            "turn/interrupt" => vec![
-                respond(message, &json!({})),
-                notify("turn/completed", &turn_in("interrupted")),
-            ],
-            _ => Vec::new(),
-        })
-    });
+    let (started, turn_running) = channel();
 
-    let run = run(&plan, script, |plan, requests| {
-        // Cancelled only once the turn is running, as `cancel` would find it.
-        let started = eventually(|| {
-            requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|m| method(m) == "turn/start")
-        });
-        if started {
-            let _ = std::fs::write(&plan.cancel_marker, "");
-        }
-    })?;
+    let run = run(
+        &plan,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            signal(&started);
+            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            peer.reply(&interrupt, &fixtures::turn_interrupt_response())?;
+            end(peer, TurnStatus::Interrupted, Vec::new())
+        },
+        |plan| {
+            // Cancelled only once the turn is running, as `cancel` would find it.
+            if reached(&turn_running) {
+                std::fs::write(&plan.cancel_marker, "").ok();
+            }
+        },
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Cancelled));
     assert_that!(
@@ -528,15 +509,16 @@ fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
 fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, Some(THREAD))?;
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.extend(reply_and_finish("BANANAPHONE"));
-        }
-        answers
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            finish(peer, "BANANAPHONE")
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
     assert_that!(sent(&run, "thread/start"), is_empty());
@@ -567,26 +549,27 @@ fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
 fn an_approval_request_is_declined_and_noted() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        if let Some(mut answers) = setup(message) {
-            if method(message) == "turn/start" {
-                answers.push(
-                    json!({"id": "srv-1", "method": "item/commandExecution/requestApproval",
-                    "params": {"threadId": THREAD, "turnId": TURN, "itemId": "c1"}}),
-                );
-            }
-            return answers;
-        }
-        // The driver's answer to the approval request: the turn carries on and finishes.
-        if message.get("id") == Some(&json!("srv-1")) {
-            return reply_and_finish("ran without it");
-        }
-        Vec::new()
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let approval = peer.request::<m::ItemCommandExecutionRequestApproval>(
+                RequestId::from("srv-1"),
+                &fixtures::command_approval(THREAD, TURN, "c1"),
+            )?;
+            // The turn carries on once it is answered, and finishes.
+            let answer = peer.expect_answer(&approval)?;
+            finish(peer, "ran without it")?;
+            Ok(answer)
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
+    // The answer decodes as the method's own response type, and declines.
+    assert_that!(run.script, ok(anything()));
     let answer = run
         .requests
         .iter()
@@ -612,38 +595,24 @@ fn an_approval_request_is_declined_and_noted() -> Result<()> {
 fn a_server_that_exits_mid_turn_breaks_the_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    // The server answers setup, then exits on the first message after it.
-    let script: Script = Box::new(|message| setup(message).unwrap_or_default());
-    let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let server = std::thread::spawn({
-        let mut script = script;
-        move || {
-            for line in BufReader::new(server_in).lines() {
-                let Ok(line) = line else { return };
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let started = method(&message) == "turn/start";
-                for answer in script(&message) {
-                    let _ = writeln!(server_out, "{answer}");
-                }
-                if started {
-                    // Dropping the writer is the server's stdout closing.
-                    return;
-                }
-            }
-        }
-    });
 
-    let (ending, _) = drive_bounded(&plan, Vec::new(), to_server, from_server, || false)?;
-    finished(server, "the fake server")?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            // Its output closing is the server exiting.
+            peer.close();
+            Ok(())
+        },
+        |_| {},
+    )?;
 
     assert_that!(
-        ending,
+        run.ending,
         matches_pattern!(Ending::Broken(contains_substring("exited while the turn")))
     );
-    assert_that!(ending.exit_code(), eq(1));
+    assert_that!(run.ending.exit_code(), eq(1));
     Ok(())
 }
 
@@ -653,15 +622,16 @@ fn a_server_that_exits_mid_turn_breaks_the_turn() -> Result<()> {
 fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.extend(reply_and_finish("ok"));
-        }
-        answers
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            finish(peer, "ok")
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
     assert_that!(
@@ -684,7 +654,7 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
             .and_then(|m| m.get("params")),
         some(eq(&json!({
             "threadId": THREAD,
-            "input": [{"type": "text", "text": "Review the auth module."}],
+            "input": [{"type": "text", "text": QUESTION}],
         })))
     );
     Ok(())
@@ -698,27 +668,21 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
 fn a_turn_that_ends_before_turn_start_answers_still_ends() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        if method(message) == "turn/start" {
-            let mut answers = vec![notify("turn/started", &turn_in("inProgress"))];
-            answers.extend(reply_and_finish("Done before you asked."));
-            answers.push(respond(
-                message,
-                &json!({"turn": {"id": TURN, "items": [], "status": "inProgress"}}),
-            ));
-            return answers;
-        }
-        setup(message).unwrap_or_default()
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            let start = peer.expect::<m::TurnStart>()?;
+            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
+            finish(peer, "Done before you asked.")?;
+            peer.reply(&start, &fixtures::turn_start_response(TURN))
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
-    let ends = kinds(&run.capture)
-        .into_iter()
-        .filter(|kind| kind == "turn.completed")
-        .count();
-    assert_that!(ends, eq(1));
+    assert_that!(count(&run.capture, "turn.completed"), eq(1));
     assert_that!(
         std::fs::read_to_string(&plan.last_message).or_fail()?,
         eq("Done before you asked.")
@@ -732,22 +696,20 @@ fn a_turn_that_ends_before_turn_start_answers_still_ends() -> Result<()> {
 fn a_steer_accepted_as_the_turn_ends_is_recorded_before_its_end() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).unwrap_or_else(|| match method(message) {
-            // The completion overtakes the steer's own answer.
-            "turn/steer" => {
-                let mut answers = reply_and_finish("finished anyway");
-                answers.push(respond(message, &json!({"turnId": TURN})));
-                answers
-            }
-            _ => Vec::new(),
-        })
-    });
 
     let mut reply = None;
-    let run = run(&plan, script, |plan, _| {
-        reply = steer(plan, "last word");
-    })?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            // The completion overtakes the steer's own answer.
+            finish(peer, "finished anyway")?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+        },
+        |plan| reply = steer(plan, "last word"),
+    )?;
 
     assert_that!(reply, some(eq(&Reply::Accepted)));
     let order = kinds(&run.capture);
@@ -763,17 +725,18 @@ fn a_steer_accepted_as_the_turn_ends_is_recorded_before_its_end() -> Result<()> 
 fn a_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).unwrap_or_else(|| match method(message) {
-            "turn/steer" => reply_and_finish("ended without a word about it"),
-            _ => Vec::new(),
-        })
-    });
 
     let mut reply = None;
-    let run = run(&plan, script, |plan, _| {
-        reply = steer(plan, "lost in transit");
-    })?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            peer.expect::<m::TurnSteer>()?;
+            finish(peer, "ended without a word about it")
+        },
+        |plan| reply = steer(plan, "lost in transit"),
+    )?;
 
     assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
     assert_that!(run.capture, not(contains_substring("lost in transit")));
@@ -804,17 +767,19 @@ impl std::io::Write for RefusesSteers {
 fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        setup(message).unwrap_or_else(|| match method(message) {
-            "turn/steer" => vec![respond(message, &json!({"turnId": TURN}))],
-            _ => Vec::new(),
-        })
-    });
 
     let mut reply = None;
-    let (ending, _, _) = run_into(&plan, script, RefusesSteers(Vec::new()), |plan, _| {
-        reply = steer(plan, "unrecordable");
-    })?;
+    let driven = run_with(
+        &plan,
+        Driver::capturing(RefusesSteers(Vec::new())),
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+        },
+        |plan| reply = steer(plan, "unrecordable"),
+    )?;
 
     assert_that!(
         reply,
@@ -823,7 +788,7 @@ fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> 
         }))
     );
     assert_that!(
-        ending,
+        driven.ending,
         matches_pattern!(Ending::Broken(contains_substring("capture")))
     );
     Ok(())
@@ -835,15 +800,20 @@ fn a_cancellation_during_setup_starts_no_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let marker = plan.cancel_marker.clone();
-    let script: Script = Box::new(move |message| {
-        if method(message) == "thread/start" {
-            // `cancel` marks the turn while the server is still opening the thread.
-            let _ = std::fs::write(&marker, "");
-        }
-        setup(message).unwrap_or_default()
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        move |peer| {
+            let initialize = peer.expect::<m::Initialize>()?;
+            peer.reply(&initialize, &fixtures::initialize_response())?;
+            peer.expect_notification::<m::Initialized>()?;
+            let start = peer.expect::<m::ThreadStart>()?;
+            // `cancel` marks the turn while the server is still opening the thread.
+            std::fs::write(&marker, "").ok();
+            peer.reply(&start, &fixtures::thread_start_response(THREAD))
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Cancelled));
     assert_that!(sent(&run, "turn/start"), is_empty());
@@ -892,34 +862,53 @@ fn every_request_the_server_can_make_is_refused() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let methods: Vec<&'static str> = kinds.iter().map(|(kind, _)| *kind).collect();
-    let count = methods.len();
-    let asked = move |phase: &str| -> Vec<Value> {
-        methods
-            .iter()
-            .map(|kind| json!({"id": format!("{phase}:{kind}"), "method": kind, "params": {}}))
-            .collect()
+    let ask = move |peer: &mut Peer, phase: &str| -> std::result::Result<(), PeerError> {
+        for kind in &methods {
+            peer.send(&Message::Request {
+                id: RequestId::String(format!("{phase}:{kind}")),
+                method: (*kind).to_owned(),
+                params: json!({}),
+            })?;
+        }
+        Ok(())
     };
-    let mut answered = 0;
-    let script: Script = Box::new(move |message| {
-        if let Some(mut answers) = setup(message) {
-            match method(message) {
-                "initialize" => answers.extend(asked("setup")),
-                "turn/start" => answers.extend(asked("turn")),
-                _ => {}
-            }
-            return answers;
-        }
-        // The turn ends once every request has been answered.
-        if message.get("id").and_then(Value::as_str).is_some() {
-            answered += 1;
-            if answered == 2 * count {
-                return reply_and_finish("carried on");
-            }
-        }
-        Vec::new()
-    });
+    let asked = kinds.len();
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        move |peer| {
+            // Asked as soon as the handshake is answered, so the driver answers while it opens
+            // the thread.
+            let initialize = peer.expect::<m::Initialize>()?;
+            peer.reply(&initialize, &fixtures::initialize_response())?;
+            ask(peer, "setup")?;
+            let mut answered = 0;
+            let mut thread_start = None;
+            while answered < asked || thread_start.is_none() {
+                match peer.recv()? {
+                    Message::Response { .. } => answered += 1,
+                    Message::Request { id, method, .. } if method == "thread/start" => {
+                        thread_start = Some(id);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(id) = thread_start {
+                peer.send(&Message::result::<m::ThreadStart>(
+                    id,
+                    &fixtures::thread_start_response(THREAD),
+                )?)?;
+            }
+            // And again while the turn runs, which ends once every request is answered.
+            peer.start_turn(THREAD, TURN)?;
+            ask(peer, "turn")?;
+            for _ in 0..asked {
+                peer.recv()?;
+            }
+            finish(peer, "carried on")
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
     for phase in ["setup", "turn"] {
@@ -943,39 +932,31 @@ fn every_request_the_server_can_make_is_refused() -> Result<()> {
 
 /// A server that stops reading its input cannot stall the driver: the turn still ends when the
 /// server says so, and a steer stuck in the pipe is reported as unconfirmed.
+///
+/// The peer reads only when its script asks, so a script that stops asking leaves the steer in
+/// the pipe until the driver has finished.
 #[gtest]
 fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let (started_tx, started) = std::sync::mpsc::channel();
-    let (go_tx, go) = std::sync::mpsc::channel::<()>();
-    let (stop_tx, stop) = std::sync::mpsc::channel::<()>();
+    let (from_server, server_out) = std::io::pipe().or_fail()?;
+    let (started_tx, started) = channel();
+    let (go_tx, go) = channel::<()>();
+    let (stop_tx, stop) = channel::<()>();
 
-    // Answers setup, then reads nothing more until told to, and ends the turn when told to.
-    let server = std::thread::spawn(move || {
-        let mut lines = BufReader::new(server_in).lines();
-        while let Some(Ok(line)) = lines.next() {
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            for answer in setup(&message).unwrap_or_default() {
-                let _ = writeln!(server_out, "{answer}");
-            }
-            if method(&message) == "turn/start" {
-                break;
-            }
-        }
-        let _ = started_tx.send(());
-        let _ = go.recv_timeout(Duration::from_secs(20));
-        for answer in reply_and_finish("ended regardless") {
-            let _ = writeln!(server_out, "{answer}");
-        }
-        let _ = stop.recv_timeout(Duration::from_secs(20));
-        drop(lines);
+    // Answers setup, then reads nothing more until the test has seen the driver finish.
+    let server = std::thread::spawn(move || -> std::result::Result<(), PeerError> {
+        let mut peer = Peer::new(BufReader::new(server_in), server_out);
+        peer.open_thread(THREAD)?;
+        peer.start_turn(THREAD, TURN)?;
+        signal(&started_tx);
+        go.recv_timeout(Duration::from_secs(20)).ok();
+        finish(&mut peer, "ended regardless")?;
+        stop.recv_timeout(Duration::from_secs(20)).ok();
+        Ok(())
     });
-    let (done_tx, done) = std::sync::mpsc::channel();
+    let (done_tx, done) = channel();
     std::thread::spawn({
         let plan = plan.clone();
         move || {
@@ -987,12 +968,13 @@ fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
                 to_server,
                 BufReader::new(from_server),
                 &mut || false,
+                Deadlines::default(),
             );
-            let _ = done_tx.send(ending);
+            done_tx.send(ending).ok();
         }
     });
 
-    started.recv_timeout(Duration::from_secs(10)).or_fail()?;
+    assert_that!(reached(&started), eq(true));
     // Far more than a pipe holds, so writing it blocks for as long as the server does not read.
     let mailbox = Mailbox::new(&plan.mailbox);
     let letter = mailbox.submit(&"x".repeat(4 << 20)).or_fail()?;
@@ -1001,8 +983,8 @@ fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
 
     let ending = done.recv_timeout(Duration::from_secs(20)).or_fail()?;
     let reply = mailbox.reply(&letter).or_fail()?;
-    let _ = stop_tx.send(());
-    let _ = server.join();
+    stop_tx.send(()).ok();
+    finished(server, "the scripted server")?.or_fail()?;
 
     assert_that!(ending, eq(&Ending::Finished));
     assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
@@ -1020,40 +1002,25 @@ fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
 /// `a_plan_only_turn_keeps_its_report_for_store_readers`.
 #[gtest]
 fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
-    let item = |item: Value| {
-        notify(
-            "item/completed",
-            &json!({"threadId": THREAD, "turnId": TURN, "completedAtMs": 1, "item": item}),
-        )
-    };
-    let error = |will_retry: bool, message: &str| {
-        notify(
-            "error",
-            &json!({"threadId": THREAD, "turnId": TURN, "willRetry": will_retry,
-                    "error": {"message": message}}),
-        )
-    };
-    let completed_turn = || {
-        let mut answers = vec![
-            item(json!({"id": "r", "type": "reasoning", "summary": ["thinking"], "content": []})),
-            item(
-                json!({"id": "c", "type": "commandExecution", "command": "ls",
-                "aggregatedOutput": "src", "exitCode": 0, "status": "completed",
-                "commandActions": [], "cwd": "/work", "durationMs": 3}),
-            ),
-            notify(
-                "warning",
-                &json!({"threadId": THREAD, "message": "heads up"}),
-            ),
-            error(true, "reconnecting"),
-        ];
-        answers.extend(reply_and_finish("FINDINGS"));
-        answers
-    };
-    let cases: [(&str, Vec<Value>, &str); 2] = [
+    type During = fn(&mut Peer) -> std::result::Result<(), PeerError>;
+    let cases: [(&str, During, &str); 2] = [
         (
             "a completed turn, with a warning and a retried error",
-            completed_turn(),
+            |peer| {
+                peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+                    THREAD,
+                    TURN,
+                    fixtures::reasoning("r", &["thinking"]),
+                ))?;
+                peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+                    THREAD,
+                    TURN,
+                    fixtures::command("c", "ls", "src", 0),
+                ))?;
+                peer.notify::<m::Warning>(&fixtures::warning(THREAD, "heads up"))?;
+                peer.notify::<m::Error>(&fixtures::error(THREAD, TURN, true, "reconnecting"))?;
+                finish(peer, "FINDINGS")
+            },
             indoc::indoc! {r#"
                 {"type":"thread.started","thread_id":"th-fake"}
                 {"type":"turn.started"}
@@ -1067,10 +1034,15 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
         ),
         (
             "a turn that failed on an error it did not retry",
-            vec![
-                error(false, "model not supported"),
-                notify("turn/completed", &turn_in("failed")),
-            ],
+            |peer| {
+                peer.notify::<m::Error>(&fixtures::error(
+                    THREAD,
+                    TURN,
+                    false,
+                    "model not supported",
+                ))?;
+                end(peer, TurnStatus::Failed, Vec::new())
+            },
             indoc::indoc! {r#"
                 {"type":"thread.started","thread_id":"th-fake"}
                 {"type":"turn.started"}
@@ -1079,19 +1051,18 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
             "#},
         ),
     ];
-
     for (case, during, exec) in cases {
         let dir = tempfile::tempdir().or_fail()?;
         let plan = plan(dir.path(), Billing::Subscription, None)?;
-        let mut during = Some(during);
-        let script: Script = Box::new(move |message| {
-            let mut answers = setup(message).unwrap_or_default();
-            if method(message) == "turn/start" {
-                answers.extend(during.take().unwrap_or_default());
-            }
-            answers
-        });
-        let run = run(&plan, script, |_, _| {})?;
+        let run = run(
+            &plan,
+            move |peer| {
+                peer.open_thread(THREAD)?;
+                peer.start_turn(THREAD, TURN)?;
+                during(peer)
+            },
+            |_| {},
+        )?;
 
         let driven = stream::fold(Vendor::Codex, 0, "q", &run.capture);
         let written = stream::fold(Vendor::Codex, 0, "q", exec);
@@ -1115,21 +1086,22 @@ fn a_turn_cancelled_before_turn_start_answers_is_interrupted_by_its_announced_id
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let marker = plan.cancel_marker.clone();
-    let script: Script = Box::new(move |message| match method(message) {
-        // The turn starts and is announced, but its answer never comes; the caller cancels.
-        "turn/start" => {
-            let _ = std::fs::write(&marker, "");
-            vec![notify("turn/started", &turn_in("inProgress"))]
-        }
-        "turn/interrupt" => vec![
-            respond(message, &json!({})),
-            notify("turn/completed", &turn_in("interrupted")),
-        ],
-        _ => setup(message).unwrap_or_default(),
-    });
 
     // The answer never comes, so a driver that waited for it would never finish, and fail.
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            // The turn starts and is announced, but its answer never comes; the caller cancels.
+            peer.expect::<m::TurnStart>()?;
+            std::fs::write(&marker, "").ok();
+            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
+            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            peer.reply(&interrupt, &fixtures::turn_interrupt_response())?;
+            end(peer, TurnStatus::Interrupted, Vec::new())
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Cancelled));
     assert_that!(
@@ -1150,27 +1122,26 @@ fn a_turn_cancelled_before_turn_start_answers_is_interrupted_by_its_announced_id
 fn a_turn_start_left_unanswered_is_followed_from_turn_started() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| match method(message) {
-        "turn/start" => vec![notify("turn/started", &turn_in("inProgress"))],
-        "turn/steer" => {
-            let mut answers = vec![respond(message, &json!({"turnId": TURN}))];
-            answers.extend(reply_and_finish("STEERED"));
-            answers
-        }
-        _ => setup(message).unwrap_or_default(),
-    });
 
     let mut reply = None;
-    let run = run(&plan, script, |plan, _| {
-        reply = steer(plan, "only auth");
-    })?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.expect::<m::TurnStart>()?;
+            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
+            finish(peer, "STEERED")
+        },
+        |plan| reply = steer(plan, "only auth"),
+    )?;
 
     assert_that!(reply, some(eq(&Reply::Accepted)));
     assert_that!(run.ending, eq(&Ending::Finished));
     assert_that!(sent(&run, "turn/steer").len(), eq(1));
-    let order = kinds(&run.capture);
     assert_that!(
-        order,
+        kinds(&run.capture),
         elements_are![
             eq("thread.started"),
             eq("turn.started"),
@@ -1188,21 +1159,21 @@ fn a_turn_start_left_unanswered_is_followed_from_turn_started() -> Result<()> {
 fn a_turn_finished_before_turn_start_is_ever_answered_ends_at_once() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| match method(message) {
-        "turn/start" => reply_and_finish("Done unasked."),
-        _ => setup(message).unwrap_or_default(),
-    });
 
     let began = Instant::now();
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.expect::<m::TurnStart>()?;
+            finish(peer, "Done unasked.")
+        },
+        |_| {},
+    )?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
     assert_that!(began.elapsed() < Duration::from_secs(30), eq(true));
-    let ends = kinds(&run.capture)
-        .into_iter()
-        .filter(|kind| kind == "turn.completed")
-        .count();
-    assert_that!(ends, eq(1));
+    assert_that!(count(&run.capture, "turn.completed"), eq(1));
     Ok(())
 }
 
@@ -1230,6 +1201,17 @@ impl std::io::Write for WitnessAtEnd {
     }
 }
 
+/// The server's side of a turn that answers only with a plan, which arrives in `turn/completed`.
+fn plan_only(peer: &mut Peer) -> std::result::Result<(), PeerError> {
+    peer.open_thread(THREAD)?;
+    peer.start_turn(THREAD, TURN)?;
+    end(
+        peer,
+        TurnStatus::Completed,
+        vec![fixtures::plan("p1", PLAN)],
+    )
+}
+
 /// A turn whose only answer is a plan has that plan on disk before its end is written, so a
 /// reader that sees the turn end finds the report, and the store renders it exactly once, both
 /// when it first recovers it and when the consultation is read again.
@@ -1241,20 +1223,8 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script as Child, ScriptedLauncher};
 
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.push(notify(
-                "turn/completed",
-                &json!({"threadId": THREAD, "turn": {"id": TURN, "status": "completed",
-                        "items": [{"id": "p1", "type": "plan", "text": PLAN}]}}),
-            ));
-        }
-        answers
-    });
     let witness = WitnessAtEnd {
         capture: Vec::new(),
         last_message: plan.last_message.clone(),
@@ -1262,9 +1232,10 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
         seen: None,
     };
 
-    let (ending, witness, _) = run_into(&plan, script, witness, |_, _| {})?;
+    let driven = run_with(&plan, Driver::capturing(witness), plan_only, |_| {})?;
+    let witness = driven.out;
 
-    assert_that!(ending, eq(&Ending::Finished));
+    assert_that!(driven.ending, eq(&Ending::Finished));
     assert_that!(witness.ended, eq(true));
     assert_that!(witness.seen, some(eq(PLAN)));
 
@@ -1324,59 +1295,52 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
 #[gtest]
 fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()> {
     const CHILD: &str = "th-child";
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
-    let usage = |thread: &str, turn: &str, input: u64| {
-        notify(
-            "thread/tokenUsage/updated",
-            &json!({"threadId": thread, "turnId": turn, "tokenUsage": {
-                "last": {"inputTokens": input, "cachedInputTokens": 0, "outputTokens": 1,
-                         "reasoningOutputTokens": 0, "totalTokens": input + 1},
-                "total": {"inputTokens": input, "cachedInputTokens": 0, "outputTokens": 1,
-                          "reasoningOutputTokens": 0, "totalTokens": input + 1}}}),
-        )
+    let usage = |thread: &str, turn: &str, input: i64| {
+        let tokens = Tokens {
+            input,
+            output: 1,
+            ..Tokens::default()
+        };
+        fixtures::token_usage(thread, turn, tokens, tokens)
     };
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let script: Script = Box::new(move |message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.extend([
-                usage(THREAD, TURN, 300),
-                notify(
-                    "item/completed",
-                    &json!({"threadId": CHILD, "turnId": "tu-child", "completedAtMs": 1,
-                           "item": {"id": "c1", "type": "agentMessage", "text": "CHILD-ANSWER"}}),
-                ),
-                notify(
-                    "error",
-                    &json!({"threadId": CHILD, "turnId": "tu-child", "willRetry": false,
-                           "error": {"message": "CHILD-ERROR"}}),
-                ),
-                usage(CHILD, "tu-child", 9_000),
-                // Each id on its own: this thread's earlier turn, and another thread that happens
-                // to name this turn's id.
-                usage(THREAD, "tu-earlier", 7_000),
-                notify(
-                    "item/completed",
-                    &json!({"threadId": CHILD, "turnId": TURN, "completedAtMs": 1,
-                           "item": {"id": "c2", "type": "agentMessage", "text": "CHILD-SAME-TURN-ID"}}),
-                ),
-                notify(
-                    "turn/completed",
-                    &json!({"threadId": CHILD,
-                           "turn": {"id": "tu-child", "items": [], "status": "failed"}}),
-                ),
-                notify(
-                    "turn/completed",
-                    &json!({"threadId": THREAD, "turn": {"id": TURN, "status": "completed",
-                            "items": [{"id": "p1", "type": "plan", "text": PLAN}]}}),
-                ),
-            ]);
-        }
-        answers
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(
+        &plan,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(THREAD, TURN, 300))?;
+            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+                CHILD,
+                "tu-child",
+                fixtures::agent_message("c1", "CHILD-ANSWER"),
+            ))?;
+            peer.notify::<m::Error>(&fixtures::error(CHILD, "tu-child", false, "CHILD-ERROR"))?;
+            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(CHILD, "tu-child", 9_000))?;
+            // Each id on its own: this thread's earlier turn, and another thread that happens to
+            // name this turn's id.
+            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(THREAD, "tu-earlier", 7_000))?;
+            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+                CHILD,
+                TURN,
+                fixtures::agent_message("c2", "CHILD-SAME-TURN-ID"),
+            ))?;
+            peer.notify::<m::TurnCompleted>(&fixtures::turn_completed(
+                CHILD,
+                "tu-child",
+                TurnStatus::Failed,
+                Vec::new(),
+            ))?;
+            end(
+                peer,
+                TurnStatus::Completed,
+                vec![fixtures::plan("p1", PLAN)],
+            )
+        },
+        |_| {},
+    )?;
 
     // The consultation's own turn ended, once, with its own usage.
     assert_that!(run.ending, eq(&Ending::Finished));
@@ -1414,6 +1378,15 @@ impl std::io::Write for SlowCapture {
     }
 }
 
+/// A driver capturing slowly, whose server counts as exited once `exited` is set.
+fn slow_until_exited(exited: &Arc<AtomicBool>) -> Driver<SlowCapture> {
+    let exited = Arc::clone(exited);
+    Driver {
+        exited: Box::new(move || exited.load(Ordering::Acquire)),
+        ..Driver::capturing(SlowCapture(Vec::new()))
+    }
+}
+
 /// A completion the server wrote before it exited ends the turn as completed, however long the
 /// messages queued ahead of it take to record.
 ///
@@ -1423,54 +1396,28 @@ impl std::io::Write for SlowCapture {
 fn a_completion_queued_before_the_server_exits_still_ends_the_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let server = std::thread::spawn({
-        let exited = Arc::clone(&exited);
-        move || {
-            for line in BufReader::new(server_in).lines() {
-                let Ok(line) = line else { return };
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let mut answers = setup(&message).unwrap_or_default();
-                if method(&message) == "turn/start" {
-                    for n in 0..8 {
-                        answers.push(notify(
-                            "warning",
-                            &json!({"threadId": THREAD, "message": format!("busy {n}")}),
-                        ));
-                    }
-                    answers.extend(reply_and_finish("QUEUED-ANSWER"));
-                }
-                for answer in answers {
-                    let _ = writeln!(server_out, "{answer}");
-                }
-                if method(&message) == "turn/start" {
-                    exited.store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-        }
-    });
+    let exited = Arc::new(AtomicBool::new(false));
 
-    let (ending, capture) = drive_bounded(
+    let driven = run_with(
         &plan,
-        SlowCapture(Vec::new()),
-        to_server,
-        from_server,
-        move || exited.load(std::sync::atomic::Ordering::Acquire),
+        slow_until_exited(&exited),
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            for n in 0..8 {
+                peer.notify::<m::Warning>(&fixtures::warning(THREAD, &format!("busy {n}")))?;
+            }
+            finish(peer, "QUEUED-ANSWER")?;
+            exited.store(true, Ordering::Release);
+            Ok(())
+        },
+        |_| {},
     )?;
-    finished(server, "the fake server")?;
 
-    assert_that!(ending, eq(&Ending::Finished));
-    let capture = String::from_utf8(capture.0).or_fail()?;
+    assert_that!(driven.ending, eq(&Ending::Finished));
+    let capture = String::from_utf8(driven.out.0).or_fail()?;
     assert_that!(capture, contains_substring("QUEUED-ANSWER"));
-    let ends = kinds(&capture)
-        .into_iter()
-        .filter(|kind| kind == "turn.completed")
-        .count();
-    assert_that!(ends, eq(1));
+    assert_that!(count(&capture, "turn.completed"), eq(1));
     Ok(())
 }
 
@@ -1478,24 +1425,12 @@ fn a_completion_queued_before_the_server_exits_still_ends_the_turn() -> Result<(
 /// so the turn still ends with its report readable.
 #[gtest]
 fn a_plan_report_survives_a_closing_message_that_cannot_be_written() -> Result<()> {
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
     let dir = tempfile::tempdir().or_fail()?;
     let mut plan = plan(dir.path(), Billing::Subscription, None)?;
     // A directory that does not exist, so the file cannot be created.
     plan.last_message = dir.path().join("missing/last-message.md");
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.push(notify(
-                "turn/completed",
-                &json!({"threadId": THREAD, "turn": {"id": TURN, "status": "completed",
-                        "items": [{"id": "p1", "type": "plan", "text": PLAN}]}}),
-            ));
-        }
-        answers
-    });
 
-    let run = run(&plan, script, |_, _| {})?;
+    let run = run(&plan, plan_only, |_| {})?;
 
     assert_that!(run.ending, eq(&Ending::Finished));
     let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &run.capture);
@@ -1508,37 +1443,27 @@ fn a_plan_report_survives_a_closing_message_that_cannot_be_written() -> Result<(
 /// reply is recovered from.
 #[gtest]
 fn a_completed_plan_survives_a_server_that_dies() -> Result<()> {
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let server = std::thread::spawn(move || {
-        for line in BufReader::new(server_in).lines() {
-            let Ok(line) = line else { return };
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            for answer in setup(&message).unwrap_or_default() {
-                let _ = writeln!(server_out, "{answer}");
-            }
-            if method(&message) == "turn/start" {
-                let item = notify(
-                    "item/completed",
-                    &json!({"threadId": THREAD, "turnId": TURN, "completedAtMs": 1,
-                           "item": {"id": "p1", "type": "plan", "text": PLAN}}),
-                );
-                let _ = writeln!(server_out, "{item}");
-                // Dropping the writer is the server's stdout closing, with the turn unfinished.
-                return;
-            }
-        }
-    });
 
-    let (ending, _) = drive_bounded(&plan, Vec::new(), to_server, from_server, || false)?;
-    finished(server, "the fake server")?;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+                THREAD,
+                TURN,
+                fixtures::plan("p1", PLAN),
+            ))?;
+            // Its output closing is the server dying, with the turn unfinished.
+            peer.close();
+            Ok(())
+        },
+        |_| {},
+    )?;
 
-    assert_that!(ending, matches_pattern!(Ending::Broken(_)));
+    assert_that!(run.ending, matches_pattern!(Ending::Broken(_)));
     assert_that!(
         std::fs::read_to_string(&plan.last_message).or_fail()?,
         eq(PLAN)
@@ -1566,26 +1491,19 @@ impl std::io::Write for RefusesReplies {
 /// completed turn with nothing in it: the turn breaks, and says so.
 #[gtest]
 fn a_plan_nothing_could_keep_breaks_the_turn() -> Result<()> {
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
     let dir = tempfile::tempdir().or_fail()?;
     let mut plan = plan(dir.path(), Billing::Subscription, None)?;
     plan.last_message = dir.path().join("missing/last-message.md");
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.push(notify(
-                "turn/completed",
-                &json!({"threadId": THREAD, "turn": {"id": TURN, "status": "completed",
-                        "items": [{"id": "p1", "type": "plan", "text": PLAN}]}}),
-            ));
-        }
-        answers
-    });
 
-    let (ending, capture, _) = run_into(&plan, script, RefusesReplies(Vec::new()), |_, _| {})?;
+    let driven = run_with(
+        &plan,
+        Driver::capturing(RefusesReplies(Vec::new())),
+        plan_only,
+        |_| {},
+    )?;
 
-    assert_that!(ending, matches_pattern!(Ending::Broken(_)));
-    let capture = String::from_utf8(capture.0).or_fail()?;
+    assert_that!(driven.ending, matches_pattern!(Ending::Broken(_)));
+    let capture = String::from_utf8(driven.out.0).or_fail()?;
     assert_that!(capture, not(contains_substring("turn.completed")));
     Ok(())
 }
@@ -1597,47 +1515,27 @@ fn a_plan_nothing_could_keep_breaks_the_turn() -> Result<()> {
 fn a_dead_servers_continuous_output_cannot_extend_the_drain() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (server_in, to_server) = std::io::pipe().or_fail()?;
-    let (from_server, mut server_out) = std::io::pipe().or_fail()?;
-    let server = std::thread::spawn({
-        let exited = Arc::clone(&exited);
-        move || {
-            let mut lines = BufReader::new(server_in).lines();
-            while let Some(Ok(line)) = lines.next() {
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                for answer in setup(&message).unwrap_or_default() {
-                    let _ = writeln!(server_out, "{answer}");
-                }
-                if method(&message) == "turn/start" {
-                    break;
-                }
-            }
+    let exited = Arc::new(AtomicBool::new(false));
+
+    let driven = run_with(
+        &plan,
+        slow_until_exited(&exited),
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
             // The server is gone; what it started keeps writing until nobody reads.
-            exited.store(true, std::sync::atomic::Ordering::Release);
-            let chatter = notify(
-                "warning",
-                &json!({"threadId": THREAD, "message": "still here"}),
-            );
-            while writeln!(server_out, "{chatter}").is_ok() {
+            exited.store(true, Ordering::Release);
+            let chatter = fixtures::warning(THREAD, "still here");
+            while peer.notify::<m::Warning>(&chatter).is_ok() {
                 std::thread::sleep(Duration::from_millis(20));
             }
-        }
-    });
-
-    let (ending, _) = drive_bounded(
-        &plan,
-        SlowCapture(Vec::new()),
-        to_server,
-        from_server,
-        move || exited.load(std::sync::atomic::Ordering::Acquire),
+            Ok(())
+        },
+        |_| {},
     )?;
-    finished(server, "the fake server")?;
 
     assert_that!(
-        ending,
+        driven.ending,
         matches_pattern!(Ending::Broken(contains_substring("exited")))
     );
     Ok(())
@@ -1667,31 +1565,574 @@ impl std::io::Write for RefusesFirstEnd {
 /// when the turn then breaks writing its end.
 #[gtest]
 fn a_plan_fallback_is_recorded_once_if_the_end_cannot_be_written() -> Result<()> {
-    const PLAN: &str = "1. read the auth module\n2. fix the token check";
     let dir = tempfile::tempdir().or_fail()?;
     let mut plan = plan(dir.path(), Billing::Subscription, None)?;
     plan.last_message = dir.path().join("missing/last-message.md");
-    let script: Script = Box::new(|message| {
-        let mut answers = setup(message).unwrap_or_default();
-        if method(message) == "turn/start" {
-            answers.push(notify(
-                "turn/completed",
-                &json!({"threadId": THREAD, "turn": {"id": TURN, "status": "completed",
-                        "items": [{"id": "p1", "type": "plan", "text": PLAN}]}}),
-            ));
-        }
-        answers
-    });
     let capture = RefusesFirstEnd {
         capture: Vec::new(),
         refused: false,
     };
 
-    let (ending, capture, _) = run_into(&plan, script, capture, |_, _| {})?;
+    let driven = run_with(&plan, Driver::capturing(capture), plan_only, |_| {})?;
 
-    assert_that!(ending, matches_pattern!(Ending::Broken(_)));
-    let capture = String::from_utf8(capture.capture).or_fail()?;
+    assert_that!(driven.ending, matches_pattern!(Ending::Broken(_)));
+    let capture = String::from_utf8(driven.out.capture).or_fail()?;
     let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &capture);
     assert_that!(render_turn(&turn).matches(PLAN).count(), eq(1));
+    Ok(())
+}
+
+/// A deadline short enough for a test to wait out; only the one a test reaches is shortened, so a
+/// loaded machine cannot fail the steps before it.
+const SHORT: Duration = Duration::from_millis(500);
+
+/// A setup request the server never answers breaks the turn at its deadline, naming the request,
+/// rather than holding the consultation for ever.
+#[gtest]
+fn a_setup_request_left_unanswered_breaks_the_turn_at_its_deadline() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    let mut driver = Driver::standard();
+    driver.deadlines.setup = SHORT;
+
+    let driven = run_with(
+        &plan,
+        driver,
+        |peer| peer.expect::<m::Initialize>().map(|_| ()),
+        |_| {},
+    )?;
+
+    assert_that!(
+        driven.ending,
+        matches_pattern!(Ending::Broken(contains_substring(
+            "did not answer `initialize` within 500ms"
+        )))
+    );
+    Ok(())
+}
+
+/// A setup request the server refuses breaks the turn with the server's own reason, or says it
+/// gave none; an answer to a request the driver never made is passed over on the way.
+#[gtest]
+fn a_refused_setup_request_breaks_the_turn_with_the_servers_reason() -> Result<()> {
+    for (resume, reason, said) in [
+        (
+            None,
+            "no such model",
+            "refused `thread/start`: no such model",
+        ),
+        (
+            Some(THREAD),
+            "",
+            "refused `thread/resume`: the server gave no reason",
+        ),
+    ] {
+        let dir = tempfile::tempdir().or_fail()?;
+        let plan = plan(dir.path(), Billing::Subscription, resume)?;
+
+        let run = run(
+            &plan,
+            move |peer| {
+                let initialize = peer.expect::<m::Initialize>()?;
+                peer.reply(&initialize, &fixtures::initialize_response())?;
+                peer.expect_notification::<m::Initialized>()?;
+                let Message::Request { id, .. } = peer.recv()? else {
+                    return Ok(());
+                };
+                // An answer to nothing the driver asked.
+                peer.send(&Message::Response {
+                    id: RequestId::Integer(999),
+                    outcome: Ok(json!({})),
+                })?;
+                peer.send(&Message::error(id, -32600, reason))
+            },
+            |_| {},
+        )?;
+
+        expect_that!(
+            run.ending,
+            matches_pattern!(Ending::Broken(contains_substring(said))),
+            "{said}"
+        );
+        expect_that!(sent(&run, "turn/start"), is_empty(), "{said}");
+    }
+    Ok(())
+}
+
+/// A cancellation while the turn is being started, before anything has named it, ends the turn
+/// within the interrupt's grace without interrupting anything, because there is no turn id to
+/// interrupt.
+#[gtest]
+fn a_cancellation_before_the_turn_is_known_interrupts_nothing() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    let mut driver = Driver::standard();
+    driver.deadlines.interrupt = SHORT;
+    let (asked, starting) = channel();
+
+    let driven = run_with(
+        &plan,
+        driver,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            // Neither answered nor announced.
+            peer.expect::<m::TurnStart>()?;
+            signal(&asked);
+            Ok(())
+        },
+        |plan| {
+            if reached(&starting) {
+                std::fs::write(&plan.cancel_marker, "").ok();
+            }
+        },
+    )?;
+
+    assert_that!(driven.ending, eq(&Ending::Cancelled));
+    let interrupts = driven
+        .requests
+        .iter()
+        .filter(|request| request.get("method") == Some(&json!("turn/interrupt")))
+        .count();
+    assert_that!(interrupts, eq(0));
+    Ok(())
+}
+
+/// An interrupt the server refuses is said in the transcript, and the turn the server then ends
+/// is still a cancellation.
+#[gtest]
+fn an_interrupt_the_server_refuses_is_noted() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    let (started, turn_running) = channel();
+
+    let run = run(
+        &plan,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            signal(&started);
+            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            peer.refuse(&interrupt, -32600, "the turn is already finishing")?;
+            end(peer, TurnStatus::Interrupted, Vec::new())
+        },
+        |plan| {
+            if reached(&turn_running) {
+                std::fs::write(&plan.cancel_marker, "").ok();
+            }
+        },
+    )?;
+
+    assert_that!(run.ending, eq(&Ending::Cancelled));
+    assert_that!(
+        run.capture,
+        contains_substring("codex refused to interrupt the turn: the turn is already finishing")
+    );
+    assert_that!(count(&run.capture, "turn.failed"), eq(0));
+    Ok(())
+}
+
+/// An interrupt the server never answers, nor follows with the turn's end, does not hold the
+/// driver: it leaves once the interrupt's grace is over, as a cancellation.
+#[gtest]
+fn an_interrupt_never_answered_ends_the_turn_at_its_grace() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    let mut driver = Driver::standard();
+    driver.deadlines.interrupt = SHORT;
+    let (started, turn_running) = channel();
+
+    let driven = run_with(
+        &plan,
+        driver,
+        move |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            signal(&started);
+            peer.expect::<m::TurnInterrupt>().map(|_| ())
+        },
+        |plan| {
+            if reached(&turn_running) {
+                std::fs::write(&plan.cancel_marker, "").ok();
+            }
+        },
+    )?;
+
+    assert_that!(driven.ending, eq(&Ending::Cancelled));
+    let capture = String::from_utf8(driven.out).or_fail()?;
+    assert_that!(count(&capture, "turn.completed"), eq(0));
+    assert_that!(count(&capture, "turn.failed"), eq(0));
+    Ok(())
+}
+
+/// Two steers in flight at once are each answered with their own outcome, however the server
+/// orders its answers, and an answer twice over, or to nothing asked, changes neither.
+#[gtest]
+fn concurrent_steers_are_each_answered_with_their_own_outcome() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let mut replies = (None, None);
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let first = peer.expect::<m::TurnSteer>()?;
+            let second = peer.expect::<m::TurnSteer>()?;
+            let text = |steer: &codex_app_server_mock::Received<m::TurnSteer>| {
+                steer
+                    .params
+                    .input
+                    .first()
+                    .and_then(|input| input.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            let (accept, refuse) = if text(&first).as_deref() == Some("KEEP") {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            // Answered in the opposite order to the asking, the accepted one twice.
+            peer.refuse(&refuse, -32600, "one instruction at a time")?;
+            peer.reply(&accept, &fixtures::turn_steer_response(TURN))?;
+            peer.reply(&accept, &fixtures::turn_steer_response(TURN))?;
+            peer.send(&Message::Response {
+                id: RequestId::Integer(424_242),
+                outcome: Ok(json!({"turnId": TURN})),
+            })?;
+            finish(peer, "done")
+        },
+        |plan| {
+            let mailbox = Mailbox::new(&plan.mailbox);
+            let (Ok(keep), Ok(drop)) = (mailbox.submit("KEEP"), mailbox.submit("DROP")) else {
+                return;
+            };
+            replies = (replied(&mailbox, &keep), replied(&mailbox, &drop));
+        },
+    )?;
+
+    let (keep, drop) = replies;
+    assert_that!(keep, some(eq(&Reply::Accepted)));
+    assert_that!(
+        drop,
+        some(matches_pattern!(Reply::Rejected {
+            reason: contains_substring("one instruction at a time")
+        }))
+    );
+    // The accepted one is recorded once, and the refused one not at all.
+    assert_that!(count(&run.capture, "agentmux.steer"), eq(1));
+    assert_that!(run.capture, contains_substring("KEEP"));
+    assert_that!(run.capture, not(contains_substring("DROP")));
+    assert_that!(run.ending, eq(&Ending::Finished));
+    Ok(())
+}
+
+/// A request the server makes while setup is waiting on its own answer is answered at once, and
+/// the server's id is never mistaken for the driver's, even when they are the same number.
+#[gtest]
+fn a_request_during_setup_is_answered_and_its_id_kept_apart() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let run = run(
+        &plan,
+        |peer| {
+            let initialize = peer.expect::<m::Initialize>()?;
+            // The same id the driver gave `initialize`.
+            let approval = peer.request::<m::ItemCommandExecutionRequestApproval>(
+                initialize.id.clone(),
+                &fixtures::command_approval(THREAD, TURN, "c0"),
+            )?;
+            let answer = peer.expect_answer(&approval)?;
+            peer.reply(&initialize, &fixtures::initialize_response())?;
+            peer.expect_notification::<m::Initialized>()?;
+            let start = peer.expect::<m::ThreadStart>()?;
+            peer.reply(&start, &fixtures::thread_start_response(THREAD))?;
+            peer.start_turn(THREAD, TURN)?;
+            finish(peer, "set up")?;
+            Ok(answer)
+        },
+        |_| {},
+    )?;
+
+    assert_that!(run.script, ok(anything()));
+    assert_that!(run.ending, eq(&Ending::Finished));
+    Ok(())
+}
+
+/// A request that arrives while the turn's end is held for a steer's answer is still answered,
+/// and the steer then still lands before the end.
+#[gtest]
+fn a_request_while_the_turn_settles_is_still_answered() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let mut reply = None;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            finish(peer, "ended")?;
+            let late = RequestId::from("late");
+            peer.send(&Message::Request {
+                id: late.clone(),
+                method: "item/tool/call".to_owned(),
+                params: json!({}),
+            })?;
+            let answer = peer.expect_raw_answer(&late)?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
+            Ok(answer)
+        },
+        |plan| reply = steer(plan, "while it settles"),
+    )?;
+
+    assert_that!(
+        run.script,
+        err(field!(
+            codex_app_server_protocol::envelope::RpcError.code,
+            eq(&METHOD_NOT_FOUND)
+        ))
+    );
+    assert_that!(reply, some(eq(&Reply::Accepted)));
+    let order = kinds(&run.capture);
+    let steer_at = order.iter().position(|kind| kind == "agentmux.steer");
+    let end_at = order.iter().position(|kind| kind == "turn.completed");
+    assert_that!(steer_at.zip(end_at).map(|(s, e)| s < e), some(eq(true)));
+    Ok(())
+}
+
+/// A turn known only from the answer to `turn/start` takes steers, and a `turn/started` that
+/// arrives later does not announce it twice.
+#[gtest]
+fn a_turn_known_from_its_answer_alone_takes_steers() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let mut reply = None;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            let start = peer.expect::<m::TurnStart>()?;
+            peer.reply(&start, &fixtures::turn_start_response(TURN))?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
+            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
+            finish(peer, "steered")
+        },
+        |plan| reply = steer(plan, "only auth"),
+    )?;
+
+    assert_that!(reply, some(eq(&Reply::Accepted)));
+    assert_that!(
+        kinds(&run.capture),
+        elements_are![
+            eq("thread.started"),
+            eq("turn.started"),
+            eq("agentmux.steer"),
+            eq("item.completed"),
+            eq("turn.completed"),
+        ]
+    );
+    Ok(())
+}
+
+/// What the server says after the turn ended — another reply, a second end — is not part of the
+/// turn: the capture ends once, with the reply that ended it.
+#[gtest]
+fn what_the_server_says_after_the_end_changes_nothing() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            // A steer still unanswered holds the end, so what follows arrives while it is held.
+            let steer = peer.expect::<m::TurnSteer>()?;
+            finish(peer, "FIRST")?;
+            says(peer, "i-late", "LATE")?;
+            end(peer, TurnStatus::Failed, Vec::new())?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+        },
+        |plan| {
+            steer(plan, "hold the end");
+        },
+    )?;
+
+    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(count(&run.capture, "turn.completed"), eq(1));
+    assert_that!(count(&run.capture, "turn.failed"), eq(0));
+    assert_that!(run.capture, not(contains_substring("LATE")));
+    assert_that!(
+        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        eq("FIRST")
+    );
+    Ok(())
+}
+
+/// Messages are read whole however the server's output falls apart: half a message in one write,
+/// the rest with the next message in another, a reply of several megabytes, and all of it read
+/// sixteen bytes at a time.
+#[gtest]
+fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    let large = "y".repeat(3 << 20);
+    let mut driver = Driver::standard();
+    driver.read_capacity = 16;
+
+    let driven = run_with(
+        &plan,
+        driver,
+        {
+            let large = large.clone();
+            move |peer| {
+                peer.open_thread(THREAD)?;
+                peer.start_turn(THREAD, TURN)?;
+                let line = |message: Message| format!("{}\n", message.to_line());
+                let split = line(Message::notification::<m::ItemCompleted>(
+                    &fixtures::item_completed(THREAD, TURN, fixtures::agent_message("a", "SPLIT")),
+                )?);
+                let joined = line(Message::notification::<m::Warning>(&fixtures::warning(
+                    THREAD, "JOINED",
+                ))?);
+                let (head, tail) = split.split_at(split.len() / 2);
+                peer.send_bytes(head.as_bytes())?;
+                peer.send_bytes(format!("{tail}{joined}").as_bytes())?;
+                finish(peer, &large)
+            }
+        },
+        |_| {},
+    )?;
+
+    assert_that!(driven.ending, eq(&Ending::Finished));
+    let capture = String::from_utf8(driven.out).or_fail()?;
+    assert_that!(capture, contains_substring("SPLIT"));
+    assert_that!(capture, contains_substring("JOINED"));
+    assert_that!(
+        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        eq(&large)
+    );
+    Ok(())
+}
+
+/// A message the server's exit cuts off is not read as one, and the turn breaks as one whose
+/// server went away.
+#[gtest]
+fn a_message_cut_off_by_the_servers_exit_breaks_the_turn() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let end = Message::notification::<m::TurnCompleted>(&fixtures::turn_completed(
+                THREAD,
+                TURN,
+                TurnStatus::Completed,
+                Vec::new(),
+            ))?
+            .to_line();
+            let (head, _) = end.split_at(end.len() / 2);
+            peer.send_bytes(head.as_bytes())?;
+            peer.close();
+            Ok(())
+        },
+        |_| {},
+    )?;
+
+    assert_that!(
+        run.ending,
+        matches_pattern!(Ending::Broken(contains_substring("exited")))
+    );
+    assert_that!(count(&run.capture, "turn.completed"), eq(0));
+    Ok(())
+}
+
+/// An answer to `thread/start` that no longer matches the protocol is recorded as drift, and the
+/// thread id it still carries is used; one without a thread id breaks the turn, naming why.
+#[gtest]
+fn a_thread_start_answer_that_drifted_is_drift_but_its_id_is_kept() -> Result<()> {
+    for (answer, works) in [
+        (json!({"thread": {"id": THREAD}}), true),
+        (json!({"thread": {}}), false),
+    ] {
+        let dir = tempfile::tempdir().or_fail()?;
+        let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+        let run = run(
+            &plan,
+            move |peer| {
+                let initialize = peer.expect::<m::Initialize>()?;
+                peer.reply(&initialize, &fixtures::initialize_response())?;
+                peer.expect_notification::<m::Initialized>()?;
+                let start = peer.expect::<m::ThreadStart>()?;
+                peer.send(&Message::Response {
+                    id: start.id,
+                    outcome: Ok(answer),
+                })?;
+                if works {
+                    peer.start_turn(THREAD, TURN)?;
+                    finish(peer, "despite it")?;
+                }
+                Ok(())
+            },
+            |_| {},
+        )?;
+
+        let drift: Vec<Value> = run
+            .capture
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["type"] == UNDECODED_EVENT)
+            .collect();
+        if works {
+            expect_that!(run.ending, eq(&Ending::Finished));
+            expect_that!(
+                drift.first().map(|event| event["method"].clone()),
+                some(eq(&json!("thread/start")))
+            );
+        } else {
+            expect_that!(
+                run.ending,
+                matches_pattern!(Ending::Broken(contains_substring("no thread id")))
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An answer that carries neither a result nor an error acknowledges nothing: the steer it names
+/// is neither accepted nor refused, because whether codex took it is still unknown.
+#[gtest]
+fn an_answer_with_neither_result_nor_error_acknowledges_no_steer() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+
+    let mut reply = None;
+    let run = run(
+        &plan,
+        |peer| {
+            peer.open_thread(THREAD)?;
+            peer.start_turn(THREAD, TURN)?;
+            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.send_bytes(format!("{{\"id\":{}}}\n", steer.id).as_bytes())?;
+            finish(peer, "ended")
+        },
+        |plan| reply = steer(plan, "ACKNOWLEDGED-BY-NOTHING"),
+    )?;
+
+    assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
+    assert_that!(
+        run.capture,
+        not(contains_substring("ACKNOWLEDGED-BY-NOTHING"))
+    );
     Ok(())
 }
