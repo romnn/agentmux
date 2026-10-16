@@ -193,8 +193,9 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   stops reading cannot stall the driver's deadlines or a cancellation; a turn the server ends
   before answering `turn/start` is remembered, and the end is written once, after the steers in
   flight are settled. `steer` and `cancel` reach the driver through files alone, so a restarted
-  agentmux can: the turn's mailbox (a request is claimed or withdrawn by rename, exactly one wins;
-  a claimed one is answered accepted, rejected, or unconfirmed when it was sent and never
+  agentmux can: the turn's mailbox (a request is claimed or withdrawn by hard-linking its one
+  decision file into place, so exactly one wins — not by rename, which on Windows lets every
+  racer win; a claimed one is answered accepted, rejected, or unconfirmed when it was sent and never
   answered, because codex may have taken it) and the `cancelling` marker, after which the driver
   sends nothing new and interrupts a started turn. `RunStore::accepts_steers` is the one predicate
   behind both `RunStatus::steerable` and `steer`'s admission; a turn whose capture does not yet
@@ -214,25 +215,33 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   captured as an `agentmux.steer` event that renders as `### user (steer)`.
 - **The app-server protocol is generated, never written by hand, and every message goes through
   its method binding.** `codex-app-server-protocol`'s `schema.rs` (progeny's types) and
-  `methods.rs` (one marker type per method, plus `SERVER_NOTIFICATIONS` and `SERVER_REQUESTS`) are
-  written by `crates/codex-app-server-codegen` from the vendored
-  `schema/codex_app_server_protocol.schemas.json`, pruned to what its `manifest::MANIFEST` names.
-  A marker's `Request` or `Notification` impl binds the wire method to its params and response
-  types and a direction trait (`ClientRequest`, `ServerNotification`, …) says who sends it, so the
-  driver sends `call::<m::TurnStart>`, matches `m::TurnCompleted::METHOD`, and answers a server
-  request with that method's own response type. The generator is a workspace of its own because
-  progeny turns on `serde_json/arbitrary_precision`, which feature unification would otherwise
-  hand every agentmux test build; its `Cargo.lock` pins progeny, and progeny's configuration is
-  code. Do not edit the generated files: change the manifest or the generator, then
-  `task codegen:app-server`. `task codegen:app-server:check` (the generator's tests, no codex
-  needed) fails when they drift. Moving the codex pin is deliberate: install that codex, write
-  `schema/codex-version`, run `task codegen:app-server:refresh`; `codex-app-server-codegen refresh`
-  refuses a codex other than the pin, and one whose app-server accepts `--ignore-user-config`, the
-  cue to let isolated delegates be driven. The `codegen` workflow runs both checks. Only the
-  JSON-RPC envelope is hand-written: codex leaves out the `"jsonrpc"` member, so a message is
-  classified by which of `id` and `method` it carries, and a payload is decoded separately, so
-  drift is recorded rather than the message lost. agentmux's own side — which settings a thread
-  runs under, how a request is declined — stays in `appserver/protocol.rs`.
+  `methods.rs` are written by `crates/codex-app-server-codegen` from two vendored inputs: codex's
+  JSON Schema (`schema/codex_app_server_protocol.schemas.json`), whose four message unions name
+  every method and its params, and `schema/codex_app_server_protocol.responses.json`, which type
+  answers each request — the schema never says, so `refresh` reads it from the
+  `client_request_definitions!`/`server_request_definitions!` tables of codex's own `common.rs` at
+  the pinned tag. Generation checks the two against each other method for method; nothing is
+  chosen by hand, and every method codex lists is bound. Each method is a marker type: `Method`
+  binds its wire name and params (`()` when it carries none, `Option` when they may be left out),
+  `Request` its response, and a direction trait (`ClientRequest`, `ServerNotification`, …) says
+  who sends it, so the driver sends `call::<m::TurnStart>` and gets a `TurnStartResponse` back.
+  Each direction also gets an `Any*` enum: `AnyServerNotification::classify(method, params)`
+  names the method as a variant holding a `Payload<M>` that decodes only as `M`'s params, so a
+  receiver matches variants, not strings, and decodes only what it acts on. `decline` matches
+  `AnyServerRequest` with no wildcard, so a regeneration that adds a server request fails to
+  build until it is decided. The generator is a workspace of its own because progeny turns on
+  `serde_json/arbitrary_precision`, which feature unification would otherwise hand every agentmux
+  test build; its `Cargo.lock` pins progeny, and progeny's configuration is code. Do not edit the
+  generated files: change the generator, then `task codegen:app-server`.
+  `task codegen:app-server:check` (the generator's tests, no codex needed) fails when they drift.
+  Moving the codex pin is deliberate: install that codex, write `schema/codex-version`, run
+  `task codegen:app-server:refresh`; `codex-app-server-codegen refresh` refuses a codex other than
+  the pin, and one whose app-server accepts `--ignore-user-config`, the cue to let isolated
+  delegates be driven. The `codegen` workflow runs both checks. Only the JSON-RPC envelope is
+  hand-written: codex leaves out the `"jsonrpc"` member, so a message is classified by which of
+  `id` and `method` it carries, and a payload is decoded separately, so drift is recorded rather
+  than the message lost. agentmux's own side — which settings a thread runs under, how a request
+  is declined — stays in `appserver/protocol.rs`.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 
