@@ -1,5 +1,7 @@
 [files]
 ignore-files = true
+# Generated from codex's own schema, whose descriptions are codex's words, not ours.
+extend-exclude = ["crates/agentmux/src/appserver/schema.rs"]
 
 [default]
 extend-ignore-re = [

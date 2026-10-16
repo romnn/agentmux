@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
+name: codegen
+# Only a change to what the protocol types are generated from, or to the types themselves, can
+# make them drift, so nothing else runs this.
+on:
+  push:
+    paths: &inputs
+      - crates/agentmux/codegen/**
+      - crates/agentmux/src/appserver/schema.rs
+      - taskfile.yaml
+      - .github/workflows/codegen.yaml
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    paths: *inputs
+
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_AUTO_INSTALL: "0"
+
+jobs:
+  app-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Read the pins
+        id: pins
+        run: |
+          dir=crates/agentmux/codegen/app-server
+          echo "codex=$(cat "$dir/codex-version")" >>"$GITHUB_OUTPUT"
+          echo "progeny=$(cat "$dir/progeny-rev")" >>"$GITHUB_OUTPUT"
+      # Each tool is installed once per pin and then restored: codex from npm, and progeny, which
+      # publishes no binary, built from its pinned commit by `generate.sh` itself.
+      - name: Restore the pinned tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/agentmux/codex-${{ steps.pins.outputs.codex }}
+            ~/.cache/agentmux/progeny-${{ steps.pins.outputs.progeny }}
+          key: codegen-${{ runner.os }}-codex-${{ steps.pins.outputs.codex }}-progeny-${{ steps.pins.outputs.progeny }}
+      - name: Install the pinned codex
+        env:
+          CODEX_VERSION: ${{ steps.pins.outputs.codex }}
+        run: |
+          prefix="$HOME/.cache/agentmux/codex-$CODEX_VERSION"
+          if [ ! -x "$prefix/bin/codex" ]; then
+            npm install --global --prefix "$prefix" "@openai/codex@$CODEX_VERSION"
+          fi
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+      - name: Check the protocol types match what the pinned codex and progeny generate
+        run: task codegen:app-server:check

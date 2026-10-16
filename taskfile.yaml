@@ -186,3 +186,20 @@ tasks:
     desc: "lint github actions"
     cmds:
       - actionlint
+
+  codegen:app-server:
+    desc: "regenerate the codex app-server protocol types from the pinned codex CLI and progeny"
+    cmds:
+      # Needs the pinned `codex` on PATH, `jq`, and `cargo` to build the pinned progeny once
+      # (PROGENY=<path> uses another binary); see the script.
+      - bash crates/agentmux/codegen/app-server/generate.sh crates/agentmux/src/appserver/schema.rs
+
+  codegen:app-server:check:
+    desc: "fail if the committed protocol types differ from what the pinned codex CLI and progeny generate"
+    cmds:
+      - |
+        set -euo pipefail
+        work="$(mktemp -d)"
+        trap 'rm -rf "$work"' EXIT
+        bash crates/agentmux/codegen/app-server/generate.sh "$work/schema.rs"
+        diff -u crates/agentmux/src/appserver/schema.rs "$work/schema.rs"
