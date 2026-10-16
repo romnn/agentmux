@@ -200,8 +200,7 @@ fn a_steerable_turn_takes_one_steer_and_refuses_the_rest() -> Result<()> {
 }
 
 /// A crashing server never answers `turn/start` and exits with a failure once released, having
-/// recorded the command it started in a session of its own.
-#[cfg(unix)]
+/// recorded the command it started — in a session of its own, where the platform has sessions.
 #[gtest]
 fn a_crashing_server_exits_with_a_failure() -> Result<()> {
     let mut fake = fake(|home| {
@@ -237,10 +236,15 @@ fn a_crashing_server_exits_with_a_failure() -> Result<()> {
 
     let status = fake.exit_status()?;
     assert_that!(status.code(), some(eq(1)));
-    // The command recorded itself only once it led a session of its own; dropping the fake
-    // stops it.
-    let pid = fake.recorded(1)?.first().copied().or_fail()?;
-    let pid = nix::unistd::Pid::from_raw(i32::try_from(pid).or_fail()?);
-    assert_that!(nix::unistd::getsid(Some(pid)).or_fail()?, eq(pid));
+    // The command recorded itself only once it was set up; dropping the fake stops it.
+    let recorded = fake.recorded(1)?;
+    assert_that!(recorded.len(), eq(1));
+    // On Unix, set up means leading a session of its own.
+    #[cfg(unix)]
+    {
+        let pid = recorded.first().copied().or_fail()?;
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(pid).or_fail()?);
+        assert_that!(nix::unistd::getsid(Some(pid)).or_fail()?, eq(pid));
+    }
     Ok(())
 }

@@ -154,7 +154,6 @@ fn commands(file: &Path) -> Vec<u32> {
 struct Process {
     /// Whether it runs, rather than having exited without being waited for.
     running: bool,
-    parent: Option<u32>,
     command_line: String,
 }
 
@@ -172,7 +171,6 @@ fn process(pid: u32) -> Option<Process> {
             process.status(),
             sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
         ),
-        parent: process.parent().map(sysinfo::Pid::as_u32),
         command_line: process
             .cmd()
             .iter()
@@ -180,6 +178,18 @@ fn process(pid: u32) -> Option<Process> {
             .collect::<Vec<_>>()
             .join(" "),
     })
+}
+
+/// The parent of process `pid`, where the platform says.
+#[cfg(target_os = "linux")]
+fn parent(pid: u32) -> Option<u32> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .and_then(sysinfo::Process::parent)
+        .map(sysinfo::Pid::as_u32)
 }
 
 /// Whether `pid` is a running process, rather than gone or exited and not yet waited for.
@@ -582,15 +592,10 @@ async fn a_driver_reaps_adopted_children_before_the_turn_ends() -> Result<()> {
     // The helper's parent goes, and the driver takes its place.
     let driver_pid = driver.child.id();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while process(helper).and_then(|process| process.parent) != Some(driver_pid)
-        && Instant::now() < deadline
-    {
+    while parent(helper) != Some(driver_pid) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_that!(
-        process(helper).and_then(|process| process.parent),
-        some(eq(driver_pid))
-    );
+    assert_that!(parent(helper), some(eq(driver_pid)));
     // It exits, and is waited for, while the turn still runs.
     std::fs::write(&helper_release, "").or_fail()?;
     let deadline = Instant::now() + Duration::from_secs(10);
