@@ -68,8 +68,8 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 - **A request's `env` is an allowlist the operator writes, never a denylist agentmux keeps.** Only
   the names under `request_env` in `agentmux.toml` may be set per call, and by default none: no
   list of names to refuse stays complete against `PATH`, `NODE_OPTIONS`, `LD_PRELOAD` and whatever
-  the next runtime reads. An account's own `request_env` counts only when the machine file or the
-  caller chose the account, not when a project file did. Every environment name agentmux handles
+  the next runtime reads. An account's own `request_env` counts only when a project file did not
+  choose the account. Every environment name agentmux handles
   passes through `config::canonical_env_name` on the way in (upper-cased on Windows, exact
   elsewhere), so every comparison is a plain one.
 - **The rendered transcript is append-only for the life of a consultation, and a turn's fold input
@@ -81,21 +81,29 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `ExitRecord::Cancelled { events_len }`; a concurrent reader that sees the child go first records
   the same cancellation. A Codex reply recovered from `last-message.md` is only ever added to the
   newest turn and is then kept in `recovered.md`, so it can neither land above a later turn nor
-  go missing once rendered; text that cannot be kept is not rendered. Nothing taken under the
-  run lock calls back into anything that takes it — a second lock on the same file from one
-  process waits on the first for ever. Whatever record settles a turn, the turn is re-folded
-  from exactly the length that record froze, so two observers publish the same bytes. `remove`
-  and the sweep refuse a run while any recorded child without an exit record is still alive,
-  because both CLIs outlive their closing event. `every_fixture_renders_monotonically_over_its_prefixes`
+  go missing once rendered; text that cannot be kept is not rendered. Whatever record settles a
+  turn, the turn is re-folded from exactly the length that record froze, so two observers publish
+  the same bytes. `remove` and the sweep refuse a run while any recorded child without an exit
+  record is still alive, because both CLIs outlive their closing event, and a follow-up is
+  refused (`NotResumable::StillSaving`) until the newest turn's delegate has left, because both
+  save the session it resumes on their way out. `every_fixture_renders_monotonically_over_its_prefixes`
   checks every fixture at every line cut.
 - **A pid on disk is trusted only with the start time recorded beside it.** `Launched::started`
   comes from `sysinfo` at spawn; liveness after a restart requires it to match, and a settled turn
-  is never observed again. Per-run state changes — claiming a turn, cancelling, publishing the
-  render, removing the run — happen under the advisory lock at `runs/<id>.lock`, which is never
-  unlinked.
-- **A project file selects an account but cannot switch on its `inherit_settings`.** It arrives
-  with a clone; `resolve_isolation` answers `Isolated` for an alias the project file chose unless
-  the caller asked explicitly.
+  is never observed again. Every change to a run's shape — folding a turn, which may settle it,
+  recovering a late reply, publishing the render, claiming a turn, marking and recording a
+  cancellation, removing the run — is a method of `run::LockedRun`, which only `RunStore::lock`
+  makes, from the advisory lock at `runs/<id>.lock`, which is never unlinked. A fold and the
+  publication of its render happen under one hold, so no reader can publish a reading another
+  caller has since settled differently. Nothing reachable from a `LockedRun` takes the lock
+  again — a second lock on the same file from one process waits on the first for ever.
+- **A project file selects an account and switches nothing on.** It arrives with a clone, so an
+  account it chose runs isolated, never on API pricing, and without its own `request_env`,
+  whatever the machine file configures for it; only an explicit `inherit_settings` from the caller
+  overrides the isolation. `delegate::AccountPolicy` is the one place that is decided, for every
+  reader — isolation, billing, request environment — and an alias that is the checkout's default
+  counts as its choice even when a caller names it, because a follow-up names the default it
+  resolved and the checkout's own instructions could name it too.
 - **Only a machine config file may define an account.** A project `agentmux.toml`, found by walking
   up from the delegate's working directory, may only select one. It can arrive with a `git clone`,
   and a file that could name a `base_url` and an `api_key_env` would be a credential-exfiltration
@@ -128,9 +136,15 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   says nothing about launches with no `--effort` and no `model_reasoning_effort` at all, so the
   CLI's own default runs rather than a value agentmux invented. A default keyed by a model the
   same file rewrites away is refused at load (`ConfigError::EffortForRewrittenModel`): it could
-  never match and reads as if it did. Both sides are plain strings, because effort vocabularies
-  change with models. The schema no longer requires `effort`, and the record and every summary
+  never match and reads as if it did. Both sides are opaque `ModelId` and `Effort` values, because
+  effort vocabularies change with models. The schema no longer requires `effort`, and the record and every summary
   name the effort that ran, or `cli-default`.
+- **A configuration file is parsed into its types as it is read.** Vendors, aliases, models and
+  efforts are map keys of `Vendor`, `AccountAlias`, `ModelId` and `Effort`, so nothing downstream
+  re-parses a string, and a value no argument parser would accept is a `ConfigError::Malformed`
+  pointing at its byte offset. A vendor this build does not know is passed over by
+  `config::by_vendor` and reported as an unknown key, because one file is synced across machines
+  running different agentmux releases.
 - **An unknown configuration key is reported, never refused.** No struct in `config` sets
   `deny_unknown_fields`: one machine file is read by every agentmux on the machine, and the ones
   that matter are the long-running MCP servers started before the key was added — refusing the file
@@ -168,8 +182,8 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   (`ProcessLauncher::launch`, and the driver for the server it starts), so no layer — host,
   `[launch]`, account `env`, request `env` — can bring a key; `apply_request_env` refuses a
   billing name even when `request_env` lists it; `apply_account` refuses an account whose
-  `Account::api_credential_field` is set under a subscription, and treats an account a project
-  file chose as subscription whatever it says. `is_billing_name` is a rule, not a list — any
+  `Account::api_credential_field` is set under a subscription, and an account a project file
+  chose is subscription whatever it says. `is_billing_name` is a rule, not a list — any
   `*_API_KEY` or `*_API_KEY_FILE`, every vendor namespace's URL, `*_ISSUER` and `*_AUTH_TOKEN`
   names (a token endpoint override would send a subscription's refresh token elsewhere), plus a
   few named switches. The rule is about the environment only: what a CLI's own configuration
@@ -186,8 +200,10 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   executable run as the hidden `agentmux codex-app-server <plan>`, launched by the same launcher
   into the same turn directory, reading the question on stdin and writing `codex exec
   --json`-shaped events to stdout, so `stream::codex` folds both modes and nothing downstream
-  branches on them. What each notification becomes follows codex-cli 0.159.3's own exec client
-  (`EventProcessorWithJsonOutput`), and `KNOWN_ITEM_TYPES` is exactly its `ThreadItemDetails`.
+  branches on them. What each notification becomes follows codex's own exec client
+  (`EventProcessorWithJsonOutput`), and the translator writes, and the fold reads, one model:
+  `stream::codex::CaptureEvent`, whose `exec` events are the `codex_app_server_protocol::exec`
+  mirror of codex's own types.
   One driver runs one turn; a follow-up starts another that resumes the thread with
   `thread/resume`. Reading and writing the server's pipes happen on two threads, so a server that
   stops reading cannot stall the driver's deadlines or a cancellation; a turn the server ends
@@ -213,35 +229,61 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `appserver` says why) — and `RunStore::with_codex_app_server` opts a store in; without it every
   Codex turn is `exec`. The mode is recorded per turn (`LaunchMode`), and a delivered steer is
   captured as an `agentmux.steer` event that renders as `### user (steer)`.
-- **The app-server protocol is generated, never written by hand, and every message goes through
+- **The app-server protocol is generated from codex's own schema, and every message goes through
   its method binding.** `codex-app-server-protocol`'s `schema.rs` (progeny's types) and
-  `methods.rs` are written by `crates/codex-app-server-codegen` from two vendored inputs: codex's
-  JSON Schema (`schema/codex_app_server_protocol.schemas.json`), whose four message unions name
-  every method and its params, and `schema/codex_app_server_protocol.responses.json`, which type
-  answers each request — the schema never says, so `refresh` reads it from the
-  `client_request_definitions!`/`server_request_definitions!` tables of codex's own `common.rs` at
-  the pinned tag. Generation checks the two against each other method for method; nothing is
-  chosen by hand, and every method codex lists is bound. Each method is a marker type: `Method`
-  binds its wire name and params (`()` when it carries none, `Option` when they may be left out),
-  `Request` its response, and a direction trait (`ClientRequest`, `ServerNotification`, …) says
-  who sends it, so the driver sends `call::<m::TurnStart>` and gets a `TurnStartResponse` back.
-  Each direction also gets an `Any*` enum: `AnyServerNotification::classify(method, params)`
-  names the method as a variant holding a `Payload<M>` that decodes only as `M`'s params, so a
-  receiver matches variants, not strings, and decodes only what it acts on. `decline` matches
-  `AnyServerRequest` with no wildcard, so a regeneration that adds a server request fails to
-  build until it is decided. The generator is a workspace of its own because progeny turns on
-  `serde_json/arbitrary_precision`, which feature unification would otherwise hand every agentmux
-  test build; its `Cargo.lock` pins progeny, and progeny's configuration is code. Do not edit the
-  generated files: change the generator, then `task codegen:app-server`.
+  `methods.rs` are written by `crates/codex-app-server-codegen` from codex's JSON Schema
+  (`schema/codex_app_server_protocol.schemas.json`), whose four message unions name every method
+  and its params. Every method is bound by name, but only the methods `surface!` in the generator
+  lists — what agentmux sends, answers or decodes — are bound to types, and only their payloads
+  are generated: a method agentmux never reads costs nothing and cannot be decoded. The table is
+  also the one place that says which type answers a request, which the schema never does:
+  `"turn/start" = TurnStart(TurnStartParams) => TurnStartResponse`, with codex's own variant name.
+  Two checks keep it honest: generation checks each entry against the schema (the method is
+  listed with exactly those params, no other method of that union carries them, a request's
+  response exists), and the oracle (`crates/codex-app-server-codegen/oracle`, `task
+  codegen:app-server:oracle`) expands the same table into a match on codex's own
+  `ClientRequest`/`ClientResponse`/`ClientNotification`/`ServerRequest`/`ServerResponse`/
+  `ServerNotification` at the pinned release, which compiles only when each variant carries
+  exactly the entry's params and response. Nothing reads codex's source. Each method is a marker
+  type: `Method` names it, `Request` or `Notification` says what kind of message it is, a
+  direction trait (`ClientRequest`, `ServerNotification`, …) who sends it, and for a surface
+  method `Typed` binds its params (`()` when it carries none, `Option` when they may be left out)
+  and `Answered` a request's response, so the driver sends `call::<m::TurnStart>` and gets a
+  `TurnStartResponse` back. Each direction also gets an `Any*` enum:
+  `AnyServerNotification::classify(method, params)` names the method as a variant, holding a
+  `Payload<M>` that decodes only as `M`'s params for a surface method, so a receiver matches
+  variants, not strings, and decodes only what it acts on. `decline` matches `AnyServerRequest`
+  with no wildcard, so a regeneration that adds a server request fails to build until it is
+  decided. The
+  generator is a workspace of its own because progeny turns on `serde_json/arbitrary_precision`,
+  which feature unification would otherwise hand every agentmux test build; its `Cargo.lock` pins
+  progeny, and progeny's configuration is code. The oracle is a workspace of its own again,
+  because codex's crate is several hundred packages with native dependencies that only the oracle
+  should build, and resolves only with codex's `[patch.crates-io]` forks and lockfile pins. Do
+  not edit the generated files: change the generator, then `task codegen:app-server`.
   `task codegen:app-server:check` (the generator's tests, no codex needed) fails when they drift.
-  Moving the codex pin is deliberate: install that codex, write `schema/codex-version`, run
-  `task codegen:app-server:refresh`; `codex-app-server-codegen refresh` refuses a codex other than
-  the pin, and one whose app-server accepts `--ignore-user-config`, the cue to let isolated
-  delegates be driven. The `codegen` workflow runs both checks. Only the JSON-RPC envelope is
-  hand-written: codex leaves out the `"jsonrpc"` member, so a message is classified by which of
-  `id` and `method` it carries, and a payload is decoded separately, so drift is recorded rather
-  than the message lost. agentmux's own side — which settings a thread runs under, how a request
-  is declined — stays in `appserver/protocol.rs`.
+  The codex pin is the oracle's git tag, as its `Cargo.lock` resolves it
+  (`codex-app-server-codegen pin` prints it). Moving it is deliberate: set the tag in
+  `oracle/Cargo.toml`, copy the forks `codex-rs/Cargo.toml` patches that the graph uses, seed
+  `oracle/Cargo.lock` from `codex-rs/Cargo.lock` at that tag, install that codex, and run `task
+  codegen:app-server:refresh` and `task codegen:app-server:oracle`. `codex-app-server-codegen
+  refresh` refuses a codex other than the pin, and one whose app-server accepts
+  `--ignore-user-config`, the cue to let isolated delegates be driven. The `codegen` workflow runs
+  all three checks. Two things are hand-written. The JSON-RPC envelope: codex leaves out the
+  `"jsonrpc"` member, so a message is classified by which of `id` and `method` it carries, and a
+  payload is decoded separately, so drift is recorded rather than the message lost. And `exec`,
+  the events `codex exec --json` writes, for which codex publishes no schema: it mirrors codex's
+  `exec_events.rs` type for type, and the oracle converts each of codex's types into its mirror
+  with every field named on both sides (a change on either side fails to build) and checks that
+  each serialises as codex's does. The mirror writes what codex writes and reads more than codex
+  reads, because a capture holds lines a newer codex wrote and lines an older agentmux wrote, and
+  the render of a finished consultation must not change: an `Unknown` variant names a type,
+  status or kind it was not built for; every field a reader takes that codex requires is an
+  `Option`, so absence and `null` read as they always did; and every field of a narration item,
+  which nothing reads, has a default. `a_capture_an_older_agentmux_wrote_folds_as_it_did` holds
+  the old shapes. A line is read as a JSON value first, because codex writes a web search's `id`
+  twice. The oracle's codex crates must resolve to one tag and commit, or the pin is refused. agentmux's own side —
+  which settings a thread runs under, how a request is declined — stays in `appserver/protocol.rs`.
 - The workspace denies `unwrap`/`expect`/`panic`/`indexing_slicing` outside tests, and denies
   `#[allow]`/`#[expect]` without a `reason = "..."`.
 
@@ -266,6 +308,7 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `task codegen:app-server:check` | the generator's tests: fail when the protocol crate is not what the vendored schema generates — CI runs it |
 | `task codegen:app-server:lint` | clippy over the generator, which `lint:fc` does not reach |
 | `task codegen:app-server:refresh` | re-export the vendored schema from the pinned codex on `PATH`, then regenerate |
+| `task codegen:app-server:oracle` | check the answers table and the `exec` mirror against codex's own crates at the pinned tag — CI runs it |
 | `task codegen:app-server:upstream` | fail when the vendored schema is not what the pinned codex exports — CI runs it |
 
 ## Probing accounts
