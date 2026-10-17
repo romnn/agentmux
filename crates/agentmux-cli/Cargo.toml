@@ -24,6 +24,7 @@ agentmux-mcp = { path = "../agentmux-mcp" }
 
 clap.workspace = true
 color-eyre.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # `io-std` is the stdio transport the MCP server runs on.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-std", "signal"] }

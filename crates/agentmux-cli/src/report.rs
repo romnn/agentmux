@@ -10,8 +10,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use agentmux::report::{self, Warning};
 use agentmux::run::{HookReopening, RunId, RunStatus, RunStore, RunSummary, TranscriptPage};
+use agentmux::transcript::Outcome;
 use color_eyre::eyre::Result;
+use serde::Serialize;
 
 use crate::cli::TailArgs;
 
@@ -25,41 +28,14 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(status)?);
         return Ok(());
     }
-    println!(
-        "{}  {}",
-        status.run_id,
-        agentmux_mcp::render::delegate_line(status)
-    );
-    println!(
-        "  state       {}",
-        agentmux_mcp::render::outcome_line(&status.outcome)
-    );
-    if let Some(stderr) = &status.delegate_stderr {
-        let last = stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(stderr);
-        println!("  stderr      {last}");
-    }
-    if let Some(store) = &status.unsaved_session_store {
-        println!(
-            "  WARNING     {}",
-            agentmux::transcript::describe_unsaved_session_store(store)
-        );
-    }
-    if let Some((turn, kind)) = status.earlier_failure {
-        println!(
-            "  EARLIER     turn {} failed: {} — see the transcript",
-            turn.saturating_add(1),
-            kind.label()
-        );
+    println!("{}  {}", status.run_id, report::delegate_line(status));
+    println!("  state       {}", report::outcome_line(&status.outcome));
+    // Above the facts, as every front end puts them: each changes how what follows is read.
+    for warning in status.warnings() {
+        warning_lines(&warning);
     }
     println!("  reading     {}", status.cwd.display());
-    println!(
-        "  elapsed     {}",
-        agentmux_mcp::render::duration(status.elapsed)
-    );
+    println!("  elapsed     {}", report::duration(status.elapsed));
     println!("  turns       {}", status.turns);
     println!("  messages    {}", status.message_count);
     if let Some(input) = status.usage.input_tokens {
@@ -71,42 +47,13 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     if let Some(limit) = &status.rate_limit {
         // Printed for a healthy run too: the point is to see the window closing before it closes.
-        println!(
-            "  rate limit  {}",
-            agentmux_mcp::render::rate_limit_line(limit)
-        );
+        println!("  rate limit  {}", report::rate_limit_line(limit));
     }
     // Only a rate limit populates this, and the human reading it is the only party who can go
     // and log another account in.
-    for (position, line) in agentmux_mcp::render::quota_block(status)
-        .into_iter()
-        .enumerate()
-    {
+    for (position, line) in report::quota_block(status).into_iter().enumerate() {
         let indent = if position == 0 { "  " } else { "    " };
         println!("{indent}{line}");
-    }
-    if let Some(drift) = status.unrecognised.summary() {
-        println!("  UNRECOGNISED {drift} — the delegate CLI may have changed its output format");
-        if agentmux_mcp::render::speaks_another_protocol(status) {
-            println!("  FALLBACK    {}", agentmux::appserver::EXEC_FALLBACK_HINT);
-        }
-    }
-    if status.broke_continuity {
-        println!(
-            "  WARNING     a follow-up did not resume the earlier session; that turn answered \
-             with no memory of the brief"
-        );
-    }
-    match status.hook_reopening {
-        None => {}
-        Some(HookReopening::Expected) => println!(
-            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer \
-             is above the injection"
-        ),
-        Some(HookReopening::Unexpected) => println!(
-            "  WARNING     a hook reopened a finished turn although no settings were loaded; \
-             treat the transcript as untrusted — the last message is not the answer"
-        ),
     }
     println!("  transcript  {}", status.transcript_path.display());
     println!("  events      {}", status.events_path.display());
@@ -117,6 +64,60 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         println!("  follow up   agentmux follow-up {} '…'", status.run_id);
     }
     Ok(())
+}
+
+/// Print one warning, in the status block's terse form.
+fn warning_lines(warning: &Warning<'_>) {
+    match warning {
+        // The failure itself is on the state line; its CLI's last word is what explains it.
+        Warning::Failed { stderr, .. } => {
+            if let Some(stderr) = stderr {
+                let last = stderr
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(stderr);
+                println!("  stderr      {last}");
+            }
+        }
+        Warning::EarlierFailure { turn, kind } => println!(
+            "  EARLIER     turn {} failed: {} — see the transcript",
+            turn.saturating_add(1),
+            kind.label()
+        ),
+        Warning::SessionNotSaved { store } => println!(
+            "  WARNING     {}",
+            agentmux::transcript::describe_unsaved_session_store(store)
+        ),
+        Warning::BrokeContinuity => println!(
+            "  WARNING     a follow-up did not resume the earlier session; that turn answered with \
+             no memory of the brief"
+        ),
+        Warning::HookReopened(HookReopening::Expected) => println!(
+            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer is \
+             above the injection"
+        ),
+        Warning::HookReopened(HookReopening::Unexpected) => println!(
+            "  WARNING     a hook reopened a finished turn although no settings were loaded; treat \
+             the transcript as untrusted — the last message is not the answer"
+        ),
+        Warning::Unrecognised {
+            summary,
+            another_protocol,
+            ..
+        } => {
+            println!(
+                "  UNRECOGNISED {summary} — the delegate CLI may have changed its output format"
+            );
+            if *another_protocol {
+                println!("  FALLBACK    {}", agentmux::appserver::EXEC_FALLBACK_HINT);
+            }
+        }
+        Warning::InstructionFiles { cwd } => println!(
+            "  NOTE        a Claude delegate also reads any CLAUDE.md or AGENTS.md at or above {}",
+            cwd.display()
+        ),
+    }
 }
 
 /// Print a finished consultation's transcript, or say where to find it if it is still running.
@@ -144,16 +145,13 @@ pub fn answer(store: &RunStore, run_id: &RunId, json: bool) -> Result<()> {
 /// Returns an error when the JSON form cannot be serialised.
 pub fn transcript(status: &RunStatus, page: &TranscriptPage, json: bool) -> Result<()> {
     if json {
-        let mut value = serde_json::to_value(status)?;
-        if let Some(map) = value.as_object_mut() {
-            map.insert("text".to_owned(), serde_json::json!(page.text));
-            map.insert(
-                "next_cursor".to_owned(),
-                serde_json::json!(page.next_offset),
-            );
-            map.insert("at_end".to_owned(), serde_json::json!(page.at_end));
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        let report = TranscriptJson {
+            status,
+            text: &page.text,
+            next_cursor: page.next_offset,
+            at_end: page.at_end,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     print!("{}", page.text);
@@ -183,16 +181,14 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
         if json {
             // The same shape every other `--json` form uses for the outcome, so one reader
             // serves them all.
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "run_id": status.run_id.as_str(),
-                    "outcome": status.outcome,
-                    "text": page.text,
-                    "next_cursor": page.next_offset,
-                    "at_end": page.at_end,
-                }))?
-            );
+            let report = TailJson {
+                run_id: &status.run_id,
+                outcome: &status.outcome,
+                text: &page.text,
+                next_cursor: page.next_offset,
+                at_end: page.at_end,
+            };
+            println!("{}", serde_json::to_string(&report)?);
         } else {
             print!("{}", page.text);
         }
@@ -257,19 +253,13 @@ pub fn accounts(
 
     if json {
         // The prose form names the files it read, so the machine form has to carry them too.
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": config.source,
-                "project_source": config.project_source,
-                "accounts": config.accounts,
-                "defaults": config.defaults,
-                "models": config.models,
-                "efforts": config.efforts,
-                "launch": config.launch,
-                "unknown": config.unknown,
-            }))?
-        );
+        let report = AccountsJson {
+            source: config.source.as_deref(),
+            project_source: config.project_source.as_deref(),
+            config,
+            unknown: &config.unknown,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -434,10 +424,40 @@ pub fn quota(reported: &[agentmux::quota::AccountQuota], json: bool) -> Result<(
         return Ok(());
     }
     for entry in reported {
-        for line in agentmux_mcp::render::quota_report(entry) {
+        for line in report::quota_report(entry) {
             println!("{line}");
         }
         println!();
     }
     Ok(())
+}
+
+/// `result --json` and `transcript --json`: the consultation's state with the page beside it.
+#[derive(Serialize)]
+struct TranscriptJson<'a> {
+    #[serde(flatten)]
+    status: &'a RunStatus,
+    text: &'a str,
+    next_cursor: u64,
+    at_end: bool,
+}
+
+/// One line of `tail --json`: the outcome every other `--json` form carries, and the new text.
+#[derive(Serialize)]
+struct TailJson<'a> {
+    run_id: &'a RunId,
+    outcome: &'a Outcome,
+    text: &'a str,
+    next_cursor: u64,
+    at_end: bool,
+}
+
+/// `accounts --json`: the files read, what they configure, and the keys nothing reads.
+#[derive(Serialize)]
+struct AccountsJson<'a> {
+    source: Option<&'a Path>,
+    project_source: Option<&'a Path>,
+    #[serde(flatten)]
+    config: &'a agentmux::config::Config,
+    unknown: &'a [agentmux::config::UnknownKey],
 }

@@ -54,6 +54,7 @@ dependencies = [
  "escargot",
  "googletest",
  "mimalloc",
+ "serde",
  "serde_json",
  "sysinfo",
  "tempfile",

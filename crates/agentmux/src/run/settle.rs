@@ -30,10 +30,13 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use super::{
-    ExitRecord, InvocationRecord, LaunchMode, Meta, RunError, RunState, RunStore, TurnDir,
-    TurnFiles, read_complete_records, read_json, tail_of_file, write_json, write_json_once,
+use super::layout::TurnDir;
+use super::lock::LockedRun;
+use super::records::{
+    ExitRecord, InvocationRecord, LaunchMode, Meta, TurnFiles, read_complete_records, read_json,
+    tail_of_file, write_json_once,
 };
+use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
@@ -50,16 +53,36 @@ pub(super) struct FoldedTurn {
     pub(super) session: Option<SessionRef>,
     /// The newest write to any of this turn's capture files.
     pub(super) last_activity: Option<SystemTime>,
-    /// Whether the outcome came from the exit record rather than the stream.
+    /// What decided the outcome, once something has.
     ///
     /// An outcome the record settled already quotes the stderr tail the record froze; a reader
     /// that would quote stderr again asks this rather than the disk, which may have gained a
     /// record since the fold.
-    pub(super) settled_by_record: bool,
+    pub(super) settled_by: Option<SettledBy>,
     /// How the turn's delegate was launched.
     pub(super) mode: LaunchMode,
     /// Whether the turn's capture says the turn itself began.
     pub(super) turn_started: bool,
+    /// Where its usage window is still to be read from, when its stream carried none.
+    pub(super) rollout: Option<RolloutSearch>,
+}
+
+/// A finished Codex turn whose usage window is still to be read from its session rollout.
+///
+/// Searched for outside the run's lock, by [`RunStore::read_rollouts`]: the search walks the
+/// vendor's whole session tree, and the transcript does not depend on what it finds.
+#[derive(Debug)]
+pub(super) struct RolloutSearch {
+    /// The turn's index.
+    index: u32,
+    /// The turn's directory, which caches the answer.
+    dir: TurnDir,
+    /// The `CODEX_HOME` the launch recorded, when it recorded one.
+    codex_home: Option<std::path::PathBuf>,
+    /// The thread whose rollout to read.
+    thread: SessionRef,
+    /// Whether the turn's delegate had gone before the search, so its rollout was final.
+    departed: bool,
 }
 
 /// What one observation of a child that had gone established.
@@ -88,13 +111,11 @@ struct Departure {
 /// from beside the turn by every later fold.
 /// A file that lands for an earlier turn after a later one exists is left where it is rather
 /// than inserted above the turn that followed; one kept before then stays.
-impl RunStore {
+impl LockedRun<'_> {
     fn recover_from_last_message(
         &self,
-        meta: &Meta,
         files: &TurnFiles,
         turn: &mut Turn,
-        may_recover: bool,
     ) -> Result<(), RunError> {
         let dir = &files.dir;
         if !turn.outcome.is_terminal() || turn.messages.iter().any(Message::is_report_content) {
@@ -104,25 +125,18 @@ impl RunStore {
             turn.recovered = Some(kept);
             return Ok(());
         }
-        if !may_recover {
-            return Ok(());
-        }
         let Some(text) = read_text(&dir.last_message())?.filter(|text| !text.trim().is_empty())
         else {
             return Ok(());
         };
         // Kept before it is rendered, so what a reader is handed cannot later go missing, and
-        // kept under the lock so that a turn claimed in the meantime is seen: a fold that
-        // decided this turn was the newest before that claim must not recover into it now.
+        // only into the newest turn, which the lock makes a fact rather than a guess: no turn can
+        // be claimed while it is held.
         // Text that cannot be kept is not rendered either; a note the turn never gains keeps
         // every page a prefix of the next, where a note that came and went would not.
-        let _lock = self.lock(&meta.run_id)?;
-        if let Some(kept) = read_text(&dir.recovered())? {
-            turn.recovered = Some(kept);
-            return Ok(());
-        }
         if self
-            .turn_dir(&meta.run_id, files.index.saturating_add(1))
+            .store
+            .turn_dir(&self.run_id, files.index.saturating_add(1))
             .root
             .exists()
         {
@@ -185,24 +199,37 @@ pub(super) fn last_write(dir: &TurnDir) -> Option<SystemTime> {
 }
 
 impl RunStore {
-    /// The recovered usage window, searched for once and remembered.
+    /// Read every usage window the fold left to a rollout search, and remember each answer.
     ///
-    /// The absence of one is cached too.
-    /// A finished turn's rollout does not gain rate limits later, so a fruitless search repeated
-    /// on every `status` would walk the vendor's whole session tree for nothing.
-    fn cached_codex_rate_limit(
-        &self,
-        dir: &TurnDir,
-        meta: &Meta,
-        codex_home: Option<&Path>,
-        thread_id: &str,
-    ) -> Option<RateLimit> {
-        if let Ok(Some(cached)) = read_json::<Option<RateLimit>>(&dir.rate_limit()) {
-            return cached;
+    /// The absence of one is remembered too, once the delegate has gone.
+    /// Its rollout does not gain rate limits after that, so a fruitless search repeated on every
+    /// `status` would walk the vendor's whole session tree for nothing.
+    /// Before then the CLI may still be writing it, and a miss remembered early would hide the
+    /// window for good.
+    /// The first answer remembered is the one every caller adopts: a follow-up resuming the same
+    /// thread appends to the same rollout, so two searches can disagree, and overwriting would let
+    /// a later miss erase an earlier hit.
+    pub(super) fn read_rollouts(&self, meta: &Meta, state: &mut RunState) {
+        for search in std::mem::take(&mut state.rollouts) {
+            let found =
+                self.codex_rate_limit(meta, search.codex_home.as_deref(), search.thread.as_str());
+            let found = if found.is_some() || search.departed {
+                write_json_once(&search.dir.rate_limit(), &found).unwrap_or_else(|err| {
+                    tracing::debug!(?err, "not remembering a turn's usage window");
+                    found
+                })
+            } else {
+                found
+            };
+            if let Some(turn) = state
+                .transcript
+                .turns
+                .iter_mut()
+                .find(|turn| turn.index == search.index)
+            {
+                turn.rate_limit = found;
+            }
         }
-        let found = self.codex_rate_limit(meta, codex_home, thread_id);
-        let _ = write_json(&dir.rate_limit(), &found);
-        found
     }
 
     /// The usage window Codex recorded while running one turn.
@@ -238,7 +265,9 @@ impl RunStore {
                 .map(ToOwned::to_owned),
         })
     }
+}
 
+impl LockedRun<'_> {
     /// Rebuild a consultation from its capture files.
     ///
     /// This is the only place a `Transcript` comes from.
@@ -253,20 +282,20 @@ impl RunStore {
     pub(super) fn fold_run(&self, meta: &Meta) -> Result<RunState, RunError> {
         let mut transcript = Transcript::default();
         let mut session = None;
-        let mut newest_turn_index = 0;
-        let mut newest_settled_by_record = false;
-        let mut newest_mode = LaunchMode::Exec;
-        let mut newest_turn_started = false;
+        let mut newest = None;
         let mut last_activity: Option<SystemTime> = None;
+        let mut rollouts = Vec::new();
 
-        let turns = self.turn_files(&meta.run_id)?;
-        let newest_index = turns.last().map(|files| files.index);
-        for files in turns {
-            let folded = self.fold_turn(meta, &files, Some(files.index) == newest_index)?;
-            newest_turn_index = files.index;
-            newest_settled_by_record = folded.settled_by_record;
-            newest_mode = folded.mode;
-            newest_turn_started = folded.turn_started;
+        for files in self.store.turn_files(&self.run_id)? {
+            let folded = self.fold_turn(meta, &files)?;
+            rollouts.extend(folded.rollout);
+            newest = Some(NewestTurn {
+                index: files.index,
+                settled_by: folded.settled_by,
+                mode: folded.mode,
+                turn_started: folded.turn_started,
+                departed: self.store.departed(&files),
+            });
             if folded.session.is_some() {
                 session = folded.session;
             }
@@ -279,27 +308,31 @@ impl RunStore {
         Ok(RunState {
             transcript,
             session,
-            newest_turn_index,
-            newest_settled_by_record,
-            newest_mode,
-            newest_turn_started,
+            newest,
             last_activity,
+            rollouts,
         })
     }
 
-    /// Fold one turn from its own files, settling it if its child has gone.
+    /// The outcome of the run's newest turn, folded on its own, or `None` for a run with no turn.
+    ///
+    /// A run's outcome is its newest turn's, and a turn folds from its own files alone, so the
+    /// callers that only need to know whether a consultation is over — the poll loop, `list`,
+    /// the sweep — do not re-read every settled turn's capture to find out.
+    pub(super) fn newest_turn(&self, meta: &Meta) -> Result<Option<Turn>, RunError> {
+        let turns = self.store.turn_files(&self.run_id)?;
+        let Some(newest) = turns.last() else {
+            return Ok(None);
+        };
+        Ok(Some(self.fold_turn(meta, newest)?.turn))
+    }
+
+    /// Fold one turn from its own files, settling it if its child has gone, and keeping a reply
+    /// the CLI wrote out late when the turn is the newest.
     ///
     /// Reading a turn never depends on another turn's capture, which is what lets a caller that
     /// only needs the newest turn's state fold that one alone.
-    /// `may_recover` says whether this fold may keep a reply the CLI wrote out late, which only
-    /// the newest turn may gain and which takes the run lock to do — so a caller that already
-    /// holds the lock, or only needs the outcome, passes `false`.
-    pub(super) fn fold_turn(
-        &self,
-        meta: &Meta,
-        files: &TurnFiles,
-        may_recover: bool,
-    ) -> Result<FoldedTurn, RunError> {
+    pub(super) fn fold_turn(&self, meta: &Meta, files: &TurnFiles) -> Result<FoldedTurn, RunError> {
         let vendor = meta.delegate.vendor();
         let dir = &files.dir;
         let question = match std::fs::read_to_string(dir.question()) {
@@ -325,7 +358,7 @@ impl RunStore {
         let reaped = files
             .launch
             .as_ref()
-            .and_then(|record| self.launcher.reap(record.launched));
+            .and_then(|record| self.store.launcher.reap(record.launched));
 
         // One observation of the child, made only while nothing has settled the turn, so a
         // settled turn's pid is never asked about again.
@@ -344,7 +377,7 @@ impl RunStore {
             let liveness = if reaped.is_some() {
                 Liveness::Gone
             } else {
-                self.launcher.liveness(record.launched)
+                self.store.launcher.liveness(record.launched)
             };
             if liveness == Liveness::Gone {
                 let (settled, settled_len) = read_complete_records(&dir.events(), None)?;
@@ -368,7 +401,7 @@ impl RunStore {
         let record = if fold.turn.outcome.is_terminal() {
             None
         } else {
-            Self::settle_unfinished(dir, files.exit.as_ref(), departure)?
+            RunStore::settle_unfinished(dir, files.exit.as_ref(), departure)?
         };
         if let Some(record) = &record
             && record.events_len() != folded_len
@@ -382,10 +415,13 @@ impl RunStore {
             session: turn_session,
             turn_started,
         } = fold;
-        let settled_by_record = record.is_some();
-        if let Some(record) = &record {
-            turn.outcome = Self::outcome_of(dir, record, vendor);
-        }
+        let settled_by = match &record {
+            Some(record) => {
+                turn.outcome = RunStore::outcome_of(dir, record, vendor);
+                Some(SettledBy::Record)
+            }
+            None => turn.outcome.is_terminal().then_some(SettledBy::Stream),
+        };
 
         // What the launch recorded before the spawn: which session it asked to resume, and
         // whether the child was ever going to be able to save its own.
@@ -405,31 +441,42 @@ impl RunStore {
         // all, and it costs neither a process nor a token.
         // Only once the turn is over: a running turn's rollout is still being written, and the
         // search is too expensive to repeat on every fold.
+        // A remembered answer is read here; a search is left to the caller, after the lock.
+        let mut rollout = None;
         if vendor == Vendor::Codex
             && turn.rate_limit.is_none()
             && turn.outcome.is_terminal()
             && let Some(thread) = turn_session.as_ref()
         {
-            turn.rate_limit = self.cached_codex_rate_limit(
-                dir,
-                meta,
-                invocation.config_dir.as_deref(),
-                thread.as_str(),
-            );
+            match read_json::<Option<RateLimit>>(&dir.rate_limit()) {
+                Ok(Some(remembered)) => turn.rate_limit = remembered,
+                Ok(None) | Err(_) => {
+                    rollout = Some(RolloutSearch {
+                        index: files.index,
+                        dir: dir.clone(),
+                        codex_home: invocation.config_dir.clone(),
+                        thread: thread.clone(),
+                        departed: self.store.departed(files),
+                    });
+                }
+            }
         }
 
-        self.recover_from_last_message(meta, files, &mut turn, may_recover)?;
+        self.recover_from_last_message(files, &mut turn)?;
 
         Ok(FoldedTurn {
             turn,
             session: turn_session,
             last_activity: last_write(dir),
-            settled_by_record,
+            settled_by,
             mode,
             turn_started,
+            rollout,
         })
     }
+}
 
+impl RunStore {
     /// The record that settles a turn whose stream carries no terminal event, if anything does.
     ///
     /// The stream comes first precisely because it survives everything else; only when it is

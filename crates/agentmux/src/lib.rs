@@ -32,7 +32,7 @@
 //! # // Uses `no_run` because the example spawns a real delegate CLI and writes a run directory.
 //! use std::sync::Arc;
 //!
-//! use agentmux::delegate::{Delegate, Effort, ModelId};
+//! use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId};
 //! use agentmux::launch::ProcessLauncher;
 //! use agentmux::run::{Retention, RunStore, StartRequest};
 //!
@@ -48,7 +48,7 @@
 //!     delegate: Delegate::Claude {
 //!         model: ModelId::parse("claude-opus-5")?,
 //!         effort: Some(Effort::parse("xhigh")?),
-//!         account: None,
+//!         account: AccountChoice::Default,
 //!         isolation: None,
 //!     },
 //!     question: "Review the merge-base diff for correctness bugs.".to_owned(),
@@ -70,6 +70,7 @@ pub mod delegate;
 pub mod launch;
 mod once;
 pub mod quota;
+pub mod report;
 pub mod run;
 pub mod stream;
 pub mod testing;

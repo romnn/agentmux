@@ -269,16 +269,33 @@ impl Outcome {
         }
     }
 
-    /// A one-word state name, stable enough for a caller to branch on.
+    /// Where the turn stands, without what the outcome carries.
     #[must_use]
-    pub fn state(&self) -> &'static str {
+    pub fn state(&self) -> State {
         match self {
-            Self::Running => "running",
-            Self::Completed { .. } => "completed",
-            Self::Failed { .. } => "failed",
-            Self::Cancelled => "cancelled",
+            Self::Running => State::Running,
+            Self::Completed { .. } => State::Completed,
+            Self::Failed { .. } => State::Failed,
+            Self::Cancelled => State::Cancelled,
         }
     }
+}
+
+/// Where a turn stands: an [`Outcome`] without what it carries.
+///
+/// Displayed as the one word the serialised outcome's `state` tag holds, stable enough for a
+/// caller to branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum State {
+    /// See [`Outcome::Running`].
+    Running,
+    /// See [`Outcome::Completed`].
+    Completed,
+    /// See [`Outcome::Failed`].
+    Failed,
+    /// See [`Outcome::Cancelled`].
+    Cancelled,
 }
 
 /// Event types the parser met but does not model, counted rather than skipped.
@@ -356,6 +373,10 @@ pub struct Turn {
     pub outcome: Outcome,
     /// Event types the parser met but does not model.
     pub unrecognised: UnrecognisedEvents,
+    /// Whether codex sent app-server messages the generated protocol could not read, which
+    /// running the consultation over `codex exec` gets round.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub undecoded_messages: bool,
     /// What the vendor reported about the account's usage window, when it reported anything.
     ///
     /// Set whenever the stream carries the information, not only on a rate-limited failure: a run
@@ -425,6 +446,7 @@ impl Turn {
             messages: Vec::new(),
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
+            undecoded_messages: false,
             rate_limit: None,
             resolved_model: None,
             broke_continuity: false,

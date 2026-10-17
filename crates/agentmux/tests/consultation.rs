@@ -8,6 +8,7 @@ use std::time::Duration;
 use agentmux::delegate::{
     AccountAlias, AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId,
 };
+use agentmux::launch::Launcher as _;
 use agentmux::run::{
     HookReopening, NotResumable, Retention, RunError, RunId, RunStore, StartRequest,
 };
@@ -208,6 +209,71 @@ fn a_follow_up_is_refused_when_there_is_nothing_to_resume() -> Result<()> {
     assert_that!(refused.map(|_| ()), err(anything()));
     // Only the original launch happened; no second child was started against a dead session.
     assert_that!(h.launcher.launches().len(), eq(1));
+    Ok(())
+}
+
+/// A turn whose stream has ended but whose delegate is still there is not continued until the
+/// delegate leaves, because both CLIs save the session a follow-up resumes on their way out.
+#[gtest]
+fn a_follow_up_waits_for_the_delegate_to_leave() -> Result<()> {
+    // The first child answers and stays, as a CLI still saving its session does; the second is
+    // the follow-up's.
+    let h = harness([
+        Script::running(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = h.store.start(&request(codex()?, "review this"))?;
+    assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
+
+    // Answered, and not yet resumable: a follow-up now is refused, and launches nothing.
+    assert_that!(started.resumable, eq(false));
+    assert_that!(
+        h.store.follow_up(&started.run_id, "and the session code?"),
+        err(matches_pattern!(RunError::NotResumable(eq(
+            &NotResumable::StillSaving {
+                run_id: started.run_id.clone()
+            }
+        ))))
+    );
+    assert_that!(h.launcher.launches().len(), eq(1));
+
+    // Once the delegate has gone, the same follow-up is a new turn.
+    h.launcher.terminate(h.launcher.launched(0));
+    assert_that!(h.store.status(&started.run_id)?.resumable, eq(true));
+    let followed = h
+        .store
+        .follow_up(&started.run_id, "and the session code?")?;
+    assert_that!(followed.turns, eq(2));
+    Ok(())
+}
+
+/// A delegate agentmux cannot identify may be the one still saving, so a follow-up waits until
+/// nothing holds its pid.
+#[gtest]
+fn a_follow_up_waits_for_a_delegate_it_cannot_identify() -> Result<()> {
+    let h = harness([
+        Script::unidentifiable(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = h.store.start(&request(codex()?, "review this"))?;
+
+    // Unknown is not gone: the follow-up is refused, and launches nothing.
+    assert_that!(
+        h.store.follow_up(&started.run_id, "and the session code?"),
+        err(matches_pattern!(RunError::NotResumable(eq(
+            &NotResumable::StillSaving {
+                run_id: started.run_id.clone()
+            }
+        ))))
+    );
+    assert_that!(h.launcher.launches().len(), eq(1));
+
+    // Once the pid is free, the same follow-up is a new turn.
+    h.launcher.vanish(h.launcher.launched(0));
+    let followed = h
+        .store
+        .follow_up(&started.run_id, "and the session code?")?;
+    assert_that!(followed.turns, eq(2));
     Ok(())
 }
 
@@ -1283,6 +1349,58 @@ fn a_rollout_is_found_where_the_requests_environment_sent_the_child() -> Result<
     let status = store.status(&started.run_id).or_fail()?;
     assert_that!(
         status.rate_limit.map(|limit| limit.window),
+        some(some(eq("codex")))
+    );
+    Ok(())
+}
+
+/// A rollout searched while the delegate is still saving is searched again once it has gone.
+///
+/// The stream ends before the CLI finishes writing its rollout, so a miss found in between is
+/// not final, and remembering it would hide the window for good.
+#[gtest]
+fn a_rollout_missed_while_the_delegate_saves_is_searched_again() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let codex_home = home.path().join(".codex");
+    std::fs::create_dir_all(&codex_home)?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    host.insert(
+        "CODEX_HOME".to_owned(),
+        codex_home.to_string_lossy().into_owned(),
+    );
+    let dir = tempfile::tempdir().or_fail()?;
+    // Answered, and still running: the CLI saving its session.
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running(
+        fixtures::CODEX_HAPPY,
+    )]));
+    let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
+    let started = store.start(&request(codex()?, "q")).or_fail()?;
+
+    // Nothing written yet, so nothing found.
+    assert_that!(store.status(&started.run_id).or_fail()?.rate_limit, none());
+
+    // The CLI writes its rollout on the way out.
+    let day = codex_home.join("sessions/2026/09/07");
+    std::fs::create_dir_all(&day)?;
+    std::fs::write(
+        day.join("rollout-2026-09-07T01-53-34-01a0784a-915b-7d92-a381-b53d765296c4.jsonl"),
+        indoc::indoc! {r#"
+            {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1789303382}}}}
+        "#},
+    )?;
+    launcher.terminate(launcher.launched(0));
+
+    // The earlier miss was not remembered, so the window is found now.
+    assert_that!(
+        store
+            .status(&started.run_id)
+            .or_fail()?
+            .rate_limit
+            .map(|limit| limit.window),
         some(some(eq("codex")))
     );
     Ok(())

@@ -6,7 +6,7 @@
 //! CLI's own end-to-end test, which runs the real executable.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,8 +16,9 @@ use agentmux::delegate::{
     AccountChoice, Billing, CodexSandbox, Delegate, Effort, Isolation, ModelId,
 };
 use agentmux::launch::Launcher as _;
-use agentmux::run::{Retention, RunError, RunId, RunStore, StartRequest, SteerRefused};
+use agentmux::run::{Idle, Retention, RunError, RunId, RunStore, StartRequest, SteerRefused};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::transcript::State;
 use googletest::prelude::*;
 
 /// Where a test pretends the agentmux executable lives.
@@ -122,7 +123,7 @@ fn until_submitted(mailbox: &Path) -> bool {
 }
 
 /// Play the driver's half of a turn's mailbox: answer the first message with `reply`.
-fn answer_first(mailbox: &Path, reply: Reply) -> std::thread::JoinHandle<Option<String>> {
+fn answer_first(mailbox: PathBuf, reply: Reply) -> std::thread::JoinHandle<Option<String>> {
     let mailbox = Mailbox::new(mailbox);
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -260,7 +261,7 @@ async fn a_steer_is_delivered_through_the_turns_mailbox() -> Result<()> {
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
     assert_that!(started.steerable, eq(true));
 
-    let driver = answer_first(&h.plan(0)?.mailbox, Reply::Accepted);
+    let driver = answer_first(h.plan(0)?.mailbox(), Reply::Accepted);
     let steered = h
         .store
         .steer(&started.run_id, "Only look at the auth module.")
@@ -281,7 +282,7 @@ async fn a_refused_steer_says_why() -> Result<()> {
     let h = harness([Script::running(RUNNING)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
     let driver = answer_first(
-        &h.plan(0)?.mailbox,
+        h.plan(0)?.mailbox(),
         Reply::Rejected {
             reason: "no active turn".to_owned(),
         },
@@ -315,7 +316,7 @@ async fn a_steer_the_driver_could_not_confirm_says_so() -> Result<()> {
     let h = harness([Script::running(RUNNING)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
     let driver = answer_first(
-        &h.plan(0)?.mailbox,
+        h.plan(0)?.mailbox(),
         Reply::Unconfirmed {
             reason: "the turn ended before codex answered it".to_owned(),
         },
@@ -350,13 +351,13 @@ async fn a_claimed_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
     ] {
         let h = harness([Script::running(RUNNING)])?;
         let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-        let mailbox = Mailbox::new(h.plan(0)?.mailbox);
+        let mailbox = Mailbox::new(h.plan(0)?.mailbox());
         let launcher = Arc::clone(&h.launcher);
         let driver = tokio::spawn(async move {
             for _ in 0..1000 {
                 if !mailbox.claim_all().is_empty() {
                     if driver_leaves {
-                        launcher.kill(ScriptedLauncher::launched(0));
+                        launcher.kill(launcher.launched(0));
                     }
                     return true;
                 }
@@ -390,20 +391,20 @@ async fn a_claimed_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
 async fn a_turn_being_cancelled_takes_no_steer() -> Result<()> {
     let h = harness([Script::running(RUNNING)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    std::fs::write(&h.plan(0)?.cancel_marker, "").or_fail()?;
+    std::fs::write(h.plan(0)?.cancel_marker(), "").or_fail()?;
 
     assert_that!(h.store.status(&started.run_id)?.steerable, eq(false));
     assert_that!(
         h.store.steer(&started.run_id, "x").await,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
             SteerRefused::NotRunning {
-                state: eq(&"cancelling"),
+                state: eq(&Idle::Cancelling),
                 ..
             }
         ))))
     );
     assert_that!(
-        std::fs::read_dir(h.plan(0)?.mailbox)
+        std::fs::read_dir(h.plan(0)?.mailbox())
             .map(Iterator::count)
             .unwrap_or(0),
         eq(0)
@@ -439,7 +440,7 @@ async fn a_turn_not_yet_running_takes_no_steer() -> Result<()> {
             "{case}"
         );
         assert_that!(
-            std::fs::read_dir(h.plan(0)?.mailbox)
+            std::fs::read_dir(h.plan(0)?.mailbox())
                 .map(Iterator::count)
                 .unwrap_or(0),
             eq(0),
@@ -456,7 +457,7 @@ async fn a_turn_not_yet_running_takes_no_steer() -> Result<()> {
 async fn a_steer_the_turn_outlives_is_withdrawn_unsent() -> Result<()> {
     let h = harness([Script::running(RUNNING)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let mailbox = h.plan(0)?.mailbox;
+    let mailbox = h.plan(0)?.mailbox();
 
     // The turn's child goes away while the message waits, unclaimed, in the mailbox.
     let launcher = Arc::clone(&h.launcher);
@@ -464,7 +465,7 @@ async fn a_steer_the_turn_outlives_is_withdrawn_unsent() -> Result<()> {
         let mailbox = mailbox.clone();
         move || {
             if until_submitted(&mailbox) {
-                launcher.terminate(ScriptedLauncher::launched(0));
+                launcher.terminate(launcher.launched(0));
             }
         }
     });
@@ -525,7 +526,7 @@ async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
         h.store.steer(&finished.run_id, "x").await,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
             SteerRefused::NotRunning {
-                state: eq(&"completed"),
+                state: eq(&Idle::Ended(State::Completed)),
                 ..
             }
         ))))
@@ -579,7 +580,7 @@ async fn a_store_without_a_driver_launches_codex_over_exec() -> Result<()> {
 async fn a_cancelled_driver_is_given_its_whole_stop_budget_before_any_signal() -> Result<()> {
     let h = harness([Script::running(RUNNING)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let marker = h.plan(0)?.cancel_marker;
+    let marker = h.plan(0)?.cancel_marker();
 
     let launcher = Arc::clone(&h.launcher);
     let driver = tokio::spawn(async move {
@@ -588,12 +589,12 @@ async fn a_cancelled_driver_is_given_its_whole_stop_budget_before_any_signal() -
         }
         tokio::time::sleep(STOP_BUDGET).await;
         // Leaving is all the store can observe of a driver that interrupted its turn.
-        launcher.kill(ScriptedLauncher::launched(0));
+        launcher.kill(launcher.launched(0));
     });
     let cancelled = h.store.cancel(&started.run_id).await?;
     driver.await.or_fail()?;
 
-    assert_that!(cancelled.outcome.state(), eq("cancelled"));
+    assert_that!(cancelled.outcome.state(), eq(State::Cancelled));
     // The store sends a termination before anything harsher, and never had to.
     assert_that!(h.launcher.terminated(), is_empty());
     Ok(())
@@ -611,12 +612,12 @@ async fn a_cancelled_driver_that_never_leaves_is_signalled() -> Result<()> {
     let cancelled = h.store.cancel(&started.run_id).await?;
 
     assert_that!(asked.elapsed() > STOP_BUDGET, eq(true));
-    assert_that!(h.plan(0)?.cancel_marker.exists(), eq(true));
+    assert_that!(h.plan(0)?.cancel_marker().exists(), eq(true));
     assert_that!(
         h.launcher.terminated(),
-        elements_are![eq(&ScriptedLauncher::launched(0).pid)]
+        elements_are![eq(&h.launcher.launched(0).pid)]
     );
-    assert_that!(cancelled.outcome.state(), eq("cancelled"));
+    assert_that!(cancelled.outcome.state(), eq(State::Cancelled));
     Ok(())
 }
 
@@ -637,7 +638,7 @@ async fn a_cancel_after_a_completed_turn_waits_for_driver_cleanup() -> Result<()
     let launcher = Arc::clone(&h.launcher);
     let driver = tokio::spawn(async move {
         tokio::time::sleep(STOP_BUDGET).await;
-        launcher.kill(ScriptedLauncher::launched(0));
+        launcher.kill(launcher.launched(0));
     });
     let asked = tokio::time::Instant::now();
     let cancelled = h.store.cancel(&started.run_id).await?;
@@ -645,6 +646,6 @@ async fn a_cancel_after_a_completed_turn_waits_for_driver_cleanup() -> Result<()
 
     assert_that!(asked.elapsed() >= STOP_BUDGET, eq(true));
     assert_that!(h.launcher.terminated(), is_empty());
-    assert_that!(cancelled.outcome.state(), eq("completed"));
+    assert_that!(cancelled.outcome.state(), eq(State::Completed));
     Ok(())
 }

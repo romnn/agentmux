@@ -262,6 +262,19 @@ async fn until_steerable(store: &RunStore, id: &RunId) -> Result<bool> {
     Ok(false)
 }
 
+/// Wait for the consultation to take a follow-up, which it does once its turn is over and its
+/// delegate has left, having saved the session the follow-up resumes.
+async fn until_resumable(store: &RunStore, id: &RunId) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if store.status(id)?.resumable {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(false)
+}
+
 /// Start, steer, finish, follow up, and cancel one consultation, through the real driver.
 #[gtest]
 #[tokio::test(flavor = "multi_thread")]
@@ -309,7 +322,7 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     let (status, page) = w.store.view(&id, 0, 1_000_000)?;
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(status.steerable, eq(false));
-    assert_that!(status.resumable, eq(true));
+    assert_that!(until_resumable(&w.store, &id).await?, eq(true));
     // Every message the fake sent decoded into the generated protocol types.
     assert_that!(status.unrecognised.is_empty(), eq(true));
 
@@ -386,12 +399,10 @@ fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
             cwd: w.project.clone(),
             resume: None,
             billing,
-            last_message: turn.join("last-message.md"),
-            cancel_marker: turn.join("cancelling"),
-            mailbox: turn.join("steer"),
+            turn_dir: turn.to_path_buf(),
         };
         // Cancelled before it starts: the server is spawned, and no turn is begun.
-        std::fs::write(&plan.cancel_marker, "").or_fail()?;
+        std::fs::write(plan.cancel_marker(), "").or_fail()?;
         let plan_path = turn.join("app-server.json");
         std::fs::write(&plan_path, serde_json::to_string(&plan).or_fail()?).or_fail()?;
 
@@ -481,9 +492,7 @@ fn drive_fake(w: &World, dir: &Path, scenario: Scenario, releases: Vec<PathBuf>)
         cwd: w.project.clone(),
         resume: None,
         billing: Billing::Subscription,
-        last_message: dir.join("last-message.md"),
-        cancel_marker: dir.join("cancelling"),
-        mailbox: dir.join("steer"),
+        turn_dir: dir.to_path_buf(),
     };
     let plan_path = dir.join("app-server.json");
     std::fs::write(&plan_path, serde_json::to_string(&plan).or_fail()?).or_fail()?;

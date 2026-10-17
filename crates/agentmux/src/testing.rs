@@ -39,6 +39,11 @@ pub struct Script {
     /// Whether the child outlives every request to stop, as one stuck in an uninterruptible
     /// wait does.
     pub survives_stop: bool,
+    /// Whether the launcher cannot tell the running child from another process holding its pid,
+    /// as an agentmux restarted without a recorded start time cannot.
+    ///
+    /// Such a child reports [`Liveness::Unknown`] until it [vanishes](ScriptedLauncher::vanish).
+    pub unidentifiable: bool,
 }
 
 impl Script {
@@ -93,6 +98,16 @@ impl Script {
         Self {
             events: events.into(),
             survives_stop: true,
+            ..Self::default()
+        }
+    }
+
+    /// A child that emits `events` and keeps running, which the launcher cannot identify.
+    #[must_use]
+    pub fn unidentifiable(events: impl Into<String>) -> Self {
+        Self {
+            events: events.into(),
+            unidentifiable: true,
             ..Self::default()
         }
     }
@@ -168,25 +183,36 @@ impl RecordedLaunch {
 }
 
 /// A launcher that plays back canned event streams instead of starting processes.
-#[derive(Debug, Default)]
+///
+/// Each launcher hands out pids from a range of its own, so two launchers serving one store, as
+/// two agentmux processes would, never name each other's children; a pid a launcher did not hand
+/// out is a process it cannot see, which it reports gone, as the real launcher reports a process
+/// that is not there.
+#[derive(Debug)]
 pub struct ScriptedLauncher {
+    /// The first pid this launcher hands out.
+    base: u32,
     scripts: Mutex<VecDeque<Script>>,
     launches: Mutex<Vec<RecordedLaunch>>,
     terminated: Mutex<Vec<u32>>,
     killed: Mutex<Vec<u32>>,
     flushed: Mutex<BTreeSet<u32>>,
+    vanished: Mutex<BTreeSet<u32>>,
 }
 
 impl ScriptedLauncher {
     /// A launcher that will play `scripts` in order, one per launch.
     #[must_use]
     pub fn new(scripts: impl IntoIterator<Item = Script>) -> Self {
+        let launcher = NEXT_LAUNCHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
+            base: FAKE_PID_BASE.saturating_add(launcher.saturating_mul(PIDS_PER_LAUNCHER)),
             scripts: Mutex::new(scripts.into_iter().collect()),
             launches: Mutex::new(Vec::new()),
             terminated: Mutex::new(Vec::new()),
             killed: Mutex::new(Vec::new()),
             flushed: Mutex::new(BTreeSet::new()),
+            vanished: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -196,15 +222,24 @@ impl ScriptedLauncher {
         lock(&self.launches).clone()
     }
 
-    /// The handle a scripted launcher returns for its `index`th launch, counting from zero, so a
-    /// test can stop that child as a real one would stop.
+    /// The handle this launcher returns for its `index`th launch, counting from zero, so a test
+    /// can stop that child as a real one would stop.
     #[must_use]
-    pub fn launched(index: usize) -> Launched {
+    pub fn launched(&self, index: usize) -> Launched {
         Launched {
-            pid: FAKE_PID_BASE.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)),
+            pid: self
+                .base
+                .saturating_add(u32::try_from(index).unwrap_or(u32::MAX)),
             process_group: None,
             started: None,
         }
+    }
+
+    /// Which of this launcher's launches `pid` is, or `None` for a pid it never handed out.
+    fn index_of(&self, pid: u32) -> Option<usize> {
+        pid.checked_sub(self.base)
+            .filter(|offset| *offset < PIDS_PER_LAUNCHER)
+            .and_then(|offset| usize::try_from(offset).ok())
     }
 
     /// The pids the launcher was asked to terminate.
@@ -217,6 +252,12 @@ impl ScriptedLauncher {
     #[must_use]
     pub fn killed(&self) -> Vec<u32> {
         lock(&self.killed).clone()
+    }
+
+    /// Take a child out of the process table without being asked, as one agentmux cannot signal
+    /// leaves when it is done.
+    pub fn vanish(&self, launched: Launched) {
+        lock(&self.vanished).insert(launched.pid);
     }
 
     /// Whether a scripted child has been asked to stop.
@@ -251,8 +292,20 @@ impl ScriptedLauncher {
     }
 }
 
+impl Default for ScriptedLauncher {
+    fn default() -> Self {
+        Self::new([])
+    }
+}
+
 /// Pids above `i32::MAX` so a stray reap can never name a real process.
 const FAKE_PID_BASE: u32 = 4_000_000_000;
+
+/// How many pids each launcher's range holds, which is more launches than any test makes.
+const PIDS_PER_LAUNCHER: u32 = 1024;
+
+/// How many launchers this process has made, which places the next one's pid range.
+static NEXT_LAUNCHER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Launcher for ScriptedLauncher {
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {
@@ -278,20 +331,23 @@ impl Launcher for ScriptedLauncher {
             question: std::fs::read_to_string(spec.question).unwrap_or_default(),
         });
 
-        Ok(Launched {
-            pid: FAKE_PID_BASE.saturating_add(u32::try_from(index).unwrap_or(0)),
-            process_group: None,
-            started: None,
-        })
+        Ok(self.launched(index))
     }
 
     fn liveness(&self, launched: Launched) -> Liveness {
-        let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
+        let Some(index) = self.index_of(launched.pid) else {
+            return Liveness::Gone;
+        };
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
 
-        if script.exit.is_some() || (self.stopped(launched.pid) && !script.survives_stop) {
+        if script.exit.is_some()
+            || (self.stopped(launched.pid) && !script.survives_stop)
+            || lock(&self.vanished).contains(&launched.pid)
+        {
             Liveness::Gone
+        } else if script.unidentifiable {
+            Liveness::Unknown
         } else {
             Liveness::Alive
         }
@@ -312,7 +368,7 @@ impl Launcher for ScriptedLauncher {
     }
 
     fn reap(&self, launched: Launched) -> Option<ExitStatus> {
-        let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
+        let index = self.index_of(launched.pid)?;
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
         script.exit.or_else(|| {

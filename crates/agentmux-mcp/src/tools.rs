@@ -815,7 +815,7 @@ mod tests {
         // The mailbox the driver was pointed at, from the plan it was launched with.
         let launch = launcher.launches().into_iter().next().or_fail()?;
         let plan = Plan::read(Path::new(launch.args.get(1).or_fail()?)).or_fail()?;
-        let mailbox = Mailbox::new(plan.mailbox);
+        let mailbox = Mailbox::new(plan.mailbox());
         let driver = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {

@@ -21,39 +21,15 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use agentmux::delegate::Billing;
-use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
+use agentmux::quota::{AccountQuota, Observation};
+use agentmux::report::{
+    Warning, delegate_line, duration, outcome_line, quota_block, quota_report, summarise,
+};
 use agentmux::run::{HookReopening, RunStatus, RunSummary, TranscriptPage};
-use agentmux::transcript::{FailureKind, Outcome, RateLimit, describe_unsaved_session_store};
+use agentmux::transcript::{FailureKind, RateLimit, describe_unsaved_session_store};
 use chrono::Utc;
 
 use crate::tools::MAX_WAIT_SECONDS;
-
-/// A one-line state, with the failure reason inline when there is one.
-#[must_use]
-pub fn outcome_line(outcome: &Outcome) -> String {
-    match outcome {
-        // The detail is the vendor's verbatim text: a JSON blob from Claude, sometimes several
-        // lines from Codex.
-        // Left whole it breaks the header's alignment and pushes `transcript:` and `bytes:` down,
-        // undoing the truncation protection the header exists to provide.
-        // The full text is in the failure warning below, where length costs nothing.
-        Outcome::Failed { kind, detail } => {
-            format!("failed ({}): {}", kind.label(), summarise(detail, 160))
-        }
-        other => other.state().to_owned(),
-    }
-}
-
-/// Collapse whitespace and clip, so a value stays on one header line.
-fn summarise(text: &str, max_chars: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max_chars {
-        return flat;
-    }
-    let clipped: String = flat.chars().take(max_chars).collect();
-    format!("{clipped}…")
-}
 
 /// Which tool is speaking, so the paging advice in the header names that tool rather than another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,107 +130,107 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
 #[must_use]
 pub fn warnings(status: &RunStatus) -> String {
     let mut out = String::new();
-
-    if let Outcome::Failed { kind, detail } = &status.outcome {
-        let _ = write!(
-            out,
-            "warning:    this consultation failed ({}), and the failure did not discard the work.\n\
-             \x20           {} message(s) arrived before it and are all in the transcript below.\n\
-             \x20           {}\n\
-             \x20           The delegate said: {}\n",
-            kind.label(),
-            status.message_count,
-            recovery_advice(
-                *kind,
-                status.rate_limit.as_ref(),
-                &status.quota,
-                status.delegate.vendor(),
-                status.delegate.account().alias()
+    for warning in status.warnings() {
+        match warning {
+            Warning::Failed {
+                kind,
+                detail,
+                stderr,
+            } => {
+                let _ = write!(
+                    out,
+                    "warning:    this consultation failed ({}), and the failure did not discard the work.\n\
+                     \x20           {} message(s) arrived before it and are all in the transcript below.\n\
+                     \x20           {}\n\
+                     \x20           The delegate said: {}\n",
+                    kind.label(),
+                    status.message_count,
+                    recovery_advice(
+                        kind,
+                        status.rate_limit.as_ref(),
+                        &status.quota,
+                        status.delegate.vendor(),
+                        status.delegate.account().alias()
+                    ),
+                    summarise(detail, 600),
+                );
+                if let Some(stderr) = stderr {
+                    // Where a CLI explains what its stream only calls an error.
+                    let _ = writeln!(
+                        out,
+                        "\x20           Its CLI wrote to stderr: {}",
+                        summarise(stderr, 600)
+                    );
+                }
+                // The alternatives, where the failure itself made them worth fetching.
+                for line in quota_block(status) {
+                    let _ = writeln!(out, "\x20           {line}");
+                }
+            }
+            // Said in the header's state line, which reports the newest turn and would otherwise
+            // present the consultation as completed.
+            Warning::EarlierFailure { .. } => {}
+            Warning::SessionNotSaved { store } => {
+                out.push_str(&indoc::formatdoc! {"
+                    warning:    this consultation cannot be followed up: {fact}.
+                                Launching from an agent's sandboxed shell does that, because the delegate
+                                inherits the sandbox. The answer is unaffected; for a follow-up, start a
+                                new consultation through the agentmux MCP server, which runs outside the
+                                sandbox.
+                    ",
+                    fact = describe_unsaved_session_store(store),
+                });
+            }
+            Warning::BrokeContinuity => out.push_str(
+                "warning:    a follow-up did not resume the earlier session.\n\
+                 \x20           The delegate CLI accepted the resume and silently started a new\n\
+                 \x20           conversation, so that turn answered with no memory of the earlier\n\
+                 \x20           ones. Read it as a fresh consultation, and restate the brief if the\n\
+                 \x20           answer looks context-free.\n",
             ),
-            summarise(detail, 600),
-        );
-        if let Some(stderr) = &status.delegate_stderr {
-            // Where a CLI explains what its stream only calls an error.
-            let _ = writeln!(
-                out,
-                "\x20           Its CLI wrote to stderr: {}",
-                summarise(stderr, 600)
-            );
-        }
-        // The alternatives, where the failure itself made them worth fetching.
-        for line in quota_block(status) {
-            let _ = writeln!(out, "\x20           {line}");
-        }
-    }
-    if let Some(store) = &status.unsaved_session_store {
-        out.push_str(&indoc::formatdoc! {"
-            warning:    this consultation cannot be followed up: {fact}.
-                        Launching from an agent's sandboxed shell does that, because the delegate
-                        inherits the sandbox. The answer is unaffected; for a follow-up, start a
-                        new consultation through the agentmux MCP server, which runs outside the
-                        sandbox.
-            ",
-            fact = describe_unsaved_session_store(store),
-        });
-    }
-    if status.broke_continuity {
-        out.push_str(
-            "warning:    a follow-up did not resume the earlier session.\n\
-             \x20           The delegate CLI accepted the resume and silently started a new\n\
-             \x20           conversation, so that turn answered with no memory of the earlier\n\
-             \x20           ones. Read it as a fresh consultation, and restate the brief if the\n\
-             \x20           answer looks context-free.\n",
-        );
-    }
-    // The same event means opposite things depending on what the run loaded, and the library
-    // decides which so the CLI says the same thing.
-    match status.hook_reopening {
-        None => {}
-        Some(HookReopening::Expected) => out.push_str(
-            "note:       a hook in the account's settings reopened a finished turn, which is\n\
-             \x20           expected because this run inherited them. The answer is above the\n\
-             \x20           injection, which is marked in the transcript.\n",
-        ),
-        Some(HookReopening::Unexpected) => out.push_str(
-            "warning:    a hook reopened a finished turn even though this run loaded no\n\
-             \x20           settings. That should not be possible: treat this transcript as\n\
-             \x20           untrusted, and re-run with `inherit_settings: false` set\n\
-             \x20           explicitly. The last thing the delegate said is NOT the answer —\n\
-             \x20           the answer is above the injection.\n",
-        ),
-    }
-    if let Some(drift) = status.unrecognised.summary() {
-        let _ = write!(
-            out,
-            "warning:    agentmux did not recognise {} event(s) from the delegate CLI ({drift}).\n\
-             \x20           The CLI may have changed its output format and this transcript may be\n\
-             \x20           missing content. The raw stream is at {}.\n",
-            status.unrecognised.total(),
-            status.events_path.display(),
-        );
-        if speaks_another_protocol(status) {
-            let _ = writeln!(
-                out,
-                "            codex sent messages agentmux could not read: {}.",
-                agentmux::appserver::EXEC_FALLBACK_HINT
-            );
+            Warning::HookReopened(HookReopening::Expected) => out.push_str(
+                "note:       a hook in the account's settings reopened a finished turn, which is\n\
+                 \x20           expected because this run inherited them. The answer is above the\n\
+                 \x20           injection, which is marked in the transcript.\n",
+            ),
+            Warning::HookReopened(HookReopening::Unexpected) => out.push_str(
+                "warning:    a hook reopened a finished turn even though this run loaded no\n\
+                 \x20           settings. That should not be possible: treat this transcript as\n\
+                 \x20           untrusted, and re-run with `inherit_settings: false` set\n\
+                 \x20           explicitly. The last thing the delegate said is NOT the answer —\n\
+                 \x20           the answer is above the injection.\n",
+            ),
+            Warning::Unrecognised {
+                total,
+                summary,
+                events,
+                another_protocol,
+            } => {
+                let _ = write!(
+                    out,
+                    "warning:    agentmux did not recognise {total} event(s) from the delegate CLI ({summary}).\n\
+                     \x20           The CLI may have changed its output format and this transcript may be\n\
+                     \x20           missing content. The raw stream is at {}.\n",
+                    events.display(),
+                );
+                if another_protocol {
+                    let _ = writeln!(
+                        out,
+                        "            codex sent messages agentmux could not read: {}.",
+                        agentmux::appserver::EXEC_FALLBACK_HINT
+                    );
+                }
+            }
+            Warning::InstructionFiles { cwd } => {
+                let _ = write!(
+                    out,
+                    "note:       a Claude delegate also reads any CLAUDE.md or AGENTS.md it finds at or \n\
+                     \x20           above {}. Those become part of its prompt and you did not write them.\n",
+                    cwd.display(),
+                );
+            }
         }
     }
-    // Measured: `--setting-sources ""` stops hooks and settings but does not stop the Claude CLI
-    // reading a project's instruction file, and it searches up the directory tree rather than
-    // only in `cwd`.
-    // agentmux cannot tell which files that found, so it states the rule rather than guessing at
-    // the answer — a note that fired only when the file happened to sit in `cwd` would read as
-    // "there is none" everywhere else.
-    if status.delegate.vendor() == agentmux::delegate::Vendor::Claude {
-        let _ = write!(
-            out,
-            "note:       a Claude delegate also reads any CLAUDE.md or AGENTS.md it finds at or \n\
-             \x20           above {}. Those become part of its prompt and you did not write them.\n",
-            status.cwd.display(),
-        );
-    }
-
     out
 }
 
@@ -264,16 +240,6 @@ pub fn warnings(status: &RunStatus) -> String {
 /// The most valuable case is the one where retrying is exactly wrong: a blocked closing message
 /// means the analysis is already in the transcript and paying for it again would produce the same
 /// block.
-/// Whether codex sent app-server messages agentmux could not read, which is when running the
-/// consultation with `codex exec` is the way round it.
-#[must_use]
-pub fn speaks_another_protocol(status: &RunStatus) -> bool {
-    status
-        .unrecognised
-        .iter()
-        .any(|(kind, _)| kind == agentmux::appserver::UNDECODED_EVENT)
-}
-
 fn recovery_advice(
     kind: FailureKind,
     rate_limit: Option<&RateLimit>,
@@ -343,23 +309,6 @@ fn recovery_advice(
     }
 
     Cow::Borrowed(fixed_advice(kind))
-}
-
-/// One line describing where an account's usage window stands.
-///
-/// Shared with the CLI so both surfaces name the window the same way; a caller comparing the two
-/// should never have to work out whether they mean the same thing.
-#[must_use]
-pub fn rate_limit_line(limit: &RateLimit) -> String {
-    let window = limit.window.as_deref().unwrap_or("usage");
-    match limit.reopens_in(Utc::now()) {
-        Some(remaining) => format!(
-            "{window} window reopens in {} ({})",
-            duration(remaining),
-            limit.resets_at.to_rfc3339()
-        ),
-        None => format!("{window} window has reopened"),
-    }
 }
 
 /// Advice for a rate limit whose window reopening time the vendor disclosed.
@@ -579,20 +528,6 @@ pub fn list(runs: &[RunSummary]) -> String {
     out
 }
 
-/// Render an elapsed time the way both front ends do.
-///
-/// Public so the CLI can print the same string; a second copy across the crate boundary would
-/// drift where nobody would notice.
-#[must_use]
-pub fn duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs();
-    match seconds {
-        0..60 => format!("{seconds}s"),
-        60..3600 => format!("{}m{}s", seconds / 60, seconds % 60),
-        _ => format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60),
-    }
-}
-
 /// Every account's quota, for the `quota` tool.
 ///
 /// Header first, like every other tool result: a host that truncates cuts the end, and the reason
@@ -615,267 +550,4 @@ pub fn quota(reported: &[AccountQuota]) -> String {
         out.push('\n');
     }
     out
-}
-
-/// The line that introduces the other accounts, for a consultation that ran as `ran_as`.
-///
-/// A consultation on the CLI's own login is not told the listed aliases are *other* accounts:
-/// one of them may name that very login, and agentmux cannot tell.
-/// With no other account at all there is nothing to switch to, and the lead-in says what the
-/// figures are instead of inviting a switch to the account that just failed.
-#[must_use]
-pub fn quota_lead_in(
-    ran_as: Option<&agentmux::delegate::AccountAlias>,
-    others_exist: bool,
-) -> &'static str {
-    match (others_exist, ran_as) {
-        (false, _) => "this account's usage:",
-        (true, Some(_)) => "other accounts on this machine (pass one as `account`):",
-        (true, None) => {
-            "accounts this machine configures (pass one as `account`; this consultation ran on \
-             the CLI's own login, which one of them may also be):"
-        }
-    }
-}
-
-/// The lines that report every account's figures after a rate-limited failure, lead-in first.
-///
-/// Empty for every other outcome, because only a rate limit fetches them.
-/// Both front ends print exactly these lines under their own indentation, so they cannot order
-/// or introduce the list differently.
-#[must_use]
-pub fn quota_block(status: &RunStatus) -> Vec<String> {
-    let ordered = ordered_quota(
-        &status.quota,
-        status.delegate.vendor(),
-        status.delegate.account().alias(),
-    );
-    if ordered.is_empty() {
-        return Vec::new();
-    }
-    let others_exist = ordered.iter().any(|(_, ran)| !ran);
-    let mut lines = vec![quota_lead_in(status.delegate.account().alias(), others_exist).to_owned()];
-    for (entry, ran) in ordered {
-        lines.extend(quota_report_labelled(entry, ran));
-    }
-    lines
-}
-
-/// This vendor's quota entries, in the order a reader should meet them, with the one that ran
-/// flagged.
-///
-/// The account that just failed goes last: it eats several lines restating what the failure
-/// already said, and a reader skimming the top of the list would otherwise meet the exhausted one
-/// first and conclude nothing is available.
-///
-/// Shared with the CLI so both surfaces order the list the same way; keeping it inline in one of
-/// them is how the two came to disagree.
-/// [`quota_report_labelled`] carries the flag through to the rendered lines, for the same reason.
-#[must_use]
-pub fn ordered_quota<'a>(
-    quota: &'a [AccountQuota],
-    vendor: agentmux::delegate::Vendor,
-    ran_as: Option<&agentmux::delegate::AccountAlias>,
-) -> Vec<(&'a AccountQuota, bool)> {
-    // Only this vendor's accounts: the lead-in offers each as an `account` value, and an alias
-    // from the other vendor's table resolves to nothing but a paid round trip.
-    let (failed, others): (Vec<_>, Vec<_>) = quota
-        .iter()
-        .filter(|entry| entry.vendor == vendor)
-        .partition(|entry| entry.account.as_ref() == ran_as);
-    others
-        .into_iter()
-        .map(|entry| (entry, false))
-        .chain(failed.into_iter().map(|entry| (entry, true)))
-        .collect()
-}
-
-/// One account's quota, with the failed account flagged.
-///
-/// The flag lives here rather than at each call site: the ordering was shared and the label was
-/// not, which is the drift [`ordered_quota`] exists to prevent, one field over.
-#[must_use]
-pub fn quota_report_labelled(entry: &AccountQuota, ran: bool) -> Vec<String> {
-    let mut lines = quota_report(entry);
-    if ran && let Some(first) = lines.first_mut() {
-        first.push_str(" — this consultation");
-    }
-    lines
-}
-
-/// One account's quota, as lines a reader scans.
-///
-/// The vendor payloads have nothing in common — Claude reports a `limits` array of percentages,
-/// Codex a map of named buckets — so this reads whichever shape is present and says nothing when
-/// it recognises neither.
-/// It is presentation only: the payload itself is passed through untouched, so a field this
-/// function has never heard of still reaches a caller reading the JSON.
-#[must_use]
-pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
-    let mut lines = Vec::new();
-    let account = entry
-        .account
-        .as_ref()
-        .map_or_else(|| "(default)".to_owned(), ToString::to_string);
-    let described = entry
-        .description
-        .as_ref()
-        .map_or_else(String::new, |d| format!(" — {d}"));
-    lines.push(format!("{} {account}{described}", entry.vendor));
-
-    match &entry.observation {
-        Observation::Unavailable { reason } => {
-            // Said plainly, because the one reading this may be choosing where to send work and
-            // must not read silence as spare capacity.
-            lines.push(format!("  unavailable, not idle — {reason}"));
-        }
-        Observation::Reported { origin, payload } => {
-            lines.push(format!("  {}", describe_origin(origin)));
-            let windows = claude_windows(payload)
-                .or_else(|| codex_windows(payload))
-                .unwrap_or_default();
-            if windows.is_empty() {
-                lines.push("  no window this build recognises; read the payload".to_owned());
-            }
-            lines.extend(windows.into_iter().map(|line| format!("  {line}")));
-        }
-    }
-    lines
-}
-
-/// Who ran, and what actually answered when that is not what was asked for.
-///
-/// Two things can move a model out from under a request, and a caller comparing consultations has
-/// to be able to see both.
-/// The machine's configuration may rewrite the identifier before launch, which
-/// [`agentmux::run::describe_delegate`] names; the vendor may then expand it into a fuller one —
-/// `sonnet` answering as `claude-sonnet-5` — which is invisible in a result that echoes only the
-/// request.
-///
-/// A turn on API pricing says so here, on the one line every result opens with, because which
-/// pricing a consultation runs on is decided by the account and invisible from the request.
-#[must_use]
-pub fn delegate_line(status: &RunStatus) -> String {
-    let summary =
-        agentmux::run::describe_delegate(&status.delegate, status.rewritten_from.as_ref());
-    let line = match &status.resolved_model {
-        Some(resolved) if resolved != status.delegate.model().as_str() => {
-            format!("{summary} (answered by {resolved})")
-        }
-        _ => summary,
-    };
-    match status.billing {
-        Some(Billing::Api) => format!("{line} billing=api"),
-        Some(Billing::Subscription) | None => line,
-    }
-}
-
-/// How current a set of figures is.
-fn describe_origin(origin: &Origin) -> String {
-    match origin {
-        Origin::Live => "live".to_owned(),
-        Origin::Cache {
-            fetched_at_ms,
-            refresh,
-            ..
-        } => {
-            let age = fetched_at_ms
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map_or_else(
-                    || "from the CLI's cache, age unknown".to_owned(),
-                    |at| {
-                        let age = Utc::now().signed_duration_since(at).to_std().ok();
-                        age.map_or_else(
-                            || "from the CLI's cache".to_owned(),
-                            |age| format!("from the CLI's cache, measured {} ago", duration(age)),
-                        )
-                    },
-                );
-            format!("{age}{}", describe_refresh(refresh))
-        }
-    }
-}
-
-/// What the attempt to refresh the cache adds to a cached reading.
-///
-/// Always said, including when nothing was spawned.
-/// The age alone cannot distinguish figures that are current from figures that merely survived a
-/// refresh which timed out, and that is the difference a reader is trying to make.
-fn describe_refresh(refresh: &Refresh) -> String {
-    match refresh {
-        Refresh::Skipped => ", still inside the refresh window".to_owned(),
-        Refresh::Succeeded => ", just refreshed".to_owned(),
-        Refresh::TimedOut => ", and a refresh timed out — these figures predate it".to_owned(),
-        Refresh::Failed { reason } => {
-            format!(", and the refresh failed ({reason}) — these figures predate it")
-        }
-    }
-}
-
-/// Claude reports a `limits` array, each entry a percentage with its own severity.
-fn claude_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
-    let limits = payload.get("utilization")?.get("limits")?.as_array()?;
-    Some(
-        limits
-            .iter()
-            .map(|limit| {
-                let kind = limit
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("window");
-                // The scope names a model, and only by display name: the vendor leaves `id` null,
-                // which is why nothing here tries to match it to the model a caller asked for.
-                let scope = limit
-                    .get("scope")
-                    .and_then(|s| s.get("model"))
-                    .and_then(|m| m.get("display_name"))
-                    .and_then(|n| n.as_str())
-                    .map_or_else(String::new, |name| format!(" ({name})"));
-                let percent = limit
-                    .get("percent")
-                    .and_then(serde_json::Value::as_i64)
-                    .map_or_else(|| "?".to_owned(), |p| format!("{p}%"));
-                let severity = limit
-                    .get("severity")
-                    .and_then(|s| s.as_str())
-                    .filter(|s| *s != "normal")
-                    .map_or_else(String::new, |s| format!(" [{s}]"));
-                let resets = limit
-                    .get("resets_at")
-                    .and_then(|r| r.as_str())
-                    .map_or_else(String::new, |r| format!(", resets {r}"));
-                format!("{kind}{scope}: {percent} used{severity}{resets}")
-            })
-            .collect(),
-    )
-}
-
-/// Codex reports a map of named buckets, each with a primary and optional secondary window.
-fn codex_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
-    let buckets = payload.get("rateLimitsByLimitId")?.as_object()?;
-    Some(
-        buckets
-            .iter()
-            .map(|(id, bucket)| {
-                let name = bucket
-                    .get("limitName")
-                    .and_then(|n| n.as_str())
-                    .map_or_else(String::new, |n| format!(" ({n})"));
-                let windows = ["primary", "secondary"]
-                    .into_iter()
-                    .filter_map(|which| {
-                        let window = bucket.get(which)?;
-                        let percent = window.get("usedPercent")?.as_i64()?;
-                        let minutes = window
-                            .get("windowDurationMins")
-                            .and_then(serde_json::Value::as_i64)
-                            .map_or_else(String::new, |m| format!(" over {m}m"));
-                        Some(format!("{percent}% used{minutes}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{id}{name}: {windows}")
-            })
-            .collect(),
-    )
 }
