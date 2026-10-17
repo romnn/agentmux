@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId, RpcError};
 use codex_app_server_protocol::{
-    ClientNotification, ClientRequest, DecodeError, Method, Payload, Request, ServerNotification,
-    ServerRequest,
+    Answered, ClientNotification, ClientRequest, DecodeError, Method, Payload, ServerNotification,
+    ServerRequest, Typed,
 };
 use serde_json::Value;
 
@@ -91,14 +91,14 @@ fn transcript(received: &[String]) -> String {
 
 /// A request the client sent, decoded into its method's parameters.
 #[derive(Debug)]
-pub struct Received<M: Request> {
+pub struct Received<M: Typed> {
     /// The client's id for it, which its answer must carry.
     pub id: RequestId,
     /// Its parameters.
     pub params: M::Params,
 }
 
-impl<M: ClientRequest> Received<M> {
+impl<M: ClientRequest + Typed> Received<M> {
     /// Request `M`, from its id and its parameters as they arrived.
     ///
     /// # Errors
@@ -115,7 +115,7 @@ impl<M: ClientRequest> Received<M> {
 
 /// A request the peer sent, whose answer [`Peer::expect_answer`] waits for.
 #[derive(Debug)]
-pub struct Sent<M: Request> {
+pub struct Sent<M: Method> {
     /// The peer's id for it.
     pub id: RequestId,
     method: PhantomData<M>,
@@ -295,7 +295,7 @@ impl Peer {
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
     /// its parameters do not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect<M: ClientRequest>(&mut self) -> Result<Received<M>, PeerError> {
+    pub fn expect<M: ClientRequest + Typed>(&mut self) -> Result<Received<M>, PeerError> {
         match self.recv()? {
             Message::Request { id, method, params } if method == M::METHOD => {
                 Received::decode(id, Payload::new(&params))
@@ -310,10 +310,12 @@ impl Peer {
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
     /// its parameters do not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect_notification<M: ClientNotification>(&mut self) -> Result<M::Params, PeerError> {
+    pub fn expect_notification<M: ClientNotification + Typed>(
+        &mut self,
+    ) -> Result<M::Params, PeerError> {
         match self.recv()? {
             Message::Notification { method, params } if method == M::METHOD => {
-                <M as Method>::params(&params)
+                <M as Typed>::params(&params)
                     .map_err(|source| PeerError::Undecodable { method, source })
             }
             other => Err(self.unexpected(&format!("a `{}` notification", M::METHOD), other)),
@@ -327,7 +329,7 @@ impl Peer {
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
     /// the result does not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect_answer<M: ServerRequest>(
+    pub fn expect_answer<M: ServerRequest + Answered>(
         &mut self,
         request: &Sent<M>,
     ) -> Result<Result<M::Response, RpcError>, PeerError> {
@@ -366,7 +368,7 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the answer cannot be encoded or written.
-    pub fn reply<M: ClientRequest>(
+    pub fn reply<M: ClientRequest + Answered>(
         &mut self,
         request: &Received<M>,
         response: &M::Response,
@@ -379,7 +381,7 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Write`] when the client cannot be written to.
-    pub fn refuse<M: ClientRequest>(
+    pub fn refuse<M: ClientRequest + Typed>(
         &mut self,
         request: &Received<M>,
         code: i64,
@@ -393,7 +395,10 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the notification cannot be encoded or written.
-    pub fn notify<M: ServerNotification>(&mut self, params: &M::Params) -> Result<(), PeerError> {
+    pub fn notify<M: ServerNotification + Typed>(
+        &mut self,
+        params: &M::Params,
+    ) -> Result<(), PeerError> {
         self.send_conforming(&Message::notification::<M>(params)?)
     }
 
@@ -402,7 +407,7 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the request cannot be encoded or written.
-    pub fn request<M: ServerRequest>(
+    pub fn request<M: ServerRequest + Typed>(
         &mut self,
         id: RequestId,
         params: &M::Params,

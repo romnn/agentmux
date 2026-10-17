@@ -5,8 +5,9 @@
 
 # rust
 /target/
-# The protocol generator is a workspace of its own; see its manifest.
+# The protocol generator and its oracle are workspaces of their own; see their manifests.
 /crates/codex-app-server-codegen/target/
+/crates/codex-app-server-codegen/oracle/target/
 
 # goreleaser
 goreleaser-dist/

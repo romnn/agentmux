@@ -2,10 +2,11 @@
 
 //! Every method of the codex app-server protocol, each bound to its payload types.
 //!
-//! Each marker type stands for one JSON-RPC method: its trait implementations name the wire
-//! method, the type its `params` decode into, and, for a request, the type of its `result`,
-//! so a message cannot be built with one method and another method's payload.
-//! The direction traits say who may send it.
+//! Each marker type stands for one JSON-RPC method and names it on the wire; the direction
+//! traits say who may send it.
+//! A method agentmux uses is also bound to the type its `params` decode into and, for a
+//! request, the type of its `result`, so a message cannot be built with one method and
+//! another method's payload, and a method agentmux does not use cannot be decoded at all.
 //!
 //! Each `Any*` enum lists every method of one direction, so a receiver that matches on it
 //! is told by the compiler when a regeneration adds one.
@@ -14,9 +15,12 @@ use serde_json::Value;
 
 use crate::types;
 use crate::{
-    ClientNotification, ClientRequest, Method, Notification, Payload, Request,
-    ServerNotification, ServerRequest,
+    Answered, ClientNotification, ClientRequest, Method, Notification, Payload, Request,
+    ServerNotification, ServerRequest, Typed,
 };
+
+/// The codex release this protocol was generated from.
+pub const CODEX_VERSION: &str = "0.162.1";
 
 /// The `account/gatewayOAuth/cancel` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,12 +28,9 @@ pub struct AccountGatewayOAuthCancel;
 
 impl Method for AccountGatewayOAuthCancel {
     const METHOD: &'static str = "account/gatewayOAuth/cancel";
-    type Params = ();
 }
 
-impl Request for AccountGatewayOAuthCancel {
-    type Response = types::GatewayOAuthCancelResponse;
-}
+impl Request for AccountGatewayOAuthCancel {}
 
 impl ClientRequest for AccountGatewayOAuthCancel {}
 
@@ -39,12 +40,9 @@ pub struct AccountGatewayOAuthLogin;
 
 impl Method for AccountGatewayOAuthLogin {
     const METHOD: &'static str = "account/gatewayOAuth/login";
-    type Params = ();
 }
 
-impl Request for AccountGatewayOAuthLogin {
-    type Response = types::GatewayOAuthLoginResponse;
-}
+impl Request for AccountGatewayOAuthLogin {}
 
 impl ClientRequest for AccountGatewayOAuthLogin {}
 
@@ -54,12 +52,9 @@ pub struct AccountGatewayOAuthRead;
 
 impl Method for AccountGatewayOAuthRead {
     const METHOD: &'static str = "account/gatewayOAuth/read";
-    type Params = ();
 }
 
-impl Request for AccountGatewayOAuthRead {
-    type Response = types::GatewayOAuthReadResponse;
-}
+impl Request for AccountGatewayOAuthRead {}
 
 impl ClientRequest for AccountGatewayOAuthRead {}
 
@@ -69,12 +64,9 @@ pub struct AccountLoginCancel;
 
 impl Method for AccountLoginCancel {
     const METHOD: &'static str = "account/login/cancel";
-    type Params = types::CancelLoginAccountParams;
 }
 
-impl Request for AccountLoginCancel {
-    type Response = types::CancelLoginAccountResponse;
-}
+impl Request for AccountLoginCancel {}
 
 impl ClientRequest for AccountLoginCancel {}
 
@@ -84,12 +76,9 @@ pub struct AccountLoginStart;
 
 impl Method for AccountLoginStart {
     const METHOD: &'static str = "account/login/start";
-    type Params = types::LoginAccountParams;
 }
 
-impl Request for AccountLoginStart {
-    type Response = types::LoginAccountResponse;
-}
+impl Request for AccountLoginStart {}
 
 impl ClientRequest for AccountLoginStart {}
 
@@ -99,12 +88,9 @@ pub struct AccountLogout;
 
 impl Method for AccountLogout {
     const METHOD: &'static str = "account/logout";
-    type Params = ();
 }
 
-impl Request for AccountLogout {
-    type Response = types::LogoutAccountResponse;
-}
+impl Request for AccountLogout {}
 
 impl ClientRequest for AccountLogout {}
 
@@ -114,12 +100,9 @@ pub struct AccountRateLimitResetCreditConsume;
 
 impl Method for AccountRateLimitResetCreditConsume {
     const METHOD: &'static str = "account/rateLimitResetCredit/consume";
-    type Params = types::ConsumeAccountRateLimitResetCreditParams;
 }
 
-impl Request for AccountRateLimitResetCreditConsume {
-    type Response = types::ConsumeAccountRateLimitResetCreditResponse;
-}
+impl Request for AccountRateLimitResetCreditConsume {}
 
 impl ClientRequest for AccountRateLimitResetCreditConsume {}
 
@@ -129,12 +112,17 @@ pub struct AccountRateLimitsRead;
 
 impl Method for AccountRateLimitsRead {
     const METHOD: &'static str = "account/rateLimits/read";
+}
+
+impl Typed for AccountRateLimitsRead {
     type Params = Option<types::GetAccountRateLimitsParams>;
 }
 
-impl Request for AccountRateLimitsRead {
+impl Answered for AccountRateLimitsRead {
     type Response = types::GetAccountRateLimitsResponse;
 }
+
+impl Request for AccountRateLimitsRead {}
 
 impl ClientRequest for AccountRateLimitsRead {}
 
@@ -144,12 +132,9 @@ pub struct AccountRead;
 
 impl Method for AccountRead {
     const METHOD: &'static str = "account/read";
-    type Params = types::GetAccountParams;
 }
 
-impl Request for AccountRead {
-    type Response = types::GetAccountResponse;
-}
+impl Request for AccountRead {}
 
 impl ClientRequest for AccountRead {}
 
@@ -159,12 +144,9 @@ pub struct AccountSendAddCreditsNudgeEmail;
 
 impl Method for AccountSendAddCreditsNudgeEmail {
     const METHOD: &'static str = "account/sendAddCreditsNudgeEmail";
-    type Params = types::SendAddCreditsNudgeEmailParams;
 }
 
-impl Request for AccountSendAddCreditsNudgeEmail {
-    type Response = types::SendAddCreditsNudgeEmailResponse;
-}
+impl Request for AccountSendAddCreditsNudgeEmail {}
 
 impl ClientRequest for AccountSendAddCreditsNudgeEmail {}
 
@@ -174,12 +156,9 @@ pub struct AccountUsageRead;
 
 impl Method for AccountUsageRead {
     const METHOD: &'static str = "account/usage/read";
-    type Params = Option<types::GetAccountTokenUsageParams>;
 }
 
-impl Request for AccountUsageRead {
-    type Response = types::GetAccountTokenUsageResponse;
-}
+impl Request for AccountUsageRead {}
 
 impl ClientRequest for AccountUsageRead {}
 
@@ -189,12 +168,9 @@ pub struct AccountWorkspaceMessagesRead;
 
 impl Method for AccountWorkspaceMessagesRead {
     const METHOD: &'static str = "account/workspaceMessages/read";
-    type Params = ();
 }
 
-impl Request for AccountWorkspaceMessagesRead {
-    type Response = types::GetWorkspaceMessagesResponse;
-}
+impl Request for AccountWorkspaceMessagesRead {}
 
 impl ClientRequest for AccountWorkspaceMessagesRead {}
 
@@ -204,12 +180,9 @@ pub struct AppInstalled;
 
 impl Method for AppInstalled {
     const METHOD: &'static str = "app/installed";
-    type Params = types::AppsInstalledParams;
 }
 
-impl Request for AppInstalled {
-    type Response = types::AppsInstalledResponse;
-}
+impl Request for AppInstalled {}
 
 impl ClientRequest for AppInstalled {}
 
@@ -219,12 +192,9 @@ pub struct AppList;
 
 impl Method for AppList {
     const METHOD: &'static str = "app/list";
-    type Params = types::AppsListParams;
 }
 
-impl Request for AppList {
-    type Response = types::AppsListResponse;
-}
+impl Request for AppList {}
 
 impl ClientRequest for AppList {}
 
@@ -234,12 +204,9 @@ pub struct AppRead;
 
 impl Method for AppRead {
     const METHOD: &'static str = "app/read";
-    type Params = types::AppsReadParams;
 }
 
-impl Request for AppRead {
-    type Response = types::AppsReadResponse;
-}
+impl Request for AppRead {}
 
 impl ClientRequest for AppRead {}
 
@@ -249,12 +216,9 @@ pub struct CommandExec;
 
 impl Method for CommandExec {
     const METHOD: &'static str = "command/exec";
-    type Params = types::CommandExecParams;
 }
 
-impl Request for CommandExec {
-    type Response = types::CommandExecResponse;
-}
+impl Request for CommandExec {}
 
 impl ClientRequest for CommandExec {}
 
@@ -264,12 +228,9 @@ pub struct CommandExecResize;
 
 impl Method for CommandExecResize {
     const METHOD: &'static str = "command/exec/resize";
-    type Params = types::CommandExecResizeParams;
 }
 
-impl Request for CommandExecResize {
-    type Response = types::CommandExecResizeResponse;
-}
+impl Request for CommandExecResize {}
 
 impl ClientRequest for CommandExecResize {}
 
@@ -279,12 +240,9 @@ pub struct CommandExecTerminate;
 
 impl Method for CommandExecTerminate {
     const METHOD: &'static str = "command/exec/terminate";
-    type Params = types::CommandExecTerminateParams;
 }
 
-impl Request for CommandExecTerminate {
-    type Response = types::CommandExecTerminateResponse;
-}
+impl Request for CommandExecTerminate {}
 
 impl ClientRequest for CommandExecTerminate {}
 
@@ -294,12 +252,9 @@ pub struct CommandExecWrite;
 
 impl Method for CommandExecWrite {
     const METHOD: &'static str = "command/exec/write";
-    type Params = types::CommandExecWriteParams;
 }
 
-impl Request for CommandExecWrite {
-    type Response = types::CommandExecWriteResponse;
-}
+impl Request for CommandExecWrite {}
 
 impl ClientRequest for CommandExecWrite {}
 
@@ -309,12 +264,9 @@ pub struct ConfigBatchWrite;
 
 impl Method for ConfigBatchWrite {
     const METHOD: &'static str = "config/batchWrite";
-    type Params = types::ConfigBatchWriteParams;
 }
 
-impl Request for ConfigBatchWrite {
-    type Response = types::ConfigWriteResponse;
-}
+impl Request for ConfigBatchWrite {}
 
 impl ClientRequest for ConfigBatchWrite {}
 
@@ -324,12 +276,9 @@ pub struct ConfigMcpServerReload;
 
 impl Method for ConfigMcpServerReload {
     const METHOD: &'static str = "config/mcpServer/reload";
-    type Params = ();
 }
 
-impl Request for ConfigMcpServerReload {
-    type Response = types::McpServerRefreshResponse;
-}
+impl Request for ConfigMcpServerReload {}
 
 impl ClientRequest for ConfigMcpServerReload {}
 
@@ -339,12 +288,9 @@ pub struct ConfigRead;
 
 impl Method for ConfigRead {
     const METHOD: &'static str = "config/read";
-    type Params = types::ConfigReadParams;
 }
 
-impl Request for ConfigRead {
-    type Response = types::ConfigReadResponse;
-}
+impl Request for ConfigRead {}
 
 impl ClientRequest for ConfigRead {}
 
@@ -354,12 +300,9 @@ pub struct ConfigValueWrite;
 
 impl Method for ConfigValueWrite {
     const METHOD: &'static str = "config/value/write";
-    type Params = types::ConfigValueWriteParams;
 }
 
-impl Request for ConfigValueWrite {
-    type Response = types::ConfigWriteResponse;
-}
+impl Request for ConfigValueWrite {}
 
 impl ClientRequest for ConfigValueWrite {}
 
@@ -369,12 +312,9 @@ pub struct ConfigRequirementsRead;
 
 impl Method for ConfigRequirementsRead {
     const METHOD: &'static str = "configRequirements/read";
-    type Params = ();
 }
 
-impl Request for ConfigRequirementsRead {
-    type Response = types::ConfigRequirementsReadResponse;
-}
+impl Request for ConfigRequirementsRead {}
 
 impl ClientRequest for ConfigRequirementsRead {}
 
@@ -384,12 +324,9 @@ pub struct ExperimentalFeatureEnablementSet;
 
 impl Method for ExperimentalFeatureEnablementSet {
     const METHOD: &'static str = "experimentalFeature/enablement/set";
-    type Params = types::ExperimentalFeatureEnablementSetParams;
 }
 
-impl Request for ExperimentalFeatureEnablementSet {
-    type Response = types::ExperimentalFeatureEnablementSetResponse;
-}
+impl Request for ExperimentalFeatureEnablementSet {}
 
 impl ClientRequest for ExperimentalFeatureEnablementSet {}
 
@@ -399,12 +336,9 @@ pub struct ExperimentalFeatureList;
 
 impl Method for ExperimentalFeatureList {
     const METHOD: &'static str = "experimentalFeature/list";
-    type Params = types::ExperimentalFeatureListParams;
 }
 
-impl Request for ExperimentalFeatureList {
-    type Response = types::ExperimentalFeatureListResponse;
-}
+impl Request for ExperimentalFeatureList {}
 
 impl ClientRequest for ExperimentalFeatureList {}
 
@@ -414,12 +348,9 @@ pub struct ExternalAgentConfigDetect;
 
 impl Method for ExternalAgentConfigDetect {
     const METHOD: &'static str = "externalAgentConfig/detect";
-    type Params = types::ExternalAgentConfigDetectParams;
 }
 
-impl Request for ExternalAgentConfigDetect {
-    type Response = types::ExternalAgentConfigDetectResponse;
-}
+impl Request for ExternalAgentConfigDetect {}
 
 impl ClientRequest for ExternalAgentConfigDetect {}
 
@@ -429,12 +360,9 @@ pub struct ExternalAgentConfigImport;
 
 impl Method for ExternalAgentConfigImport {
     const METHOD: &'static str = "externalAgentConfig/import";
-    type Params = types::ExternalAgentConfigImportParams;
 }
 
-impl Request for ExternalAgentConfigImport {
-    type Response = types::ExternalAgentConfigImportResponse;
-}
+impl Request for ExternalAgentConfigImport {}
 
 impl ClientRequest for ExternalAgentConfigImport {}
 
@@ -444,12 +372,9 @@ pub struct ExternalAgentConfigImportReadHistories;
 
 impl Method for ExternalAgentConfigImportReadHistories {
     const METHOD: &'static str = "externalAgentConfig/import/readHistories";
-    type Params = ();
 }
 
-impl Request for ExternalAgentConfigImportReadHistories {
-    type Response = types::ExternalAgentConfigImportHistoriesReadResponse;
-}
+impl Request for ExternalAgentConfigImportReadHistories {}
 
 impl ClientRequest for ExternalAgentConfigImportReadHistories {}
 
@@ -459,12 +384,9 @@ pub struct ExternalAgentConfigImportRecordHistory;
 
 impl Method for ExternalAgentConfigImportRecordHistory {
     const METHOD: &'static str = "externalAgentConfig/import/recordHistory";
-    type Params = types::ExternalAgentConfigImportHistoryRecordParams;
 }
 
-impl Request for ExternalAgentConfigImportRecordHistory {
-    type Response = types::ExternalAgentConfigImportHistoryRecordResponse;
-}
+impl Request for ExternalAgentConfigImportRecordHistory {}
 
 impl ClientRequest for ExternalAgentConfigImportRecordHistory {}
 
@@ -474,12 +396,9 @@ pub struct FeedbackUpload;
 
 impl Method for FeedbackUpload {
     const METHOD: &'static str = "feedback/upload";
-    type Params = types::FeedbackUploadParams;
 }
 
-impl Request for FeedbackUpload {
-    type Response = types::FeedbackUploadResponse;
-}
+impl Request for FeedbackUpload {}
 
 impl ClientRequest for FeedbackUpload {}
 
@@ -489,12 +408,9 @@ pub struct FsCopy;
 
 impl Method for FsCopy {
     const METHOD: &'static str = "fs/copy";
-    type Params = types::FsCopyParams;
 }
 
-impl Request for FsCopy {
-    type Response = types::FsCopyResponse;
-}
+impl Request for FsCopy {}
 
 impl ClientRequest for FsCopy {}
 
@@ -504,12 +420,9 @@ pub struct FsCreateDirectory;
 
 impl Method for FsCreateDirectory {
     const METHOD: &'static str = "fs/createDirectory";
-    type Params = types::FsCreateDirectoryParams;
 }
 
-impl Request for FsCreateDirectory {
-    type Response = types::FsCreateDirectoryResponse;
-}
+impl Request for FsCreateDirectory {}
 
 impl ClientRequest for FsCreateDirectory {}
 
@@ -519,12 +432,9 @@ pub struct FsGetMetadata;
 
 impl Method for FsGetMetadata {
     const METHOD: &'static str = "fs/getMetadata";
-    type Params = types::FsGetMetadataParams;
 }
 
-impl Request for FsGetMetadata {
-    type Response = types::FsGetMetadataResponse;
-}
+impl Request for FsGetMetadata {}
 
 impl ClientRequest for FsGetMetadata {}
 
@@ -534,12 +444,9 @@ pub struct FsReadDirectory;
 
 impl Method for FsReadDirectory {
     const METHOD: &'static str = "fs/readDirectory";
-    type Params = types::FsReadDirectoryParams;
 }
 
-impl Request for FsReadDirectory {
-    type Response = types::FsReadDirectoryResponse;
-}
+impl Request for FsReadDirectory {}
 
 impl ClientRequest for FsReadDirectory {}
 
@@ -549,12 +456,9 @@ pub struct FsReadFile;
 
 impl Method for FsReadFile {
     const METHOD: &'static str = "fs/readFile";
-    type Params = types::FsReadFileParams;
 }
 
-impl Request for FsReadFile {
-    type Response = types::FsReadFileResponse;
-}
+impl Request for FsReadFile {}
 
 impl ClientRequest for FsReadFile {}
 
@@ -564,12 +468,9 @@ pub struct FsRemove;
 
 impl Method for FsRemove {
     const METHOD: &'static str = "fs/remove";
-    type Params = types::FsRemoveParams;
 }
 
-impl Request for FsRemove {
-    type Response = types::FsRemoveResponse;
-}
+impl Request for FsRemove {}
 
 impl ClientRequest for FsRemove {}
 
@@ -579,12 +480,9 @@ pub struct FsUnwatch;
 
 impl Method for FsUnwatch {
     const METHOD: &'static str = "fs/unwatch";
-    type Params = types::FsUnwatchParams;
 }
 
-impl Request for FsUnwatch {
-    type Response = types::FsUnwatchResponse;
-}
+impl Request for FsUnwatch {}
 
 impl ClientRequest for FsUnwatch {}
 
@@ -594,12 +492,9 @@ pub struct FsWatch;
 
 impl Method for FsWatch {
     const METHOD: &'static str = "fs/watch";
-    type Params = types::FsWatchParams;
 }
 
-impl Request for FsWatch {
-    type Response = types::FsWatchResponse;
-}
+impl Request for FsWatch {}
 
 impl ClientRequest for FsWatch {}
 
@@ -609,12 +504,9 @@ pub struct FsWriteFile;
 
 impl Method for FsWriteFile {
     const METHOD: &'static str = "fs/writeFile";
-    type Params = types::FsWriteFileParams;
 }
 
-impl Request for FsWriteFile {
-    type Response = types::FsWriteFileResponse;
-}
+impl Request for FsWriteFile {}
 
 impl ClientRequest for FsWriteFile {}
 
@@ -624,12 +516,9 @@ pub struct FuzzyFileSearch;
 
 impl Method for FuzzyFileSearch {
     const METHOD: &'static str = "fuzzyFileSearch";
-    type Params = types::FuzzyFileSearchParams;
 }
 
-impl Request for FuzzyFileSearch {
-    type Response = types::FuzzyFileSearchResponse;
-}
+impl Request for FuzzyFileSearch {}
 
 impl ClientRequest for FuzzyFileSearch {}
 
@@ -639,12 +528,9 @@ pub struct HooksList;
 
 impl Method for HooksList {
     const METHOD: &'static str = "hooks/list";
-    type Params = types::HooksListParams;
 }
 
-impl Request for HooksList {
-    type Response = types::HooksListResponse;
-}
+impl Request for HooksList {}
 
 impl ClientRequest for HooksList {}
 
@@ -654,12 +540,17 @@ pub struct Initialize;
 
 impl Method for Initialize {
     const METHOD: &'static str = "initialize";
+}
+
+impl Typed for Initialize {
     type Params = types::InitializeParams;
 }
 
-impl Request for Initialize {
+impl Answered for Initialize {
     type Response = types::InitializeResponse;
 }
+
+impl Request for Initialize {}
 
 impl ClientRequest for Initialize {}
 
@@ -669,12 +560,9 @@ pub struct MarketplaceAdd;
 
 impl Method for MarketplaceAdd {
     const METHOD: &'static str = "marketplace/add";
-    type Params = types::MarketplaceAddParams;
 }
 
-impl Request for MarketplaceAdd {
-    type Response = types::MarketplaceAddResponse;
-}
+impl Request for MarketplaceAdd {}
 
 impl ClientRequest for MarketplaceAdd {}
 
@@ -684,12 +572,9 @@ pub struct MarketplaceRemove;
 
 impl Method for MarketplaceRemove {
     const METHOD: &'static str = "marketplace/remove";
-    type Params = types::MarketplaceRemoveParams;
 }
 
-impl Request for MarketplaceRemove {
-    type Response = types::MarketplaceRemoveResponse;
-}
+impl Request for MarketplaceRemove {}
 
 impl ClientRequest for MarketplaceRemove {}
 
@@ -699,12 +584,9 @@ pub struct MarketplaceUpgrade;
 
 impl Method for MarketplaceUpgrade {
     const METHOD: &'static str = "marketplace/upgrade";
-    type Params = types::MarketplaceUpgradeParams;
 }
 
-impl Request for MarketplaceUpgrade {
-    type Response = types::MarketplaceUpgradeResponse;
-}
+impl Request for MarketplaceUpgrade {}
 
 impl ClientRequest for MarketplaceUpgrade {}
 
@@ -714,12 +596,9 @@ pub struct McpServerOauthLogin;
 
 impl Method for McpServerOauthLogin {
     const METHOD: &'static str = "mcpServer/oauth/login";
-    type Params = types::McpServerOauthLoginParams;
 }
 
-impl Request for McpServerOauthLogin {
-    type Response = types::McpServerOauthLoginResponse;
-}
+impl Request for McpServerOauthLogin {}
 
 impl ClientRequest for McpServerOauthLogin {}
 
@@ -729,12 +608,9 @@ pub struct McpServerResourceRead;
 
 impl Method for McpServerResourceRead {
     const METHOD: &'static str = "mcpServer/resource/read";
-    type Params = types::McpResourceReadParams;
 }
 
-impl Request for McpServerResourceRead {
-    type Response = types::McpResourceReadResponse;
-}
+impl Request for McpServerResourceRead {}
 
 impl ClientRequest for McpServerResourceRead {}
 
@@ -744,12 +620,9 @@ pub struct McpServerToolCall;
 
 impl Method for McpServerToolCall {
     const METHOD: &'static str = "mcpServer/tool/call";
-    type Params = types::McpServerToolCallParams;
 }
 
-impl Request for McpServerToolCall {
-    type Response = types::McpServerToolCallResponse;
-}
+impl Request for McpServerToolCall {}
 
 impl ClientRequest for McpServerToolCall {}
 
@@ -759,12 +632,9 @@ pub struct McpServerStatusList;
 
 impl Method for McpServerStatusList {
     const METHOD: &'static str = "mcpServerStatus/list";
-    type Params = types::ListMcpServerStatusParams;
 }
 
-impl Request for McpServerStatusList {
-    type Response = types::ListMcpServerStatusResponse;
-}
+impl Request for McpServerStatusList {}
 
 impl ClientRequest for McpServerStatusList {}
 
@@ -774,12 +644,9 @@ pub struct ModelList;
 
 impl Method for ModelList {
     const METHOD: &'static str = "model/list";
-    type Params = types::ModelListParams;
 }
 
-impl Request for ModelList {
-    type Response = types::ModelListResponse;
-}
+impl Request for ModelList {}
 
 impl ClientRequest for ModelList {}
 
@@ -789,12 +656,9 @@ pub struct ModelProviderCapabilitiesRead;
 
 impl Method for ModelProviderCapabilitiesRead {
     const METHOD: &'static str = "modelProvider/capabilities/read";
-    type Params = types::ModelProviderCapabilitiesReadParams;
 }
 
-impl Request for ModelProviderCapabilitiesRead {
-    type Response = types::ModelProviderCapabilitiesReadResponse;
-}
+impl Request for ModelProviderCapabilitiesRead {}
 
 impl ClientRequest for ModelProviderCapabilitiesRead {}
 
@@ -804,12 +668,9 @@ pub struct PermissionProfileList;
 
 impl Method for PermissionProfileList {
     const METHOD: &'static str = "permissionProfile/list";
-    type Params = types::PermissionProfileListParams;
 }
 
-impl Request for PermissionProfileList {
-    type Response = types::PermissionProfileListResponse;
-}
+impl Request for PermissionProfileList {}
 
 impl ClientRequest for PermissionProfileList {}
 
@@ -819,12 +680,9 @@ pub struct PluginInstall;
 
 impl Method for PluginInstall {
     const METHOD: &'static str = "plugin/install";
-    type Params = types::PluginInstallParams;
 }
 
-impl Request for PluginInstall {
-    type Response = types::PluginInstallResponse;
-}
+impl Request for PluginInstall {}
 
 impl ClientRequest for PluginInstall {}
 
@@ -834,12 +692,9 @@ pub struct PluginInstalled;
 
 impl Method for PluginInstalled {
     const METHOD: &'static str = "plugin/installed";
-    type Params = types::PluginInstalledParams;
 }
 
-impl Request for PluginInstalled {
-    type Response = types::PluginInstalledResponse;
-}
+impl Request for PluginInstalled {}
 
 impl ClientRequest for PluginInstalled {}
 
@@ -849,12 +704,9 @@ pub struct PluginList;
 
 impl Method for PluginList {
     const METHOD: &'static str = "plugin/list";
-    type Params = types::PluginListParams;
 }
 
-impl Request for PluginList {
-    type Response = types::PluginListResponse;
-}
+impl Request for PluginList {}
 
 impl ClientRequest for PluginList {}
 
@@ -864,12 +716,9 @@ pub struct PluginRead;
 
 impl Method for PluginRead {
     const METHOD: &'static str = "plugin/read";
-    type Params = types::PluginReadParams;
 }
 
-impl Request for PluginRead {
-    type Response = types::PluginReadResponse;
-}
+impl Request for PluginRead {}
 
 impl ClientRequest for PluginRead {}
 
@@ -879,12 +728,9 @@ pub struct PluginReconcile;
 
 impl Method for PluginReconcile {
     const METHOD: &'static str = "plugin/reconcile";
-    type Params = types::PluginReconcileParams;
 }
 
-impl Request for PluginReconcile {
-    type Response = types::PluginReconcileResponse;
-}
+impl Request for PluginReconcile {}
 
 impl ClientRequest for PluginReconcile {}
 
@@ -894,12 +740,9 @@ pub struct PluginShareCheckout;
 
 impl Method for PluginShareCheckout {
     const METHOD: &'static str = "plugin/share/checkout";
-    type Params = types::PluginShareCheckoutParams;
 }
 
-impl Request for PluginShareCheckout {
-    type Response = types::PluginShareCheckoutResponse;
-}
+impl Request for PluginShareCheckout {}
 
 impl ClientRequest for PluginShareCheckout {}
 
@@ -909,12 +752,9 @@ pub struct PluginShareDelete;
 
 impl Method for PluginShareDelete {
     const METHOD: &'static str = "plugin/share/delete";
-    type Params = types::PluginShareDeleteParams;
 }
 
-impl Request for PluginShareDelete {
-    type Response = types::PluginShareDeleteResponse;
-}
+impl Request for PluginShareDelete {}
 
 impl ClientRequest for PluginShareDelete {}
 
@@ -924,12 +764,9 @@ pub struct PluginShareList;
 
 impl Method for PluginShareList {
     const METHOD: &'static str = "plugin/share/list";
-    type Params = types::PluginShareListParams;
 }
 
-impl Request for PluginShareList {
-    type Response = types::PluginShareListResponse;
-}
+impl Request for PluginShareList {}
 
 impl ClientRequest for PluginShareList {}
 
@@ -939,12 +776,9 @@ pub struct PluginShareSave;
 
 impl Method for PluginShareSave {
     const METHOD: &'static str = "plugin/share/save";
-    type Params = types::PluginShareSaveParams;
 }
 
-impl Request for PluginShareSave {
-    type Response = types::PluginShareSaveResponse;
-}
+impl Request for PluginShareSave {}
 
 impl ClientRequest for PluginShareSave {}
 
@@ -954,12 +788,9 @@ pub struct PluginShareUpdateTargets;
 
 impl Method for PluginShareUpdateTargets {
     const METHOD: &'static str = "plugin/share/updateTargets";
-    type Params = types::PluginShareUpdateTargetsParams;
 }
 
-impl Request for PluginShareUpdateTargets {
-    type Response = types::PluginShareUpdateTargetsResponse;
-}
+impl Request for PluginShareUpdateTargets {}
 
 impl ClientRequest for PluginShareUpdateTargets {}
 
@@ -969,12 +800,9 @@ pub struct PluginSkillRead;
 
 impl Method for PluginSkillRead {
     const METHOD: &'static str = "plugin/skill/read";
-    type Params = types::PluginSkillReadParams;
 }
 
-impl Request for PluginSkillRead {
-    type Response = types::PluginSkillReadResponse;
-}
+impl Request for PluginSkillRead {}
 
 impl ClientRequest for PluginSkillRead {}
 
@@ -984,12 +812,9 @@ pub struct PluginUninstall;
 
 impl Method for PluginUninstall {
     const METHOD: &'static str = "plugin/uninstall";
-    type Params = types::PluginUninstallParams;
 }
 
-impl Request for PluginUninstall {
-    type Response = types::PluginUninstallResponse;
-}
+impl Request for PluginUninstall {}
 
 impl ClientRequest for PluginUninstall {}
 
@@ -999,12 +824,9 @@ pub struct ReviewStart;
 
 impl Method for ReviewStart {
     const METHOD: &'static str = "review/start";
-    type Params = types::ReviewStartParams;
 }
 
-impl Request for ReviewStart {
-    type Response = types::ReviewStartResponse;
-}
+impl Request for ReviewStart {}
 
 impl ClientRequest for ReviewStart {}
 
@@ -1014,12 +836,9 @@ pub struct SkillsConfigWrite;
 
 impl Method for SkillsConfigWrite {
     const METHOD: &'static str = "skills/config/write";
-    type Params = types::SkillsConfigWriteParams;
 }
 
-impl Request for SkillsConfigWrite {
-    type Response = types::SkillsConfigWriteResponse;
-}
+impl Request for SkillsConfigWrite {}
 
 impl ClientRequest for SkillsConfigWrite {}
 
@@ -1029,12 +848,9 @@ pub struct SkillsExtraRootsSet;
 
 impl Method for SkillsExtraRootsSet {
     const METHOD: &'static str = "skills/extraRoots/set";
-    type Params = types::SkillsExtraRootsSetParams;
 }
 
-impl Request for SkillsExtraRootsSet {
-    type Response = types::SkillsExtraRootsSetResponse;
-}
+impl Request for SkillsExtraRootsSet {}
 
 impl ClientRequest for SkillsExtraRootsSet {}
 
@@ -1044,12 +860,9 @@ pub struct SkillsList;
 
 impl Method for SkillsList {
     const METHOD: &'static str = "skills/list";
-    type Params = types::SkillsListParams;
 }
 
-impl Request for SkillsList {
-    type Response = types::SkillsListResponse;
-}
+impl Request for SkillsList {}
 
 impl ClientRequest for SkillsList {}
 
@@ -1059,12 +872,9 @@ pub struct ThreadApproveGuardianDeniedAction;
 
 impl Method for ThreadApproveGuardianDeniedAction {
     const METHOD: &'static str = "thread/approveGuardianDeniedAction";
-    type Params = types::ThreadApproveGuardianDeniedActionParams;
 }
 
-impl Request for ThreadApproveGuardianDeniedAction {
-    type Response = types::ThreadApproveGuardianDeniedActionResponse;
-}
+impl Request for ThreadApproveGuardianDeniedAction {}
 
 impl ClientRequest for ThreadApproveGuardianDeniedAction {}
 
@@ -1074,12 +884,9 @@ pub struct ThreadArchive;
 
 impl Method for ThreadArchive {
     const METHOD: &'static str = "thread/archive";
-    type Params = types::ThreadArchiveParams;
 }
 
-impl Request for ThreadArchive {
-    type Response = types::ThreadArchiveResponse;
-}
+impl Request for ThreadArchive {}
 
 impl ClientRequest for ThreadArchive {}
 
@@ -1089,12 +896,9 @@ pub struct ThreadAttachmentAdd;
 
 impl Method for ThreadAttachmentAdd {
     const METHOD: &'static str = "thread/attachment/add";
-    type Params = types::ThreadAttachmentAddParams;
 }
 
-impl Request for ThreadAttachmentAdd {
-    type Response = types::ThreadAttachmentAddResponse;
-}
+impl Request for ThreadAttachmentAdd {}
 
 impl ClientRequest for ThreadAttachmentAdd {}
 
@@ -1104,12 +908,9 @@ pub struct ThreadAttachmentList;
 
 impl Method for ThreadAttachmentList {
     const METHOD: &'static str = "thread/attachment/list";
-    type Params = types::ThreadAttachmentListParams;
 }
 
-impl Request for ThreadAttachmentList {
-    type Response = types::ThreadAttachmentListResponse;
-}
+impl Request for ThreadAttachmentList {}
 
 impl ClientRequest for ThreadAttachmentList {}
 
@@ -1119,12 +920,9 @@ pub struct ThreadAttachmentRemove;
 
 impl Method for ThreadAttachmentRemove {
     const METHOD: &'static str = "thread/attachment/remove";
-    type Params = types::ThreadAttachmentRemoveParams;
 }
 
-impl Request for ThreadAttachmentRemove {
-    type Response = types::ThreadAttachmentRemoveResponse;
-}
+impl Request for ThreadAttachmentRemove {}
 
 impl ClientRequest for ThreadAttachmentRemove {}
 
@@ -1134,12 +932,9 @@ pub struct ThreadAttachmentOwnerList;
 
 impl Method for ThreadAttachmentOwnerList {
     const METHOD: &'static str = "thread/attachmentOwner/list";
-    type Params = types::ThreadAttachmentOwnerListParams;
 }
 
-impl Request for ThreadAttachmentOwnerList {
-    type Response = types::ThreadAttachmentOwnerListResponse;
-}
+impl Request for ThreadAttachmentOwnerList {}
 
 impl ClientRequest for ThreadAttachmentOwnerList {}
 
@@ -1149,12 +944,9 @@ pub struct ThreadCompactStart;
 
 impl Method for ThreadCompactStart {
     const METHOD: &'static str = "thread/compact/start";
-    type Params = types::ThreadCompactStartParams;
 }
 
-impl Request for ThreadCompactStart {
-    type Response = types::ThreadCompactStartResponse;
-}
+impl Request for ThreadCompactStart {}
 
 impl ClientRequest for ThreadCompactStart {}
 
@@ -1164,12 +956,9 @@ pub struct ThreadDelete;
 
 impl Method for ThreadDelete {
     const METHOD: &'static str = "thread/delete";
-    type Params = types::ThreadDeleteParams;
 }
 
-impl Request for ThreadDelete {
-    type Response = types::ThreadDeleteResponse;
-}
+impl Request for ThreadDelete {}
 
 impl ClientRequest for ThreadDelete {}
 
@@ -1179,12 +968,9 @@ pub struct ThreadFork;
 
 impl Method for ThreadFork {
     const METHOD: &'static str = "thread/fork";
-    type Params = types::ThreadForkParams;
 }
 
-impl Request for ThreadFork {
-    type Response = types::ThreadForkResponse;
-}
+impl Request for ThreadFork {}
 
 impl ClientRequest for ThreadFork {}
 
@@ -1194,12 +980,9 @@ pub struct ThreadGoalClear;
 
 impl Method for ThreadGoalClear {
     const METHOD: &'static str = "thread/goal/clear";
-    type Params = types::ThreadGoalClearParams;
 }
 
-impl Request for ThreadGoalClear {
-    type Response = types::ThreadGoalClearResponse;
-}
+impl Request for ThreadGoalClear {}
 
 impl ClientRequest for ThreadGoalClear {}
 
@@ -1209,12 +992,9 @@ pub struct ThreadGoalGet;
 
 impl Method for ThreadGoalGet {
     const METHOD: &'static str = "thread/goal/get";
-    type Params = types::ThreadGoalGetParams;
 }
 
-impl Request for ThreadGoalGet {
-    type Response = types::ThreadGoalGetResponse;
-}
+impl Request for ThreadGoalGet {}
 
 impl ClientRequest for ThreadGoalGet {}
 
@@ -1224,12 +1004,9 @@ pub struct ThreadGoalSet;
 
 impl Method for ThreadGoalSet {
     const METHOD: &'static str = "thread/goal/set";
-    type Params = types::ThreadGoalSetParams;
 }
 
-impl Request for ThreadGoalSet {
-    type Response = types::ThreadGoalSetResponse;
-}
+impl Request for ThreadGoalSet {}
 
 impl ClientRequest for ThreadGoalSet {}
 
@@ -1239,12 +1016,9 @@ pub struct ThreadInjectItems;
 
 impl Method for ThreadInjectItems {
     const METHOD: &'static str = "thread/inject_items";
-    type Params = types::ThreadInjectItemsParams;
 }
 
-impl Request for ThreadInjectItems {
-    type Response = types::ThreadInjectItemsResponse;
-}
+impl Request for ThreadInjectItems {}
 
 impl ClientRequest for ThreadInjectItems {}
 
@@ -1254,12 +1028,9 @@ pub struct ThreadItemsList;
 
 impl Method for ThreadItemsList {
     const METHOD: &'static str = "thread/items/list";
-    type Params = types::ThreadItemsListParams;
 }
 
-impl Request for ThreadItemsList {
-    type Response = types::ThreadItemsListResponse;
-}
+impl Request for ThreadItemsList {}
 
 impl ClientRequest for ThreadItemsList {}
 
@@ -1269,12 +1040,9 @@ pub struct ThreadList;
 
 impl Method for ThreadList {
     const METHOD: &'static str = "thread/list";
-    type Params = types::ThreadListParams;
 }
 
-impl Request for ThreadList {
-    type Response = types::ThreadListResponse;
-}
+impl Request for ThreadList {}
 
 impl ClientRequest for ThreadList {}
 
@@ -1284,12 +1052,9 @@ pub struct ThreadLoadedList;
 
 impl Method for ThreadLoadedList {
     const METHOD: &'static str = "thread/loaded/list";
-    type Params = types::ThreadLoadedListParams;
 }
 
-impl Request for ThreadLoadedList {
-    type Response = types::ThreadLoadedListResponse;
-}
+impl Request for ThreadLoadedList {}
 
 impl ClientRequest for ThreadLoadedList {}
 
@@ -1299,12 +1064,9 @@ pub struct ThreadMetadataUpdate;
 
 impl Method for ThreadMetadataUpdate {
     const METHOD: &'static str = "thread/metadata/update";
-    type Params = types::ThreadMetadataUpdateParams;
 }
 
-impl Request for ThreadMetadataUpdate {
-    type Response = types::ThreadMetadataUpdateResponse;
-}
+impl Request for ThreadMetadataUpdate {}
 
 impl ClientRequest for ThreadMetadataUpdate {}
 
@@ -1314,12 +1076,9 @@ pub struct ThreadNameSet;
 
 impl Method for ThreadNameSet {
     const METHOD: &'static str = "thread/name/set";
-    type Params = types::ThreadSetNameParams;
 }
 
-impl Request for ThreadNameSet {
-    type Response = types::ThreadSetNameResponse;
-}
+impl Request for ThreadNameSet {}
 
 impl ClientRequest for ThreadNameSet {}
 
@@ -1329,12 +1088,9 @@ pub struct ThreadRead;
 
 impl Method for ThreadRead {
     const METHOD: &'static str = "thread/read";
-    type Params = types::ThreadReadParams;
 }
 
-impl Request for ThreadRead {
-    type Response = types::ThreadReadResponse;
-}
+impl Request for ThreadRead {}
 
 impl ClientRequest for ThreadRead {}
 
@@ -1344,12 +1100,17 @@ pub struct ThreadResume;
 
 impl Method for ThreadResume {
     const METHOD: &'static str = "thread/resume";
+}
+
+impl Typed for ThreadResume {
     type Params = types::ThreadResumeParams;
 }
 
-impl Request for ThreadResume {
+impl Answered for ThreadResume {
     type Response = types::ThreadResumeResponse;
 }
+
+impl Request for ThreadResume {}
 
 impl ClientRequest for ThreadResume {}
 
@@ -1359,12 +1120,9 @@ pub struct ThreadRevert;
 
 impl Method for ThreadRevert {
     const METHOD: &'static str = "thread/revert";
-    type Params = types::ThreadRevertParams;
 }
 
-impl Request for ThreadRevert {
-    type Response = types::ThreadRevertResponse;
-}
+impl Request for ThreadRevert {}
 
 impl ClientRequest for ThreadRevert {}
 
@@ -1374,12 +1132,9 @@ pub struct ThreadSectionMove;
 
 impl Method for ThreadSectionMove {
     const METHOD: &'static str = "thread/section/move";
-    type Params = types::ThreadSectionMoveParams;
 }
 
-impl Request for ThreadSectionMove {
-    type Response = types::ThreadSectionMoveResponse;
-}
+impl Request for ThreadSectionMove {}
 
 impl ClientRequest for ThreadSectionMove {}
 
@@ -1389,12 +1144,9 @@ pub struct ThreadShellCommand;
 
 impl Method for ThreadShellCommand {
     const METHOD: &'static str = "thread/shellCommand";
-    type Params = types::ThreadShellCommandParams;
 }
 
-impl Request for ThreadShellCommand {
-    type Response = types::ThreadShellCommandResponse;
-}
+impl Request for ThreadShellCommand {}
 
 impl ClientRequest for ThreadShellCommand {}
 
@@ -1404,12 +1156,17 @@ pub struct ThreadStart;
 
 impl Method for ThreadStart {
     const METHOD: &'static str = "thread/start";
+}
+
+impl Typed for ThreadStart {
     type Params = types::ThreadStartParams;
 }
 
-impl Request for ThreadStart {
+impl Answered for ThreadStart {
     type Response = types::ThreadStartResponse;
 }
+
+impl Request for ThreadStart {}
 
 impl ClientRequest for ThreadStart {}
 
@@ -1419,12 +1176,9 @@ pub struct ThreadTurnsList;
 
 impl Method for ThreadTurnsList {
     const METHOD: &'static str = "thread/turns/list";
-    type Params = types::ThreadTurnsListParams;
 }
 
-impl Request for ThreadTurnsList {
-    type Response = types::ThreadTurnsListResponse;
-}
+impl Request for ThreadTurnsList {}
 
 impl ClientRequest for ThreadTurnsList {}
 
@@ -1434,12 +1188,9 @@ pub struct ThreadUnarchive;
 
 impl Method for ThreadUnarchive {
     const METHOD: &'static str = "thread/unarchive";
-    type Params = types::ThreadUnarchiveParams;
 }
 
-impl Request for ThreadUnarchive {
-    type Response = types::ThreadUnarchiveResponse;
-}
+impl Request for ThreadUnarchive {}
 
 impl ClientRequest for ThreadUnarchive {}
 
@@ -1449,12 +1200,9 @@ pub struct ThreadUnsubscribe;
 
 impl Method for ThreadUnsubscribe {
     const METHOD: &'static str = "thread/unsubscribe";
-    type Params = types::ThreadUnsubscribeParams;
 }
 
-impl Request for ThreadUnsubscribe {
-    type Response = types::ThreadUnsubscribeResponse;
-}
+impl Request for ThreadUnsubscribe {}
 
 impl ClientRequest for ThreadUnsubscribe {}
 
@@ -1464,12 +1212,9 @@ pub struct ThreadSectionCreate;
 
 impl Method for ThreadSectionCreate {
     const METHOD: &'static str = "threadSection/create";
-    type Params = types::ThreadSectionCreateParams;
 }
 
-impl Request for ThreadSectionCreate {
-    type Response = types::ThreadSectionCreateResponse;
-}
+impl Request for ThreadSectionCreate {}
 
 impl ClientRequest for ThreadSectionCreate {}
 
@@ -1479,12 +1224,9 @@ pub struct ThreadSectionDelete;
 
 impl Method for ThreadSectionDelete {
     const METHOD: &'static str = "threadSection/delete";
-    type Params = types::ThreadSectionDeleteParams;
 }
 
-impl Request for ThreadSectionDelete {
-    type Response = types::ThreadSectionDeleteResponse;
-}
+impl Request for ThreadSectionDelete {}
 
 impl ClientRequest for ThreadSectionDelete {}
 
@@ -1494,12 +1236,9 @@ pub struct ThreadSectionList;
 
 impl Method for ThreadSectionList {
     const METHOD: &'static str = "threadSection/list";
-    type Params = types::ThreadSectionListParams;
 }
 
-impl Request for ThreadSectionList {
-    type Response = types::ThreadSectionListResponse;
-}
+impl Request for ThreadSectionList {}
 
 impl ClientRequest for ThreadSectionList {}
 
@@ -1509,12 +1248,9 @@ pub struct ThreadSectionUpdate;
 
 impl Method for ThreadSectionUpdate {
     const METHOD: &'static str = "threadSection/update";
-    type Params = types::ThreadSectionUpdateParams;
 }
 
-impl Request for ThreadSectionUpdate {
-    type Response = types::ThreadSectionUpdateResponse;
-}
+impl Request for ThreadSectionUpdate {}
 
 impl ClientRequest for ThreadSectionUpdate {}
 
@@ -1524,12 +1260,17 @@ pub struct TurnInterrupt;
 
 impl Method for TurnInterrupt {
     const METHOD: &'static str = "turn/interrupt";
+}
+
+impl Typed for TurnInterrupt {
     type Params = types::TurnInterruptParams;
 }
 
-impl Request for TurnInterrupt {
+impl Answered for TurnInterrupt {
     type Response = types::TurnInterruptResponse;
 }
+
+impl Request for TurnInterrupt {}
 
 impl ClientRequest for TurnInterrupt {}
 
@@ -1539,12 +1280,17 @@ pub struct TurnStart;
 
 impl Method for TurnStart {
     const METHOD: &'static str = "turn/start";
+}
+
+impl Typed for TurnStart {
     type Params = types::TurnStartParams;
 }
 
-impl Request for TurnStart {
+impl Answered for TurnStart {
     type Response = types::TurnStartResponse;
 }
+
+impl Request for TurnStart {}
 
 impl ClientRequest for TurnStart {}
 
@@ -1554,12 +1300,17 @@ pub struct TurnSteer;
 
 impl Method for TurnSteer {
     const METHOD: &'static str = "turn/steer";
+}
+
+impl Typed for TurnSteer {
     type Params = types::TurnSteerParams;
 }
 
-impl Request for TurnSteer {
+impl Answered for TurnSteer {
     type Response = types::TurnSteerResponse;
 }
+
+impl Request for TurnSteer {}
 
 impl ClientRequest for TurnSteer {}
 
@@ -1569,12 +1320,9 @@ pub struct WindowsSandboxReadiness;
 
 impl Method for WindowsSandboxReadiness {
     const METHOD: &'static str = "windowsSandbox/readiness";
-    type Params = ();
 }
 
-impl Request for WindowsSandboxReadiness {
-    type Response = types::WindowsSandboxReadinessResponse;
-}
+impl Request for WindowsSandboxReadiness {}
 
 impl ClientRequest for WindowsSandboxReadiness {}
 
@@ -1584,12 +1332,9 @@ pub struct WindowsSandboxSetupStart;
 
 impl Method for WindowsSandboxSetupStart {
     const METHOD: &'static str = "windowsSandbox/setupStart";
-    type Params = types::WindowsSandboxSetupStartParams;
 }
 
-impl Request for WindowsSandboxSetupStart {
-    type Response = types::WindowsSandboxSetupStartResponse;
-}
+impl Request for WindowsSandboxSetupStart {}
 
 impl ClientRequest for WindowsSandboxSetupStart {}
 
@@ -1599,6 +1344,9 @@ pub struct Initialized;
 
 impl Method for Initialized {
     const METHOD: &'static str = "initialized";
+}
+
+impl Typed for Initialized {
     type Params = ();
 }
 
@@ -1612,12 +1360,9 @@ pub struct AccountChatgptAuthTokensRefresh;
 
 impl Method for AccountChatgptAuthTokensRefresh {
     const METHOD: &'static str = "account/chatgptAuthTokens/refresh";
-    type Params = types::ChatgptAuthTokensRefreshParams;
 }
 
-impl Request for AccountChatgptAuthTokensRefresh {
-    type Response = types::ChatgptAuthTokensRefreshResponse;
-}
+impl Request for AccountChatgptAuthTokensRefresh {}
 
 impl ServerRequest for AccountChatgptAuthTokensRefresh {}
 
@@ -1627,12 +1372,17 @@ pub struct ApplyPatchApproval;
 
 impl Method for ApplyPatchApproval {
     const METHOD: &'static str = "applyPatchApproval";
+}
+
+impl Typed for ApplyPatchApproval {
     type Params = types::ApplyPatchApprovalParams;
 }
 
-impl Request for ApplyPatchApproval {
+impl Answered for ApplyPatchApproval {
     type Response = types::ApplyPatchApprovalResponse;
 }
+
+impl Request for ApplyPatchApproval {}
 
 impl ServerRequest for ApplyPatchApproval {}
 
@@ -1642,12 +1392,9 @@ pub struct AttestationGenerate;
 
 impl Method for AttestationGenerate {
     const METHOD: &'static str = "attestation/generate";
-    type Params = types::AttestationGenerateParams;
 }
 
-impl Request for AttestationGenerate {
-    type Response = types::AttestationGenerateResponse;
-}
+impl Request for AttestationGenerate {}
 
 impl ServerRequest for AttestationGenerate {}
 
@@ -1657,12 +1404,17 @@ pub struct ExecCommandApproval;
 
 impl Method for ExecCommandApproval {
     const METHOD: &'static str = "execCommandApproval";
+}
+
+impl Typed for ExecCommandApproval {
     type Params = types::ExecCommandApprovalParams;
 }
 
-impl Request for ExecCommandApproval {
+impl Answered for ExecCommandApproval {
     type Response = types::ExecCommandApprovalResponse;
 }
+
+impl Request for ExecCommandApproval {}
 
 impl ServerRequest for ExecCommandApproval {}
 
@@ -1672,12 +1424,17 @@ pub struct ItemCommandExecutionRequestApproval;
 
 impl Method for ItemCommandExecutionRequestApproval {
     const METHOD: &'static str = "item/commandExecution/requestApproval";
+}
+
+impl Typed for ItemCommandExecutionRequestApproval {
     type Params = types::CommandExecutionRequestApprovalParams;
 }
 
-impl Request for ItemCommandExecutionRequestApproval {
+impl Answered for ItemCommandExecutionRequestApproval {
     type Response = types::CommandExecutionRequestApprovalResponse;
 }
+
+impl Request for ItemCommandExecutionRequestApproval {}
 
 impl ServerRequest for ItemCommandExecutionRequestApproval {}
 
@@ -1687,12 +1444,17 @@ pub struct ItemFileChangeRequestApproval;
 
 impl Method for ItemFileChangeRequestApproval {
     const METHOD: &'static str = "item/fileChange/requestApproval";
+}
+
+impl Typed for ItemFileChangeRequestApproval {
     type Params = types::FileChangeRequestApprovalParams;
 }
 
-impl Request for ItemFileChangeRequestApproval {
+impl Answered for ItemFileChangeRequestApproval {
     type Response = types::FileChangeRequestApprovalResponse;
 }
+
+impl Request for ItemFileChangeRequestApproval {}
 
 impl ServerRequest for ItemFileChangeRequestApproval {}
 
@@ -1702,12 +1464,17 @@ pub struct ItemPermissionsRequestApproval;
 
 impl Method for ItemPermissionsRequestApproval {
     const METHOD: &'static str = "item/permissions/requestApproval";
+}
+
+impl Typed for ItemPermissionsRequestApproval {
     type Params = types::PermissionsRequestApprovalParams;
 }
 
-impl Request for ItemPermissionsRequestApproval {
+impl Answered for ItemPermissionsRequestApproval {
     type Response = types::PermissionsRequestApprovalResponse;
 }
+
+impl Request for ItemPermissionsRequestApproval {}
 
 impl ServerRequest for ItemPermissionsRequestApproval {}
 
@@ -1717,12 +1484,9 @@ pub struct ItemToolCall;
 
 impl Method for ItemToolCall {
     const METHOD: &'static str = "item/tool/call";
-    type Params = types::DynamicToolCallParams;
 }
 
-impl Request for ItemToolCall {
-    type Response = types::DynamicToolCallResponse;
-}
+impl Request for ItemToolCall {}
 
 impl ServerRequest for ItemToolCall {}
 
@@ -1732,12 +1496,17 @@ pub struct ItemToolRequestUserInput;
 
 impl Method for ItemToolRequestUserInput {
     const METHOD: &'static str = "item/tool/requestUserInput";
+}
+
+impl Typed for ItemToolRequestUserInput {
     type Params = types::ToolRequestUserInputParams;
 }
 
-impl Request for ItemToolRequestUserInput {
+impl Answered for ItemToolRequestUserInput {
     type Response = types::ToolRequestUserInputResponse;
 }
+
+impl Request for ItemToolRequestUserInput {}
 
 impl ServerRequest for ItemToolRequestUserInput {}
 
@@ -1747,12 +1516,17 @@ pub struct McpServerElicitationRequest;
 
 impl Method for McpServerElicitationRequest {
     const METHOD: &'static str = "mcpServer/elicitation/request";
+}
+
+impl Typed for McpServerElicitationRequest {
     type Params = types::McpServerElicitationRequestParams;
 }
 
-impl Request for McpServerElicitationRequest {
+impl Answered for McpServerElicitationRequest {
     type Response = types::McpServerElicitationRequestResponse;
 }
+
+impl Request for McpServerElicitationRequest {}
 
 impl ServerRequest for McpServerElicitationRequest {}
 
@@ -1762,7 +1536,6 @@ pub struct AccountGatewayOAuthChanged;
 
 impl Method for AccountGatewayOAuthChanged {
     const METHOD: &'static str = "account/gatewayOAuth/changed";
-    type Params = types::GatewayOAuthChangedNotification;
 }
 
 impl Notification for AccountGatewayOAuthChanged {}
@@ -1775,7 +1548,6 @@ pub struct AccountLoginCompleted;
 
 impl Method for AccountLoginCompleted {
     const METHOD: &'static str = "account/login/completed";
-    type Params = types::AccountLoginCompletedNotification;
 }
 
 impl Notification for AccountLoginCompleted {}
@@ -1788,7 +1560,6 @@ pub struct AccountRateLimitsUpdated;
 
 impl Method for AccountRateLimitsUpdated {
     const METHOD: &'static str = "account/rateLimits/updated";
-    type Params = types::AccountRateLimitsUpdatedNotification;
 }
 
 impl Notification for AccountRateLimitsUpdated {}
@@ -1801,7 +1572,6 @@ pub struct AccountUpdated;
 
 impl Method for AccountUpdated {
     const METHOD: &'static str = "account/updated";
-    type Params = types::AccountUpdatedNotification;
 }
 
 impl Notification for AccountUpdated {}
@@ -1814,7 +1584,6 @@ pub struct AppListUpdated;
 
 impl Method for AppListUpdated {
     const METHOD: &'static str = "app/list/updated";
-    type Params = types::AppListUpdatedNotification;
 }
 
 impl Notification for AppListUpdated {}
@@ -1827,7 +1596,6 @@ pub struct AutoApprovalReviewStrictReviewRequired;
 
 impl Method for AutoApprovalReviewStrictReviewRequired {
     const METHOD: &'static str = "autoApprovalReview/strictReviewRequired";
-    type Params = types::StrictReviewRequiredNotification;
 }
 
 impl Notification for AutoApprovalReviewStrictReviewRequired {}
@@ -1840,7 +1608,6 @@ pub struct CommandExecOutputDelta;
 
 impl Method for CommandExecOutputDelta {
     const METHOD: &'static str = "command/exec/outputDelta";
-    type Params = types::CommandExecOutputDeltaNotification;
 }
 
 impl Notification for CommandExecOutputDelta {}
@@ -1853,6 +1620,9 @@ pub struct ConfigWarning;
 
 impl Method for ConfigWarning {
     const METHOD: &'static str = "configWarning";
+}
+
+impl Typed for ConfigWarning {
     type Params = types::ConfigWarningNotification;
 }
 
@@ -1866,6 +1636,9 @@ pub struct DeprecationNotice;
 
 impl Method for DeprecationNotice {
     const METHOD: &'static str = "deprecationNotice";
+}
+
+impl Typed for DeprecationNotice {
     type Params = types::DeprecationNoticeNotification;
 }
 
@@ -1879,6 +1652,9 @@ pub struct Error;
 
 impl Method for Error {
     const METHOD: &'static str = "error";
+}
+
+impl Typed for Error {
     type Params = types::ErrorNotification;
 }
 
@@ -1892,7 +1668,6 @@ pub struct ExternalAgentConfigImportCompleted;
 
 impl Method for ExternalAgentConfigImportCompleted {
     const METHOD: &'static str = "externalAgentConfig/import/completed";
-    type Params = types::ExternalAgentConfigImportCompletedNotification;
 }
 
 impl Notification for ExternalAgentConfigImportCompleted {}
@@ -1905,7 +1680,6 @@ pub struct ExternalAgentConfigImportProgress;
 
 impl Method for ExternalAgentConfigImportProgress {
     const METHOD: &'static str = "externalAgentConfig/import/progress";
-    type Params = types::ExternalAgentConfigImportProgressNotification;
 }
 
 impl Notification for ExternalAgentConfigImportProgress {}
@@ -1918,7 +1692,6 @@ pub struct FsChanged;
 
 impl Method for FsChanged {
     const METHOD: &'static str = "fs/changed";
-    type Params = types::FsChangedNotification;
 }
 
 impl Notification for FsChanged {}
@@ -1931,7 +1704,6 @@ pub struct FuzzyFileSearchSessionCompleted;
 
 impl Method for FuzzyFileSearchSessionCompleted {
     const METHOD: &'static str = "fuzzyFileSearch/sessionCompleted";
-    type Params = types::FuzzyFileSearchSessionCompletedNotification;
 }
 
 impl Notification for FuzzyFileSearchSessionCompleted {}
@@ -1944,7 +1716,6 @@ pub struct FuzzyFileSearchSessionUpdated;
 
 impl Method for FuzzyFileSearchSessionUpdated {
     const METHOD: &'static str = "fuzzyFileSearch/sessionUpdated";
-    type Params = types::FuzzyFileSearchSessionUpdatedNotification;
 }
 
 impl Notification for FuzzyFileSearchSessionUpdated {}
@@ -1957,7 +1728,6 @@ pub struct GuardianWarning;
 
 impl Method for GuardianWarning {
     const METHOD: &'static str = "guardianWarning";
-    type Params = types::GuardianWarningNotification;
 }
 
 impl Notification for GuardianWarning {}
@@ -1970,7 +1740,6 @@ pub struct HookCompleted;
 
 impl Method for HookCompleted {
     const METHOD: &'static str = "hook/completed";
-    type Params = types::HookCompletedNotification;
 }
 
 impl Notification for HookCompleted {}
@@ -1983,7 +1752,6 @@ pub struct HookStarted;
 
 impl Method for HookStarted {
     const METHOD: &'static str = "hook/started";
-    type Params = types::HookStartedNotification;
 }
 
 impl Notification for HookStarted {}
@@ -1996,7 +1764,6 @@ pub struct ItemAgentMessageDelta;
 
 impl Method for ItemAgentMessageDelta {
     const METHOD: &'static str = "item/agentMessage/delta";
-    type Params = types::AgentMessageDeltaNotification;
 }
 
 impl Notification for ItemAgentMessageDelta {}
@@ -2009,7 +1776,6 @@ pub struct ItemAutoApprovalReviewCompleted;
 
 impl Method for ItemAutoApprovalReviewCompleted {
     const METHOD: &'static str = "item/autoApprovalReview/completed";
-    type Params = types::ItemGuardianApprovalReviewCompletedNotification;
 }
 
 impl Notification for ItemAutoApprovalReviewCompleted {}
@@ -2022,7 +1788,6 @@ pub struct ItemAutoApprovalReviewStarted;
 
 impl Method for ItemAutoApprovalReviewStarted {
     const METHOD: &'static str = "item/autoApprovalReview/started";
-    type Params = types::ItemGuardianApprovalReviewStartedNotification;
 }
 
 impl Notification for ItemAutoApprovalReviewStarted {}
@@ -2035,7 +1800,6 @@ pub struct ItemCommandExecutionOutputDelta;
 
 impl Method for ItemCommandExecutionOutputDelta {
     const METHOD: &'static str = "item/commandExecution/outputDelta";
-    type Params = types::CommandExecutionOutputDeltaNotification;
 }
 
 impl Notification for ItemCommandExecutionOutputDelta {}
@@ -2048,7 +1812,6 @@ pub struct ItemCommandExecutionTerminalInteraction;
 
 impl Method for ItemCommandExecutionTerminalInteraction {
     const METHOD: &'static str = "item/commandExecution/terminalInteraction";
-    type Params = types::TerminalInteractionNotification;
 }
 
 impl Notification for ItemCommandExecutionTerminalInteraction {}
@@ -2061,6 +1824,9 @@ pub struct ItemCompleted;
 
 impl Method for ItemCompleted {
     const METHOD: &'static str = "item/completed";
+}
+
+impl Typed for ItemCompleted {
     type Params = types::ItemCompletedNotification;
 }
 
@@ -2074,7 +1840,6 @@ pub struct ItemFileChangeOutputDelta;
 
 impl Method for ItemFileChangeOutputDelta {
     const METHOD: &'static str = "item/fileChange/outputDelta";
-    type Params = types::FileChangeOutputDeltaNotification;
 }
 
 impl Notification for ItemFileChangeOutputDelta {}
@@ -2087,7 +1852,6 @@ pub struct ItemFileChangePatchUpdated;
 
 impl Method for ItemFileChangePatchUpdated {
     const METHOD: &'static str = "item/fileChange/patchUpdated";
-    type Params = types::FileChangePatchUpdatedNotification;
 }
 
 impl Notification for ItemFileChangePatchUpdated {}
@@ -2100,7 +1864,6 @@ pub struct ItemMcpToolCallProgress;
 
 impl Method for ItemMcpToolCallProgress {
     const METHOD: &'static str = "item/mcpToolCall/progress";
-    type Params = types::McpToolCallProgressNotification;
 }
 
 impl Notification for ItemMcpToolCallProgress {}
@@ -2113,7 +1876,6 @@ pub struct ItemPlanDelta;
 
 impl Method for ItemPlanDelta {
     const METHOD: &'static str = "item/plan/delta";
-    type Params = types::PlanDeltaNotification;
 }
 
 impl Notification for ItemPlanDelta {}
@@ -2126,7 +1888,6 @@ pub struct ItemReasoningSummaryPartAdded;
 
 impl Method for ItemReasoningSummaryPartAdded {
     const METHOD: &'static str = "item/reasoning/summaryPartAdded";
-    type Params = types::ReasoningSummaryPartAddedNotification;
 }
 
 impl Notification for ItemReasoningSummaryPartAdded {}
@@ -2139,7 +1900,6 @@ pub struct ItemReasoningSummaryTextDelta;
 
 impl Method for ItemReasoningSummaryTextDelta {
     const METHOD: &'static str = "item/reasoning/summaryTextDelta";
-    type Params = types::ReasoningSummaryTextDeltaNotification;
 }
 
 impl Notification for ItemReasoningSummaryTextDelta {}
@@ -2152,7 +1912,6 @@ pub struct ItemReasoningTextDelta;
 
 impl Method for ItemReasoningTextDelta {
     const METHOD: &'static str = "item/reasoning/textDelta";
-    type Params = types::ReasoningTextDeltaNotification;
 }
 
 impl Notification for ItemReasoningTextDelta {}
@@ -2165,7 +1924,6 @@ pub struct ItemStarted;
 
 impl Method for ItemStarted {
     const METHOD: &'static str = "item/started";
-    type Params = types::ItemStartedNotification;
 }
 
 impl Notification for ItemStarted {}
@@ -2178,7 +1936,6 @@ pub struct McpServerEventStreamNotification;
 
 impl Method for McpServerEventStreamNotification {
     const METHOD: &'static str = "mcpServer/event/stream/notification";
-    type Params = types::McpServerEventStreamNotification;
 }
 
 impl Notification for McpServerEventStreamNotification {}
@@ -2191,7 +1948,6 @@ pub struct McpServerOauthLoginCompleted;
 
 impl Method for McpServerOauthLoginCompleted {
     const METHOD: &'static str = "mcpServer/oauthLogin/completed";
-    type Params = types::McpServerOauthLoginCompletedNotification;
 }
 
 impl Notification for McpServerOauthLoginCompleted {}
@@ -2204,7 +1960,6 @@ pub struct McpServerStartupStatusUpdated;
 
 impl Method for McpServerStartupStatusUpdated {
     const METHOD: &'static str = "mcpServer/startupStatus/updated";
-    type Params = types::McpServerStatusUpdatedNotification;
 }
 
 impl Notification for McpServerStartupStatusUpdated {}
@@ -2217,6 +1972,9 @@ pub struct ModelRerouted;
 
 impl Method for ModelRerouted {
     const METHOD: &'static str = "model/rerouted";
+}
+
+impl Typed for ModelRerouted {
     type Params = types::ModelReroutedNotification;
 }
 
@@ -2230,7 +1988,6 @@ pub struct ModelSafetyBufferingUpdated;
 
 impl Method for ModelSafetyBufferingUpdated {
     const METHOD: &'static str = "model/safetyBuffering/updated";
-    type Params = types::ModelSafetyBufferingUpdatedNotification;
 }
 
 impl Notification for ModelSafetyBufferingUpdated {}
@@ -2243,7 +2000,6 @@ pub struct ModelVerification;
 
 impl Method for ModelVerification {
     const METHOD: &'static str = "model/verification";
-    type Params = types::ModelVerificationNotification;
 }
 
 impl Notification for ModelVerification {}
@@ -2256,7 +2012,6 @@ pub struct ModelProviderAuthRecoveryCompleted;
 
 impl Method for ModelProviderAuthRecoveryCompleted {
     const METHOD: &'static str = "modelProvider/authRecoveryCompleted";
-    type Params = types::AuthRecoveryNotification;
 }
 
 impl Notification for ModelProviderAuthRecoveryCompleted {}
@@ -2269,7 +2024,6 @@ pub struct ModelProviderAuthRecoveryStarted;
 
 impl Method for ModelProviderAuthRecoveryStarted {
     const METHOD: &'static str = "modelProvider/authRecoveryStarted";
-    type Params = types::AuthRecoveryNotification;
 }
 
 impl Notification for ModelProviderAuthRecoveryStarted {}
@@ -2282,7 +2036,6 @@ pub struct ProcessExited;
 
 impl Method for ProcessExited {
     const METHOD: &'static str = "process/exited";
-    type Params = types::ProcessExitedNotification;
 }
 
 impl Notification for ProcessExited {}
@@ -2295,7 +2048,6 @@ pub struct ProcessOutputDelta;
 
 impl Method for ProcessOutputDelta {
     const METHOD: &'static str = "process/outputDelta";
-    type Params = types::ProcessOutputDeltaNotification;
 }
 
 impl Notification for ProcessOutputDelta {}
@@ -2308,7 +2060,6 @@ pub struct ProjectChanged;
 
 impl Method for ProjectChanged {
     const METHOD: &'static str = "project/changed";
-    type Params = types::ProjectChangedNotification;
 }
 
 impl Notification for ProjectChanged {}
@@ -2321,7 +2072,6 @@ pub struct RemoteControlStatusChanged;
 
 impl Method for RemoteControlStatusChanged {
     const METHOD: &'static str = "remoteControl/status/changed";
-    type Params = types::RemoteControlStatusChangedNotification;
 }
 
 impl Notification for RemoteControlStatusChanged {}
@@ -2334,7 +2084,6 @@ pub struct ServerRequestResolved;
 
 impl Method for ServerRequestResolved {
     const METHOD: &'static str = "serverRequest/resolved";
-    type Params = types::ServerRequestResolvedNotification;
 }
 
 impl Notification for ServerRequestResolved {}
@@ -2347,7 +2096,6 @@ pub struct SkillsChanged;
 
 impl Method for SkillsChanged {
     const METHOD: &'static str = "skills/changed";
-    type Params = types::SkillsChangedNotification;
 }
 
 impl Notification for SkillsChanged {}
@@ -2360,7 +2108,6 @@ pub struct ThreadArchived;
 
 impl Method for ThreadArchived {
     const METHOD: &'static str = "thread/archived";
-    type Params = types::ThreadArchivedNotification;
 }
 
 impl Notification for ThreadArchived {}
@@ -2373,7 +2120,6 @@ pub struct ThreadAttachmentUpdated;
 
 impl Method for ThreadAttachmentUpdated {
     const METHOD: &'static str = "thread/attachment/updated";
-    type Params = types::ThreadAttachmentUpdatedNotification;
 }
 
 impl Notification for ThreadAttachmentUpdated {}
@@ -2386,7 +2132,6 @@ pub struct ThreadClosed;
 
 impl Method for ThreadClosed {
     const METHOD: &'static str = "thread/closed";
-    type Params = types::ThreadClosedNotification;
 }
 
 impl Notification for ThreadClosed {}
@@ -2399,7 +2144,6 @@ pub struct ThreadCompacted;
 
 impl Method for ThreadCompacted {
     const METHOD: &'static str = "thread/compacted";
-    type Params = types::ContextCompactedNotification;
 }
 
 impl Notification for ThreadCompacted {}
@@ -2412,7 +2156,6 @@ pub struct ThreadDeleted;
 
 impl Method for ThreadDeleted {
     const METHOD: &'static str = "thread/deleted";
-    type Params = types::ThreadDeletedNotification;
 }
 
 impl Notification for ThreadDeleted {}
@@ -2425,7 +2168,6 @@ pub struct ThreadEnvironmentConnected;
 
 impl Method for ThreadEnvironmentConnected {
     const METHOD: &'static str = "thread/environment/connected";
-    type Params = types::EnvironmentConnectionNotification;
 }
 
 impl Notification for ThreadEnvironmentConnected {}
@@ -2438,7 +2180,6 @@ pub struct ThreadEnvironmentDisconnected;
 
 impl Method for ThreadEnvironmentDisconnected {
     const METHOD: &'static str = "thread/environment/disconnected";
-    type Params = types::EnvironmentConnectionNotification;
 }
 
 impl Notification for ThreadEnvironmentDisconnected {}
@@ -2451,7 +2192,6 @@ pub struct ThreadGoalCleared;
 
 impl Method for ThreadGoalCleared {
     const METHOD: &'static str = "thread/goal/cleared";
-    type Params = types::ThreadGoalClearedNotification;
 }
 
 impl Notification for ThreadGoalCleared {}
@@ -2464,7 +2204,6 @@ pub struct ThreadGoalUpdated;
 
 impl Method for ThreadGoalUpdated {
     const METHOD: &'static str = "thread/goal/updated";
-    type Params = types::ThreadGoalUpdatedNotification;
 }
 
 impl Notification for ThreadGoalUpdated {}
@@ -2477,7 +2216,6 @@ pub struct ThreadNameUpdated;
 
 impl Method for ThreadNameUpdated {
     const METHOD: &'static str = "thread/name/updated";
-    type Params = types::ThreadNameUpdatedNotification;
 }
 
 impl Notification for ThreadNameUpdated {}
@@ -2490,7 +2228,6 @@ pub struct ThreadPredictionUpdated;
 
 impl Method for ThreadPredictionUpdated {
     const METHOD: &'static str = "thread/prediction/updated";
-    type Params = types::ThreadPredictionUpdatedNotification;
 }
 
 impl Notification for ThreadPredictionUpdated {}
@@ -2503,7 +2240,6 @@ pub struct ThreadProjectUpdated;
 
 impl Method for ThreadProjectUpdated {
     const METHOD: &'static str = "thread/project/updated";
-    type Params = types::ThreadProjectUpdatedNotification;
 }
 
 impl Notification for ThreadProjectUpdated {}
@@ -2516,7 +2252,6 @@ pub struct ThreadQueueChanged;
 
 impl Method for ThreadQueueChanged {
     const METHOD: &'static str = "thread/queue/changed";
-    type Params = types::ThreadQueueChangedNotification;
 }
 
 impl Notification for ThreadQueueChanged {}
@@ -2529,7 +2264,6 @@ pub struct ThreadRealtimeClosed;
 
 impl Method for ThreadRealtimeClosed {
     const METHOD: &'static str = "thread/realtime/closed";
-    type Params = types::ThreadRealtimeClosedNotification;
 }
 
 impl Notification for ThreadRealtimeClosed {}
@@ -2542,7 +2276,6 @@ pub struct ThreadRealtimeError;
 
 impl Method for ThreadRealtimeError {
     const METHOD: &'static str = "thread/realtime/error";
-    type Params = types::ThreadRealtimeErrorNotification;
 }
 
 impl Notification for ThreadRealtimeError {}
@@ -2555,7 +2288,6 @@ pub struct ThreadRealtimeItemCompleted;
 
 impl Method for ThreadRealtimeItemCompleted {
     const METHOD: &'static str = "thread/realtime/item/completed";
-    type Params = types::ThreadRealtimeItemCompletedNotification;
 }
 
 impl Notification for ThreadRealtimeItemCompleted {}
@@ -2568,7 +2300,6 @@ pub struct ThreadRealtimeItemStarted;
 
 impl Method for ThreadRealtimeItemStarted {
     const METHOD: &'static str = "thread/realtime/item/started";
-    type Params = types::ThreadRealtimeItemStartedNotification;
 }
 
 impl Notification for ThreadRealtimeItemStarted {}
@@ -2581,7 +2312,6 @@ pub struct ThreadRealtimeItemTranscriptDelta;
 
 impl Method for ThreadRealtimeItemTranscriptDelta {
     const METHOD: &'static str = "thread/realtime/item/transcript/delta";
-    type Params = types::ThreadRealtimeItemTranscriptDeltaNotification;
 }
 
 impl Notification for ThreadRealtimeItemTranscriptDelta {}
@@ -2594,7 +2324,6 @@ pub struct ThreadRealtimeItemAdded;
 
 impl Method for ThreadRealtimeItemAdded {
     const METHOD: &'static str = "thread/realtime/itemAdded";
-    type Params = types::ThreadRealtimeItemAddedNotification;
 }
 
 impl Notification for ThreadRealtimeItemAdded {}
@@ -2607,7 +2336,6 @@ pub struct ThreadRealtimeOutputAudioDelta;
 
 impl Method for ThreadRealtimeOutputAudioDelta {
     const METHOD: &'static str = "thread/realtime/outputAudio/delta";
-    type Params = types::ThreadRealtimeOutputAudioDeltaNotification;
 }
 
 impl Notification for ThreadRealtimeOutputAudioDelta {}
@@ -2620,7 +2348,6 @@ pub struct ThreadRealtimeSdp;
 
 impl Method for ThreadRealtimeSdp {
     const METHOD: &'static str = "thread/realtime/sdp";
-    type Params = types::ThreadRealtimeSdpNotification;
 }
 
 impl Notification for ThreadRealtimeSdp {}
@@ -2633,7 +2360,6 @@ pub struct ThreadRealtimeStarted;
 
 impl Method for ThreadRealtimeStarted {
     const METHOD: &'static str = "thread/realtime/started";
-    type Params = types::ThreadRealtimeStartedNotification;
 }
 
 impl Notification for ThreadRealtimeStarted {}
@@ -2646,7 +2372,6 @@ pub struct ThreadRealtimeTranscriptDelta;
 
 impl Method for ThreadRealtimeTranscriptDelta {
     const METHOD: &'static str = "thread/realtime/transcript/delta";
-    type Params = types::ThreadRealtimeTranscriptDeltaNotification;
 }
 
 impl Notification for ThreadRealtimeTranscriptDelta {}
@@ -2659,7 +2384,6 @@ pub struct ThreadRealtimeTranscriptDone;
 
 impl Method for ThreadRealtimeTranscriptDone {
     const METHOD: &'static str = "thread/realtime/transcript/done";
-    type Params = types::ThreadRealtimeTranscriptDoneNotification;
 }
 
 impl Notification for ThreadRealtimeTranscriptDone {}
@@ -2672,7 +2396,6 @@ pub struct ThreadReverted;
 
 impl Method for ThreadReverted {
     const METHOD: &'static str = "thread/reverted";
-    type Params = types::ThreadRevertedNotification;
 }
 
 impl Notification for ThreadReverted {}
@@ -2685,7 +2408,6 @@ pub struct ThreadSettingsUpdated;
 
 impl Method for ThreadSettingsUpdated {
     const METHOD: &'static str = "thread/settings/updated";
-    type Params = types::ThreadSettingsUpdatedNotification;
 }
 
 impl Notification for ThreadSettingsUpdated {}
@@ -2698,7 +2420,6 @@ pub struct ThreadStarted;
 
 impl Method for ThreadStarted {
     const METHOD: &'static str = "thread/started";
-    type Params = types::ThreadStartedNotification;
 }
 
 impl Notification for ThreadStarted {}
@@ -2711,7 +2432,6 @@ pub struct ThreadStatusChanged;
 
 impl Method for ThreadStatusChanged {
     const METHOD: &'static str = "thread/status/changed";
-    type Params = types::ThreadStatusChangedNotification;
 }
 
 impl Notification for ThreadStatusChanged {}
@@ -2724,6 +2444,9 @@ pub struct ThreadTokenUsageUpdated;
 
 impl Method for ThreadTokenUsageUpdated {
     const METHOD: &'static str = "thread/tokenUsage/updated";
+}
+
+impl Typed for ThreadTokenUsageUpdated {
     type Params = types::ThreadTokenUsageUpdatedNotification;
 }
 
@@ -2737,7 +2460,6 @@ pub struct ThreadUnarchived;
 
 impl Method for ThreadUnarchived {
     const METHOD: &'static str = "thread/unarchived";
-    type Params = types::ThreadUnarchivedNotification;
 }
 
 impl Notification for ThreadUnarchived {}
@@ -2750,6 +2472,9 @@ pub struct TurnCompleted;
 
 impl Method for TurnCompleted {
     const METHOD: &'static str = "turn/completed";
+}
+
+impl Typed for TurnCompleted {
     type Params = types::TurnCompletedNotification;
 }
 
@@ -2763,7 +2488,6 @@ pub struct TurnDiffUpdated;
 
 impl Method for TurnDiffUpdated {
     const METHOD: &'static str = "turn/diff/updated";
-    type Params = types::TurnDiffUpdatedNotification;
 }
 
 impl Notification for TurnDiffUpdated {}
@@ -2776,7 +2500,6 @@ pub struct TurnModerationMetadata;
 
 impl Method for TurnModerationMetadata {
     const METHOD: &'static str = "turn/moderationMetadata";
-    type Params = types::TurnModerationMetadataNotification;
 }
 
 impl Notification for TurnModerationMetadata {}
@@ -2789,7 +2512,6 @@ pub struct TurnPlanUpdated;
 
 impl Method for TurnPlanUpdated {
     const METHOD: &'static str = "turn/plan/updated";
-    type Params = types::TurnPlanUpdatedNotification;
 }
 
 impl Notification for TurnPlanUpdated {}
@@ -2802,6 +2524,9 @@ pub struct TurnStarted;
 
 impl Method for TurnStarted {
     const METHOD: &'static str = "turn/started";
+}
+
+impl Typed for TurnStarted {
     type Params = types::TurnStartedNotification;
 }
 
@@ -2815,6 +2540,9 @@ pub struct Warning;
 
 impl Method for Warning {
     const METHOD: &'static str = "warning";
+}
+
+impl Typed for Warning {
     type Params = types::WarningNotification;
 }
 
@@ -2828,7 +2556,6 @@ pub struct WindowsWorldWritableWarning;
 
 impl Method for WindowsWorldWritableWarning {
     const METHOD: &'static str = "windows/worldWritableWarning";
-    type Params = types::WindowsWorldWritableWarningNotification;
 }
 
 impl Notification for WindowsWorldWritableWarning {}
@@ -2841,226 +2568,226 @@ pub struct WindowsSandboxSetupCompleted;
 
 impl Method for WindowsSandboxSetupCompleted {
     const METHOD: &'static str = "windowsSandbox/setupCompleted";
-    type Params = types::WindowsSandboxSetupCompletedNotification;
 }
 
 impl Notification for WindowsSandboxSetupCompleted {}
 
 impl ServerNotification for WindowsSandboxSetupCompleted {}
 
-/// A request the client sends, classified by its method, with its parameters not yet decoded.
+/// A request the client sends, classified by its method, with the parameters of one agentmux decodes not yet
+/// decoded.
 #[derive(Debug, Clone, Copy)]
 pub enum AnyClientRequest<'a> {
-    /// `account/gatewayOAuth/cancel`.
-    AccountGatewayOAuthCancel(Payload<'a, AccountGatewayOAuthCancel>),
-    /// `account/gatewayOAuth/login`.
-    AccountGatewayOAuthLogin(Payload<'a, AccountGatewayOAuthLogin>),
-    /// `account/gatewayOAuth/read`.
-    AccountGatewayOAuthRead(Payload<'a, AccountGatewayOAuthRead>),
-    /// `account/login/cancel`.
-    AccountLoginCancel(Payload<'a, AccountLoginCancel>),
-    /// `account/login/start`.
-    AccountLoginStart(Payload<'a, AccountLoginStart>),
-    /// `account/logout`.
-    AccountLogout(Payload<'a, AccountLogout>),
-    /// `account/rateLimitResetCredit/consume`.
-    AccountRateLimitResetCreditConsume(Payload<'a, AccountRateLimitResetCreditConsume>),
+    /// `account/gatewayOAuth/cancel`, which agentmux does not decode.
+    AccountGatewayOAuthCancel,
+    /// `account/gatewayOAuth/login`, which agentmux does not decode.
+    AccountGatewayOAuthLogin,
+    /// `account/gatewayOAuth/read`, which agentmux does not decode.
+    AccountGatewayOAuthRead,
+    /// `account/login/cancel`, which agentmux does not decode.
+    AccountLoginCancel,
+    /// `account/login/start`, which agentmux does not decode.
+    AccountLoginStart,
+    /// `account/logout`, which agentmux does not decode.
+    AccountLogout,
+    /// `account/rateLimitResetCredit/consume`, which agentmux does not decode.
+    AccountRateLimitResetCreditConsume,
     /// `account/rateLimits/read`.
     AccountRateLimitsRead(Payload<'a, AccountRateLimitsRead>),
-    /// `account/read`.
-    AccountRead(Payload<'a, AccountRead>),
-    /// `account/sendAddCreditsNudgeEmail`.
-    AccountSendAddCreditsNudgeEmail(Payload<'a, AccountSendAddCreditsNudgeEmail>),
-    /// `account/usage/read`.
-    AccountUsageRead(Payload<'a, AccountUsageRead>),
-    /// `account/workspaceMessages/read`.
-    AccountWorkspaceMessagesRead(Payload<'a, AccountWorkspaceMessagesRead>),
-    /// `app/installed`.
-    AppInstalled(Payload<'a, AppInstalled>),
-    /// `app/list`.
-    AppList(Payload<'a, AppList>),
-    /// `app/read`.
-    AppRead(Payload<'a, AppRead>),
-    /// `command/exec`.
-    CommandExec(Payload<'a, CommandExec>),
-    /// `command/exec/resize`.
-    CommandExecResize(Payload<'a, CommandExecResize>),
-    /// `command/exec/terminate`.
-    CommandExecTerminate(Payload<'a, CommandExecTerminate>),
-    /// `command/exec/write`.
-    CommandExecWrite(Payload<'a, CommandExecWrite>),
-    /// `config/batchWrite`.
-    ConfigBatchWrite(Payload<'a, ConfigBatchWrite>),
-    /// `config/mcpServer/reload`.
-    ConfigMcpServerReload(Payload<'a, ConfigMcpServerReload>),
-    /// `config/read`.
-    ConfigRead(Payload<'a, ConfigRead>),
-    /// `config/value/write`.
-    ConfigValueWrite(Payload<'a, ConfigValueWrite>),
-    /// `configRequirements/read`.
-    ConfigRequirementsRead(Payload<'a, ConfigRequirementsRead>),
-    /// `experimentalFeature/enablement/set`.
-    ExperimentalFeatureEnablementSet(Payload<'a, ExperimentalFeatureEnablementSet>),
-    /// `experimentalFeature/list`.
-    ExperimentalFeatureList(Payload<'a, ExperimentalFeatureList>),
-    /// `externalAgentConfig/detect`.
-    ExternalAgentConfigDetect(Payload<'a, ExternalAgentConfigDetect>),
-    /// `externalAgentConfig/import`.
-    ExternalAgentConfigImport(Payload<'a, ExternalAgentConfigImport>),
-    /// `externalAgentConfig/import/readHistories`.
-    ExternalAgentConfigImportReadHistories(Payload<'a, ExternalAgentConfigImportReadHistories>),
-    /// `externalAgentConfig/import/recordHistory`.
-    ExternalAgentConfigImportRecordHistory(Payload<'a, ExternalAgentConfigImportRecordHistory>),
-    /// `feedback/upload`.
-    FeedbackUpload(Payload<'a, FeedbackUpload>),
-    /// `fs/copy`.
-    FsCopy(Payload<'a, FsCopy>),
-    /// `fs/createDirectory`.
-    FsCreateDirectory(Payload<'a, FsCreateDirectory>),
-    /// `fs/getMetadata`.
-    FsGetMetadata(Payload<'a, FsGetMetadata>),
-    /// `fs/readDirectory`.
-    FsReadDirectory(Payload<'a, FsReadDirectory>),
-    /// `fs/readFile`.
-    FsReadFile(Payload<'a, FsReadFile>),
-    /// `fs/remove`.
-    FsRemove(Payload<'a, FsRemove>),
-    /// `fs/unwatch`.
-    FsUnwatch(Payload<'a, FsUnwatch>),
-    /// `fs/watch`.
-    FsWatch(Payload<'a, FsWatch>),
-    /// `fs/writeFile`.
-    FsWriteFile(Payload<'a, FsWriteFile>),
-    /// `fuzzyFileSearch`.
-    FuzzyFileSearch(Payload<'a, FuzzyFileSearch>),
-    /// `hooks/list`.
-    HooksList(Payload<'a, HooksList>),
+    /// `account/read`, which agentmux does not decode.
+    AccountRead,
+    /// `account/sendAddCreditsNudgeEmail`, which agentmux does not decode.
+    AccountSendAddCreditsNudgeEmail,
+    /// `account/usage/read`, which agentmux does not decode.
+    AccountUsageRead,
+    /// `account/workspaceMessages/read`, which agentmux does not decode.
+    AccountWorkspaceMessagesRead,
+    /// `app/installed`, which agentmux does not decode.
+    AppInstalled,
+    /// `app/list`, which agentmux does not decode.
+    AppList,
+    /// `app/read`, which agentmux does not decode.
+    AppRead,
+    /// `command/exec`, which agentmux does not decode.
+    CommandExec,
+    /// `command/exec/resize`, which agentmux does not decode.
+    CommandExecResize,
+    /// `command/exec/terminate`, which agentmux does not decode.
+    CommandExecTerminate,
+    /// `command/exec/write`, which agentmux does not decode.
+    CommandExecWrite,
+    /// `config/batchWrite`, which agentmux does not decode.
+    ConfigBatchWrite,
+    /// `config/mcpServer/reload`, which agentmux does not decode.
+    ConfigMcpServerReload,
+    /// `config/read`, which agentmux does not decode.
+    ConfigRead,
+    /// `config/value/write`, which agentmux does not decode.
+    ConfigValueWrite,
+    /// `configRequirements/read`, which agentmux does not decode.
+    ConfigRequirementsRead,
+    /// `experimentalFeature/enablement/set`, which agentmux does not decode.
+    ExperimentalFeatureEnablementSet,
+    /// `experimentalFeature/list`, which agentmux does not decode.
+    ExperimentalFeatureList,
+    /// `externalAgentConfig/detect`, which agentmux does not decode.
+    ExternalAgentConfigDetect,
+    /// `externalAgentConfig/import`, which agentmux does not decode.
+    ExternalAgentConfigImport,
+    /// `externalAgentConfig/import/readHistories`, which agentmux does not decode.
+    ExternalAgentConfigImportReadHistories,
+    /// `externalAgentConfig/import/recordHistory`, which agentmux does not decode.
+    ExternalAgentConfigImportRecordHistory,
+    /// `feedback/upload`, which agentmux does not decode.
+    FeedbackUpload,
+    /// `fs/copy`, which agentmux does not decode.
+    FsCopy,
+    /// `fs/createDirectory`, which agentmux does not decode.
+    FsCreateDirectory,
+    /// `fs/getMetadata`, which agentmux does not decode.
+    FsGetMetadata,
+    /// `fs/readDirectory`, which agentmux does not decode.
+    FsReadDirectory,
+    /// `fs/readFile`, which agentmux does not decode.
+    FsReadFile,
+    /// `fs/remove`, which agentmux does not decode.
+    FsRemove,
+    /// `fs/unwatch`, which agentmux does not decode.
+    FsUnwatch,
+    /// `fs/watch`, which agentmux does not decode.
+    FsWatch,
+    /// `fs/writeFile`, which agentmux does not decode.
+    FsWriteFile,
+    /// `fuzzyFileSearch`, which agentmux does not decode.
+    FuzzyFileSearch,
+    /// `hooks/list`, which agentmux does not decode.
+    HooksList,
     /// `initialize`.
     Initialize(Payload<'a, Initialize>),
-    /// `marketplace/add`.
-    MarketplaceAdd(Payload<'a, MarketplaceAdd>),
-    /// `marketplace/remove`.
-    MarketplaceRemove(Payload<'a, MarketplaceRemove>),
-    /// `marketplace/upgrade`.
-    MarketplaceUpgrade(Payload<'a, MarketplaceUpgrade>),
-    /// `mcpServer/oauth/login`.
-    McpServerOauthLogin(Payload<'a, McpServerOauthLogin>),
-    /// `mcpServer/resource/read`.
-    McpServerResourceRead(Payload<'a, McpServerResourceRead>),
-    /// `mcpServer/tool/call`.
-    McpServerToolCall(Payload<'a, McpServerToolCall>),
-    /// `mcpServerStatus/list`.
-    McpServerStatusList(Payload<'a, McpServerStatusList>),
-    /// `model/list`.
-    ModelList(Payload<'a, ModelList>),
-    /// `modelProvider/capabilities/read`.
-    ModelProviderCapabilitiesRead(Payload<'a, ModelProviderCapabilitiesRead>),
-    /// `permissionProfile/list`.
-    PermissionProfileList(Payload<'a, PermissionProfileList>),
-    /// `plugin/install`.
-    PluginInstall(Payload<'a, PluginInstall>),
-    /// `plugin/installed`.
-    PluginInstalled(Payload<'a, PluginInstalled>),
-    /// `plugin/list`.
-    PluginList(Payload<'a, PluginList>),
-    /// `plugin/read`.
-    PluginRead(Payload<'a, PluginRead>),
-    /// `plugin/reconcile`.
-    PluginReconcile(Payload<'a, PluginReconcile>),
-    /// `plugin/share/checkout`.
-    PluginShareCheckout(Payload<'a, PluginShareCheckout>),
-    /// `plugin/share/delete`.
-    PluginShareDelete(Payload<'a, PluginShareDelete>),
-    /// `plugin/share/list`.
-    PluginShareList(Payload<'a, PluginShareList>),
-    /// `plugin/share/save`.
-    PluginShareSave(Payload<'a, PluginShareSave>),
-    /// `plugin/share/updateTargets`.
-    PluginShareUpdateTargets(Payload<'a, PluginShareUpdateTargets>),
-    /// `plugin/skill/read`.
-    PluginSkillRead(Payload<'a, PluginSkillRead>),
-    /// `plugin/uninstall`.
-    PluginUninstall(Payload<'a, PluginUninstall>),
-    /// `review/start`.
-    ReviewStart(Payload<'a, ReviewStart>),
-    /// `skills/config/write`.
-    SkillsConfigWrite(Payload<'a, SkillsConfigWrite>),
-    /// `skills/extraRoots/set`.
-    SkillsExtraRootsSet(Payload<'a, SkillsExtraRootsSet>),
-    /// `skills/list`.
-    SkillsList(Payload<'a, SkillsList>),
-    /// `thread/approveGuardianDeniedAction`.
-    ThreadApproveGuardianDeniedAction(Payload<'a, ThreadApproveGuardianDeniedAction>),
-    /// `thread/archive`.
-    ThreadArchive(Payload<'a, ThreadArchive>),
-    /// `thread/attachment/add`.
-    ThreadAttachmentAdd(Payload<'a, ThreadAttachmentAdd>),
-    /// `thread/attachment/list`.
-    ThreadAttachmentList(Payload<'a, ThreadAttachmentList>),
-    /// `thread/attachment/remove`.
-    ThreadAttachmentRemove(Payload<'a, ThreadAttachmentRemove>),
-    /// `thread/attachmentOwner/list`.
-    ThreadAttachmentOwnerList(Payload<'a, ThreadAttachmentOwnerList>),
-    /// `thread/compact/start`.
-    ThreadCompactStart(Payload<'a, ThreadCompactStart>),
-    /// `thread/delete`.
-    ThreadDelete(Payload<'a, ThreadDelete>),
-    /// `thread/fork`.
-    ThreadFork(Payload<'a, ThreadFork>),
-    /// `thread/goal/clear`.
-    ThreadGoalClear(Payload<'a, ThreadGoalClear>),
-    /// `thread/goal/get`.
-    ThreadGoalGet(Payload<'a, ThreadGoalGet>),
-    /// `thread/goal/set`.
-    ThreadGoalSet(Payload<'a, ThreadGoalSet>),
-    /// `thread/inject_items`.
-    ThreadInjectItems(Payload<'a, ThreadInjectItems>),
-    /// `thread/items/list`.
-    ThreadItemsList(Payload<'a, ThreadItemsList>),
-    /// `thread/list`.
-    ThreadList(Payload<'a, ThreadList>),
-    /// `thread/loaded/list`.
-    ThreadLoadedList(Payload<'a, ThreadLoadedList>),
-    /// `thread/metadata/update`.
-    ThreadMetadataUpdate(Payload<'a, ThreadMetadataUpdate>),
-    /// `thread/name/set`.
-    ThreadNameSet(Payload<'a, ThreadNameSet>),
-    /// `thread/read`.
-    ThreadRead(Payload<'a, ThreadRead>),
+    /// `marketplace/add`, which agentmux does not decode.
+    MarketplaceAdd,
+    /// `marketplace/remove`, which agentmux does not decode.
+    MarketplaceRemove,
+    /// `marketplace/upgrade`, which agentmux does not decode.
+    MarketplaceUpgrade,
+    /// `mcpServer/oauth/login`, which agentmux does not decode.
+    McpServerOauthLogin,
+    /// `mcpServer/resource/read`, which agentmux does not decode.
+    McpServerResourceRead,
+    /// `mcpServer/tool/call`, which agentmux does not decode.
+    McpServerToolCall,
+    /// `mcpServerStatus/list`, which agentmux does not decode.
+    McpServerStatusList,
+    /// `model/list`, which agentmux does not decode.
+    ModelList,
+    /// `modelProvider/capabilities/read`, which agentmux does not decode.
+    ModelProviderCapabilitiesRead,
+    /// `permissionProfile/list`, which agentmux does not decode.
+    PermissionProfileList,
+    /// `plugin/install`, which agentmux does not decode.
+    PluginInstall,
+    /// `plugin/installed`, which agentmux does not decode.
+    PluginInstalled,
+    /// `plugin/list`, which agentmux does not decode.
+    PluginList,
+    /// `plugin/read`, which agentmux does not decode.
+    PluginRead,
+    /// `plugin/reconcile`, which agentmux does not decode.
+    PluginReconcile,
+    /// `plugin/share/checkout`, which agentmux does not decode.
+    PluginShareCheckout,
+    /// `plugin/share/delete`, which agentmux does not decode.
+    PluginShareDelete,
+    /// `plugin/share/list`, which agentmux does not decode.
+    PluginShareList,
+    /// `plugin/share/save`, which agentmux does not decode.
+    PluginShareSave,
+    /// `plugin/share/updateTargets`, which agentmux does not decode.
+    PluginShareUpdateTargets,
+    /// `plugin/skill/read`, which agentmux does not decode.
+    PluginSkillRead,
+    /// `plugin/uninstall`, which agentmux does not decode.
+    PluginUninstall,
+    /// `review/start`, which agentmux does not decode.
+    ReviewStart,
+    /// `skills/config/write`, which agentmux does not decode.
+    SkillsConfigWrite,
+    /// `skills/extraRoots/set`, which agentmux does not decode.
+    SkillsExtraRootsSet,
+    /// `skills/list`, which agentmux does not decode.
+    SkillsList,
+    /// `thread/approveGuardianDeniedAction`, which agentmux does not decode.
+    ThreadApproveGuardianDeniedAction,
+    /// `thread/archive`, which agentmux does not decode.
+    ThreadArchive,
+    /// `thread/attachment/add`, which agentmux does not decode.
+    ThreadAttachmentAdd,
+    /// `thread/attachment/list`, which agentmux does not decode.
+    ThreadAttachmentList,
+    /// `thread/attachment/remove`, which agentmux does not decode.
+    ThreadAttachmentRemove,
+    /// `thread/attachmentOwner/list`, which agentmux does not decode.
+    ThreadAttachmentOwnerList,
+    /// `thread/compact/start`, which agentmux does not decode.
+    ThreadCompactStart,
+    /// `thread/delete`, which agentmux does not decode.
+    ThreadDelete,
+    /// `thread/fork`, which agentmux does not decode.
+    ThreadFork,
+    /// `thread/goal/clear`, which agentmux does not decode.
+    ThreadGoalClear,
+    /// `thread/goal/get`, which agentmux does not decode.
+    ThreadGoalGet,
+    /// `thread/goal/set`, which agentmux does not decode.
+    ThreadGoalSet,
+    /// `thread/inject_items`, which agentmux does not decode.
+    ThreadInjectItems,
+    /// `thread/items/list`, which agentmux does not decode.
+    ThreadItemsList,
+    /// `thread/list`, which agentmux does not decode.
+    ThreadList,
+    /// `thread/loaded/list`, which agentmux does not decode.
+    ThreadLoadedList,
+    /// `thread/metadata/update`, which agentmux does not decode.
+    ThreadMetadataUpdate,
+    /// `thread/name/set`, which agentmux does not decode.
+    ThreadNameSet,
+    /// `thread/read`, which agentmux does not decode.
+    ThreadRead,
     /// `thread/resume`.
     ThreadResume(Payload<'a, ThreadResume>),
-    /// `thread/revert`.
-    ThreadRevert(Payload<'a, ThreadRevert>),
-    /// `thread/section/move`.
-    ThreadSectionMove(Payload<'a, ThreadSectionMove>),
-    /// `thread/shellCommand`.
-    ThreadShellCommand(Payload<'a, ThreadShellCommand>),
+    /// `thread/revert`, which agentmux does not decode.
+    ThreadRevert,
+    /// `thread/section/move`, which agentmux does not decode.
+    ThreadSectionMove,
+    /// `thread/shellCommand`, which agentmux does not decode.
+    ThreadShellCommand,
     /// `thread/start`.
     ThreadStart(Payload<'a, ThreadStart>),
-    /// `thread/turns/list`.
-    ThreadTurnsList(Payload<'a, ThreadTurnsList>),
-    /// `thread/unarchive`.
-    ThreadUnarchive(Payload<'a, ThreadUnarchive>),
-    /// `thread/unsubscribe`.
-    ThreadUnsubscribe(Payload<'a, ThreadUnsubscribe>),
-    /// `threadSection/create`.
-    ThreadSectionCreate(Payload<'a, ThreadSectionCreate>),
-    /// `threadSection/delete`.
-    ThreadSectionDelete(Payload<'a, ThreadSectionDelete>),
-    /// `threadSection/list`.
-    ThreadSectionList(Payload<'a, ThreadSectionList>),
-    /// `threadSection/update`.
-    ThreadSectionUpdate(Payload<'a, ThreadSectionUpdate>),
+    /// `thread/turns/list`, which agentmux does not decode.
+    ThreadTurnsList,
+    /// `thread/unarchive`, which agentmux does not decode.
+    ThreadUnarchive,
+    /// `thread/unsubscribe`, which agentmux does not decode.
+    ThreadUnsubscribe,
+    /// `threadSection/create`, which agentmux does not decode.
+    ThreadSectionCreate,
+    /// `threadSection/delete`, which agentmux does not decode.
+    ThreadSectionDelete,
+    /// `threadSection/list`, which agentmux does not decode.
+    ThreadSectionList,
+    /// `threadSection/update`, which agentmux does not decode.
+    ThreadSectionUpdate,
     /// `turn/interrupt`.
     TurnInterrupt(Payload<'a, TurnInterrupt>),
     /// `turn/start`.
     TurnStart(Payload<'a, TurnStart>),
     /// `turn/steer`.
     TurnSteer(Payload<'a, TurnSteer>),
-    /// `windowsSandbox/readiness`.
-    WindowsSandboxReadiness(Payload<'a, WindowsSandboxReadiness>),
-    /// `windowsSandbox/setupStart`.
-    WindowsSandboxSetupStart(Payload<'a, WindowsSandboxSetupStart>),
+    /// `windowsSandbox/readiness`, which agentmux does not decode.
+    WindowsSandboxReadiness,
+    /// `windowsSandbox/setupStart`, which agentmux does not decode.
+    WindowsSandboxSetupStart,
 }
 
 impl<'a> AnyClientRequest<'a> {
@@ -3069,111 +2796,111 @@ impl<'a> AnyClientRequest<'a> {
     #[must_use]
     pub fn classify(method: &str, params: &'a Value) -> Option<Self> {
         Some(match method {
-            AccountGatewayOAuthCancel::METHOD => Self::AccountGatewayOAuthCancel(Payload::new(params)),
-            AccountGatewayOAuthLogin::METHOD => Self::AccountGatewayOAuthLogin(Payload::new(params)),
-            AccountGatewayOAuthRead::METHOD => Self::AccountGatewayOAuthRead(Payload::new(params)),
-            AccountLoginCancel::METHOD => Self::AccountLoginCancel(Payload::new(params)),
-            AccountLoginStart::METHOD => Self::AccountLoginStart(Payload::new(params)),
-            AccountLogout::METHOD => Self::AccountLogout(Payload::new(params)),
-            AccountRateLimitResetCreditConsume::METHOD => Self::AccountRateLimitResetCreditConsume(Payload::new(params)),
+            AccountGatewayOAuthCancel::METHOD => Self::AccountGatewayOAuthCancel,
+            AccountGatewayOAuthLogin::METHOD => Self::AccountGatewayOAuthLogin,
+            AccountGatewayOAuthRead::METHOD => Self::AccountGatewayOAuthRead,
+            AccountLoginCancel::METHOD => Self::AccountLoginCancel,
+            AccountLoginStart::METHOD => Self::AccountLoginStart,
+            AccountLogout::METHOD => Self::AccountLogout,
+            AccountRateLimitResetCreditConsume::METHOD => Self::AccountRateLimitResetCreditConsume,
             AccountRateLimitsRead::METHOD => Self::AccountRateLimitsRead(Payload::new(params)),
-            AccountRead::METHOD => Self::AccountRead(Payload::new(params)),
-            AccountSendAddCreditsNudgeEmail::METHOD => Self::AccountSendAddCreditsNudgeEmail(Payload::new(params)),
-            AccountUsageRead::METHOD => Self::AccountUsageRead(Payload::new(params)),
-            AccountWorkspaceMessagesRead::METHOD => Self::AccountWorkspaceMessagesRead(Payload::new(params)),
-            AppInstalled::METHOD => Self::AppInstalled(Payload::new(params)),
-            AppList::METHOD => Self::AppList(Payload::new(params)),
-            AppRead::METHOD => Self::AppRead(Payload::new(params)),
-            CommandExec::METHOD => Self::CommandExec(Payload::new(params)),
-            CommandExecResize::METHOD => Self::CommandExecResize(Payload::new(params)),
-            CommandExecTerminate::METHOD => Self::CommandExecTerminate(Payload::new(params)),
-            CommandExecWrite::METHOD => Self::CommandExecWrite(Payload::new(params)),
-            ConfigBatchWrite::METHOD => Self::ConfigBatchWrite(Payload::new(params)),
-            ConfigMcpServerReload::METHOD => Self::ConfigMcpServerReload(Payload::new(params)),
-            ConfigRead::METHOD => Self::ConfigRead(Payload::new(params)),
-            ConfigValueWrite::METHOD => Self::ConfigValueWrite(Payload::new(params)),
-            ConfigRequirementsRead::METHOD => Self::ConfigRequirementsRead(Payload::new(params)),
-            ExperimentalFeatureEnablementSet::METHOD => Self::ExperimentalFeatureEnablementSet(Payload::new(params)),
-            ExperimentalFeatureList::METHOD => Self::ExperimentalFeatureList(Payload::new(params)),
-            ExternalAgentConfigDetect::METHOD => Self::ExternalAgentConfigDetect(Payload::new(params)),
-            ExternalAgentConfigImport::METHOD => Self::ExternalAgentConfigImport(Payload::new(params)),
-            ExternalAgentConfigImportReadHistories::METHOD => Self::ExternalAgentConfigImportReadHistories(Payload::new(params)),
-            ExternalAgentConfigImportRecordHistory::METHOD => Self::ExternalAgentConfigImportRecordHistory(Payload::new(params)),
-            FeedbackUpload::METHOD => Self::FeedbackUpload(Payload::new(params)),
-            FsCopy::METHOD => Self::FsCopy(Payload::new(params)),
-            FsCreateDirectory::METHOD => Self::FsCreateDirectory(Payload::new(params)),
-            FsGetMetadata::METHOD => Self::FsGetMetadata(Payload::new(params)),
-            FsReadDirectory::METHOD => Self::FsReadDirectory(Payload::new(params)),
-            FsReadFile::METHOD => Self::FsReadFile(Payload::new(params)),
-            FsRemove::METHOD => Self::FsRemove(Payload::new(params)),
-            FsUnwatch::METHOD => Self::FsUnwatch(Payload::new(params)),
-            FsWatch::METHOD => Self::FsWatch(Payload::new(params)),
-            FsWriteFile::METHOD => Self::FsWriteFile(Payload::new(params)),
-            FuzzyFileSearch::METHOD => Self::FuzzyFileSearch(Payload::new(params)),
-            HooksList::METHOD => Self::HooksList(Payload::new(params)),
+            AccountRead::METHOD => Self::AccountRead,
+            AccountSendAddCreditsNudgeEmail::METHOD => Self::AccountSendAddCreditsNudgeEmail,
+            AccountUsageRead::METHOD => Self::AccountUsageRead,
+            AccountWorkspaceMessagesRead::METHOD => Self::AccountWorkspaceMessagesRead,
+            AppInstalled::METHOD => Self::AppInstalled,
+            AppList::METHOD => Self::AppList,
+            AppRead::METHOD => Self::AppRead,
+            CommandExec::METHOD => Self::CommandExec,
+            CommandExecResize::METHOD => Self::CommandExecResize,
+            CommandExecTerminate::METHOD => Self::CommandExecTerminate,
+            CommandExecWrite::METHOD => Self::CommandExecWrite,
+            ConfigBatchWrite::METHOD => Self::ConfigBatchWrite,
+            ConfigMcpServerReload::METHOD => Self::ConfigMcpServerReload,
+            ConfigRead::METHOD => Self::ConfigRead,
+            ConfigValueWrite::METHOD => Self::ConfigValueWrite,
+            ConfigRequirementsRead::METHOD => Self::ConfigRequirementsRead,
+            ExperimentalFeatureEnablementSet::METHOD => Self::ExperimentalFeatureEnablementSet,
+            ExperimentalFeatureList::METHOD => Self::ExperimentalFeatureList,
+            ExternalAgentConfigDetect::METHOD => Self::ExternalAgentConfigDetect,
+            ExternalAgentConfigImport::METHOD => Self::ExternalAgentConfigImport,
+            ExternalAgentConfigImportReadHistories::METHOD => Self::ExternalAgentConfigImportReadHistories,
+            ExternalAgentConfigImportRecordHistory::METHOD => Self::ExternalAgentConfigImportRecordHistory,
+            FeedbackUpload::METHOD => Self::FeedbackUpload,
+            FsCopy::METHOD => Self::FsCopy,
+            FsCreateDirectory::METHOD => Self::FsCreateDirectory,
+            FsGetMetadata::METHOD => Self::FsGetMetadata,
+            FsReadDirectory::METHOD => Self::FsReadDirectory,
+            FsReadFile::METHOD => Self::FsReadFile,
+            FsRemove::METHOD => Self::FsRemove,
+            FsUnwatch::METHOD => Self::FsUnwatch,
+            FsWatch::METHOD => Self::FsWatch,
+            FsWriteFile::METHOD => Self::FsWriteFile,
+            FuzzyFileSearch::METHOD => Self::FuzzyFileSearch,
+            HooksList::METHOD => Self::HooksList,
             Initialize::METHOD => Self::Initialize(Payload::new(params)),
-            MarketplaceAdd::METHOD => Self::MarketplaceAdd(Payload::new(params)),
-            MarketplaceRemove::METHOD => Self::MarketplaceRemove(Payload::new(params)),
-            MarketplaceUpgrade::METHOD => Self::MarketplaceUpgrade(Payload::new(params)),
-            McpServerOauthLogin::METHOD => Self::McpServerOauthLogin(Payload::new(params)),
-            McpServerResourceRead::METHOD => Self::McpServerResourceRead(Payload::new(params)),
-            McpServerToolCall::METHOD => Self::McpServerToolCall(Payload::new(params)),
-            McpServerStatusList::METHOD => Self::McpServerStatusList(Payload::new(params)),
-            ModelList::METHOD => Self::ModelList(Payload::new(params)),
-            ModelProviderCapabilitiesRead::METHOD => Self::ModelProviderCapabilitiesRead(Payload::new(params)),
-            PermissionProfileList::METHOD => Self::PermissionProfileList(Payload::new(params)),
-            PluginInstall::METHOD => Self::PluginInstall(Payload::new(params)),
-            PluginInstalled::METHOD => Self::PluginInstalled(Payload::new(params)),
-            PluginList::METHOD => Self::PluginList(Payload::new(params)),
-            PluginRead::METHOD => Self::PluginRead(Payload::new(params)),
-            PluginReconcile::METHOD => Self::PluginReconcile(Payload::new(params)),
-            PluginShareCheckout::METHOD => Self::PluginShareCheckout(Payload::new(params)),
-            PluginShareDelete::METHOD => Self::PluginShareDelete(Payload::new(params)),
-            PluginShareList::METHOD => Self::PluginShareList(Payload::new(params)),
-            PluginShareSave::METHOD => Self::PluginShareSave(Payload::new(params)),
-            PluginShareUpdateTargets::METHOD => Self::PluginShareUpdateTargets(Payload::new(params)),
-            PluginSkillRead::METHOD => Self::PluginSkillRead(Payload::new(params)),
-            PluginUninstall::METHOD => Self::PluginUninstall(Payload::new(params)),
-            ReviewStart::METHOD => Self::ReviewStart(Payload::new(params)),
-            SkillsConfigWrite::METHOD => Self::SkillsConfigWrite(Payload::new(params)),
-            SkillsExtraRootsSet::METHOD => Self::SkillsExtraRootsSet(Payload::new(params)),
-            SkillsList::METHOD => Self::SkillsList(Payload::new(params)),
-            ThreadApproveGuardianDeniedAction::METHOD => Self::ThreadApproveGuardianDeniedAction(Payload::new(params)),
-            ThreadArchive::METHOD => Self::ThreadArchive(Payload::new(params)),
-            ThreadAttachmentAdd::METHOD => Self::ThreadAttachmentAdd(Payload::new(params)),
-            ThreadAttachmentList::METHOD => Self::ThreadAttachmentList(Payload::new(params)),
-            ThreadAttachmentRemove::METHOD => Self::ThreadAttachmentRemove(Payload::new(params)),
-            ThreadAttachmentOwnerList::METHOD => Self::ThreadAttachmentOwnerList(Payload::new(params)),
-            ThreadCompactStart::METHOD => Self::ThreadCompactStart(Payload::new(params)),
-            ThreadDelete::METHOD => Self::ThreadDelete(Payload::new(params)),
-            ThreadFork::METHOD => Self::ThreadFork(Payload::new(params)),
-            ThreadGoalClear::METHOD => Self::ThreadGoalClear(Payload::new(params)),
-            ThreadGoalGet::METHOD => Self::ThreadGoalGet(Payload::new(params)),
-            ThreadGoalSet::METHOD => Self::ThreadGoalSet(Payload::new(params)),
-            ThreadInjectItems::METHOD => Self::ThreadInjectItems(Payload::new(params)),
-            ThreadItemsList::METHOD => Self::ThreadItemsList(Payload::new(params)),
-            ThreadList::METHOD => Self::ThreadList(Payload::new(params)),
-            ThreadLoadedList::METHOD => Self::ThreadLoadedList(Payload::new(params)),
-            ThreadMetadataUpdate::METHOD => Self::ThreadMetadataUpdate(Payload::new(params)),
-            ThreadNameSet::METHOD => Self::ThreadNameSet(Payload::new(params)),
-            ThreadRead::METHOD => Self::ThreadRead(Payload::new(params)),
+            MarketplaceAdd::METHOD => Self::MarketplaceAdd,
+            MarketplaceRemove::METHOD => Self::MarketplaceRemove,
+            MarketplaceUpgrade::METHOD => Self::MarketplaceUpgrade,
+            McpServerOauthLogin::METHOD => Self::McpServerOauthLogin,
+            McpServerResourceRead::METHOD => Self::McpServerResourceRead,
+            McpServerToolCall::METHOD => Self::McpServerToolCall,
+            McpServerStatusList::METHOD => Self::McpServerStatusList,
+            ModelList::METHOD => Self::ModelList,
+            ModelProviderCapabilitiesRead::METHOD => Self::ModelProviderCapabilitiesRead,
+            PermissionProfileList::METHOD => Self::PermissionProfileList,
+            PluginInstall::METHOD => Self::PluginInstall,
+            PluginInstalled::METHOD => Self::PluginInstalled,
+            PluginList::METHOD => Self::PluginList,
+            PluginRead::METHOD => Self::PluginRead,
+            PluginReconcile::METHOD => Self::PluginReconcile,
+            PluginShareCheckout::METHOD => Self::PluginShareCheckout,
+            PluginShareDelete::METHOD => Self::PluginShareDelete,
+            PluginShareList::METHOD => Self::PluginShareList,
+            PluginShareSave::METHOD => Self::PluginShareSave,
+            PluginShareUpdateTargets::METHOD => Self::PluginShareUpdateTargets,
+            PluginSkillRead::METHOD => Self::PluginSkillRead,
+            PluginUninstall::METHOD => Self::PluginUninstall,
+            ReviewStart::METHOD => Self::ReviewStart,
+            SkillsConfigWrite::METHOD => Self::SkillsConfigWrite,
+            SkillsExtraRootsSet::METHOD => Self::SkillsExtraRootsSet,
+            SkillsList::METHOD => Self::SkillsList,
+            ThreadApproveGuardianDeniedAction::METHOD => Self::ThreadApproveGuardianDeniedAction,
+            ThreadArchive::METHOD => Self::ThreadArchive,
+            ThreadAttachmentAdd::METHOD => Self::ThreadAttachmentAdd,
+            ThreadAttachmentList::METHOD => Self::ThreadAttachmentList,
+            ThreadAttachmentRemove::METHOD => Self::ThreadAttachmentRemove,
+            ThreadAttachmentOwnerList::METHOD => Self::ThreadAttachmentOwnerList,
+            ThreadCompactStart::METHOD => Self::ThreadCompactStart,
+            ThreadDelete::METHOD => Self::ThreadDelete,
+            ThreadFork::METHOD => Self::ThreadFork,
+            ThreadGoalClear::METHOD => Self::ThreadGoalClear,
+            ThreadGoalGet::METHOD => Self::ThreadGoalGet,
+            ThreadGoalSet::METHOD => Self::ThreadGoalSet,
+            ThreadInjectItems::METHOD => Self::ThreadInjectItems,
+            ThreadItemsList::METHOD => Self::ThreadItemsList,
+            ThreadList::METHOD => Self::ThreadList,
+            ThreadLoadedList::METHOD => Self::ThreadLoadedList,
+            ThreadMetadataUpdate::METHOD => Self::ThreadMetadataUpdate,
+            ThreadNameSet::METHOD => Self::ThreadNameSet,
+            ThreadRead::METHOD => Self::ThreadRead,
             ThreadResume::METHOD => Self::ThreadResume(Payload::new(params)),
-            ThreadRevert::METHOD => Self::ThreadRevert(Payload::new(params)),
-            ThreadSectionMove::METHOD => Self::ThreadSectionMove(Payload::new(params)),
-            ThreadShellCommand::METHOD => Self::ThreadShellCommand(Payload::new(params)),
+            ThreadRevert::METHOD => Self::ThreadRevert,
+            ThreadSectionMove::METHOD => Self::ThreadSectionMove,
+            ThreadShellCommand::METHOD => Self::ThreadShellCommand,
             ThreadStart::METHOD => Self::ThreadStart(Payload::new(params)),
-            ThreadTurnsList::METHOD => Self::ThreadTurnsList(Payload::new(params)),
-            ThreadUnarchive::METHOD => Self::ThreadUnarchive(Payload::new(params)),
-            ThreadUnsubscribe::METHOD => Self::ThreadUnsubscribe(Payload::new(params)),
-            ThreadSectionCreate::METHOD => Self::ThreadSectionCreate(Payload::new(params)),
-            ThreadSectionDelete::METHOD => Self::ThreadSectionDelete(Payload::new(params)),
-            ThreadSectionList::METHOD => Self::ThreadSectionList(Payload::new(params)),
-            ThreadSectionUpdate::METHOD => Self::ThreadSectionUpdate(Payload::new(params)),
+            ThreadTurnsList::METHOD => Self::ThreadTurnsList,
+            ThreadUnarchive::METHOD => Self::ThreadUnarchive,
+            ThreadUnsubscribe::METHOD => Self::ThreadUnsubscribe,
+            ThreadSectionCreate::METHOD => Self::ThreadSectionCreate,
+            ThreadSectionDelete::METHOD => Self::ThreadSectionDelete,
+            ThreadSectionList::METHOD => Self::ThreadSectionList,
+            ThreadSectionUpdate::METHOD => Self::ThreadSectionUpdate,
             TurnInterrupt::METHOD => Self::TurnInterrupt(Payload::new(params)),
             TurnStart::METHOD => Self::TurnStart(Payload::new(params)),
             TurnSteer::METHOD => Self::TurnSteer(Payload::new(params)),
-            WindowsSandboxReadiness::METHOD => Self::WindowsSandboxReadiness(Payload::new(params)),
-            WindowsSandboxSetupStart::METHOD => Self::WindowsSandboxSetupStart(Payload::new(params)),
+            WindowsSandboxReadiness::METHOD => Self::WindowsSandboxReadiness,
+            WindowsSandboxSetupStart::METHOD => Self::WindowsSandboxSetupStart,
             _ => return None,
         })
     }
@@ -3182,116 +2909,117 @@ impl<'a> AnyClientRequest<'a> {
     #[must_use]
     pub fn method(self) -> &'static str {
         match self {
-            Self::AccountGatewayOAuthCancel(_) => AccountGatewayOAuthCancel::METHOD,
-            Self::AccountGatewayOAuthLogin(_) => AccountGatewayOAuthLogin::METHOD,
-            Self::AccountGatewayOAuthRead(_) => AccountGatewayOAuthRead::METHOD,
-            Self::AccountLoginCancel(_) => AccountLoginCancel::METHOD,
-            Self::AccountLoginStart(_) => AccountLoginStart::METHOD,
-            Self::AccountLogout(_) => AccountLogout::METHOD,
-            Self::AccountRateLimitResetCreditConsume(_) => AccountRateLimitResetCreditConsume::METHOD,
+            Self::AccountGatewayOAuthCancel => AccountGatewayOAuthCancel::METHOD,
+            Self::AccountGatewayOAuthLogin => AccountGatewayOAuthLogin::METHOD,
+            Self::AccountGatewayOAuthRead => AccountGatewayOAuthRead::METHOD,
+            Self::AccountLoginCancel => AccountLoginCancel::METHOD,
+            Self::AccountLoginStart => AccountLoginStart::METHOD,
+            Self::AccountLogout => AccountLogout::METHOD,
+            Self::AccountRateLimitResetCreditConsume => AccountRateLimitResetCreditConsume::METHOD,
             Self::AccountRateLimitsRead(_) => AccountRateLimitsRead::METHOD,
-            Self::AccountRead(_) => AccountRead::METHOD,
-            Self::AccountSendAddCreditsNudgeEmail(_) => AccountSendAddCreditsNudgeEmail::METHOD,
-            Self::AccountUsageRead(_) => AccountUsageRead::METHOD,
-            Self::AccountWorkspaceMessagesRead(_) => AccountWorkspaceMessagesRead::METHOD,
-            Self::AppInstalled(_) => AppInstalled::METHOD,
-            Self::AppList(_) => AppList::METHOD,
-            Self::AppRead(_) => AppRead::METHOD,
-            Self::CommandExec(_) => CommandExec::METHOD,
-            Self::CommandExecResize(_) => CommandExecResize::METHOD,
-            Self::CommandExecTerminate(_) => CommandExecTerminate::METHOD,
-            Self::CommandExecWrite(_) => CommandExecWrite::METHOD,
-            Self::ConfigBatchWrite(_) => ConfigBatchWrite::METHOD,
-            Self::ConfigMcpServerReload(_) => ConfigMcpServerReload::METHOD,
-            Self::ConfigRead(_) => ConfigRead::METHOD,
-            Self::ConfigValueWrite(_) => ConfigValueWrite::METHOD,
-            Self::ConfigRequirementsRead(_) => ConfigRequirementsRead::METHOD,
-            Self::ExperimentalFeatureEnablementSet(_) => ExperimentalFeatureEnablementSet::METHOD,
-            Self::ExperimentalFeatureList(_) => ExperimentalFeatureList::METHOD,
-            Self::ExternalAgentConfigDetect(_) => ExternalAgentConfigDetect::METHOD,
-            Self::ExternalAgentConfigImport(_) => ExternalAgentConfigImport::METHOD,
-            Self::ExternalAgentConfigImportReadHistories(_) => ExternalAgentConfigImportReadHistories::METHOD,
-            Self::ExternalAgentConfigImportRecordHistory(_) => ExternalAgentConfigImportRecordHistory::METHOD,
-            Self::FeedbackUpload(_) => FeedbackUpload::METHOD,
-            Self::FsCopy(_) => FsCopy::METHOD,
-            Self::FsCreateDirectory(_) => FsCreateDirectory::METHOD,
-            Self::FsGetMetadata(_) => FsGetMetadata::METHOD,
-            Self::FsReadDirectory(_) => FsReadDirectory::METHOD,
-            Self::FsReadFile(_) => FsReadFile::METHOD,
-            Self::FsRemove(_) => FsRemove::METHOD,
-            Self::FsUnwatch(_) => FsUnwatch::METHOD,
-            Self::FsWatch(_) => FsWatch::METHOD,
-            Self::FsWriteFile(_) => FsWriteFile::METHOD,
-            Self::FuzzyFileSearch(_) => FuzzyFileSearch::METHOD,
-            Self::HooksList(_) => HooksList::METHOD,
+            Self::AccountRead => AccountRead::METHOD,
+            Self::AccountSendAddCreditsNudgeEmail => AccountSendAddCreditsNudgeEmail::METHOD,
+            Self::AccountUsageRead => AccountUsageRead::METHOD,
+            Self::AccountWorkspaceMessagesRead => AccountWorkspaceMessagesRead::METHOD,
+            Self::AppInstalled => AppInstalled::METHOD,
+            Self::AppList => AppList::METHOD,
+            Self::AppRead => AppRead::METHOD,
+            Self::CommandExec => CommandExec::METHOD,
+            Self::CommandExecResize => CommandExecResize::METHOD,
+            Self::CommandExecTerminate => CommandExecTerminate::METHOD,
+            Self::CommandExecWrite => CommandExecWrite::METHOD,
+            Self::ConfigBatchWrite => ConfigBatchWrite::METHOD,
+            Self::ConfigMcpServerReload => ConfigMcpServerReload::METHOD,
+            Self::ConfigRead => ConfigRead::METHOD,
+            Self::ConfigValueWrite => ConfigValueWrite::METHOD,
+            Self::ConfigRequirementsRead => ConfigRequirementsRead::METHOD,
+            Self::ExperimentalFeatureEnablementSet => ExperimentalFeatureEnablementSet::METHOD,
+            Self::ExperimentalFeatureList => ExperimentalFeatureList::METHOD,
+            Self::ExternalAgentConfigDetect => ExternalAgentConfigDetect::METHOD,
+            Self::ExternalAgentConfigImport => ExternalAgentConfigImport::METHOD,
+            Self::ExternalAgentConfigImportReadHistories => ExternalAgentConfigImportReadHistories::METHOD,
+            Self::ExternalAgentConfigImportRecordHistory => ExternalAgentConfigImportRecordHistory::METHOD,
+            Self::FeedbackUpload => FeedbackUpload::METHOD,
+            Self::FsCopy => FsCopy::METHOD,
+            Self::FsCreateDirectory => FsCreateDirectory::METHOD,
+            Self::FsGetMetadata => FsGetMetadata::METHOD,
+            Self::FsReadDirectory => FsReadDirectory::METHOD,
+            Self::FsReadFile => FsReadFile::METHOD,
+            Self::FsRemove => FsRemove::METHOD,
+            Self::FsUnwatch => FsUnwatch::METHOD,
+            Self::FsWatch => FsWatch::METHOD,
+            Self::FsWriteFile => FsWriteFile::METHOD,
+            Self::FuzzyFileSearch => FuzzyFileSearch::METHOD,
+            Self::HooksList => HooksList::METHOD,
             Self::Initialize(_) => Initialize::METHOD,
-            Self::MarketplaceAdd(_) => MarketplaceAdd::METHOD,
-            Self::MarketplaceRemove(_) => MarketplaceRemove::METHOD,
-            Self::MarketplaceUpgrade(_) => MarketplaceUpgrade::METHOD,
-            Self::McpServerOauthLogin(_) => McpServerOauthLogin::METHOD,
-            Self::McpServerResourceRead(_) => McpServerResourceRead::METHOD,
-            Self::McpServerToolCall(_) => McpServerToolCall::METHOD,
-            Self::McpServerStatusList(_) => McpServerStatusList::METHOD,
-            Self::ModelList(_) => ModelList::METHOD,
-            Self::ModelProviderCapabilitiesRead(_) => ModelProviderCapabilitiesRead::METHOD,
-            Self::PermissionProfileList(_) => PermissionProfileList::METHOD,
-            Self::PluginInstall(_) => PluginInstall::METHOD,
-            Self::PluginInstalled(_) => PluginInstalled::METHOD,
-            Self::PluginList(_) => PluginList::METHOD,
-            Self::PluginRead(_) => PluginRead::METHOD,
-            Self::PluginReconcile(_) => PluginReconcile::METHOD,
-            Self::PluginShareCheckout(_) => PluginShareCheckout::METHOD,
-            Self::PluginShareDelete(_) => PluginShareDelete::METHOD,
-            Self::PluginShareList(_) => PluginShareList::METHOD,
-            Self::PluginShareSave(_) => PluginShareSave::METHOD,
-            Self::PluginShareUpdateTargets(_) => PluginShareUpdateTargets::METHOD,
-            Self::PluginSkillRead(_) => PluginSkillRead::METHOD,
-            Self::PluginUninstall(_) => PluginUninstall::METHOD,
-            Self::ReviewStart(_) => ReviewStart::METHOD,
-            Self::SkillsConfigWrite(_) => SkillsConfigWrite::METHOD,
-            Self::SkillsExtraRootsSet(_) => SkillsExtraRootsSet::METHOD,
-            Self::SkillsList(_) => SkillsList::METHOD,
-            Self::ThreadApproveGuardianDeniedAction(_) => ThreadApproveGuardianDeniedAction::METHOD,
-            Self::ThreadArchive(_) => ThreadArchive::METHOD,
-            Self::ThreadAttachmentAdd(_) => ThreadAttachmentAdd::METHOD,
-            Self::ThreadAttachmentList(_) => ThreadAttachmentList::METHOD,
-            Self::ThreadAttachmentRemove(_) => ThreadAttachmentRemove::METHOD,
-            Self::ThreadAttachmentOwnerList(_) => ThreadAttachmentOwnerList::METHOD,
-            Self::ThreadCompactStart(_) => ThreadCompactStart::METHOD,
-            Self::ThreadDelete(_) => ThreadDelete::METHOD,
-            Self::ThreadFork(_) => ThreadFork::METHOD,
-            Self::ThreadGoalClear(_) => ThreadGoalClear::METHOD,
-            Self::ThreadGoalGet(_) => ThreadGoalGet::METHOD,
-            Self::ThreadGoalSet(_) => ThreadGoalSet::METHOD,
-            Self::ThreadInjectItems(_) => ThreadInjectItems::METHOD,
-            Self::ThreadItemsList(_) => ThreadItemsList::METHOD,
-            Self::ThreadList(_) => ThreadList::METHOD,
-            Self::ThreadLoadedList(_) => ThreadLoadedList::METHOD,
-            Self::ThreadMetadataUpdate(_) => ThreadMetadataUpdate::METHOD,
-            Self::ThreadNameSet(_) => ThreadNameSet::METHOD,
-            Self::ThreadRead(_) => ThreadRead::METHOD,
+            Self::MarketplaceAdd => MarketplaceAdd::METHOD,
+            Self::MarketplaceRemove => MarketplaceRemove::METHOD,
+            Self::MarketplaceUpgrade => MarketplaceUpgrade::METHOD,
+            Self::McpServerOauthLogin => McpServerOauthLogin::METHOD,
+            Self::McpServerResourceRead => McpServerResourceRead::METHOD,
+            Self::McpServerToolCall => McpServerToolCall::METHOD,
+            Self::McpServerStatusList => McpServerStatusList::METHOD,
+            Self::ModelList => ModelList::METHOD,
+            Self::ModelProviderCapabilitiesRead => ModelProviderCapabilitiesRead::METHOD,
+            Self::PermissionProfileList => PermissionProfileList::METHOD,
+            Self::PluginInstall => PluginInstall::METHOD,
+            Self::PluginInstalled => PluginInstalled::METHOD,
+            Self::PluginList => PluginList::METHOD,
+            Self::PluginRead => PluginRead::METHOD,
+            Self::PluginReconcile => PluginReconcile::METHOD,
+            Self::PluginShareCheckout => PluginShareCheckout::METHOD,
+            Self::PluginShareDelete => PluginShareDelete::METHOD,
+            Self::PluginShareList => PluginShareList::METHOD,
+            Self::PluginShareSave => PluginShareSave::METHOD,
+            Self::PluginShareUpdateTargets => PluginShareUpdateTargets::METHOD,
+            Self::PluginSkillRead => PluginSkillRead::METHOD,
+            Self::PluginUninstall => PluginUninstall::METHOD,
+            Self::ReviewStart => ReviewStart::METHOD,
+            Self::SkillsConfigWrite => SkillsConfigWrite::METHOD,
+            Self::SkillsExtraRootsSet => SkillsExtraRootsSet::METHOD,
+            Self::SkillsList => SkillsList::METHOD,
+            Self::ThreadApproveGuardianDeniedAction => ThreadApproveGuardianDeniedAction::METHOD,
+            Self::ThreadArchive => ThreadArchive::METHOD,
+            Self::ThreadAttachmentAdd => ThreadAttachmentAdd::METHOD,
+            Self::ThreadAttachmentList => ThreadAttachmentList::METHOD,
+            Self::ThreadAttachmentRemove => ThreadAttachmentRemove::METHOD,
+            Self::ThreadAttachmentOwnerList => ThreadAttachmentOwnerList::METHOD,
+            Self::ThreadCompactStart => ThreadCompactStart::METHOD,
+            Self::ThreadDelete => ThreadDelete::METHOD,
+            Self::ThreadFork => ThreadFork::METHOD,
+            Self::ThreadGoalClear => ThreadGoalClear::METHOD,
+            Self::ThreadGoalGet => ThreadGoalGet::METHOD,
+            Self::ThreadGoalSet => ThreadGoalSet::METHOD,
+            Self::ThreadInjectItems => ThreadInjectItems::METHOD,
+            Self::ThreadItemsList => ThreadItemsList::METHOD,
+            Self::ThreadList => ThreadList::METHOD,
+            Self::ThreadLoadedList => ThreadLoadedList::METHOD,
+            Self::ThreadMetadataUpdate => ThreadMetadataUpdate::METHOD,
+            Self::ThreadNameSet => ThreadNameSet::METHOD,
+            Self::ThreadRead => ThreadRead::METHOD,
             Self::ThreadResume(_) => ThreadResume::METHOD,
-            Self::ThreadRevert(_) => ThreadRevert::METHOD,
-            Self::ThreadSectionMove(_) => ThreadSectionMove::METHOD,
-            Self::ThreadShellCommand(_) => ThreadShellCommand::METHOD,
+            Self::ThreadRevert => ThreadRevert::METHOD,
+            Self::ThreadSectionMove => ThreadSectionMove::METHOD,
+            Self::ThreadShellCommand => ThreadShellCommand::METHOD,
             Self::ThreadStart(_) => ThreadStart::METHOD,
-            Self::ThreadTurnsList(_) => ThreadTurnsList::METHOD,
-            Self::ThreadUnarchive(_) => ThreadUnarchive::METHOD,
-            Self::ThreadUnsubscribe(_) => ThreadUnsubscribe::METHOD,
-            Self::ThreadSectionCreate(_) => ThreadSectionCreate::METHOD,
-            Self::ThreadSectionDelete(_) => ThreadSectionDelete::METHOD,
-            Self::ThreadSectionList(_) => ThreadSectionList::METHOD,
-            Self::ThreadSectionUpdate(_) => ThreadSectionUpdate::METHOD,
+            Self::ThreadTurnsList => ThreadTurnsList::METHOD,
+            Self::ThreadUnarchive => ThreadUnarchive::METHOD,
+            Self::ThreadUnsubscribe => ThreadUnsubscribe::METHOD,
+            Self::ThreadSectionCreate => ThreadSectionCreate::METHOD,
+            Self::ThreadSectionDelete => ThreadSectionDelete::METHOD,
+            Self::ThreadSectionList => ThreadSectionList::METHOD,
+            Self::ThreadSectionUpdate => ThreadSectionUpdate::METHOD,
             Self::TurnInterrupt(_) => TurnInterrupt::METHOD,
             Self::TurnStart(_) => TurnStart::METHOD,
             Self::TurnSteer(_) => TurnSteer::METHOD,
-            Self::WindowsSandboxReadiness(_) => WindowsSandboxReadiness::METHOD,
-            Self::WindowsSandboxSetupStart(_) => WindowsSandboxSetupStart::METHOD,
+            Self::WindowsSandboxReadiness => WindowsSandboxReadiness::METHOD,
+            Self::WindowsSandboxSetupStart => WindowsSandboxSetupStart::METHOD,
         }
     }
 }
 
-/// A notification the client sends, classified by its method, with its parameters not yet decoded.
+/// A notification the client sends, classified by its method, with the parameters of one agentmux decodes not yet
+/// decoded.
 #[derive(Debug, Clone, Copy)]
 pub enum AnyClientNotification<'a> {
     /// `initialized`.
@@ -3318,15 +3046,16 @@ impl<'a> AnyClientNotification<'a> {
     }
 }
 
-/// A request the server sends, classified by its method, with its parameters not yet decoded.
+/// A request the server sends, classified by its method, with the parameters of one agentmux decodes not yet
+/// decoded.
 #[derive(Debug, Clone, Copy)]
 pub enum AnyServerRequest<'a> {
-    /// `account/chatgptAuthTokens/refresh`.
-    AccountChatgptAuthTokensRefresh(Payload<'a, AccountChatgptAuthTokensRefresh>),
+    /// `account/chatgptAuthTokens/refresh`, which agentmux does not decode.
+    AccountChatgptAuthTokensRefresh,
     /// `applyPatchApproval`.
     ApplyPatchApproval(Payload<'a, ApplyPatchApproval>),
-    /// `attestation/generate`.
-    AttestationGenerate(Payload<'a, AttestationGenerate>),
+    /// `attestation/generate`, which agentmux does not decode.
+    AttestationGenerate,
     /// `execCommandApproval`.
     ExecCommandApproval(Payload<'a, ExecCommandApproval>),
     /// `item/commandExecution/requestApproval`.
@@ -3335,8 +3064,8 @@ pub enum AnyServerRequest<'a> {
     ItemFileChangeRequestApproval(Payload<'a, ItemFileChangeRequestApproval>),
     /// `item/permissions/requestApproval`.
     ItemPermissionsRequestApproval(Payload<'a, ItemPermissionsRequestApproval>),
-    /// `item/tool/call`.
-    ItemToolCall(Payload<'a, ItemToolCall>),
+    /// `item/tool/call`, which agentmux does not decode.
+    ItemToolCall,
     /// `item/tool/requestUserInput`.
     ItemToolRequestUserInput(Payload<'a, ItemToolRequestUserInput>),
     /// `mcpServer/elicitation/request`.
@@ -3349,14 +3078,14 @@ impl<'a> AnyServerRequest<'a> {
     #[must_use]
     pub fn classify(method: &str, params: &'a Value) -> Option<Self> {
         Some(match method {
-            AccountChatgptAuthTokensRefresh::METHOD => Self::AccountChatgptAuthTokensRefresh(Payload::new(params)),
+            AccountChatgptAuthTokensRefresh::METHOD => Self::AccountChatgptAuthTokensRefresh,
             ApplyPatchApproval::METHOD => Self::ApplyPatchApproval(Payload::new(params)),
-            AttestationGenerate::METHOD => Self::AttestationGenerate(Payload::new(params)),
+            AttestationGenerate::METHOD => Self::AttestationGenerate,
             ExecCommandApproval::METHOD => Self::ExecCommandApproval(Payload::new(params)),
             ItemCommandExecutionRequestApproval::METHOD => Self::ItemCommandExecutionRequestApproval(Payload::new(params)),
             ItemFileChangeRequestApproval::METHOD => Self::ItemFileChangeRequestApproval(Payload::new(params)),
             ItemPermissionsRequestApproval::METHOD => Self::ItemPermissionsRequestApproval(Payload::new(params)),
-            ItemToolCall::METHOD => Self::ItemToolCall(Payload::new(params)),
+            ItemToolCall::METHOD => Self::ItemToolCall,
             ItemToolRequestUserInput::METHOD => Self::ItemToolRequestUserInput(Payload::new(params)),
             McpServerElicitationRequest::METHOD => Self::McpServerElicitationRequest(Payload::new(params)),
             _ => return None,
@@ -3367,191 +3096,192 @@ impl<'a> AnyServerRequest<'a> {
     #[must_use]
     pub fn method(self) -> &'static str {
         match self {
-            Self::AccountChatgptAuthTokensRefresh(_) => AccountChatgptAuthTokensRefresh::METHOD,
+            Self::AccountChatgptAuthTokensRefresh => AccountChatgptAuthTokensRefresh::METHOD,
             Self::ApplyPatchApproval(_) => ApplyPatchApproval::METHOD,
-            Self::AttestationGenerate(_) => AttestationGenerate::METHOD,
+            Self::AttestationGenerate => AttestationGenerate::METHOD,
             Self::ExecCommandApproval(_) => ExecCommandApproval::METHOD,
             Self::ItemCommandExecutionRequestApproval(_) => ItemCommandExecutionRequestApproval::METHOD,
             Self::ItemFileChangeRequestApproval(_) => ItemFileChangeRequestApproval::METHOD,
             Self::ItemPermissionsRequestApproval(_) => ItemPermissionsRequestApproval::METHOD,
-            Self::ItemToolCall(_) => ItemToolCall::METHOD,
+            Self::ItemToolCall => ItemToolCall::METHOD,
             Self::ItemToolRequestUserInput(_) => ItemToolRequestUserInput::METHOD,
             Self::McpServerElicitationRequest(_) => McpServerElicitationRequest::METHOD,
         }
     }
 }
 
-/// A notification the server sends, classified by its method, with its parameters not yet decoded.
+/// A notification the server sends, classified by its method, with the parameters of one agentmux decodes not yet
+/// decoded.
 #[derive(Debug, Clone, Copy)]
 pub enum AnyServerNotification<'a> {
-    /// `account/gatewayOAuth/changed`.
-    AccountGatewayOAuthChanged(Payload<'a, AccountGatewayOAuthChanged>),
-    /// `account/login/completed`.
-    AccountLoginCompleted(Payload<'a, AccountLoginCompleted>),
-    /// `account/rateLimits/updated`.
-    AccountRateLimitsUpdated(Payload<'a, AccountRateLimitsUpdated>),
-    /// `account/updated`.
-    AccountUpdated(Payload<'a, AccountUpdated>),
-    /// `app/list/updated`.
-    AppListUpdated(Payload<'a, AppListUpdated>),
-    /// `autoApprovalReview/strictReviewRequired`.
-    AutoApprovalReviewStrictReviewRequired(Payload<'a, AutoApprovalReviewStrictReviewRequired>),
-    /// `command/exec/outputDelta`.
-    CommandExecOutputDelta(Payload<'a, CommandExecOutputDelta>),
+    /// `account/gatewayOAuth/changed`, which agentmux does not decode.
+    AccountGatewayOAuthChanged,
+    /// `account/login/completed`, which agentmux does not decode.
+    AccountLoginCompleted,
+    /// `account/rateLimits/updated`, which agentmux does not decode.
+    AccountRateLimitsUpdated,
+    /// `account/updated`, which agentmux does not decode.
+    AccountUpdated,
+    /// `app/list/updated`, which agentmux does not decode.
+    AppListUpdated,
+    /// `autoApprovalReview/strictReviewRequired`, which agentmux does not decode.
+    AutoApprovalReviewStrictReviewRequired,
+    /// `command/exec/outputDelta`, which agentmux does not decode.
+    CommandExecOutputDelta,
     /// `configWarning`.
     ConfigWarning(Payload<'a, ConfigWarning>),
     /// `deprecationNotice`.
     DeprecationNotice(Payload<'a, DeprecationNotice>),
     /// `error`.
     Error(Payload<'a, Error>),
-    /// `externalAgentConfig/import/completed`.
-    ExternalAgentConfigImportCompleted(Payload<'a, ExternalAgentConfigImportCompleted>),
-    /// `externalAgentConfig/import/progress`.
-    ExternalAgentConfigImportProgress(Payload<'a, ExternalAgentConfigImportProgress>),
-    /// `fs/changed`.
-    FsChanged(Payload<'a, FsChanged>),
-    /// `fuzzyFileSearch/sessionCompleted`.
-    FuzzyFileSearchSessionCompleted(Payload<'a, FuzzyFileSearchSessionCompleted>),
-    /// `fuzzyFileSearch/sessionUpdated`.
-    FuzzyFileSearchSessionUpdated(Payload<'a, FuzzyFileSearchSessionUpdated>),
-    /// `guardianWarning`.
-    GuardianWarning(Payload<'a, GuardianWarning>),
-    /// `hook/completed`.
-    HookCompleted(Payload<'a, HookCompleted>),
-    /// `hook/started`.
-    HookStarted(Payload<'a, HookStarted>),
-    /// `item/agentMessage/delta`.
-    ItemAgentMessageDelta(Payload<'a, ItemAgentMessageDelta>),
-    /// `item/autoApprovalReview/completed`.
-    ItemAutoApprovalReviewCompleted(Payload<'a, ItemAutoApprovalReviewCompleted>),
-    /// `item/autoApprovalReview/started`.
-    ItemAutoApprovalReviewStarted(Payload<'a, ItemAutoApprovalReviewStarted>),
-    /// `item/commandExecution/outputDelta`.
-    ItemCommandExecutionOutputDelta(Payload<'a, ItemCommandExecutionOutputDelta>),
-    /// `item/commandExecution/terminalInteraction`.
-    ItemCommandExecutionTerminalInteraction(Payload<'a, ItemCommandExecutionTerminalInteraction>),
+    /// `externalAgentConfig/import/completed`, which agentmux does not decode.
+    ExternalAgentConfigImportCompleted,
+    /// `externalAgentConfig/import/progress`, which agentmux does not decode.
+    ExternalAgentConfigImportProgress,
+    /// `fs/changed`, which agentmux does not decode.
+    FsChanged,
+    /// `fuzzyFileSearch/sessionCompleted`, which agentmux does not decode.
+    FuzzyFileSearchSessionCompleted,
+    /// `fuzzyFileSearch/sessionUpdated`, which agentmux does not decode.
+    FuzzyFileSearchSessionUpdated,
+    /// `guardianWarning`, which agentmux does not decode.
+    GuardianWarning,
+    /// `hook/completed`, which agentmux does not decode.
+    HookCompleted,
+    /// `hook/started`, which agentmux does not decode.
+    HookStarted,
+    /// `item/agentMessage/delta`, which agentmux does not decode.
+    ItemAgentMessageDelta,
+    /// `item/autoApprovalReview/completed`, which agentmux does not decode.
+    ItemAutoApprovalReviewCompleted,
+    /// `item/autoApprovalReview/started`, which agentmux does not decode.
+    ItemAutoApprovalReviewStarted,
+    /// `item/commandExecution/outputDelta`, which agentmux does not decode.
+    ItemCommandExecutionOutputDelta,
+    /// `item/commandExecution/terminalInteraction`, which agentmux does not decode.
+    ItemCommandExecutionTerminalInteraction,
     /// `item/completed`.
     ItemCompleted(Payload<'a, ItemCompleted>),
-    /// `item/fileChange/outputDelta`.
-    ItemFileChangeOutputDelta(Payload<'a, ItemFileChangeOutputDelta>),
-    /// `item/fileChange/patchUpdated`.
-    ItemFileChangePatchUpdated(Payload<'a, ItemFileChangePatchUpdated>),
-    /// `item/mcpToolCall/progress`.
-    ItemMcpToolCallProgress(Payload<'a, ItemMcpToolCallProgress>),
-    /// `item/plan/delta`.
-    ItemPlanDelta(Payload<'a, ItemPlanDelta>),
-    /// `item/reasoning/summaryPartAdded`.
-    ItemReasoningSummaryPartAdded(Payload<'a, ItemReasoningSummaryPartAdded>),
-    /// `item/reasoning/summaryTextDelta`.
-    ItemReasoningSummaryTextDelta(Payload<'a, ItemReasoningSummaryTextDelta>),
-    /// `item/reasoning/textDelta`.
-    ItemReasoningTextDelta(Payload<'a, ItemReasoningTextDelta>),
-    /// `item/started`.
-    ItemStarted(Payload<'a, ItemStarted>),
-    /// `mcpServer/event/stream/notification`.
-    McpServerEventStreamNotification(Payload<'a, McpServerEventStreamNotification>),
-    /// `mcpServer/oauthLogin/completed`.
-    McpServerOauthLoginCompleted(Payload<'a, McpServerOauthLoginCompleted>),
-    /// `mcpServer/startupStatus/updated`.
-    McpServerStartupStatusUpdated(Payload<'a, McpServerStartupStatusUpdated>),
+    /// `item/fileChange/outputDelta`, which agentmux does not decode.
+    ItemFileChangeOutputDelta,
+    /// `item/fileChange/patchUpdated`, which agentmux does not decode.
+    ItemFileChangePatchUpdated,
+    /// `item/mcpToolCall/progress`, which agentmux does not decode.
+    ItemMcpToolCallProgress,
+    /// `item/plan/delta`, which agentmux does not decode.
+    ItemPlanDelta,
+    /// `item/reasoning/summaryPartAdded`, which agentmux does not decode.
+    ItemReasoningSummaryPartAdded,
+    /// `item/reasoning/summaryTextDelta`, which agentmux does not decode.
+    ItemReasoningSummaryTextDelta,
+    /// `item/reasoning/textDelta`, which agentmux does not decode.
+    ItemReasoningTextDelta,
+    /// `item/started`, which agentmux does not decode.
+    ItemStarted,
+    /// `mcpServer/event/stream/notification`, which agentmux does not decode.
+    McpServerEventStreamNotification,
+    /// `mcpServer/oauthLogin/completed`, which agentmux does not decode.
+    McpServerOauthLoginCompleted,
+    /// `mcpServer/startupStatus/updated`, which agentmux does not decode.
+    McpServerStartupStatusUpdated,
     /// `model/rerouted`.
     ModelRerouted(Payload<'a, ModelRerouted>),
-    /// `model/safetyBuffering/updated`.
-    ModelSafetyBufferingUpdated(Payload<'a, ModelSafetyBufferingUpdated>),
-    /// `model/verification`.
-    ModelVerification(Payload<'a, ModelVerification>),
-    /// `modelProvider/authRecoveryCompleted`.
-    ModelProviderAuthRecoveryCompleted(Payload<'a, ModelProviderAuthRecoveryCompleted>),
-    /// `modelProvider/authRecoveryStarted`.
-    ModelProviderAuthRecoveryStarted(Payload<'a, ModelProviderAuthRecoveryStarted>),
-    /// `process/exited`.
-    ProcessExited(Payload<'a, ProcessExited>),
-    /// `process/outputDelta`.
-    ProcessOutputDelta(Payload<'a, ProcessOutputDelta>),
-    /// `project/changed`.
-    ProjectChanged(Payload<'a, ProjectChanged>),
-    /// `remoteControl/status/changed`.
-    RemoteControlStatusChanged(Payload<'a, RemoteControlStatusChanged>),
-    /// `serverRequest/resolved`.
-    ServerRequestResolved(Payload<'a, ServerRequestResolved>),
-    /// `skills/changed`.
-    SkillsChanged(Payload<'a, SkillsChanged>),
-    /// `thread/archived`.
-    ThreadArchived(Payload<'a, ThreadArchived>),
-    /// `thread/attachment/updated`.
-    ThreadAttachmentUpdated(Payload<'a, ThreadAttachmentUpdated>),
-    /// `thread/closed`.
-    ThreadClosed(Payload<'a, ThreadClosed>),
-    /// `thread/compacted`.
-    ThreadCompacted(Payload<'a, ThreadCompacted>),
-    /// `thread/deleted`.
-    ThreadDeleted(Payload<'a, ThreadDeleted>),
-    /// `thread/environment/connected`.
-    ThreadEnvironmentConnected(Payload<'a, ThreadEnvironmentConnected>),
-    /// `thread/environment/disconnected`.
-    ThreadEnvironmentDisconnected(Payload<'a, ThreadEnvironmentDisconnected>),
-    /// `thread/goal/cleared`.
-    ThreadGoalCleared(Payload<'a, ThreadGoalCleared>),
-    /// `thread/goal/updated`.
-    ThreadGoalUpdated(Payload<'a, ThreadGoalUpdated>),
-    /// `thread/name/updated`.
-    ThreadNameUpdated(Payload<'a, ThreadNameUpdated>),
-    /// `thread/prediction/updated`.
-    ThreadPredictionUpdated(Payload<'a, ThreadPredictionUpdated>),
-    /// `thread/project/updated`.
-    ThreadProjectUpdated(Payload<'a, ThreadProjectUpdated>),
-    /// `thread/queue/changed`.
-    ThreadQueueChanged(Payload<'a, ThreadQueueChanged>),
-    /// `thread/realtime/closed`.
-    ThreadRealtimeClosed(Payload<'a, ThreadRealtimeClosed>),
-    /// `thread/realtime/error`.
-    ThreadRealtimeError(Payload<'a, ThreadRealtimeError>),
-    /// `thread/realtime/item/completed`.
-    ThreadRealtimeItemCompleted(Payload<'a, ThreadRealtimeItemCompleted>),
-    /// `thread/realtime/item/started`.
-    ThreadRealtimeItemStarted(Payload<'a, ThreadRealtimeItemStarted>),
-    /// `thread/realtime/item/transcript/delta`.
-    ThreadRealtimeItemTranscriptDelta(Payload<'a, ThreadRealtimeItemTranscriptDelta>),
-    /// `thread/realtime/itemAdded`.
-    ThreadRealtimeItemAdded(Payload<'a, ThreadRealtimeItemAdded>),
-    /// `thread/realtime/outputAudio/delta`.
-    ThreadRealtimeOutputAudioDelta(Payload<'a, ThreadRealtimeOutputAudioDelta>),
-    /// `thread/realtime/sdp`.
-    ThreadRealtimeSdp(Payload<'a, ThreadRealtimeSdp>),
-    /// `thread/realtime/started`.
-    ThreadRealtimeStarted(Payload<'a, ThreadRealtimeStarted>),
-    /// `thread/realtime/transcript/delta`.
-    ThreadRealtimeTranscriptDelta(Payload<'a, ThreadRealtimeTranscriptDelta>),
-    /// `thread/realtime/transcript/done`.
-    ThreadRealtimeTranscriptDone(Payload<'a, ThreadRealtimeTranscriptDone>),
-    /// `thread/reverted`.
-    ThreadReverted(Payload<'a, ThreadReverted>),
-    /// `thread/settings/updated`.
-    ThreadSettingsUpdated(Payload<'a, ThreadSettingsUpdated>),
-    /// `thread/started`.
-    ThreadStarted(Payload<'a, ThreadStarted>),
-    /// `thread/status/changed`.
-    ThreadStatusChanged(Payload<'a, ThreadStatusChanged>),
+    /// `model/safetyBuffering/updated`, which agentmux does not decode.
+    ModelSafetyBufferingUpdated,
+    /// `model/verification`, which agentmux does not decode.
+    ModelVerification,
+    /// `modelProvider/authRecoveryCompleted`, which agentmux does not decode.
+    ModelProviderAuthRecoveryCompleted,
+    /// `modelProvider/authRecoveryStarted`, which agentmux does not decode.
+    ModelProviderAuthRecoveryStarted,
+    /// `process/exited`, which agentmux does not decode.
+    ProcessExited,
+    /// `process/outputDelta`, which agentmux does not decode.
+    ProcessOutputDelta,
+    /// `project/changed`, which agentmux does not decode.
+    ProjectChanged,
+    /// `remoteControl/status/changed`, which agentmux does not decode.
+    RemoteControlStatusChanged,
+    /// `serverRequest/resolved`, which agentmux does not decode.
+    ServerRequestResolved,
+    /// `skills/changed`, which agentmux does not decode.
+    SkillsChanged,
+    /// `thread/archived`, which agentmux does not decode.
+    ThreadArchived,
+    /// `thread/attachment/updated`, which agentmux does not decode.
+    ThreadAttachmentUpdated,
+    /// `thread/closed`, which agentmux does not decode.
+    ThreadClosed,
+    /// `thread/compacted`, which agentmux does not decode.
+    ThreadCompacted,
+    /// `thread/deleted`, which agentmux does not decode.
+    ThreadDeleted,
+    /// `thread/environment/connected`, which agentmux does not decode.
+    ThreadEnvironmentConnected,
+    /// `thread/environment/disconnected`, which agentmux does not decode.
+    ThreadEnvironmentDisconnected,
+    /// `thread/goal/cleared`, which agentmux does not decode.
+    ThreadGoalCleared,
+    /// `thread/goal/updated`, which agentmux does not decode.
+    ThreadGoalUpdated,
+    /// `thread/name/updated`, which agentmux does not decode.
+    ThreadNameUpdated,
+    /// `thread/prediction/updated`, which agentmux does not decode.
+    ThreadPredictionUpdated,
+    /// `thread/project/updated`, which agentmux does not decode.
+    ThreadProjectUpdated,
+    /// `thread/queue/changed`, which agentmux does not decode.
+    ThreadQueueChanged,
+    /// `thread/realtime/closed`, which agentmux does not decode.
+    ThreadRealtimeClosed,
+    /// `thread/realtime/error`, which agentmux does not decode.
+    ThreadRealtimeError,
+    /// `thread/realtime/item/completed`, which agentmux does not decode.
+    ThreadRealtimeItemCompleted,
+    /// `thread/realtime/item/started`, which agentmux does not decode.
+    ThreadRealtimeItemStarted,
+    /// `thread/realtime/item/transcript/delta`, which agentmux does not decode.
+    ThreadRealtimeItemTranscriptDelta,
+    /// `thread/realtime/itemAdded`, which agentmux does not decode.
+    ThreadRealtimeItemAdded,
+    /// `thread/realtime/outputAudio/delta`, which agentmux does not decode.
+    ThreadRealtimeOutputAudioDelta,
+    /// `thread/realtime/sdp`, which agentmux does not decode.
+    ThreadRealtimeSdp,
+    /// `thread/realtime/started`, which agentmux does not decode.
+    ThreadRealtimeStarted,
+    /// `thread/realtime/transcript/delta`, which agentmux does not decode.
+    ThreadRealtimeTranscriptDelta,
+    /// `thread/realtime/transcript/done`, which agentmux does not decode.
+    ThreadRealtimeTranscriptDone,
+    /// `thread/reverted`, which agentmux does not decode.
+    ThreadReverted,
+    /// `thread/settings/updated`, which agentmux does not decode.
+    ThreadSettingsUpdated,
+    /// `thread/started`, which agentmux does not decode.
+    ThreadStarted,
+    /// `thread/status/changed`, which agentmux does not decode.
+    ThreadStatusChanged,
     /// `thread/tokenUsage/updated`.
     ThreadTokenUsageUpdated(Payload<'a, ThreadTokenUsageUpdated>),
-    /// `thread/unarchived`.
-    ThreadUnarchived(Payload<'a, ThreadUnarchived>),
+    /// `thread/unarchived`, which agentmux does not decode.
+    ThreadUnarchived,
     /// `turn/completed`.
     TurnCompleted(Payload<'a, TurnCompleted>),
-    /// `turn/diff/updated`.
-    TurnDiffUpdated(Payload<'a, TurnDiffUpdated>),
-    /// `turn/moderationMetadata`.
-    TurnModerationMetadata(Payload<'a, TurnModerationMetadata>),
-    /// `turn/plan/updated`.
-    TurnPlanUpdated(Payload<'a, TurnPlanUpdated>),
+    /// `turn/diff/updated`, which agentmux does not decode.
+    TurnDiffUpdated,
+    /// `turn/moderationMetadata`, which agentmux does not decode.
+    TurnModerationMetadata,
+    /// `turn/plan/updated`, which agentmux does not decode.
+    TurnPlanUpdated,
     /// `turn/started`.
     TurnStarted(Payload<'a, TurnStarted>),
     /// `warning`.
     Warning(Payload<'a, Warning>),
-    /// `windows/worldWritableWarning`.
-    WindowsWorldWritableWarning(Payload<'a, WindowsWorldWritableWarning>),
-    /// `windowsSandbox/setupCompleted`.
-    WindowsSandboxSetupCompleted(Payload<'a, WindowsSandboxSetupCompleted>),
+    /// `windows/worldWritableWarning`, which agentmux does not decode.
+    WindowsWorldWritableWarning,
+    /// `windowsSandbox/setupCompleted`, which agentmux does not decode.
+    WindowsSandboxSetupCompleted,
 }
 
 impl<'a> AnyServerNotification<'a> {
@@ -3560,90 +3290,90 @@ impl<'a> AnyServerNotification<'a> {
     #[must_use]
     pub fn classify(method: &str, params: &'a Value) -> Option<Self> {
         Some(match method {
-            AccountGatewayOAuthChanged::METHOD => Self::AccountGatewayOAuthChanged(Payload::new(params)),
-            AccountLoginCompleted::METHOD => Self::AccountLoginCompleted(Payload::new(params)),
-            AccountRateLimitsUpdated::METHOD => Self::AccountRateLimitsUpdated(Payload::new(params)),
-            AccountUpdated::METHOD => Self::AccountUpdated(Payload::new(params)),
-            AppListUpdated::METHOD => Self::AppListUpdated(Payload::new(params)),
-            AutoApprovalReviewStrictReviewRequired::METHOD => Self::AutoApprovalReviewStrictReviewRequired(Payload::new(params)),
-            CommandExecOutputDelta::METHOD => Self::CommandExecOutputDelta(Payload::new(params)),
+            AccountGatewayOAuthChanged::METHOD => Self::AccountGatewayOAuthChanged,
+            AccountLoginCompleted::METHOD => Self::AccountLoginCompleted,
+            AccountRateLimitsUpdated::METHOD => Self::AccountRateLimitsUpdated,
+            AccountUpdated::METHOD => Self::AccountUpdated,
+            AppListUpdated::METHOD => Self::AppListUpdated,
+            AutoApprovalReviewStrictReviewRequired::METHOD => Self::AutoApprovalReviewStrictReviewRequired,
+            CommandExecOutputDelta::METHOD => Self::CommandExecOutputDelta,
             ConfigWarning::METHOD => Self::ConfigWarning(Payload::new(params)),
             DeprecationNotice::METHOD => Self::DeprecationNotice(Payload::new(params)),
             Error::METHOD => Self::Error(Payload::new(params)),
-            ExternalAgentConfigImportCompleted::METHOD => Self::ExternalAgentConfigImportCompleted(Payload::new(params)),
-            ExternalAgentConfigImportProgress::METHOD => Self::ExternalAgentConfigImportProgress(Payload::new(params)),
-            FsChanged::METHOD => Self::FsChanged(Payload::new(params)),
-            FuzzyFileSearchSessionCompleted::METHOD => Self::FuzzyFileSearchSessionCompleted(Payload::new(params)),
-            FuzzyFileSearchSessionUpdated::METHOD => Self::FuzzyFileSearchSessionUpdated(Payload::new(params)),
-            GuardianWarning::METHOD => Self::GuardianWarning(Payload::new(params)),
-            HookCompleted::METHOD => Self::HookCompleted(Payload::new(params)),
-            HookStarted::METHOD => Self::HookStarted(Payload::new(params)),
-            ItemAgentMessageDelta::METHOD => Self::ItemAgentMessageDelta(Payload::new(params)),
-            ItemAutoApprovalReviewCompleted::METHOD => Self::ItemAutoApprovalReviewCompleted(Payload::new(params)),
-            ItemAutoApprovalReviewStarted::METHOD => Self::ItemAutoApprovalReviewStarted(Payload::new(params)),
-            ItemCommandExecutionOutputDelta::METHOD => Self::ItemCommandExecutionOutputDelta(Payload::new(params)),
-            ItemCommandExecutionTerminalInteraction::METHOD => Self::ItemCommandExecutionTerminalInteraction(Payload::new(params)),
+            ExternalAgentConfigImportCompleted::METHOD => Self::ExternalAgentConfigImportCompleted,
+            ExternalAgentConfigImportProgress::METHOD => Self::ExternalAgentConfigImportProgress,
+            FsChanged::METHOD => Self::FsChanged,
+            FuzzyFileSearchSessionCompleted::METHOD => Self::FuzzyFileSearchSessionCompleted,
+            FuzzyFileSearchSessionUpdated::METHOD => Self::FuzzyFileSearchSessionUpdated,
+            GuardianWarning::METHOD => Self::GuardianWarning,
+            HookCompleted::METHOD => Self::HookCompleted,
+            HookStarted::METHOD => Self::HookStarted,
+            ItemAgentMessageDelta::METHOD => Self::ItemAgentMessageDelta,
+            ItemAutoApprovalReviewCompleted::METHOD => Self::ItemAutoApprovalReviewCompleted,
+            ItemAutoApprovalReviewStarted::METHOD => Self::ItemAutoApprovalReviewStarted,
+            ItemCommandExecutionOutputDelta::METHOD => Self::ItemCommandExecutionOutputDelta,
+            ItemCommandExecutionTerminalInteraction::METHOD => Self::ItemCommandExecutionTerminalInteraction,
             ItemCompleted::METHOD => Self::ItemCompleted(Payload::new(params)),
-            ItemFileChangeOutputDelta::METHOD => Self::ItemFileChangeOutputDelta(Payload::new(params)),
-            ItemFileChangePatchUpdated::METHOD => Self::ItemFileChangePatchUpdated(Payload::new(params)),
-            ItemMcpToolCallProgress::METHOD => Self::ItemMcpToolCallProgress(Payload::new(params)),
-            ItemPlanDelta::METHOD => Self::ItemPlanDelta(Payload::new(params)),
-            ItemReasoningSummaryPartAdded::METHOD => Self::ItemReasoningSummaryPartAdded(Payload::new(params)),
-            ItemReasoningSummaryTextDelta::METHOD => Self::ItemReasoningSummaryTextDelta(Payload::new(params)),
-            ItemReasoningTextDelta::METHOD => Self::ItemReasoningTextDelta(Payload::new(params)),
-            ItemStarted::METHOD => Self::ItemStarted(Payload::new(params)),
-            McpServerEventStreamNotification::METHOD => Self::McpServerEventStreamNotification(Payload::new(params)),
-            McpServerOauthLoginCompleted::METHOD => Self::McpServerOauthLoginCompleted(Payload::new(params)),
-            McpServerStartupStatusUpdated::METHOD => Self::McpServerStartupStatusUpdated(Payload::new(params)),
+            ItemFileChangeOutputDelta::METHOD => Self::ItemFileChangeOutputDelta,
+            ItemFileChangePatchUpdated::METHOD => Self::ItemFileChangePatchUpdated,
+            ItemMcpToolCallProgress::METHOD => Self::ItemMcpToolCallProgress,
+            ItemPlanDelta::METHOD => Self::ItemPlanDelta,
+            ItemReasoningSummaryPartAdded::METHOD => Self::ItemReasoningSummaryPartAdded,
+            ItemReasoningSummaryTextDelta::METHOD => Self::ItemReasoningSummaryTextDelta,
+            ItemReasoningTextDelta::METHOD => Self::ItemReasoningTextDelta,
+            ItemStarted::METHOD => Self::ItemStarted,
+            McpServerEventStreamNotification::METHOD => Self::McpServerEventStreamNotification,
+            McpServerOauthLoginCompleted::METHOD => Self::McpServerOauthLoginCompleted,
+            McpServerStartupStatusUpdated::METHOD => Self::McpServerStartupStatusUpdated,
             ModelRerouted::METHOD => Self::ModelRerouted(Payload::new(params)),
-            ModelSafetyBufferingUpdated::METHOD => Self::ModelSafetyBufferingUpdated(Payload::new(params)),
-            ModelVerification::METHOD => Self::ModelVerification(Payload::new(params)),
-            ModelProviderAuthRecoveryCompleted::METHOD => Self::ModelProviderAuthRecoveryCompleted(Payload::new(params)),
-            ModelProviderAuthRecoveryStarted::METHOD => Self::ModelProviderAuthRecoveryStarted(Payload::new(params)),
-            ProcessExited::METHOD => Self::ProcessExited(Payload::new(params)),
-            ProcessOutputDelta::METHOD => Self::ProcessOutputDelta(Payload::new(params)),
-            ProjectChanged::METHOD => Self::ProjectChanged(Payload::new(params)),
-            RemoteControlStatusChanged::METHOD => Self::RemoteControlStatusChanged(Payload::new(params)),
-            ServerRequestResolved::METHOD => Self::ServerRequestResolved(Payload::new(params)),
-            SkillsChanged::METHOD => Self::SkillsChanged(Payload::new(params)),
-            ThreadArchived::METHOD => Self::ThreadArchived(Payload::new(params)),
-            ThreadAttachmentUpdated::METHOD => Self::ThreadAttachmentUpdated(Payload::new(params)),
-            ThreadClosed::METHOD => Self::ThreadClosed(Payload::new(params)),
-            ThreadCompacted::METHOD => Self::ThreadCompacted(Payload::new(params)),
-            ThreadDeleted::METHOD => Self::ThreadDeleted(Payload::new(params)),
-            ThreadEnvironmentConnected::METHOD => Self::ThreadEnvironmentConnected(Payload::new(params)),
-            ThreadEnvironmentDisconnected::METHOD => Self::ThreadEnvironmentDisconnected(Payload::new(params)),
-            ThreadGoalCleared::METHOD => Self::ThreadGoalCleared(Payload::new(params)),
-            ThreadGoalUpdated::METHOD => Self::ThreadGoalUpdated(Payload::new(params)),
-            ThreadNameUpdated::METHOD => Self::ThreadNameUpdated(Payload::new(params)),
-            ThreadPredictionUpdated::METHOD => Self::ThreadPredictionUpdated(Payload::new(params)),
-            ThreadProjectUpdated::METHOD => Self::ThreadProjectUpdated(Payload::new(params)),
-            ThreadQueueChanged::METHOD => Self::ThreadQueueChanged(Payload::new(params)),
-            ThreadRealtimeClosed::METHOD => Self::ThreadRealtimeClosed(Payload::new(params)),
-            ThreadRealtimeError::METHOD => Self::ThreadRealtimeError(Payload::new(params)),
-            ThreadRealtimeItemCompleted::METHOD => Self::ThreadRealtimeItemCompleted(Payload::new(params)),
-            ThreadRealtimeItemStarted::METHOD => Self::ThreadRealtimeItemStarted(Payload::new(params)),
-            ThreadRealtimeItemTranscriptDelta::METHOD => Self::ThreadRealtimeItemTranscriptDelta(Payload::new(params)),
-            ThreadRealtimeItemAdded::METHOD => Self::ThreadRealtimeItemAdded(Payload::new(params)),
-            ThreadRealtimeOutputAudioDelta::METHOD => Self::ThreadRealtimeOutputAudioDelta(Payload::new(params)),
-            ThreadRealtimeSdp::METHOD => Self::ThreadRealtimeSdp(Payload::new(params)),
-            ThreadRealtimeStarted::METHOD => Self::ThreadRealtimeStarted(Payload::new(params)),
-            ThreadRealtimeTranscriptDelta::METHOD => Self::ThreadRealtimeTranscriptDelta(Payload::new(params)),
-            ThreadRealtimeTranscriptDone::METHOD => Self::ThreadRealtimeTranscriptDone(Payload::new(params)),
-            ThreadReverted::METHOD => Self::ThreadReverted(Payload::new(params)),
-            ThreadSettingsUpdated::METHOD => Self::ThreadSettingsUpdated(Payload::new(params)),
-            ThreadStarted::METHOD => Self::ThreadStarted(Payload::new(params)),
-            ThreadStatusChanged::METHOD => Self::ThreadStatusChanged(Payload::new(params)),
+            ModelSafetyBufferingUpdated::METHOD => Self::ModelSafetyBufferingUpdated,
+            ModelVerification::METHOD => Self::ModelVerification,
+            ModelProviderAuthRecoveryCompleted::METHOD => Self::ModelProviderAuthRecoveryCompleted,
+            ModelProviderAuthRecoveryStarted::METHOD => Self::ModelProviderAuthRecoveryStarted,
+            ProcessExited::METHOD => Self::ProcessExited,
+            ProcessOutputDelta::METHOD => Self::ProcessOutputDelta,
+            ProjectChanged::METHOD => Self::ProjectChanged,
+            RemoteControlStatusChanged::METHOD => Self::RemoteControlStatusChanged,
+            ServerRequestResolved::METHOD => Self::ServerRequestResolved,
+            SkillsChanged::METHOD => Self::SkillsChanged,
+            ThreadArchived::METHOD => Self::ThreadArchived,
+            ThreadAttachmentUpdated::METHOD => Self::ThreadAttachmentUpdated,
+            ThreadClosed::METHOD => Self::ThreadClosed,
+            ThreadCompacted::METHOD => Self::ThreadCompacted,
+            ThreadDeleted::METHOD => Self::ThreadDeleted,
+            ThreadEnvironmentConnected::METHOD => Self::ThreadEnvironmentConnected,
+            ThreadEnvironmentDisconnected::METHOD => Self::ThreadEnvironmentDisconnected,
+            ThreadGoalCleared::METHOD => Self::ThreadGoalCleared,
+            ThreadGoalUpdated::METHOD => Self::ThreadGoalUpdated,
+            ThreadNameUpdated::METHOD => Self::ThreadNameUpdated,
+            ThreadPredictionUpdated::METHOD => Self::ThreadPredictionUpdated,
+            ThreadProjectUpdated::METHOD => Self::ThreadProjectUpdated,
+            ThreadQueueChanged::METHOD => Self::ThreadQueueChanged,
+            ThreadRealtimeClosed::METHOD => Self::ThreadRealtimeClosed,
+            ThreadRealtimeError::METHOD => Self::ThreadRealtimeError,
+            ThreadRealtimeItemCompleted::METHOD => Self::ThreadRealtimeItemCompleted,
+            ThreadRealtimeItemStarted::METHOD => Self::ThreadRealtimeItemStarted,
+            ThreadRealtimeItemTranscriptDelta::METHOD => Self::ThreadRealtimeItemTranscriptDelta,
+            ThreadRealtimeItemAdded::METHOD => Self::ThreadRealtimeItemAdded,
+            ThreadRealtimeOutputAudioDelta::METHOD => Self::ThreadRealtimeOutputAudioDelta,
+            ThreadRealtimeSdp::METHOD => Self::ThreadRealtimeSdp,
+            ThreadRealtimeStarted::METHOD => Self::ThreadRealtimeStarted,
+            ThreadRealtimeTranscriptDelta::METHOD => Self::ThreadRealtimeTranscriptDelta,
+            ThreadRealtimeTranscriptDone::METHOD => Self::ThreadRealtimeTranscriptDone,
+            ThreadReverted::METHOD => Self::ThreadReverted,
+            ThreadSettingsUpdated::METHOD => Self::ThreadSettingsUpdated,
+            ThreadStarted::METHOD => Self::ThreadStarted,
+            ThreadStatusChanged::METHOD => Self::ThreadStatusChanged,
             ThreadTokenUsageUpdated::METHOD => Self::ThreadTokenUsageUpdated(Payload::new(params)),
-            ThreadUnarchived::METHOD => Self::ThreadUnarchived(Payload::new(params)),
+            ThreadUnarchived::METHOD => Self::ThreadUnarchived,
             TurnCompleted::METHOD => Self::TurnCompleted(Payload::new(params)),
-            TurnDiffUpdated::METHOD => Self::TurnDiffUpdated(Payload::new(params)),
-            TurnModerationMetadata::METHOD => Self::TurnModerationMetadata(Payload::new(params)),
-            TurnPlanUpdated::METHOD => Self::TurnPlanUpdated(Payload::new(params)),
+            TurnDiffUpdated::METHOD => Self::TurnDiffUpdated,
+            TurnModerationMetadata::METHOD => Self::TurnModerationMetadata,
+            TurnPlanUpdated::METHOD => Self::TurnPlanUpdated,
             TurnStarted::METHOD => Self::TurnStarted(Payload::new(params)),
             Warning::METHOD => Self::Warning(Payload::new(params)),
-            WindowsWorldWritableWarning::METHOD => Self::WindowsWorldWritableWarning(Payload::new(params)),
-            WindowsSandboxSetupCompleted::METHOD => Self::WindowsSandboxSetupCompleted(Payload::new(params)),
+            WindowsWorldWritableWarning::METHOD => Self::WindowsWorldWritableWarning,
+            WindowsSandboxSetupCompleted::METHOD => Self::WindowsSandboxSetupCompleted,
             _ => return None,
         })
     }
@@ -3652,90 +3382,90 @@ impl<'a> AnyServerNotification<'a> {
     #[must_use]
     pub fn method(self) -> &'static str {
         match self {
-            Self::AccountGatewayOAuthChanged(_) => AccountGatewayOAuthChanged::METHOD,
-            Self::AccountLoginCompleted(_) => AccountLoginCompleted::METHOD,
-            Self::AccountRateLimitsUpdated(_) => AccountRateLimitsUpdated::METHOD,
-            Self::AccountUpdated(_) => AccountUpdated::METHOD,
-            Self::AppListUpdated(_) => AppListUpdated::METHOD,
-            Self::AutoApprovalReviewStrictReviewRequired(_) => AutoApprovalReviewStrictReviewRequired::METHOD,
-            Self::CommandExecOutputDelta(_) => CommandExecOutputDelta::METHOD,
+            Self::AccountGatewayOAuthChanged => AccountGatewayOAuthChanged::METHOD,
+            Self::AccountLoginCompleted => AccountLoginCompleted::METHOD,
+            Self::AccountRateLimitsUpdated => AccountRateLimitsUpdated::METHOD,
+            Self::AccountUpdated => AccountUpdated::METHOD,
+            Self::AppListUpdated => AppListUpdated::METHOD,
+            Self::AutoApprovalReviewStrictReviewRequired => AutoApprovalReviewStrictReviewRequired::METHOD,
+            Self::CommandExecOutputDelta => CommandExecOutputDelta::METHOD,
             Self::ConfigWarning(_) => ConfigWarning::METHOD,
             Self::DeprecationNotice(_) => DeprecationNotice::METHOD,
             Self::Error(_) => Error::METHOD,
-            Self::ExternalAgentConfigImportCompleted(_) => ExternalAgentConfigImportCompleted::METHOD,
-            Self::ExternalAgentConfigImportProgress(_) => ExternalAgentConfigImportProgress::METHOD,
-            Self::FsChanged(_) => FsChanged::METHOD,
-            Self::FuzzyFileSearchSessionCompleted(_) => FuzzyFileSearchSessionCompleted::METHOD,
-            Self::FuzzyFileSearchSessionUpdated(_) => FuzzyFileSearchSessionUpdated::METHOD,
-            Self::GuardianWarning(_) => GuardianWarning::METHOD,
-            Self::HookCompleted(_) => HookCompleted::METHOD,
-            Self::HookStarted(_) => HookStarted::METHOD,
-            Self::ItemAgentMessageDelta(_) => ItemAgentMessageDelta::METHOD,
-            Self::ItemAutoApprovalReviewCompleted(_) => ItemAutoApprovalReviewCompleted::METHOD,
-            Self::ItemAutoApprovalReviewStarted(_) => ItemAutoApprovalReviewStarted::METHOD,
-            Self::ItemCommandExecutionOutputDelta(_) => ItemCommandExecutionOutputDelta::METHOD,
-            Self::ItemCommandExecutionTerminalInteraction(_) => ItemCommandExecutionTerminalInteraction::METHOD,
+            Self::ExternalAgentConfigImportCompleted => ExternalAgentConfigImportCompleted::METHOD,
+            Self::ExternalAgentConfigImportProgress => ExternalAgentConfigImportProgress::METHOD,
+            Self::FsChanged => FsChanged::METHOD,
+            Self::FuzzyFileSearchSessionCompleted => FuzzyFileSearchSessionCompleted::METHOD,
+            Self::FuzzyFileSearchSessionUpdated => FuzzyFileSearchSessionUpdated::METHOD,
+            Self::GuardianWarning => GuardianWarning::METHOD,
+            Self::HookCompleted => HookCompleted::METHOD,
+            Self::HookStarted => HookStarted::METHOD,
+            Self::ItemAgentMessageDelta => ItemAgentMessageDelta::METHOD,
+            Self::ItemAutoApprovalReviewCompleted => ItemAutoApprovalReviewCompleted::METHOD,
+            Self::ItemAutoApprovalReviewStarted => ItemAutoApprovalReviewStarted::METHOD,
+            Self::ItemCommandExecutionOutputDelta => ItemCommandExecutionOutputDelta::METHOD,
+            Self::ItemCommandExecutionTerminalInteraction => ItemCommandExecutionTerminalInteraction::METHOD,
             Self::ItemCompleted(_) => ItemCompleted::METHOD,
-            Self::ItemFileChangeOutputDelta(_) => ItemFileChangeOutputDelta::METHOD,
-            Self::ItemFileChangePatchUpdated(_) => ItemFileChangePatchUpdated::METHOD,
-            Self::ItemMcpToolCallProgress(_) => ItemMcpToolCallProgress::METHOD,
-            Self::ItemPlanDelta(_) => ItemPlanDelta::METHOD,
-            Self::ItemReasoningSummaryPartAdded(_) => ItemReasoningSummaryPartAdded::METHOD,
-            Self::ItemReasoningSummaryTextDelta(_) => ItemReasoningSummaryTextDelta::METHOD,
-            Self::ItemReasoningTextDelta(_) => ItemReasoningTextDelta::METHOD,
-            Self::ItemStarted(_) => ItemStarted::METHOD,
-            Self::McpServerEventStreamNotification(_) => McpServerEventStreamNotification::METHOD,
-            Self::McpServerOauthLoginCompleted(_) => McpServerOauthLoginCompleted::METHOD,
-            Self::McpServerStartupStatusUpdated(_) => McpServerStartupStatusUpdated::METHOD,
+            Self::ItemFileChangeOutputDelta => ItemFileChangeOutputDelta::METHOD,
+            Self::ItemFileChangePatchUpdated => ItemFileChangePatchUpdated::METHOD,
+            Self::ItemMcpToolCallProgress => ItemMcpToolCallProgress::METHOD,
+            Self::ItemPlanDelta => ItemPlanDelta::METHOD,
+            Self::ItemReasoningSummaryPartAdded => ItemReasoningSummaryPartAdded::METHOD,
+            Self::ItemReasoningSummaryTextDelta => ItemReasoningSummaryTextDelta::METHOD,
+            Self::ItemReasoningTextDelta => ItemReasoningTextDelta::METHOD,
+            Self::ItemStarted => ItemStarted::METHOD,
+            Self::McpServerEventStreamNotification => McpServerEventStreamNotification::METHOD,
+            Self::McpServerOauthLoginCompleted => McpServerOauthLoginCompleted::METHOD,
+            Self::McpServerStartupStatusUpdated => McpServerStartupStatusUpdated::METHOD,
             Self::ModelRerouted(_) => ModelRerouted::METHOD,
-            Self::ModelSafetyBufferingUpdated(_) => ModelSafetyBufferingUpdated::METHOD,
-            Self::ModelVerification(_) => ModelVerification::METHOD,
-            Self::ModelProviderAuthRecoveryCompleted(_) => ModelProviderAuthRecoveryCompleted::METHOD,
-            Self::ModelProviderAuthRecoveryStarted(_) => ModelProviderAuthRecoveryStarted::METHOD,
-            Self::ProcessExited(_) => ProcessExited::METHOD,
-            Self::ProcessOutputDelta(_) => ProcessOutputDelta::METHOD,
-            Self::ProjectChanged(_) => ProjectChanged::METHOD,
-            Self::RemoteControlStatusChanged(_) => RemoteControlStatusChanged::METHOD,
-            Self::ServerRequestResolved(_) => ServerRequestResolved::METHOD,
-            Self::SkillsChanged(_) => SkillsChanged::METHOD,
-            Self::ThreadArchived(_) => ThreadArchived::METHOD,
-            Self::ThreadAttachmentUpdated(_) => ThreadAttachmentUpdated::METHOD,
-            Self::ThreadClosed(_) => ThreadClosed::METHOD,
-            Self::ThreadCompacted(_) => ThreadCompacted::METHOD,
-            Self::ThreadDeleted(_) => ThreadDeleted::METHOD,
-            Self::ThreadEnvironmentConnected(_) => ThreadEnvironmentConnected::METHOD,
-            Self::ThreadEnvironmentDisconnected(_) => ThreadEnvironmentDisconnected::METHOD,
-            Self::ThreadGoalCleared(_) => ThreadGoalCleared::METHOD,
-            Self::ThreadGoalUpdated(_) => ThreadGoalUpdated::METHOD,
-            Self::ThreadNameUpdated(_) => ThreadNameUpdated::METHOD,
-            Self::ThreadPredictionUpdated(_) => ThreadPredictionUpdated::METHOD,
-            Self::ThreadProjectUpdated(_) => ThreadProjectUpdated::METHOD,
-            Self::ThreadQueueChanged(_) => ThreadQueueChanged::METHOD,
-            Self::ThreadRealtimeClosed(_) => ThreadRealtimeClosed::METHOD,
-            Self::ThreadRealtimeError(_) => ThreadRealtimeError::METHOD,
-            Self::ThreadRealtimeItemCompleted(_) => ThreadRealtimeItemCompleted::METHOD,
-            Self::ThreadRealtimeItemStarted(_) => ThreadRealtimeItemStarted::METHOD,
-            Self::ThreadRealtimeItemTranscriptDelta(_) => ThreadRealtimeItemTranscriptDelta::METHOD,
-            Self::ThreadRealtimeItemAdded(_) => ThreadRealtimeItemAdded::METHOD,
-            Self::ThreadRealtimeOutputAudioDelta(_) => ThreadRealtimeOutputAudioDelta::METHOD,
-            Self::ThreadRealtimeSdp(_) => ThreadRealtimeSdp::METHOD,
-            Self::ThreadRealtimeStarted(_) => ThreadRealtimeStarted::METHOD,
-            Self::ThreadRealtimeTranscriptDelta(_) => ThreadRealtimeTranscriptDelta::METHOD,
-            Self::ThreadRealtimeTranscriptDone(_) => ThreadRealtimeTranscriptDone::METHOD,
-            Self::ThreadReverted(_) => ThreadReverted::METHOD,
-            Self::ThreadSettingsUpdated(_) => ThreadSettingsUpdated::METHOD,
-            Self::ThreadStarted(_) => ThreadStarted::METHOD,
-            Self::ThreadStatusChanged(_) => ThreadStatusChanged::METHOD,
+            Self::ModelSafetyBufferingUpdated => ModelSafetyBufferingUpdated::METHOD,
+            Self::ModelVerification => ModelVerification::METHOD,
+            Self::ModelProviderAuthRecoveryCompleted => ModelProviderAuthRecoveryCompleted::METHOD,
+            Self::ModelProviderAuthRecoveryStarted => ModelProviderAuthRecoveryStarted::METHOD,
+            Self::ProcessExited => ProcessExited::METHOD,
+            Self::ProcessOutputDelta => ProcessOutputDelta::METHOD,
+            Self::ProjectChanged => ProjectChanged::METHOD,
+            Self::RemoteControlStatusChanged => RemoteControlStatusChanged::METHOD,
+            Self::ServerRequestResolved => ServerRequestResolved::METHOD,
+            Self::SkillsChanged => SkillsChanged::METHOD,
+            Self::ThreadArchived => ThreadArchived::METHOD,
+            Self::ThreadAttachmentUpdated => ThreadAttachmentUpdated::METHOD,
+            Self::ThreadClosed => ThreadClosed::METHOD,
+            Self::ThreadCompacted => ThreadCompacted::METHOD,
+            Self::ThreadDeleted => ThreadDeleted::METHOD,
+            Self::ThreadEnvironmentConnected => ThreadEnvironmentConnected::METHOD,
+            Self::ThreadEnvironmentDisconnected => ThreadEnvironmentDisconnected::METHOD,
+            Self::ThreadGoalCleared => ThreadGoalCleared::METHOD,
+            Self::ThreadGoalUpdated => ThreadGoalUpdated::METHOD,
+            Self::ThreadNameUpdated => ThreadNameUpdated::METHOD,
+            Self::ThreadPredictionUpdated => ThreadPredictionUpdated::METHOD,
+            Self::ThreadProjectUpdated => ThreadProjectUpdated::METHOD,
+            Self::ThreadQueueChanged => ThreadQueueChanged::METHOD,
+            Self::ThreadRealtimeClosed => ThreadRealtimeClosed::METHOD,
+            Self::ThreadRealtimeError => ThreadRealtimeError::METHOD,
+            Self::ThreadRealtimeItemCompleted => ThreadRealtimeItemCompleted::METHOD,
+            Self::ThreadRealtimeItemStarted => ThreadRealtimeItemStarted::METHOD,
+            Self::ThreadRealtimeItemTranscriptDelta => ThreadRealtimeItemTranscriptDelta::METHOD,
+            Self::ThreadRealtimeItemAdded => ThreadRealtimeItemAdded::METHOD,
+            Self::ThreadRealtimeOutputAudioDelta => ThreadRealtimeOutputAudioDelta::METHOD,
+            Self::ThreadRealtimeSdp => ThreadRealtimeSdp::METHOD,
+            Self::ThreadRealtimeStarted => ThreadRealtimeStarted::METHOD,
+            Self::ThreadRealtimeTranscriptDelta => ThreadRealtimeTranscriptDelta::METHOD,
+            Self::ThreadRealtimeTranscriptDone => ThreadRealtimeTranscriptDone::METHOD,
+            Self::ThreadReverted => ThreadReverted::METHOD,
+            Self::ThreadSettingsUpdated => ThreadSettingsUpdated::METHOD,
+            Self::ThreadStarted => ThreadStarted::METHOD,
+            Self::ThreadStatusChanged => ThreadStatusChanged::METHOD,
             Self::ThreadTokenUsageUpdated(_) => ThreadTokenUsageUpdated::METHOD,
-            Self::ThreadUnarchived(_) => ThreadUnarchived::METHOD,
+            Self::ThreadUnarchived => ThreadUnarchived::METHOD,
             Self::TurnCompleted(_) => TurnCompleted::METHOD,
-            Self::TurnDiffUpdated(_) => TurnDiffUpdated::METHOD,
-            Self::TurnModerationMetadata(_) => TurnModerationMetadata::METHOD,
-            Self::TurnPlanUpdated(_) => TurnPlanUpdated::METHOD,
+            Self::TurnDiffUpdated => TurnDiffUpdated::METHOD,
+            Self::TurnModerationMetadata => TurnModerationMetadata::METHOD,
+            Self::TurnPlanUpdated => TurnPlanUpdated::METHOD,
             Self::TurnStarted(_) => TurnStarted::METHOD,
             Self::Warning(_) => Warning::METHOD,
-            Self::WindowsWorldWritableWarning(_) => WindowsWorldWritableWarning::METHOD,
-            Self::WindowsSandboxSetupCompleted(_) => WindowsSandboxSetupCompleted::METHOD,
+            Self::WindowsWorldWritableWarning => WindowsWorldWritableWarning::METHOD,
+            Self::WindowsSandboxSetupCompleted => WindowsSandboxSetupCompleted::METHOD,
         }
     }
 }

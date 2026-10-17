@@ -65,7 +65,9 @@ jobs:
           cache-on-failure: true
       - name: Read the pin
         id: pin
-        run: echo "codex=$(cat crates/codex-app-server-codegen/schema/codex-version)" >>"$GITHUB_OUTPUT"
+        run: |
+          pin="$(cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- pin)"
+          echo "codex=$pin" >>"$GITHUB_OUTPUT"
       # Installed once per pin and then restored.
       - name: Restore the pinned codex
         uses: actions/cache@v6
@@ -83,3 +85,24 @@ jobs:
           echo "$prefix/bin" >>"$GITHUB_PATH"
       - name: Check the vendored schema is what the pinned codex exports
         run: task codegen:app-server:upstream
+
+  # The answers table and the exec mirror are what codex's own crates declare at the pinned tag.
+  oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/codex-app-server-codegen/oracle
+          cache-on-failure: true
+      - name: Check the answers table and the exec mirror against codex's own crates
+        run: task codegen:app-server:oracle

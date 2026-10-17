@@ -7,7 +7,7 @@
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId};
 use codex_app_server_protocol::methods::{self as m, AnyServerRequest as Any};
-use codex_app_server_protocol::{Method as _, ServerRequest, types as wire};
+use codex_app_server_protocol::{Answered, Method as _, ServerRequest, types as wire};
 
 use crate::delegate::{CodexSandbox, SessionRef};
 
@@ -233,7 +233,7 @@ const UNATTENDED: &str = "agentmux runs consultations unattended, with nobody to
 /// and every request codex can send is named, so a regeneration that adds one fails to build
 /// until it is decided here.
 pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message, EncodeError>> {
-    fn answer<M: ServerRequest>(
+    fn answer<M: ServerRequest + Answered>(
         id: &RequestId,
         response: &M::Response,
     ) -> Result<Message, EncodeError> {
@@ -299,9 +299,9 @@ pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message
         ),
         // Asks the client for credentials, an attestation, or the result of a tool the client
         // provides, none of which a consultation has.
-        Any::AccountChatgptAuthTokensRefresh(_)
-        | Any::AttestationGenerate(_)
-        | Any::ItemToolCall(_) => return None,
+        Any::AccountChatgptAuthTokensRefresh | Any::AttestationGenerate | Any::ItemToolCall => {
+            return None;
+        }
     })
 }
 

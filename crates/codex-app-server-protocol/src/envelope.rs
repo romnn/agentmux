@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Notification, Request};
+use crate::{Answered, Notification, Request, Typed};
 
 /// JSON-RPC's code for a method the receiver does not offer.
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -148,7 +148,10 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the parameters cannot be encoded as JSON.
-    pub fn request<M: Request>(id: RequestId, params: &M::Params) -> Result<Self, EncodeError> {
+    pub fn request<M: Request + Typed>(
+        id: RequestId,
+        params: &M::Params,
+    ) -> Result<Self, EncodeError> {
         Ok(Self::Request {
             id,
             method: M::METHOD.to_owned(),
@@ -161,7 +164,7 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the parameters cannot be encoded as JSON.
-    pub fn notification<M: Notification>(params: &M::Params) -> Result<Self, EncodeError> {
+    pub fn notification<M: Notification + Typed>(params: &M::Params) -> Result<Self, EncodeError> {
         Ok(Self::Notification {
             method: M::METHOD.to_owned(),
             params: encode(M::METHOD, params)?,
@@ -173,7 +176,7 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the result cannot be encoded as JSON.
-    pub fn result<M: Request>(id: RequestId, response: &M::Response) -> Result<Self, EncodeError> {
+    pub fn result<M: Answered>(id: RequestId, response: &M::Response) -> Result<Self, EncodeError> {
         Ok(Self::Response {
             id,
             outcome: Ok(encode(M::METHOD, response)?),
@@ -315,7 +318,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{Message, RequestId, RpcError};
-    use crate::{Request, methods, types};
+    use crate::{Answered, methods, types};
 
     /// Responses, notifications and requests are told apart by `id` and `method`, with or
     /// without the `jsonrpc` member codex leaves out.

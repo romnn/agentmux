@@ -3,7 +3,5 @@
 crates/codex-app-server-protocol/src/schema.rs linguist-generated=true
 crates/codex-app-server-protocol/src/methods.rs linguist-generated=true
 
-# codex's own JSON Schema, and which type answers each request as codex's source declares it, both
-# exported from the pinned codex with `task codegen:app-server:refresh`.
+# codex's own JSON Schema, exported from the pinned codex with `task codegen:app-server:refresh`.
 crates/codex-app-server-codegen/schema/codex_app_server_protocol.schemas.json linguist-generated=true linguist-vendored=true
-crates/codex-app-server-codegen/schema/codex_app_server_protocol.responses.json linguist-generated=true linguist-vendored=true

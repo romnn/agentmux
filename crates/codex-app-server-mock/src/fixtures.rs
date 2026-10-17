@@ -43,7 +43,7 @@ pub fn thread(id: &str) -> Thread {
     Thread {
         agent_nickname: None,
         agent_role: None,
-        cli_version: "0.162.1".to_owned(),
+        cli_version: codex_app_server_protocol::methods::CODEX_VERSION.to_owned(),
         created_at: 1_790_000_000,
         cwd: "/work/project".to_owned(),
         ephemeral: false,

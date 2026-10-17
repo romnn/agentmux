@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use codex_app_server_codegen::{
-    Error, File, Inputs, Layout, generate, pinned_codex_version, upstream, vendored_responses,
+    Error, File, Inputs, Layout, generate, pinned_codex_version, upstream,
 };
 
 #[derive(Debug, Parser)]
@@ -25,16 +25,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Replace the vendored schema bundle with what the pinned codex on PATH exports, and the
-    /// vendored responses with what that release's source declares, then regenerate.
-    ///
-    /// Fetches codex's source from GitHub.
+    /// Replace the vendored schema bundle with what the pinned codex on PATH exports, then
+    /// regenerate.
     Refresh {
-        /// Change nothing, and fail when a vendored input differs from what the pinned release
+        /// Change nothing, and fail when the vendored bundle differs from what the pinned release
         /// exports.
         #[arg(long)]
         check: bool,
     },
+    /// Print the pinned codex release: the tag the oracle builds codex's own crate at.
+    Pin,
 }
 
 fn main() -> ExitCode {
@@ -43,6 +43,10 @@ fn main() -> ExitCode {
     let outcome = match options.command {
         Command::Generate { check } => regenerate(&layout, check),
         Command::Refresh { check } => refresh(&layout, check),
+        Command::Pin => pinned_codex_version(&layout).map(|version| {
+            println!("{version}");
+            true
+        }),
     };
     match outcome {
         Ok(true) => ExitCode::SUCCESS,
@@ -82,35 +86,24 @@ fn regenerate(layout: &Layout, check: bool) -> Result<bool, Error> {
     Ok(current)
 }
 
-/// Export the vendored inputs from the pinned release and regenerate, or with `check`, report
-/// whether they are what it exports.
+/// Export the vendored bundle from the pinned release and regenerate, or with `check`, report
+/// whether it is what that release exports.
 fn refresh(layout: &Layout, check: bool) -> Result<bool, Error> {
     let pinned = pinned_codex_version(layout)?;
-    let bundle = upstream::export(&pinned)?;
-    let responses = vendored_responses(&bundle, &upstream::definitions(&pinned)?)?;
-    let exported = [
-        File {
-            path: layout.bundle(),
-            contents: String::from_utf8_lossy(&bundle).into_owned(),
-        },
-        File {
-            path: layout.responses(),
-            contents: responses.to_json()?,
-        },
-    ];
+    let exported = File {
+        path: layout.bundle(),
+        contents: String::from_utf8_lossy(&upstream::export(&pinned)?).into_owned(),
+    };
     if check {
-        let mut current = true;
-        for file in &exported {
-            if !file.is_current()? {
-                eprintln!(
-                    "{} is not what codex-cli {pinned} exports; run `task codegen:app-server:refresh`",
-                    file.path.display()
-                );
-                current = false;
-            }
+        let current = exported.is_current()?;
+        if !current {
+            eprintln!(
+                "{} is not what codex-cli {pinned} exports; run `task codegen:app-server:refresh`",
+                exported.path.display()
+            );
         }
         return Ok(current);
     }
-    exported.iter().try_for_each(File::write)?;
+    exported.write()?;
     regenerate(layout, false)
 }

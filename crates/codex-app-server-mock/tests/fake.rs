@@ -119,7 +119,7 @@ fn fake(scenario: impl FnOnce(&Path) -> Scenario) -> Result<Fake> {
 }
 
 /// Send request `params` under `id` and take the next message, which must answer it.
-fn ask<M: codex_app_server_protocol::ClientRequest>(
+fn ask<M: codex_app_server_protocol::ClientRequest + codex_app_server_protocol::Typed>(
     client: &mut Peer,
     id: i64,
     params: &M::Params,

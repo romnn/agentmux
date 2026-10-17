@@ -3,29 +3,33 @@
 //! The inputs are all checked in:
 //!
 //! - `schema/codex_app_server_protocol.schemas.json`, the bundle `codex app-server
-//!   generate-json-schema` writes, and `schema/codex-version`, the codex release it came from;
-//! - `schema/codex_app_server_protocol.responses.json`, which type answers each request, read
-//!   from that release's own request definitions ([`responses`]), since the bundle does not say;
+//!   generate-json-schema` writes;
+//! - [`surface!`], the one table of the methods agentmux uses and their payload types, which is
+//!   also the only place that says which type answers a request, since the bundle does not;
+//! - `oracle/Cargo.lock`, whose codex tag is the pinned release: the oracle builds the table
+//!   against that release's own Rust, and the bundle is what that release exports;
 //! - `Cargo.lock`, whose progeny commit renders the types, configured by this crate's code.
 //!
 //! The outputs are `src/schema.rs` (the payload types, rendered by progeny) and `src/methods.rs`
 //! (the method bindings) of `codex-app-server-protocol`, and they are checked in too.
-//! Every method the bundle lists is bound ([`methods`]); nothing is chosen by hand.
+//! Every method the bundle lists is bound by name, and the surface's methods to their types
+//! ([`methods`]).
 //! Generation needs neither codex nor the network, so a test can regenerate both and fail when
 //! the committed files differ.
-//! Only [`upstream`] runs codex and fetches its source, to replace the vendored inputs with what
-//! the pinned release exports.
+//! Only [`upstream`] runs codex, to replace the vendored bundle with what the pinned release
+//! exports.
 
 pub mod bindings;
 pub mod methods;
 pub mod openapi;
-pub mod responses;
+pub mod surface;
 pub mod upstream;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::openapi::Schemas;
-use crate::responses::{Responses, Side};
+use crate::surface::Surface;
 
 /// Why generation failed.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +61,13 @@ pub enum Error {
     /// `Cargo.lock` does not say which progeny commit generates.
     #[error("Cargo.lock pins no git commit of progeny")]
     ProgenyCommit,
+    /// `oracle/Cargo.lock` does not say which codex release the protocol is pinned to.
+    #[error("oracle/Cargo.lock pins no `rust-v…` tag of codex")]
+    CodexPin,
+    /// `oracle/Cargo.lock` resolved codex's crates at more than one revision, so the checks the
+    /// oracle runs would not all be against one release.
+    #[error("oracle/Cargo.lock resolves codex at more than one revision: {}", .0.join(", "))]
+    CodexPins(Vec<String>),
     /// A schema a method reaches does not exist.
     #[error("codex's schema defines no `{0}`")]
     UnknownSchema(String),
@@ -67,18 +78,6 @@ pub enum Error {
         method: String,
         /// Why.
         reason: String,
-    },
-    /// codex's request definitions cannot be read.
-    #[error("codex's request definitions are unusable: {0}")]
-    Definitions(String),
-    /// A file could not be downloaded.
-    #[error("cannot fetch {url}")]
-    Fetch {
-        /// What was asked for.
-        url: String,
-        /// Why.
-        #[source]
-        source: Box<ureq::Error>,
     },
     /// progeny refused the document.
     #[error("progeny refused the document")]
@@ -106,7 +105,7 @@ pub enum Error {
     /// The codex on `PATH` is not the pinned release.
     #[error(
         "codex-cli {installed} is on PATH, but the protocol is pinned to {pinned} \
-         (schema/codex-version): install that release, or move the pin deliberately"
+         (the oracle's codex tag): install that release, or move the pin deliberately"
     )]
     CodexVersion {
         /// The release on `PATH`.
@@ -150,18 +149,10 @@ impl Layout {
             .join("codex_app_server_protocol.schemas.json")
     }
 
-    /// Which type answers each request, from codex's request definitions.
+    /// The oracle's lockfile, which pins the codex release.
     #[must_use]
-    pub fn responses(&self) -> PathBuf {
-        self.root
-            .join("schema")
-            .join("codex_app_server_protocol.responses.json")
-    }
-
-    /// The codex release the bundle came from.
-    #[must_use]
-    pub fn codex_version(&self) -> PathBuf {
-        self.root.join("schema").join("codex-version")
+    pub fn oracle_lockfile(&self) -> PathBuf {
+        self.root.join("oracle").join("Cargo.lock")
     }
 
     /// This crate's lockfile, which pins progeny.
@@ -195,8 +186,6 @@ impl Layout {
 pub struct Inputs {
     /// The schema bundle codex exported.
     pub bundle: Vec<u8>,
-    /// Which type answers each request.
-    pub responses: Vec<u8>,
     /// The codex release it came from.
     pub codex_version: String,
     /// The progeny commit that renders them.
@@ -213,20 +202,54 @@ impl Inputs {
         let progeny_commit = locked_progeny_commit(&read_text(&layout.lockfile())?)?;
         Ok(Self {
             bundle: read(&layout.bundle())?,
-            responses: read(&layout.responses())?,
             codex_version: pinned_codex_version(layout)?,
             progeny_commit,
         })
     }
 }
 
-/// The codex release the vendored inputs come from, which is all that refreshing them reads.
+/// The codex release the protocol is pinned to: the `rust-v…` tag the oracle's lockfile resolved
+/// codex's crate at.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Read`] when the pin cannot be read.
+/// Returns [`Error::Read`] when the lockfile cannot be read, [`Error::CodexPin`] when it pins no
+/// such tag, and [`Error::CodexPins`] when codex's crates resolve at more than one.
 pub fn pinned_codex_version(layout: &Layout) -> Result<String, Error> {
-    Ok(read_text(&layout.codex_version())?.trim().to_owned())
+    locked_codex_version(&read_text(&layout.oracle_lockfile())?)
+}
+
+/// codex's repository, as a lockfile names the source of a package it provides.
+const CODEX_REPOSITORY: &str = "git+https://github.com/openai/codex";
+
+/// The codex release a lockfile resolved codex's crates at, from their `rust-v…` tag.
+///
+/// Every package codex's repository provides must resolve to one revision: the oracle checks the
+/// method table against one of codex's crates and the exec mirror against others, and a tag moved
+/// for one of them alone would check the two against different releases.
+fn locked_codex_version(lockfile: &str) -> Result<String, Error> {
+    // Every source in codex's repository, however it is pinned: a crate on a branch beside one
+    // on a tag is two revisions too.
+    let sources: Vec<String> = locked_packages(lockfile)
+        .into_iter()
+        .filter_map(|package| package.source)
+        .filter(|source| {
+            source
+                .strip_prefix(CODEX_REPOSITORY)
+                .is_some_and(|rest| rest.starts_with(['?', '#']))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    match sources.as_slice() {
+        [source] => source
+            .split_once("?tag=rust-v")
+            .and_then(|(_, tag)| tag.split_once('#'))
+            .map(|(version, _)| version.to_owned())
+            .ok_or(Error::CodexPin),
+        [] => Err(Error::CodexPin),
+        _ => Err(Error::CodexPins(sources)),
+    }
 }
 
 /// One generated file.
@@ -272,14 +295,13 @@ impl File {
 ///
 /// # Errors
 ///
-/// Returns an error when the bundle is unusable, it and the responses disagree, or progeny
-/// refuses the document.
+/// Returns an error when the bundle is unusable, it does not bear out the [`surface!`] table, or
+/// progeny refuses the document.
 pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
     let bundle: serde_json::Value =
         serde_json::from_slice(&inputs.bundle).map_err(Error::BundleJson)?;
     let schemas = Schemas::from_bundle(&bundle)?;
-    let responses = Responses::from_json(&inputs.responses)?;
-    let methods = methods::read(&bundle, &responses, &schemas)?;
+    let methods = methods::read(&bundle, &Surface::table(), &schemas)?;
 
     let kept = schemas.closure(methods::roots(&methods))?;
     let document = schemas.document(&kept, &inputs.codex_version);
@@ -349,47 +371,44 @@ fn header(inputs: &Inputs) -> String {
     )
 }
 
-/// The progeny commit `Cargo.lock` resolved, from its `source` line.
+/// The progeny commit `Cargo.lock` resolved.
 fn locked_progeny_commit(lockfile: &str) -> Result<String, Error> {
-    #[derive(serde::Deserialize)]
-    struct Lockfile {
-        package: Vec<Package>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Package {
-        name: String,
-        source: Option<String>,
-    }
-    let lockfile: Lockfile = toml::from_str(lockfile).map_err(|_| Error::ProgenyCommit)?;
-    lockfile
-        .package
-        .into_iter()
-        .find(|package| package.name == "progeny")
-        .and_then(|package| package.source)
+    locked_source(lockfile, "progeny")
         .and_then(|source| {
-            source
-                .strip_prefix("git+")
-                .and_then(|git| git.rsplit_once('#'))
-                .map(|(_, commit)| commit.to_owned())
+            let (_, commit) = source.strip_prefix("git+")?.rsplit_once('#')?;
+            Some(commit.to_owned())
         })
         .ok_or(Error::ProgenyCommit)
 }
 
-/// Which type answers each request the bundle lists, read from codex's request definitions.
+/// One package a lockfile resolved.
+#[derive(serde::Deserialize)]
+struct LockedPackage {
+    name: String,
+    source: Option<String>,
+}
+
+/// Every package a lockfile resolved, or none when it cannot be read as one.
+fn locked_packages(lockfile: &str) -> Vec<LockedPackage> {
+    #[derive(serde::Deserialize)]
+    struct Lockfile {
+        package: Vec<LockedPackage>,
+    }
+    toml::from_str::<Lockfile>(lockfile)
+        .map(|lockfile| lockfile.package)
+        .unwrap_or_default()
+}
+
+/// Where a lockfile resolved the package `name` from, or `None` when it locks no such package or
+/// is not a lockfile.
 ///
-/// # Errors
-///
-/// Returns an error when the bundle is unusable or the definitions cannot be read.
-pub fn vendored_responses(bundle: &[u8], definitions: &str) -> Result<Responses, Error> {
-    let bundle: serde_json::Value = serde_json::from_slice(bundle).map_err(Error::BundleJson)?;
-    let client = methods::requests_sent_by(&bundle, Side::Client)?;
-    let server = methods::requests_sent_by(&bundle, Side::Server)?;
-    Ok(
-        Responses::parse(definitions)?.retain(|side, method| match side {
-            Side::Client => client.contains(method),
-            Side::Server => server.contains(method),
-        }),
-    )
+/// A path package of the same name has no source: the oracle builds agentmux's own protocol
+/// crate beside codex's, to check the mirror it holds.
+fn locked_source(lockfile: &str, name: &str) -> Option<String> {
+    locked_packages(lockfile)
+        .into_iter()
+        .filter(|package| package.name == name)
+        .find_map(|package| package.source)
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, Error> {
@@ -409,9 +428,9 @@ fn read_text(path: &Path) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use googletest::prelude::*;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
-    use super::locked_progeny_commit;
+    use super::{Error, locked_codex_version, locked_progeny_commit};
 
     /// The commit is read from the git source Cargo resolved, not from the manifest's request.
     #[gtest]
@@ -432,6 +451,60 @@ mod tests {
         assert_that!(
             locked_progeny_commit(lockfile).or_fail()?,
             eq("c8e4888b54954acef8e83a2902feaa26c860cef5")
+        );
+        Ok(())
+    }
+
+    /// The codex release is the tag the oracle's lockfile resolved codex's crate at, beside
+    /// agentmux's own crate of the same name.
+    #[gtest]
+    fn the_codex_release_comes_from_the_oracles_lockfile() -> Result<()> {
+        let lockfile = indoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "codex-app-server-protocol"
+            version = "0.0.8"
+
+            [[package]]
+            name = "codex-app-server-protocol"
+            version = "0.162.1"
+            source = "git+https://github.com/openai/codex?tag=rust-v0.162.1#092d3acd7f8e0f2d1b6b4f3c4a5e6d7c8b9a0f1e"
+        "#};
+        assert_that!(locked_codex_version(lockfile).or_fail()?, eq("0.162.1"));
+
+        // A lockfile that resolved codex at a branch or a bare commit pins no release.
+        let unpinned = lockfile.replace("?tag=rust-v0.162.1", "?branch=main");
+        assert_that!(
+            locked_codex_version(&unpinned),
+            err(matches_pattern!(Error::CodexPin))
+        );
+
+        // Nor does one that resolved another of codex's crates at another release: the oracle
+        // would check the two against different codex.
+        let split = formatdoc! {r#"
+            {lockfile}
+            [[package]]
+            name = "codex-exec"
+            version = "0.163.0"
+            source = "git+https://github.com/openai/codex?tag=rust-v0.163.0#1111111111111111111111111111111111111111"
+        "#};
+        assert_that!(
+            locked_codex_version(&split),
+            err(matches_pattern!(Error::CodexPins(len(eq(2)))))
+        );
+
+        // Nor one that resolved another of them at a branch.
+        let branch = formatdoc! {r#"
+            {lockfile}
+            [[package]]
+            name = "codex-exec"
+            version = "0.163.0"
+            source = "git+https://github.com/openai/codex?branch=main#1111111111111111111111111111111111111111"
+        "#};
+        assert_that!(
+            locked_codex_version(&branch),
+            err(matches_pattern!(Error::CodexPins(len(eq(2)))))
         );
         Ok(())
     }

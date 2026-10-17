@@ -9,7 +9,10 @@ publish = false
 # A workspace of its own, excluded from the agentmux workspace, so that nothing building agentmux
 # compiles the generator: progeny turns on `serde_json/arbitrary_precision`, and a feature unified
 # into `cargo test --workspace` would test agentmux against a serde_json its release never links.
+# The oracle is a workspace of its own again, because it builds codex's crate, which only `task
+# codegen:app-server:oracle` should pay for.
 [workspace]
+exclude = ["oracle"]
 
 [[bin]]
 name = "codex-app-server-codegen"
@@ -18,8 +21,6 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 indoc = "2"
-# Reads codex's request tables as Rust tokens, so a reformatted table still parses.
-proc-macro2 = { version = "1", default-features = false }
 # Pinned to a commit, and so by the lockfile beside this manifest: the generated sources carry it
 # in their header, and moving it is a deliberate regeneration.
 progeny = { git = "https://github.com/romnn/progeny", rev = "c8e4888b54954acef8e83a2902feaa26c860cef5" }
@@ -28,8 +29,6 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 toml = "0.9"
-# Fetches codex's request definitions at the pinned release.
-ureq = "3"
 
 [dev-dependencies]
 googletest = "0"

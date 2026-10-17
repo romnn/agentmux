@@ -204,13 +204,21 @@ tasks:
       - cargo clippy --manifest-path crates/codex-app-server-codegen/Cargo.toml --all-targets --no-deps -- -D warnings
 
   codegen:app-server:refresh:
-    desc: "re-export the vendored schema and responses from the pinned codex on PATH and its source, then regenerate"
+    desc: "re-export the vendored schema from the pinned codex on PATH, then regenerate"
     cmds:
-      # Needs the codex release named in crates/codex-app-server-codegen/schema/codex-version, and
-      # the network, for that release's request definitions on GitHub.
+      # Needs the codex release `codex-app-server-codegen pin` names.
       - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh
 
   codegen:app-server:upstream:
-    desc: "fail if the vendored schema and responses are not what the pinned codex on PATH and its source export"
+    desc: "fail if the vendored schema is not what the pinned codex on PATH exports"
     cmds:
       - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh --check
+
+  codegen:app-server:oracle:
+    desc: "fail if the answers table or the exec mirror is not what codex's own crates declare at the pinned tag"
+    cmds:
+      # Compiling is most of the check, and the test checks how the mirror serialises; it builds
+      # codex's crates, so it is slow the first time.
+      # Locked, because the lockfile is the pin every other check reads: a tag moved in the
+      # manifest alone must fail here rather than check a release nothing else does.
+      - cargo test --locked --manifest-path crates/codex-app-server-codegen/oracle/Cargo.toml
