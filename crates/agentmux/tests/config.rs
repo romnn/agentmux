@@ -242,6 +242,45 @@ fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
     Ok(())
 }
 
+/// A vendor this build does not know is reported like any other key, and the rest of the file
+/// takes effect.
+///
+/// One file is synced across machines that will not all be running the same agentmux.
+#[gtest]
+fn an_unknown_vendor_is_reported_and_the_file_still_loads() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.claude.personal]
+            config_dir = "/tmp"
+
+            [accounts.gemini.personal]
+            config_dir = "/tmp"
+
+            [defaults.gemini]
+            account = "personal"
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|u| u.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("accounts.gemini"), eq("defaults.gemini")]
+    );
+    assert_that!(
+        config.alias_names(agentmux::delegate::Vendor::Claude),
+        elements_are![eq("personal")]
+    );
+    Ok(())
+}
+
 /// A file written for a newer agentmux loads on an older one.
 ///
 /// The reason the rule is worth the misspelling it lets through: a machine file is edited once and
@@ -577,14 +616,19 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
         eq(Isolation::Isolated)
     );
 
-    // Named by the caller, the account's own preference stands.
+    // Named by the caller, it is still the checkout's choice: a follow-up names the default it
+    // resolved, and the checkout's instructions could name it too.
     let named = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     };
-    assert_that!(named.resolved_isolation(&config), eq(Isolation::Inherit));
+    assert_that!(named.resolved_isolation(&config), eq(Isolation::Isolated));
+
+    // Only the caller asking for it outright switches it on.
+    let asked = named.with_isolation(Isolation::Inherit);
+    assert_that!(asked.resolved_isolation(&config), eq(Isolation::Inherit));
     Ok(())
 }
 
@@ -603,12 +647,16 @@ fn an_unusable_alias_is_refused_at_load() -> Result<()> {
     )
     .or_fail()?;
 
+    // The file is read straight into aliases, so the parser refuses it and says where.
     let error = Config::load(&env(home.path()), home.path()).expect_err("a space is not a name");
     assert_that!(
         error,
-        matches_pattern!(agentmux::config::ConfigError::InvalidName { .. })
+        matches_pattern!(agentmux::config::ConfigError::Malformed {
+            message: contains_substring("account"),
+            offset: some(anything()),
+            ..
+        })
     );
-    assert_that!(error.to_string(), contains_substring("work account"));
     Ok(())
 }
 
@@ -820,12 +868,10 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
 
     assert_that!(
         Config::load(&env(home.path()), home.path()).map(|_| ()),
-        err(matches_pattern!(
-            agentmux::config::ConfigError::InvalidName {
-                what: eq(&"the default account"),
-                ..
-            }
-        ))
+        err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+            message: contains_substring("account"),
+            ..
+        }))
     );
     Ok(())
 }
@@ -839,7 +885,7 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
 /// business of knowing which models exist.
 #[gtest]
 fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
-    use agentmux::delegate::Vendor;
+    use agentmux::delegate::{ModelId, Vendor};
 
     let home = tempfile::tempdir().or_fail()?;
     agentmux::testing::write_config_file(
@@ -859,24 +905,30 @@ fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "fable-5"),
+        config.rewritten_model(Vendor::Claude, &ModelId::parse("fable-5").or_fail()?),
         some(eq("claude-fable-5-1"))
     );
     // Released this morning, named by nobody's configuration, launched exactly as asked.
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "claude-opus-6"),
+        config.rewritten_model(Vendor::Claude, &ModelId::parse("claude-opus-6").or_fail()?),
         none()
     );
     // The rewritten identifier is not itself a name to be rewritten again, and a rule mapping it
     // to itself is neither a rewrite nor the second link of a chain.
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "claude-fable-5-1"),
+        config.rewritten_model(
+            Vendor::Claude,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         none()
     );
     // One vendor's rules are not the other's: the same name means different things to each CLI.
-    assert_that!(config.rewritten_model(Vendor::Codex, "fable-5"), none());
     assert_that!(
-        config.rewritten_model(Vendor::Codex, "gpt-6"),
+        config.rewritten_model(Vendor::Codex, &ModelId::parse("fable-5").or_fail()?),
+        none()
+    );
+    assert_that!(
+        config.rewritten_model(Vendor::Codex, &ModelId::parse("gpt-6").or_fail()?),
         some(eq("gpt-6-astra"))
     );
     Ok(())
@@ -956,12 +1008,10 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
         .or_fail()?;
         assert_that!(
             Config::load(&env(home.path()), home.path()).map(|_| ()),
-            err(matches_pattern!(
-                agentmux::config::ConfigError::InvalidName {
-                    what: eq(&"the model"),
-                    ..
-                }
-            )),
+            err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+                message: starts_with("model "),
+                ..
+            })),
             "{rule} was accepted"
         );
     }
@@ -975,7 +1025,7 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
 /// and the CLI's own is what runs.
 #[gtest]
 fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
-    use agentmux::delegate::Vendor;
+    use agentmux::delegate::{ModelId, Vendor};
 
     let home = tempfile::tempdir().or_fail()?;
     agentmux::testing::write_config_file(
@@ -993,21 +1043,27 @@ fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.default_effort(Vendor::Claude, "claude-fable-5-1"),
+        config.default_effort(
+            Vendor::Claude,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         some(eq("high"))
     );
     assert_that!(
-        config.default_effort(Vendor::Codex, "gpt-6-astra"),
+        config.default_effort(Vendor::Codex, &ModelId::parse("gpt-6-astra").or_fail()?),
         some(eq("medium"))
     );
     // Named by nobody's configuration: no effort, and the CLI decides.
     assert_that!(
-        config.default_effort(Vendor::Claude, "claude-opus-5"),
+        config.default_effort(Vendor::Claude, &ModelId::parse("claude-opus-5").or_fail()?),
         none()
     );
     // One vendor's defaults are not the other's.
     assert_that!(
-        config.default_effort(Vendor::Codex, "claude-fable-5-1"),
+        config.default_effort(
+            Vendor::Codex,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         none()
     );
     Ok(())
@@ -1074,10 +1130,10 @@ fn a_default_effort_keyed_by_a_rewritten_model_is_refused() -> Result<()> {
 fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     for (rule, what) in [
-        (r#""fable 5" = "high""#, "the model"),
-        (r#""claude-fable-5-1" = "very high""#, "the effort"),
-        (r#""claude-fable-5-1" = "--verbose""#, "the effort"),
-        (r#""claude-fable-5-1" = """#, "the effort"),
+        (r#""fable 5" = "high""#, "model "),
+        (r#""claude-fable-5-1" = "very high""#, "effort "),
+        (r#""claude-fable-5-1" = "--verbose""#, "effort "),
+        (r#""claude-fable-5-1" = """#, "effort "),
     ] {
         agentmux::testing::write_config_file(
             home.path().join("agentmux.toml"),
@@ -1089,12 +1145,10 @@ fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> 
         .or_fail()?;
         assert_that!(
             Config::load(&env(home.path()), home.path()).map(|_| ()),
-            err(matches_pattern!(
-                agentmux::config::ConfigError::InvalidName {
-                    what: eq(&what),
-                    ..
-                }
-            )),
+            err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+                message: starts_with(what),
+                ..
+            })),
             "{rule} was accepted"
         );
     }

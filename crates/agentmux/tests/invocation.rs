@@ -10,7 +10,7 @@ use std::path::Path;
 use agentmux::config::{Account, Config, Defaults, Secret};
 use agentmux::delegate::{
     AccountAlias, AccountChoice, Billing, CodexSandbox, Delegate, DelegateError, Effort,
-    Invocation, Isolation, ModelId, SessionRef, TurnPlan,
+    Invocation, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
 };
 use googletest::prelude::*;
 
@@ -112,20 +112,20 @@ fn build_with(
 ///
 /// The directory has to be real: agentmux refuses an account whose config directory is missing,
 /// which is the whole point of that check.
-fn config_with_personal(dir: &Path) -> Config {
+fn config_with_personal(dir: &Path) -> Result<Config> {
     let mut config = Config::default();
     let account = Account {
         config_dir: Some(dir.to_path_buf()),
         ..Account::default()
     };
-    for vendor in ["claude", "codex"] {
+    for vendor in [Vendor::Claude, Vendor::Codex] {
         config
             .accounts
-            .entry(vendor.to_owned())
+            .entry(vendor)
             .or_default()
-            .insert("personal".to_owned(), account.clone());
+            .insert(AccountAlias::parse("personal").or_fail()?, account.clone());
     }
-    config
+    Ok(config)
 }
 
 /// Whether `args` contains `flag` immediately followed by `value`.
@@ -141,7 +141,7 @@ fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
 #[gtest]
 fn every_delegate_captures_its_whole_stream() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let config = config_with_personal(dir.path());
+    let config = config_with_personal(dir.path())?;
     for delegate in every_delegate()? {
         let invocation = build_with(&delegate, None, &config)?;
         let args = &invocation.args();
@@ -239,7 +239,7 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
 #[gtest]
 fn the_child_does_not_inherit_the_host_session() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let config = config_with_personal(dir.path());
+    let config = config_with_personal(dir.path())?;
     for delegate in every_delegate()? {
         let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
@@ -304,7 +304,7 @@ fn the_child_does_not_inherit_the_host_session() -> Result<()> {
 #[gtest]
 fn a_named_account_authenticates_as_itself() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let config = config_with_personal(dir.path());
+    let config = config_with_personal(dir.path())?;
 
     let personal = build_with(
         &Delegate::Claude {
@@ -348,7 +348,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
 #[gtest]
 fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let config = config_with_personal(dir.path());
+    let config = config_with_personal(dir.path())?;
     let plan = TurnPlan {
         question_path: Path::new("/runs/r/turns/0000/question.md"),
         last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
@@ -383,11 +383,11 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
 #[gtest]
 fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut config = config_with_personal(dir.path());
+    let mut config = config_with_personal(dir.path())?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         Defaults {
-            account: Some("work".to_owned()),
+            account: Some(AccountAlias::parse("work").or_fail()?),
         },
     );
     config.source = Some(dir.path().join("agentmux.toml"));
@@ -423,7 +423,7 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
 fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let missing = dir.path().join("never-created");
-    let config = config_with_personal(&missing);
+    let config = config_with_personal(&missing)?;
     let plan = TurnPlan {
         question_path: Path::new("/runs/r/turns/0000/question.md"),
         last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
@@ -458,19 +458,15 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
 #[gtest]
 fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
     let mut config = Config::default();
-    config
-        .accounts
-        .entry("codex".to_owned())
-        .or_default()
-        .insert(
-            "local".to_owned(),
-            Account {
-                base_url: Some("http://localhost:11434/v1".to_owned()),
-                api_key_env: Some("LOCAL_TOKEN".to_owned()),
-                billing: Some(Billing::Api),
-                ..Account::default()
-            },
-        );
+    config.accounts.entry(Vendor::Codex).or_default().insert(
+        AccountAlias::parse("local").or_fail()?,
+        Account {
+            base_url: Some("http://localhost:11434/v1".to_owned()),
+            api_key_env: Some("LOCAL_TOKEN".to_owned()),
+            billing: Some(Billing::Api),
+            ..Account::default()
+        },
+    );
 
     let plan = TurnPlan {
         question_path: Path::new("/runs/r/turns/0000/question.md"),
@@ -754,7 +750,7 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
 #[gtest]
 fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut config = config_with_personal(dir.path());
+    let mut config = config_with_personal(dir.path())?;
     config.launch.env_passthrough = vec!["ANTHROPIC_API_KEY".to_owned()];
     config.launch.env.insert(
         "ANTHROPIC_BASE_URL".to_owned(),
@@ -791,7 +787,7 @@ fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()>
 #[gtest]
 fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut config = config_with_personal(dir.path());
+    let mut config = config_with_personal(dir.path())?;
     config.launch.env.insert(
         "DELEGATE_TEST_LAYER".to_owned(),
         Secret::new("from-machine"),
@@ -801,10 +797,11 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         .env
         .insert("MACHINE_ONLY".to_owned(), Secret::new("yes"));
     config.launch.request_env = vec!["DELEGATE_TEST_LAYER".to_owned()];
+    let personal = AccountAlias::parse("personal").or_fail()?;
     if let Some(account) = config
         .accounts
-        .get_mut("claude")
-        .and_then(|table| table.get_mut("personal"))
+        .get_mut(&Vendor::Claude)
+        .and_then(|table| table.get_mut(&personal))
     {
         account.launch.env.insert(
             "DELEGATE_TEST_LAYER".to_owned(),
@@ -856,11 +853,11 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
 #[gtest]
 fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut config = config_with_personal(dir.path());
+    let mut config = config_with_personal(dir.path())?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         agentmux::config::Defaults {
-            account: Some("personal".to_owned()),
+            account: Some(AccountAlias::parse("personal").or_fail()?),
         },
     );
 
@@ -896,13 +893,13 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
 fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result<()> {
     let mut config = Config {
         project_source: Some(std::path::PathBuf::from("/work/client/agentmux.toml")),
-        project_defaults: ["claude".to_owned()].into_iter().collect(),
+        project_defaults: [Vendor::Claude].into_iter().collect(),
         ..Config::default()
     };
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         agentmux::config::Defaults {
-            account: Some("clientx".to_owned()),
+            account: Some(AccountAlias::parse("clientx").or_fail()?),
         },
     );
     let plan = TurnPlan {
@@ -1019,11 +1016,12 @@ fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
 #[gtest]
 fn an_account_can_ask_for_its_own_settings() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut config = config_with_personal(dir.path());
+    let mut config = config_with_personal(dir.path())?;
+    let personal = AccountAlias::parse("personal").or_fail()?;
     if let Some(account) = config
         .accounts
-        .get_mut("claude")
-        .and_then(|table| table.get_mut("personal"))
+        .get_mut(&Vendor::Claude)
+        .and_then(|table| table.get_mut(&personal))
     {
         account.inherit_settings = Some(true);
     }
@@ -1071,7 +1069,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
 fn every_delegate_is_marked_so_agentmux_cannot_consult_itself() -> Result<()> {
     for delegate in every_delegate()? {
         let dir = tempfile::tempdir().or_fail()?;
-        let invocation = build_with(&delegate, None, &config_with_personal(dir.path()))?;
+        let invocation = build_with(&delegate, None, &config_with_personal(dir.path())?)?;
         assert_that!(
             invocation
                 .env()
@@ -1094,25 +1092,21 @@ fn every_delegate_is_marked_so_agentmux_cannot_consult_itself() -> Result<()> {
 #[gtest]
 fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
     let mut config = Config::default();
-    config
-        .accounts
-        .entry("claude".to_owned())
-        .or_default()
-        .insert(
-            "debug".to_owned(),
-            Account {
-                description: Some("debugging".to_owned()),
-                launch: agentmux::config::LaunchEnv {
-                    request_env: vec!["NODE_OPTIONS".to_owned()],
-                    ..agentmux::config::LaunchEnv::default()
-                },
-                ..Account::default()
+    config.accounts.entry(Vendor::Claude).or_default().insert(
+        AccountAlias::parse("debug").or_fail()?,
+        Account {
+            description: Some("debugging".to_owned()),
+            launch: agentmux::config::LaunchEnv {
+                request_env: vec!["NODE_OPTIONS".to_owned()],
+                ..agentmux::config::LaunchEnv::default()
             },
-        );
+            ..Account::default()
+        },
+    );
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         agentmux::config::Defaults {
-            account: Some("debug".to_owned()),
+            account: Some(AccountAlias::parse("debug").or_fail()?),
         },
     );
     let requested = [("NODE_OPTIONS".to_owned(), "--require /tmp/x.js".to_owned())]
@@ -1138,7 +1132,7 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
 
     // The same account chosen by the checkout: it does not.
     config.project_source = Some(std::path::PathBuf::from("/work/client/agentmux.toml"));
-    config.project_defaults = ["claude".to_owned()].into_iter().collect();
+    config.project_defaults = [Vendor::Claude].into_iter().collect();
     let project = delegate.invocation(&plan, &host_session_env(), &config);
     assert_that!(
         project.map(|_| ()),
@@ -1168,29 +1162,29 @@ fn build_requesting(
 }
 
 /// A configuration with one account per vendor, `named`, as `account` describes it.
-fn config_with_account(named: &str, account: &Account) -> Config {
+fn config_with_account(named: &str, account: &Account) -> Result<Config> {
     let mut config = Config::default();
-    for vendor in ["claude", "codex"] {
+    for vendor in [Vendor::Claude, Vendor::Codex] {
         config
             .accounts
-            .entry(vendor.to_owned())
+            .entry(vendor)
             .or_default()
-            .insert(named.to_owned(), account.clone());
+            .insert(AccountAlias::parse(named).or_fail()?, account.clone());
     }
-    config
+    Ok(config)
 }
 
 /// A delegate of either vendor on the named account.
-fn on_account(vendor: &str, alias: &str) -> Result<Delegate> {
+fn on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
     let account = AccountChoice::Named(AccountAlias::parse(alias).or_fail()?);
     Ok(match vendor {
-        "claude" => Delegate::Claude {
+        Vendor::Claude => Delegate::Claude {
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account,
             isolation: None,
         },
-        _ => Delegate::Codex {
+        Vendor::Codex => Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: Some(effort("high")?),
             sandbox: CodexSandbox::ReadOnly,
@@ -1220,7 +1214,7 @@ fn a_subscription_delegate_carries_no_billing_variable_from_any_layer() -> Resul
             },
             ..Account::default()
         },
-    );
+    )?;
     config.launch.env_passthrough = vec!["OPENAI_API_KEY".to_owned()];
     config.launch.env.insert(
         "ANTHROPIC_BASE_URL".to_owned(),
@@ -1228,8 +1222,8 @@ fn a_subscription_delegate_carries_no_billing_variable_from_any_layer() -> Resul
     );
 
     let mut delegates = every_delegate()?;
-    delegates.push(on_account("claude", "personal")?);
-    delegates.push(on_account("codex", "personal")?);
+    delegates.push(on_account(Vendor::Claude, "personal")?);
+    delegates.push(on_account(Vendor::Codex, "personal")?);
     for delegate in delegates {
         let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
@@ -1296,7 +1290,7 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
             billing: Some(Billing::Api),
             ..Account::default()
         },
-    );
+    )?;
     config.launch.request_env = vec![
         "ANTHROPIC_API_KEY".to_owned(),
         "OPENAI_API_KEY".to_owned(),
@@ -1340,7 +1334,7 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         extra_env: &requested,
         billing: None,
     };
-    let opted_in = on_account("codex", "metered")?
+    let opted_in = on_account(Vendor::Codex, "metered")?
         .invocation(&plan, &host, &config)
         .or_fail()?;
     assert_that!(
@@ -1373,8 +1367,8 @@ fn an_account_that_names_a_key_must_opt_into_api_pricing() -> Result<()> {
             },
         ),
     ] {
-        let config = config_with_account("ci", &account);
-        let refused = build_requesting(&on_account("codex", "ci")?, &config, &[]);
+        let config = config_with_account("ci", &account)?;
+        let refused = build_requesting(&on_account(Vendor::Codex, "ci")?, &config, &[]);
         assert_that!(
             refused,
             err(matches_pattern!(DelegateError::ApiBillingNotAllowed {
@@ -1398,15 +1392,15 @@ fn a_checkout_cannot_switch_on_api_pricing() -> Result<()> {
             billing: Some(Billing::Api),
             ..Account::default()
         },
-    );
+    )?;
     config.defaults.insert(
-        "codex".to_owned(),
+        Vendor::Codex,
         agentmux::config::Defaults {
-            account: Some("metered".to_owned()),
+            account: Some(AccountAlias::parse("metered").or_fail()?),
         },
     );
     config.project_source = Some(std::path::PathBuf::from("/work/client/agentmux.toml"));
-    config.project_defaults = ["codex".to_owned()].into_iter().collect();
+    config.project_defaults = [Vendor::Codex].into_iter().collect();
 
     let delegate = every_delegate()?.swap_remove(2);
     assert_that!(
@@ -1471,7 +1465,7 @@ fn build_billed(
 #[gtest]
 fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    let codex = on_account("codex", "personal")?;
+    let codex = on_account(Vendor::Codex, "personal")?;
     let allows_api = config_with_account(
         "personal",
         &Account {
@@ -1479,14 +1473,14 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
             billing: Some(Billing::Api),
             ..Account::default()
         },
-    );
+    )?;
     let subscription_only = config_with_account(
         "personal",
         &Account {
             config_dir: Some(home.path().to_path_buf()),
             ..Account::default()
         },
-    );
+    )?;
 
     // The account's opt-in decides when nothing is asked, and a caller may ask for less.
     assert_that!(
@@ -1515,7 +1509,7 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
             billing: Some(Billing::Api),
             ..Account::default()
         },
-    );
+    )?;
     assert_that!(
         build_billed(&codex, &keyed, Some(Billing::Subscription)),
         err(displays_as(contains_substring(

@@ -31,7 +31,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
-use crate::config::{Account, ChosenBy, Config, DefaultAccount, Secret};
+use crate::config::{Account, ChosenBy, Config, Secret};
 
 /// A delegate argument that could not be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -77,9 +77,9 @@ pub enum DelegateError {
         /// Which CLI the alias was being resolved for.
         vendor: Vendor,
         /// The alias that was asked for.
-        alias: String,
+        alias: AccountAlias,
         /// Every alias that vendor does have.
-        configured: Vec<String>,
+        configured: Vec<AccountAlias>,
         /// Which file supplied them, when one did.
         config_path: Option<std::path::PathBuf>,
         /// The file that chose this alias, when the caller did not.
@@ -98,7 +98,7 @@ pub enum DelegateError {
         /// Which CLI the account belongs to.
         vendor: Vendor,
         /// The alias that was asked for.
-        alias: String,
+        alias: AccountAlias,
         /// The directory that is missing.
         path: std::path::PathBuf,
     },
@@ -119,7 +119,7 @@ pub enum DelegateError {
         /// Which CLI the account belongs to.
         vendor: Vendor,
         /// The alias that was asked for.
-        alias: String,
+        alias: AccountAlias,
         /// The account field that names the credential or endpoint.
         field: &'static str,
         /// Why the consultation runs on a subscription.
@@ -170,11 +170,7 @@ fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
 /// own configuration directory and "use my personal account, with its hooks" is one thought rather
 /// than two.
 /// With neither, the answer is isolation: it is the safe default and needs no configuration.
-///
-/// An account chosen by a *project* file does not get to decide.
-/// Such a file arrives with a `git clone`, and while it may say which of the operator's accounts
-/// pays, letting it also switch on that account's hooks and MCP servers would make a checkout a
-/// third way to change isolation, which the operator was promised is imposed by argument alone.
+/// An account a checkout chose does not get to decide; see [`AccountPolicy`].
 fn resolve_isolation(
     explicit: Option<Isolation>,
     vendor: Vendor,
@@ -184,22 +180,12 @@ fn resolve_isolation(
     if let Some(isolation) = explicit {
         return isolation;
     }
-    let alias = match account {
-        AccountChoice::Named(alias) => alias.as_str(),
-        AccountChoice::CliLogin => return Isolation::Isolated,
-        AccountChoice::Default => match config.default_account(vendor) {
-            Some(DefaultAccount {
-                chosen_by: ChosenBy::Project(_),
-                ..
-            })
-            | None => return Isolation::Isolated,
-            Some(default) => default.alias,
-        },
-    };
-    let inherits = config
-        .account(vendor, alias)
-        .and_then(|account| account.inherit_settings)
-        .unwrap_or(false);
+    // An account that cannot be resolved is refused by the launch, which says why; until then
+    // it switches nothing on.
+    let inherits = AccountPolicy::resolve(vendor, account, config)
+        .ok()
+        .flatten()
+        .is_some_and(|policy| policy.inherits_settings());
     if inherits {
         Isolation::Inherit
     } else {
@@ -221,7 +207,7 @@ fn describe_isolation(isolation: Option<Isolation>) -> &'static str {
 }
 
 /// Describe which aliases exist, for an unknown-alias error.
-fn describe_configured(configured: &[String], source: Option<&std::path::Path>) -> String {
+fn describe_configured(configured: &[AccountAlias], source: Option<&std::path::Path>) -> String {
     if configured.is_empty() {
         return match source {
             Some(path) => format!("{} defines none for it.", path.display()),
@@ -231,7 +217,11 @@ fn describe_configured(configured: &[String], source: Option<&std::path::Path>) 
                 .to_owned(),
         };
     }
-    let names = configured.join(", ");
+    let names = configured
+        .iter()
+        .map(AccountAlias::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
     match source {
         Some(path) => format!("{} defines: {names}.", path.display()),
         None => format!("Configured: {names}."),
@@ -348,9 +338,15 @@ macro_rules! string_newtype_conversions {
                 value.0
             }
         }
+        // Padded, so a table can align a column of them.
         impl std::fmt::Display for $ty {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.0)
+                f.pad(&self.0)
+            }
+        }
+        impl PartialEq<str> for $ty {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
             }
         }
     )+};
@@ -1240,8 +1236,7 @@ impl Delegate {
     ) -> Result<Invocation, DelegateError> {
         let Identity {
             mut env,
-            account,
-            chosen_by_project,
+            policy,
             billing,
         } = resolve_identity(
             self.vendor(),
@@ -1264,21 +1259,11 @@ impl Delegate {
             } => codex_args(model, effort.as_ref(), *sandbox, plan, isolation),
         };
 
-        // An account's own `request_env` counts only when the account was the machine's choice
-        // or the caller's.
-        // A checkout that selects an account is allowed to say which account pays, and nothing
-        // more; the names a request may set are policy the same checkout's instructions could
-        // otherwise steer a caller into using.
         let allowed: Vec<&str> = config
             .launch
             .request_env
             .iter()
-            .chain(
-                account
-                    .filter(|_| !chosen_by_project)
-                    .into_iter()
-                    .flat_map(|a| a.launch.request_env.iter()),
-            )
+            .chain(policy.iter().flat_map(|policy| policy.request_env()))
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
@@ -1395,9 +1380,7 @@ pub(crate) struct Identity<'c> {
     /// The environment, complete but for the request's own names and the recursion marker.
     pub(crate) env: BTreeMap<String, String>,
     /// The account that was applied, when one was.
-    pub(crate) account: Option<&'c Account>,
-    /// Whether that account was the checkout's choice rather than the machine's or the caller's.
-    pub(crate) chosen_by_project: bool,
+    pub(crate) policy: Option<AccountPolicy<'c>>,
     /// The pricing the delegate may run on.
     pub(crate) billing: Billing,
 }
@@ -1409,7 +1392,7 @@ pub(crate) struct Identity<'c> {
 /// Returns the account errors documented on [`Delegate::invocation`].
 pub(crate) fn resolve_identity<'c>(
     vendor: Vendor,
-    account: &AccountChoice,
+    account: &'c AccountChoice,
     config: &'c Config,
     host_env: &BTreeMap<String, String>,
     requested: Option<Billing>,
@@ -1417,28 +1400,8 @@ pub(crate) fn resolve_identity<'c>(
     let mut env = base_env(host_env);
     // The machine-wide layer, before any account chooses an identity.
     config.launch.apply(&mut env, host_env);
-    let selection = select_alias(vendor, account, config)?;
-    // Whether the checkout's file names this alias as the default, whoever else did: a
-    // consultation records the alias it resolved to, so a follow-up asks for it by name, and a
-    // caller told by the checkout's own instructions to name it is the checkout's choice too.
-    let chosen_by_project = selection.as_ref().is_some_and(|selection| {
-        matches!(
-            config.default_account(vendor),
-            Some(DefaultAccount {
-                alias,
-                chosen_by: ChosenBy::Project(_),
-            }) if alias == selection.alias.as_str()
-        )
-    });
-    let (account, billing) = apply_account(
-        &mut env,
-        vendor,
-        selection,
-        config,
-        host_env,
-        chosen_by_project,
-        requested,
-    )?;
+    let policy = AccountPolicy::resolve(vendor, account, config)?;
+    let billing = apply_account(&mut env, vendor, policy, host_env, requested)?;
     // Whatever the machine's or the account's launch layer forwarded or set, a subscription
     // delegate carries no key and no endpoint override.
     if billing == Billing::Subscription {
@@ -1454,8 +1417,7 @@ pub(crate) fn resolve_identity<'c>(
     }
     Ok(Identity {
         env,
-        account,
-        chosen_by_project,
+        policy,
         billing,
     })
 }
@@ -1542,53 +1504,107 @@ pub(crate) fn credential_vars(vendor: Vendor) -> CredentialVars {
     }
 }
 
-/// Who chose the alias a launch resolves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Chooser {
-    Caller,
-    Machine,
-    Project,
-}
-
-/// Which alias a launch resolves to, and who chose it.
-struct Selection {
-    alias: AccountAlias,
-    chooser: Chooser,
-}
-
-/// The alias a launch resolves to: the one named, else the configured default unless the CLI's
-/// own login was chosen, else none.
+/// The account a launch runs as, and what whoever chose it lets it switch on.
 ///
-/// A caller that names no account gets the machine's or the checkout's chosen default, which is
-/// the only thing a project file is allowed to say and therefore the only reason it exists.
-fn select_alias(
-    vendor: Vendor,
-    account: &AccountChoice,
-    config: &Config,
-) -> Result<Option<Selection>, DelegateError> {
-    let default = config.default_account(vendor);
-    let chosen_by = |default: &DefaultAccount| match default.chosen_by {
-        ChosenBy::Machine(_) => Chooser::Machine,
-        ChosenBy::Project(_) => Chooser::Project,
-    };
-    match account {
-        // A consultation records the default it resolved by name, so an alias that is still the
-        // default is the file's choice, and an unknown one is reported against that file.
-        AccountChoice::Named(alias) => Ok(Some(Selection {
-            alias: alias.clone(),
-            chooser: default
-                .filter(|default| default.alias == alias.as_str())
-                .map_or(Chooser::Caller, |default| chosen_by(&default)),
-        })),
-        AccountChoice::CliLogin => Ok(None),
-        AccountChoice::Default => default
-            .map(|default| {
-                Ok(Selection {
-                    alias: AccountAlias::parse(default.alias)?,
-                    chooser: chosen_by(&default),
-                })
-            })
-            .transpose(),
+/// A project file may say which of the operator's accounts pays, and nothing more.
+/// So an account it chose runs isolated, never on API pricing, and with none of the request
+/// environment names the machine file lists for it, whatever that file says: each is something
+/// the same checkout's instructions could otherwise steer a caller into using.
+/// An alias that is the checkout's default counts as its choice even when a caller names it,
+/// because a consultation records the default it resolved by name and a follow-up asks for it
+/// that way, and because a caller told by the checkout's instructions to name it is the
+/// checkout's choice too.
+/// This is the one place that rule is decided.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AccountPolicy<'a> {
+    /// The alias.
+    pub(crate) alias: &'a AccountAlias,
+    /// The account the machine file defines under it.
+    pub(crate) account: &'a Account,
+    /// The file whose default the alias is, or `None` when only the caller named it.
+    chosen_by: Option<ChosenBy<'a>>,
+}
+
+impl<'a> AccountPolicy<'a> {
+    /// The account `choice` resolves to: the one named, else the configured default unless the
+    /// CLI's own login was chosen, else none.
+    ///
+    /// A caller that names no account gets the machine's or the checkout's chosen default,
+    /// which is the only thing a project file is allowed to say and therefore the only reason it
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::UnknownAccount`] for an alias the configuration does not define,
+    /// and [`DelegateError::Environment`] for an account that is empty.
+    pub(crate) fn resolve(
+        vendor: Vendor,
+        choice: &'a AccountChoice,
+        config: &'a Config,
+    ) -> Result<Option<Self>, DelegateError> {
+        let default = config.default_account(vendor);
+        let (alias, chosen_by) = match choice {
+            AccountChoice::CliLogin => return Ok(None),
+            AccountChoice::Named(alias) => (
+                alias,
+                default
+                    .filter(|default| default.alias == alias)
+                    .map(|default| default.chosen_by),
+            ),
+            AccountChoice::Default => match default {
+                Some(default) => (default.alias, Some(default.chosen_by)),
+                None => return Ok(None),
+            },
+        };
+        let account =
+            config
+                .account(vendor, alias)
+                .ok_or_else(|| DelegateError::UnknownAccount {
+                    vendor,
+                    alias: alias.clone(),
+                    configured: config.alias_names(vendor),
+                    config_path: config.source.clone(),
+                    // The file that made the choice, so an unresolvable default sends the reader
+                    // to that file rather than to their own tool call.
+                    selected_by: chosen_by
+                        .and_then(|chosen_by| chosen_by.path())
+                        .map(std::path::Path::to_path_buf),
+                })?;
+        if account.is_empty() {
+            return Err(DelegateError::Environment(format!(
+                "the {vendor} account `{alias}` is configured but empty. Give it a `config_dir`, \
+                 an `api_key`, an `api_key_env` or a `base_url`."
+            )));
+        }
+        Ok(Some(Self {
+            alias,
+            account,
+            chosen_by,
+        }))
+    }
+
+    /// Whether a checkout's file chose the account.
+    fn from_checkout(&self) -> bool {
+        matches!(self.chosen_by, Some(ChosenBy::Project(_)))
+    }
+
+    /// Whether delegates on the account load its own settings, hooks and MCP servers.
+    pub(crate) fn inherits_settings(&self) -> bool {
+        !self.from_checkout() && self.account.inherit_settings == Some(true)
+    }
+
+    /// Whether the machine file opted the account into API pricing, and nothing withdrew it.
+    fn opted_into_api(&self) -> bool {
+        !self.from_checkout() && self.account.billing == Some(Billing::Api)
+    }
+
+    /// The environment names the account lets a request set, beyond the machine's own.
+    fn request_env(&self) -> &'a [String] {
+        if self.from_checkout() {
+            &[]
+        } else {
+            &self.account.launch.request_env
+        }
     }
 }
 
@@ -1597,17 +1613,15 @@ fn select_alias(
 /// With no alias the CLI uses its default configuration, which is what a machine with a single
 /// account of that vendor needs; only the host's pointer to a relocated Codex login is
 /// forwarded, because no account has opted into API pricing and a key would outrank that login.
-/// Returns the account that was applied, when one was, and the pricing the delegate runs on.
-fn apply_account<'c>(
+/// Returns the pricing the delegate runs on.
+fn apply_account(
     env: &mut BTreeMap<String, String>,
     vendor: Vendor,
-    selection: Option<Selection>,
-    config: &'c Config,
+    policy: Option<AccountPolicy<'_>>,
     host_env: &BTreeMap<String, String>,
-    chosen_by_project: bool,
     requested: Option<Billing>,
-) -> Result<(Option<&'c Account>, Billing), DelegateError> {
-    let Some(Selection { alias, chooser }) = selection else {
+) -> Result<Billing, DelegateError> {
+    let Some(policy) = policy else {
         if requested == Some(Billing::Api) {
             return Err(DelegateError::ApiBillingNotOptedIn {
                 why: format!(
@@ -1623,8 +1637,9 @@ fn apply_account<'c>(
                 env.insert((*key).to_owned(), value.clone());
             }
         }
-        return Ok((None, Billing::Subscription));
+        return Ok(Billing::Subscription);
     };
+    let AccountPolicy { alias, account, .. } = policy;
     // Withholding is the other half of the forwarding above, not an absence.
     // The machine's `[launch]` layer runs before this and may forward the host's own key; left
     // in place it would outrank the account's login and the caller would believe it had switched
@@ -1633,36 +1648,12 @@ fn apply_account<'c>(
         env.remove(*key);
     }
 
-    // `selected_by` names the file that made the choice, so an unresolvable default sends the
-    // reader to the file that named it rather than to their own tool call.
-    let selected_by = match chooser {
-        Chooser::Project => config.project_source.clone(),
-        Chooser::Machine => config.source.clone(),
-        Chooser::Caller => None,
-    };
-    let account =
-        config
-            .account(vendor, alias.as_str())
-            .ok_or_else(|| DelegateError::UnknownAccount {
-                vendor,
-                alias: alias.to_string(),
-                configured: config.alias_names(vendor),
-                config_path: config.source.clone(),
-                selected_by,
-            })?;
-    if account.is_empty() {
-        return Err(DelegateError::Environment(format!(
-            "the {vendor} account `{alias}` is configured but empty. Give it a `config_dir`, an \
-             `api_key`, an `api_key_env` or a `base_url`."
-        )));
-    }
-
     // The opt-in is the machine file's, for this account, and a checkout that selected the
     // account does not carry it along: a file that arrives with a clone may say which account
     // pays, never that it pays per token.
     // A caller may ask for less than the account allows, never for more.
     let opted_in = account.billing == Some(Billing::Api);
-    let billing = match (requested, opted_in && !chosen_by_project) {
+    let billing = match (requested, policy.opted_into_api()) {
         (Some(Billing::Api) | None, true) => Billing::Api,
         (Some(Billing::Api), false) => {
             return Err(DelegateError::ApiBillingNotOptedIn {
@@ -1686,7 +1677,7 @@ fn apply_account<'c>(
     {
         return Err(DelegateError::ApiBillingNotAllowed {
             vendor,
-            alias: alias.to_string(),
+            alias: alias.clone(),
             field,
             why: if requested == Some(Billing::Subscription) && opted_in {
                 "the consultation asked for subscription pricing"
@@ -1699,9 +1690,9 @@ fn apply_account<'c>(
         });
     }
 
-    apply_credentials(env, vendor, &alias, account, host_env)?;
+    apply_credentials(env, vendor, alias, account, host_env)?;
     account.launch.apply(env, host_env);
-    Ok((Some(account), billing))
+    Ok(billing)
 }
 
 /// Map one account's fields onto the variables its CLI reads.
@@ -1723,7 +1714,7 @@ fn apply_credentials(
         if !resolved.is_dir() {
             return Err(DelegateError::AccountDirMissing {
                 vendor,
-                alias: alias.to_string(),
+                alias: alias.clone(),
                 path: resolved,
             });
         }

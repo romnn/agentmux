@@ -43,22 +43,22 @@ fn host_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn config_with(vendor: &str, accounts: &[(&str, Account)]) -> Config {
+fn config_with(vendor: Vendor, accounts: &[(&str, Account)]) -> Result<Config> {
     let mut config = Config::default();
-    let table = config.accounts.entry(vendor.to_owned()).or_default();
+    let table = config.accounts.entry(vendor).or_default();
     for (alias, account) in accounts {
-        table.insert((*alias).to_owned(), account.clone());
+        table.insert(AccountAlias::parse(alias).or_fail()?, account.clone());
     }
-    config
+    Ok(config)
 }
 
 /// Every configured account is asked, and each answer is labelled with the account it came from.
 ///
 /// A caller choosing where to send work needs the mapping; a bare list of percentages is unusable.
 #[gtest]
-fn every_configured_account_is_reported_by_name() {
+fn every_configured_account_is_reported_by_name() -> Result<()> {
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[
             (
                 "work",
@@ -75,7 +75,7 @@ fn every_configured_account_is_reported_by_name() {
                 },
             ),
         ],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
@@ -87,6 +87,7 @@ fn every_configured_account_is_reported_by_name() {
         .filter_map(|entry| entry.account.as_ref().map(ToString::to_string))
         .collect();
     assert_that!(names, unordered_elements_are![eq("work"), eq("personal")]);
+    Ok(())
 }
 
 /// A machine with no configuration still gets an answer, for the CLI's own default account.
@@ -107,9 +108,9 @@ fn a_machine_without_configuration_still_reports_its_default_account() {
 /// Probing it would otherwise answer with the *default* account's figures under this account's
 /// name, which is worse than no answer.
 #[gtest]
-fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
+fn an_endpoint_account_reports_no_window_rather_than_someone_elses() -> Result<()> {
     let config = config_with(
-        "codex",
+        Vendor::Codex,
         &[(
             "local",
             Account {
@@ -118,7 +119,7 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"rateLimitsByLimitId": {}}),
     };
@@ -129,6 +130,7 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
         reported[0].observation,
         matches_pattern!(Observation::Unavailable { .. })
     );
+    Ok(())
 }
 
 /// An account that names a profile directory but authenticates with a key has no window either.
@@ -144,7 +146,7 @@ fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
     let mut env = host_env();
     env.insert("CI_ANTHROPIC_KEY".to_owned(), "sk-ci".to_owned());
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[(
             "ci",
             Account {
@@ -154,7 +156,7 @@ fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
@@ -304,7 +306,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let missing = dir.path().join("never-created");
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[(
             "gone",
             Account {
@@ -312,7 +314,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
                 ..Account::default()
             },
         )],
-    );
+    )?;
 
     let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &SystemProbe);
 
@@ -401,7 +403,7 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
         std::fs::write(home.path().join("auth.json"), auth_json).or_fail()?;
     }
     let config = config_with(
-        "codex",
+        Vendor::Codex,
         &[(
             "personal",
             Account {
@@ -412,7 +414,7 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let mut env = host_env();
     env.insert(
         "OPENAI_API_KEY".to_owned(),
@@ -430,8 +432,8 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
 /// Reporting only the named accounts hides the identity actually paying behind a list of the ones
 /// that are not, which is the same mistake as reading a failed probe as spare capacity.
 #[gtest]
-fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
-    let config = config_with("claude", &[("work", Account::default())]);
+fn the_cli_login_is_probed_when_no_configured_account_is_the_default() -> Result<()> {
+    let config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
@@ -448,6 +450,7 @@ fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
             .count(),
         eq(1)
     );
+    Ok(())
 }
 
 /// A configured default leaves the CLI's own login out, because nothing would spend it.
@@ -456,12 +459,12 @@ fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
 /// holds that role every consultation resolves to a named account, and listing the login as well
 /// would offer a window no work is drawn against.
 #[gtest]
-fn a_configured_default_leaves_the_cli_login_out() {
-    let mut config = config_with("claude", &[("work", Account::default())]);
+fn a_configured_default_leaves_the_cli_login_out() -> Result<()> {
+    let mut config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         Defaults {
-            account: Some("work".to_owned()),
+            account: Some(AccountAlias::parse("work").or_fail()?),
         },
     );
     let probe = ScriptedProbe {
@@ -475,6 +478,7 @@ fn a_configured_default_leaves_the_cli_login_out() {
         reported[0].account.as_ref().map(ToString::to_string),
         some(eq("work"))
     );
+    Ok(())
 }
 
 /// A default naming an account the file does not define is reported as the launch would refuse it.
@@ -483,11 +487,11 @@ fn a_configured_default_leaves_the_cli_login_out() {
 /// carries the launch's own refusal rather than standing in for a login nothing would spend.
 #[gtest]
 fn a_default_naming_an_undefined_account_carries_the_launch_refusal() -> Result<()> {
-    let mut config = config_with("claude", &[("work", Account::default())]);
+    let mut config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         Defaults {
-            account: Some("missing".to_owned()),
+            account: Some(AccountAlias::parse("missing").or_fail()?),
         },
     );
     let probe = ScriptedProbe {

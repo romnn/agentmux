@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::Vendor;
+use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
 
 /// Environment variable holding an explicit path to the configuration file.
 pub const CONFIG_PATH_ENV: &str = "AGENTMUX_CONFIG";
@@ -102,9 +102,9 @@ pub enum ConfigError {
         /// The file.
         path: PathBuf,
         /// The identifier a caller would ask for.
-        from: String,
+        from: ModelId,
         /// What it is rewritten to, which is itself rewritten.
-        to: String,
+        to: ModelId,
     },
     /// A default effort is keyed by a model the same file rewrites to another.
     #[error(
@@ -116,9 +116,9 @@ pub enum ConfigError {
         /// The file.
         path: PathBuf,
         /// The model the effort is keyed by.
-        model: String,
+        model: ModelId,
         /// What the same file rewrites it to.
-        to: String,
+        to: ModelId,
     },
     /// A configuration file another user could have written was found.
     #[error(
@@ -471,7 +471,59 @@ impl Account {
 pub struct Defaults {
     /// The account alias to use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
+    pub account: Option<AccountAlias>,
+}
+
+/// Tables keyed by vendor, which load whatever vendors they name.
+///
+/// A vendor this build does not know is passed over rather than refused, because one file is
+/// synced across machines that will not all be running the same agentmux.
+/// Passed over, it does not serialise back, so [`Config::unknown_keys`] reports it like any other
+/// key this build does not read.
+mod by_vendor {
+    use std::collections::BTreeMap;
+    use std::marker::PhantomData;
+
+    use serde::de::{self, IgnoredAny, IntoDeserializer as _, MapAccess};
+    use serde::{Deserialize, Deserializer};
+
+    use crate::delegate::Vendor;
+
+    pub(super) fn deserialize<'de, D, T>(deserializer: D) -> Result<BTreeMap<Vendor, T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        struct Visitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
+            type Value = BTreeMap<Vendor, T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a table keyed by vendor")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut tables = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    // Named the way `Vendor` deserialises, so the spelling has one source.
+                    let vendor: Result<Vendor, de::value::Error> =
+                        Vendor::deserialize(name.as_str().into_deserializer());
+                    match vendor {
+                        Ok(vendor) => {
+                            tables.insert(vendor, map.next_value()?);
+                        }
+                        Err(_) => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(tables)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor(PhantomData))
+    }
 }
 
 /// The machine's agentmux configuration.
@@ -479,30 +531,26 @@ pub struct Defaults {
 pub struct Config {
     /// Accounts by vendor, then by alias.
     ///
-    /// The vendor level is a plain string rather than a closed enum so that a file naming a vendor
-    /// this build has never heard of is ignored rather than rejected.
-    /// One file is synced across machines that will not all be running the same version.
-    #[serde(default)]
-    pub accounts: BTreeMap<String, BTreeMap<String, Account>>,
+    /// A vendor this build has never heard of is reported rather than refused; see `by_vendor`.
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub accounts: BTreeMap<Vendor, BTreeMap<AccountAlias, Account>>,
     /// Which account to use per vendor when the caller names none.
-    #[serde(default)]
-    pub defaults: BTreeMap<String, Defaults>,
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub defaults: BTreeMap<Vendor, Defaults>,
     /// Model identifiers to substitute, by vendor, then by the identifier a caller asks for.
     ///
     /// Read through [`Config::rewritten_model`].
-    /// Keyed by vendor as [`Self::accounts`] is, and for the same reason: a file naming a vendor
-    /// this build has never heard of loads anyway.
-    #[serde(default)]
-    pub models: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub models: BTreeMap<Vendor, BTreeMap<ModelId, ModelId>>,
     /// Reasoning efforts to use when a caller names none, by vendor, then by the model that runs.
     ///
     /// Read through [`Config::default_effort`].
     /// Keyed by the identifier that is launched, after any rewrite in [`Self::models`]: it is
     /// the one identifier every consultation of that model shares, whatever name it asked by.
-    /// Both sides are plain strings, as the rewrites are, so a vendor's new effort vocabulary is a
-    /// line in this file and never an agentmux release.
-    #[serde(default)]
-    pub efforts: BTreeMap<String, BTreeMap<String, String>>,
+    /// Both sides are opaque identifiers, as the rewrites are, so a vendor's new effort
+    /// vocabulary is a line in this file and never an agentmux release.
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub efforts: BTreeMap<Vendor, BTreeMap<ModelId, Effort>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -529,7 +577,7 @@ pub struct Config {
     /// Public so a caller can build a `Config` in full; nothing outside this module should read
     /// it.
     #[serde(skip)]
-    pub project_defaults: BTreeSet<String>,
+    pub project_defaults: BTreeSet<Vendor>,
 }
 
 /// A key a configuration file set that this build does not read.
@@ -563,12 +611,12 @@ pub enum ChosenBy<'a> {
     Project(&'a Path),
 }
 
-impl ChosenBy<'_> {
+impl<'a> ChosenBy<'a> {
     /// The file that made the choice, when there was one.
     #[must_use]
-    pub fn path(&self) -> Option<&Path> {
+    pub fn path(self) -> Option<&'a Path> {
         match self {
-            Self::Machine(path) => *path,
+            Self::Machine(path) => path,
             Self::Project(path) => Some(path),
         }
     }
@@ -577,8 +625,8 @@ impl ChosenBy<'_> {
 /// The account one vendor falls back to when the caller names none, and who said so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultAccount<'a> {
-    /// The alias the file names, already checked to be one a caller could pass back.
-    pub alias: &'a str,
+    /// The alias the file names.
+    pub alias: &'a AccountAlias,
     /// Which file chose it, because a checkout's choice may switch on less than the machine's.
     pub chosen_by: ChosenBy<'a>,
 }
@@ -758,7 +806,7 @@ impl Config {
             // and is not counted as the project's choice.
             for (vendor, chosen) in project.defaults {
                 if config.defaults.get(&vendor) != Some(&chosen) {
-                    config.project_defaults.insert(vendor.clone());
+                    config.project_defaults.insert(vendor);
                 }
                 config.defaults.insert(vendor, chosen);
             }
@@ -853,24 +901,14 @@ impl Config {
         }
     }
 
-    /// Refuse a name the file uses that could never be used back.
+    /// Refuse what the file says that could never be used.
     ///
-    /// An alias is advertised to callers and passed back as an argument, so one the argument
-    /// parser would refuse must not be advertised; an environment name the operating system
-    /// would misread must not reach a child.
-    /// Vendor keys are left alone, so a file naming a vendor this build does not know still
-    /// loads.
+    /// Aliases, models and efforts were parsed as they were read, so one the argument parser
+    /// would refuse never got this far; an environment name the operating system would misread
+    /// must not reach a child, and rules that could not do what they read as are refused.
     fn validate(&self, path: &Path) -> Result<(), ConfigError> {
         for (vendor, accounts) in &self.accounts {
             for (alias, account) in accounts {
-                crate::delegate::AccountAlias::parse(alias).map_err(|_| {
-                    ConfigError::InvalidName {
-                        path: path.to_path_buf(),
-                        what: "the account alias",
-                        value: alias.clone(),
-                        reason: "may only contain letters, digits, `-`, `_` and `.`",
-                    }
-                })?;
                 if account.is_empty() {
                     return Err(ConfigError::InvalidName {
                         path: path.to_path_buf(),
@@ -896,22 +934,12 @@ impl Config {
         }
         for rewrites in self.models.values() {
             for (from, to) in rewrites {
-                for value in [from, to] {
-                    crate::delegate::ModelId::parse(value).map_err(|_| {
-                        ConfigError::InvalidName {
-                            path: path.to_path_buf(),
-                            what: "the model",
-                            value: value.clone(),
-                            reason: "is not an identifier a delegate CLI could be given",
-                        }
-                    })?;
-                }
                 // A rule naming another rule's key reads as a chain, and one substitution is all
                 // there is; refused here rather than resolved, because either answer would be a
                 // guess at which of the two lines the operator meant.
                 // A rule that maps a name to itself changes nothing, so a rule pointing at it
                 // does not chain.
-                let is_rewritten = |name: &String| rewrites.get(name).is_some_and(|to| to != name);
+                let is_rewritten = |name: &ModelId| rewrites.get(name).is_some_and(|to| to != name);
                 if is_rewritten(from) && is_rewritten(to) {
                     return Err(ConfigError::ChainedRewrite {
                         path: path.to_path_buf(),
@@ -922,19 +950,7 @@ impl Config {
             }
         }
         for (vendor, efforts) in &self.efforts {
-            for (model, effort) in efforts {
-                crate::delegate::ModelId::parse(model).map_err(|_| ConfigError::InvalidName {
-                    path: path.to_path_buf(),
-                    what: "the model",
-                    value: model.clone(),
-                    reason: "is not an identifier a delegate CLI could be given",
-                })?;
-                crate::delegate::Effort::parse(effort).map_err(|_| ConfigError::InvalidName {
-                    path: path.to_path_buf(),
-                    what: "the effort",
-                    value: effort.clone(),
-                    reason: "is not a reasoning effort a delegate CLI could be given",
-                })?;
+            for model in efforts.keys() {
                 // Looked up by the model that runs, so a key the file rewrites away can never be
                 // met; refused rather than left in, because a rule that does nothing reads as one
                 // that does.
@@ -952,28 +968,20 @@ impl Config {
                 }
             }
         }
-        for chosen in self.defaults.values().filter_map(|d| d.account.as_ref()) {
-            crate::delegate::AccountAlias::parse(chosen).map_err(|_| ConfigError::InvalidName {
-                path: path.to_path_buf(),
-                what: "the default account",
-                value: chosen.clone(),
-                reason: "may only contain letters, digits, `-`, `_` and `.`",
-            })?;
-        }
         self.launch.validate(path)
     }
 
     /// The accounts defined for one vendor, which may be none.
     #[must_use]
-    pub fn accounts(&self, vendor: Vendor) -> &BTreeMap<String, Account> {
-        static NONE: BTreeMap<String, Account> = BTreeMap::new();
-        self.accounts.get(vendor.program()).unwrap_or(&NONE)
+    pub fn accounts(&self, vendor: Vendor) -> &BTreeMap<AccountAlias, Account> {
+        static NONE: BTreeMap<AccountAlias, Account> = BTreeMap::new();
+        self.accounts.get(&vendor).unwrap_or(&NONE)
     }
 
     /// One account, by alias.
     #[must_use]
-    pub fn account(&self, vendor: Vendor, alias: &str) -> Option<&Account> {
-        self.accounts.get(vendor.program())?.get(alias)
+    pub fn account(&self, vendor: Vendor, alias: &AccountAlias) -> Option<&Account> {
+        self.accounts.get(&vendor)?.get(alias)
     }
 
     /// The model rewrites defined for one vendor, which may be none.
@@ -981,9 +989,9 @@ impl Config {
     /// For a reader listing what the machine offers; [`Self::rewritten_model`] is what a launch
     /// asks.
     #[must_use]
-    pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<String, String> {
-        static NONE: BTreeMap<String, String> = BTreeMap::new();
-        self.models.get(vendor.program()).unwrap_or(&NONE)
+    pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<ModelId, ModelId> {
+        static NONE: BTreeMap<ModelId, ModelId> = BTreeMap::new();
+        self.models.get(&vendor).unwrap_or(&NONE)
     }
 
     /// What to run when a caller asks for `model`, when this machine rewrites it.
@@ -1000,10 +1008,9 @@ impl Config {
     /// A file whose rules would chain is refused when it is read, so what is written on one line
     /// is what runs.
     #[must_use]
-    pub fn rewritten_model(&self, vendor: Vendor, model: &str) -> Option<&str> {
+    pub fn rewritten_model(&self, vendor: Vendor, model: &ModelId) -> Option<&ModelId> {
         self.model_rewrites(vendor)
             .get(model)
-            .map(String::as_str)
             .filter(|rewritten| *rewritten != model)
     }
 
@@ -1012,9 +1019,9 @@ impl Config {
     /// For a reader listing what the machine offers; [`Self::default_effort`] is what a launch
     /// asks.
     #[must_use]
-    pub fn effort_defaults(&self, vendor: Vendor) -> &BTreeMap<String, String> {
-        static NONE: BTreeMap<String, String> = BTreeMap::new();
-        self.efforts.get(vendor.program()).unwrap_or(&NONE)
+    pub fn effort_defaults(&self, vendor: Vendor) -> &BTreeMap<ModelId, Effort> {
+        static NONE: BTreeMap<ModelId, Effort> = BTreeMap::new();
+        self.efforts.get(&vendor).unwrap_or(&NONE)
     }
 
     /// The reasoning effort to run `model` at when the caller named none, if this machine says.
@@ -1024,8 +1031,8 @@ impl Config {
     /// A fallback only: an effort the caller names is never overridden, and a model the file says
     /// nothing about runs at the CLI's own default, with no effort passed at all.
     #[must_use]
-    pub fn default_effort(&self, vendor: Vendor, model: &str) -> Option<&str> {
-        self.effort_defaults(vendor).get(model).map(String::as_str)
+    pub fn default_effort(&self, vendor: Vendor, model: &ModelId) -> Option<&Effort> {
+        self.effort_defaults(vendor).get(model)
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.
@@ -1036,12 +1043,9 @@ impl Config {
     /// place that is decided.
     #[must_use]
     pub fn default_account(&self, vendor: Vendor) -> Option<DefaultAccount<'_>> {
-        let alias = self
-            .defaults
-            .get(vendor.program())
-            .and_then(|d| d.account.as_deref())?;
+        let alias = self.defaults.get(&vendor)?.account.as_ref()?;
         let chosen_by = match (
-            self.project_defaults.contains(vendor.program()),
+            self.project_defaults.contains(&vendor),
             self.project_source.as_deref(),
         ) {
             (true, Some(path)) => ChosenBy::Project(path),
@@ -1052,7 +1056,7 @@ impl Config {
 
     /// Every alias defined for one vendor, for an error message or a tool description.
     #[must_use]
-    pub fn alias_names(&self, vendor: Vendor) -> Vec<String> {
+    pub fn alias_names(&self, vendor: Vendor) -> Vec<AccountAlias> {
         self.accounts(vendor).keys().cloned().collect()
     }
 }

@@ -294,15 +294,10 @@ pub fn probe_vendor(
     host_env: &BTreeMap<String, String>,
     probe: &dyn QuotaProbe,
 ) -> Vec<AccountQuota> {
-    // Aliases were validated when the file was read, so every key parses.
-    let accounts = config.accounts(vendor);
-    let mut targets: Vec<(Option<AccountAlias>, Option<&Account>)> = accounts
+    let mut targets: Vec<(Option<AccountAlias>, Option<&Account>)> = config
+        .accounts(vendor)
         .iter()
-        .filter_map(|(alias, account)| {
-            AccountAlias::parse(alias)
-                .ok()
-                .map(|alias| (Some(alias), Some(account)))
-        })
+        .map(|(alias, account)| (Some(alias.clone()), Some(account)))
         .collect();
     // The unnamed login is asked whenever a consultation naming no `account` would resolve to
     // it, which is when no defined account holds the default: the same condition the launch

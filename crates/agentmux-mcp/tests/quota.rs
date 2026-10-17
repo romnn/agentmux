@@ -64,7 +64,7 @@ fn an_unavailable_account_never_reads_as_spare_capacity() {
         },
     };
 
-    let rendered = agentmux_mcp::render::quota_report(&entry).join("\n");
+    let rendered = agentmux::report::quota_report(&entry).join("\n");
 
     assert_that!(rendered, contains_substring("unavailable"));
     assert_that!(rendered, contains_substring("not idle"));
@@ -93,7 +93,7 @@ fn nothing_rendered_recommends_an_account() {
         },
     };
 
-    let rendered = agentmux_mcp::render::quota_report(&entry)
+    let rendered = agentmux::report::quota_report(&entry)
         .join("\n")
         .to_lowercase();
 
@@ -305,8 +305,8 @@ fn a_refresh_that_did_not_happen_is_named_rather_than_implied() {
         reason: "`claude --print /usage` exited with exit status: 1".to_owned(),
     });
 
-    let timed_out = agentmux_mcp::render::quota_report(&timed_out).join("\n");
-    let failed = agentmux_mcp::render::quota_report(&failed).join("\n");
+    let timed_out = agentmux::report::quota_report(&timed_out).join("\n");
+    let failed = agentmux::report::quota_report(&failed).join("\n");
 
     // Both say the figures predate the attempt, so neither can be mistaken for a fresh reading.
     assert_that!(timed_out, contains_substring("timed out"));
@@ -318,8 +318,8 @@ fn a_refresh_that_did_not_happen_is_named_rather_than_implied() {
 /// The ordinary outcomes are named too, so silence never has to be interpreted.
 #[gtest]
 fn a_refresh_that_happened_says_so() {
-    let refreshed = agentmux_mcp::render::quota_report(&cached_with(Refresh::Succeeded)).join("\n");
-    let skipped = agentmux_mcp::render::quota_report(&cached_with(Refresh::Skipped)).join("\n");
+    let refreshed = agentmux::report::quota_report(&cached_with(Refresh::Succeeded)).join("\n");
+    let skipped = agentmux::report::quota_report(&cached_with(Refresh::Skipped)).join("\n");
 
     assert_that!(refreshed, contains_substring("just refreshed"));
     assert_that!(
