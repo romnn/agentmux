@@ -16,121 +16,121 @@
 //! - One failure arrives as up to three events — an `item.completed` error, a top-level `error`,
 //!   and `turn.failed` — all carrying the same message.
 //!   The first two are notes, and the terminal one ends the fold with the outcome.
-//! - Unknown `item.type` values are counted, not skipped.
+//! - Unknown event and `item.type` values are counted, not skipped.
 //!   If a future release renamed `agent_message`, a parser that filtered on the name alone would
 //!   silently drop every report.
+//!
+//! The events are read as [`codex_app_server_protocol::exec`] types, codex's own mirrored and
+//! checked against codex at the pinned release, so the names this parser knows are exactly the
+//! ones codex writes.
 //!
 //! # The same stream from `codex app-server`
 //!
 //! A turn driven over `codex app-server` is written in this same shape by
 //! [`crate::appserver`], which translates the server's notifications as they arrive, so one parser
 //! serves both launch modes.
-//! The only event that path writes and `codex exec` never does is [`STEER_EVENT`]: an instruction
-//! the caller steered into the running turn, recorded at the moment the server accepted it.
+//! It writes the same [`CaptureEvent`] this parser reads, and adds what `codex exec` never writes:
+//! an instruction the caller steered into the running turn, and drift it could not read.
 
-use serde::Deserialize;
+use codex_app_server_protocol::exec::{self, ThreadEvent, ThreadItemDetails};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::delegate::SessionRef;
-use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines, probe};
+use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines};
 use crate::transcript::{Message, Outcome, Role, Turn, Usage};
 
-/// `item.type` values `codex exec --json` writes: the variants of `ThreadItemDetails` in the
-/// pinned codex-cli 0.159.3 (`codex-rs/exec/src/exec_events.rs`), which the app-server translation
-/// writes too.
+/// One line of a Codex capture: an event `codex exec --json` writes, or one agentmux adds.
 ///
-/// Only `agent_message` carries the answer, and `error` is advisory.
-/// The rest are the delegate narrating its own work — commands, file edits, tool and sub-agent
-/// calls, web searches, its reasoning summary and its to-do list — kept in the capture and, like
-/// all narration, not rendered.
-/// The list is the CLI's own and nothing more: every name here is drift the counter will never
-/// report, so naming a type on a guess is a hole in the guarantee.
-/// A type that turns up later is counted, which is a loud note in `status` rather than a failure —
-/// and if a future release renames `agent_message`, that count is the only thing standing between
-/// a silently empty report and a caller who notices.
-const KNOWN_ITEM_TYPES: &[&str] = &[
-    "agent_message",
-    "reasoning",
-    "command_execution",
-    "file_change",
-    "mcp_tool_call",
-    "collab_tool_call",
-    "web_search",
-    "todo_list",
-    "error",
-];
-
-/// The event agentmux writes into a Codex capture when a steered instruction was accepted.
-///
-/// Namespaced so that no event the CLI itself emits can ever be read as one.
-pub const STEER_EVENT: &str = "agentmux.steer";
-
-#[derive(Debug, Deserialize)]
-struct SteerEvent {
-    text: String,
+/// agentmux's own are namespaced, so that no event codex writes can be read as one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CaptureEvent {
+    /// An instruction the caller steered into the running turn, recorded the moment the server
+    /// accepted it.
+    #[serde(rename = "agentmux.steer")]
+    Steer {
+        /// The instruction.
+        text: String,
+    },
+    /// Something `codex app-server` said that the generated types could not read, kept with
+    /// what it said.
+    #[serde(rename = "agentmux.undecoded")]
+    Undecoded(Undecoded),
+    /// An event as `codex exec --json` writes it.
+    #[serde(untagged)]
+    Exec(ThreadEvent),
 }
 
-#[derive(Debug, Deserialize)]
-struct ThreadStarted {
-    thread_id: Option<String>,
+/// What the server said that could not be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Undecoded {
+    /// A message whose payload did not match the generated types, or whose method the pinned
+    /// schema never had.
+    Message {
+        /// The method.
+        method: String,
+        /// Why it could not be read.
+        reason: String,
+        /// The payload, verbatim.
+        payload: Value,
+    },
+    /// A line that was no JSON-RPC message at all.
+    Line {
+        /// Why it could not be read.
+        reason: String,
+        /// The line, verbatim.
+        line: String,
+    },
 }
 
+/// Enough of a line to name it in the drift count: its `type`, and its item's.
 #[derive(Debug, Deserialize)]
-struct ItemEvent {
-    item: Item,
-}
-
-#[derive(Debug, Deserialize)]
-struct Item {
+struct Named {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+    item: Option<NamedItem>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TurnCompleted {
-    #[serde(default)]
-    usage: Option<CodexUsage>,
+struct NamedItem {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[allow(
-    clippy::struct_field_names,
-    reason = "field names are Codex's own JSON keys; renaming them would need serde renames that \
-              hide the wire format"
-)]
-struct CodexUsage {
-    input_tokens: Option<u64>,
-    cached_input_tokens: Option<u64>,
-    cache_write_input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    reasoning_output_tokens: Option<u64>,
-}
-
-impl From<&CodexUsage> for Usage {
-    fn from(usage: &CodexUsage) -> Self {
-        Self {
-            input_tokens: usage.input_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            cache_write_input_tokens: usage.cache_write_input_tokens,
-            output_tokens: usage.output_tokens,
-            reasoning_output_tokens: usage.reasoning_output_tokens,
-        }
+/// What the drift count calls a line it cannot read: its `type`.
+fn unparsable(line: &Value) -> String {
+    match Named::deserialize(line) {
+        Ok(Named { kind, .. }) => format!("{kind}.<unparsable>"),
+        Err(_) => MALFORMED_LINE.to_owned(),
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ErrorEvent {
-    #[serde(default)]
-    message: Option<String>,
+/// What the drift count calls a line: its `type`, and its item's when it carries one.
+fn name(line: &Value) -> String {
+    match Named::deserialize(line) {
+        Ok(Named {
+            kind,
+            item: Some(item),
+        }) => format!("{kind}.{}", item.kind),
+        Ok(Named { kind, item: None }) => kind,
+        Err(_) => MALFORMED_LINE.to_owned(),
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct TurnFailed {
-    #[serde(default)]
-    error: Option<ErrorEvent>,
+impl From<&exec::Usage> for Usage {
+    fn from(usage: &exec::Usage) -> Self {
+        let count = |tokens: Option<i64>| tokens.and_then(|tokens| u64::try_from(tokens).ok());
+        Self {
+            input_tokens: count(usage.input_tokens),
+            cached_input_tokens: count(usage.cached_input_tokens),
+            cache_write_input_tokens: count(usage.cache_write_input_tokens),
+            output_tokens: count(usage.output_tokens),
+            reasoning_output_tokens: count(usage.reasoning_output_tokens),
+        }
+    }
 }
 
 /// Fold a Codex `--json` stream into a turn.
@@ -141,67 +141,83 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn_started = false;
 
     for line in complete_lines(events) {
-        let Some(kind) = probe(line) else {
+        // Read as a JSON value first, which settles a key codex writes twice; see
+        // `exec::ThreadItem`.
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             turn.unrecognised.record(MALFORMED_LINE);
             continue;
         };
+        let event = match CaptureEvent::deserialize(&value) {
+            Ok(CaptureEvent::Exec(event)) => event,
+            Ok(CaptureEvent::Steer { text }) => {
+                turn.messages.push(Message::steer(text));
+                continue;
+            }
+            // Drift the driver recorded, counted as such.
+            Ok(CaptureEvent::Undecoded(_)) => {
+                turn.unrecognised.record(name(&value));
+                turn.undecoded_messages = true;
+                continue;
+            }
+            // An event this parser names, in a shape it does not.
+            Err(_) => {
+                turn.unrecognised.record(unparsable(&value));
+                continue;
+            }
+        };
 
-        match kind.as_str() {
-            "thread.started" => {
-                if let Ok(event) = serde_json::from_str::<ThreadStarted>(line)
-                    && let Some(id) = event.thread_id.as_deref()
-                    && let Ok(parsed) = SessionRef::parse(id)
+        match event {
+            ThreadEvent::ThreadStarted(started) => {
+                if let Some(parsed) = started
+                    .thread_id
+                    .as_deref()
+                    .and_then(|id| SessionRef::parse(id).ok())
                 {
                     session = Some(parsed);
                 }
             }
-            "turn.started" => turn_started = true,
-            "item.started" | "item.updated" => {}
-            STEER_EVENT => match serde_json::from_str::<SteerEvent>(line) {
-                Ok(event) => turn.messages.push(Message::steer(event.text)),
-                Err(_) => turn.unrecognised.record("agentmux.steer.<unparsable>"),
-            },
-            "item.completed" => {
-                let Ok(event) = serde_json::from_str::<ItemEvent>(line) else {
-                    turn.unrecognised.record("item.completed.<unparsable>");
-                    continue;
-                };
-                if !KNOWN_ITEM_TYPES.contains(&event.item.kind.as_str()) {
-                    turn.unrecognised
-                        .record(format!("item.completed.{}", event.item.kind));
-                    continue;
-                }
-                match event.item.kind.as_str() {
-                    "agent_message" => match event.item.text {
-                        Some(text) if !text.trim().is_empty() => {
-                            turn.messages.push(Message::delegate(Role::Assistant, text));
-                        }
-                        // A reply with no `text` is not an empty reply; it means the payload
-                        // field was renamed, and defaulting it away would drop the report.
-                        None => turn
-                            .unrecognised
-                            .record("item.completed.agent_message.text"),
-                        Some(_) => {}
-                    },
-                    // Advisory, not terminal.
-                    // See the module docs.
-                    "error" => {
-                        if let Some(text) = event.item.message.filter(|t| !t.trim().is_empty()) {
-                            turn.messages
-                                .push(Message::synthetic(format!("delegate warning: {text}")));
-                        }
+            ThreadEvent::TurnStarted(_) => turn_started = true,
+            ThreadEvent::ItemStarted(_) | ThreadEvent::ItemUpdated(_) => {}
+            ThreadEvent::ItemCompleted(completed) => match completed.item.details {
+                ThreadItemDetails::AgentMessage(message) => match message.text {
+                    Some(text) if !text.trim().is_empty() => {
+                        turn.messages.push(Message::delegate(Role::Assistant, text));
                     }
-                    _ => {}
+                    // A reply with no `text` is not an empty reply; it means the payload field
+                    // was renamed, and defaulting it away would drop the report.
+                    None => turn.unrecognised.record(format!("{}.text", name(&value))),
+                    Some(_) => {}
+                },
+                // Advisory, not terminal.
+                // See the module docs.
+                ThreadItemDetails::Error(warning) => {
+                    if let Some(text) = warning.message.filter(|text| !text.trim().is_empty()) {
+                        turn.messages
+                            .push(Message::synthetic(format!("delegate warning: {text}")));
+                    }
                 }
-            }
-            "turn.completed" => {
-                let Ok(event) = serde_json::from_str::<TurnCompleted>(line) else {
-                    turn.unrecognised.record("turn.completed.<unparsable>");
-                    continue;
-                };
+                // Counted rather than skipped: if a release renamed `agent_message`, this count
+                // would be all that stands between a silently empty report and a caller who
+                // notices.
+                ThreadItemDetails::Unknown => turn.unrecognised.record(name(&value)),
+                // The delegate narrating its own work: kept in the capture and, like all
+                // narration, not rendered.
+                ThreadItemDetails::Reasoning(_)
+                | ThreadItemDetails::CommandExecution(_)
+                | ThreadItemDetails::FileChange(_)
+                | ThreadItemDetails::McpToolCall(_)
+                | ThreadItemDetails::CollabToolCall(_)
+                | ThreadItemDetails::WebSearch(_)
+                | ThreadItemDetails::TodoList(_) => {}
+            },
+            ThreadEvent::TurnCompleted(completed) => {
                 if !turn.outcome.is_terminal() {
                     turn.outcome = Outcome::Completed {
-                        usage: event.usage.as_ref().map(Usage::from).unwrap_or_default(),
+                        usage: completed
+                            .usage
+                            .as_ref()
+                            .map(Usage::from)
+                            .unwrap_or_default(),
                         cost_usd: None,
                     };
                 }
@@ -211,19 +227,17 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             }
             // Advisory, not terminal.
             // See the module docs.
-            "error" => {
-                let message = serde_json::from_str::<ErrorEvent>(line)
-                    .ok()
-                    .and_then(|event| event.message)
+            ThreadEvent::Error(error) => {
+                let message = error
+                    .message
                     .filter(|message| !message.trim().is_empty())
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
                 turn.messages
                     .push(Message::synthetic(format!("delegate error: {message}")));
             }
-            "turn.failed" => {
-                let message = serde_json::from_str::<TurnFailed>(line)
-                    .ok()
-                    .and_then(|event| event.error)
+            ThreadEvent::TurnFailed(failed) => {
+                let message = failed
+                    .error
                     .and_then(|error| error.message)
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
                 turn.outcome = Outcome::Failed {
@@ -232,7 +246,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 };
                 break;
             }
-            other => turn.unrecognised.record(other),
+            ThreadEvent::Unknown => turn.unrecognised.record(name(&value)),
         }
     }
 

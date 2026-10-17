@@ -80,7 +80,8 @@
 //! two renames can succeed, so a message is either claimed or withdrawn and never sent.
 //! A claimed message is answered with exactly what the driver knows:
 //!
-//! - accepted, once the server said so and the capture holds it as [`STEER_EVENT`], where it
+//! - accepted, once the server said so and the capture holds it as a
+//!   [`CaptureEvent::Steer`](crate::stream::codex::CaptureEvent::Steer), where it
 //!   arrived and before the end of the turn, which the fold stops at;
 //! - rejected, when the server refused it or it was never sent;
 //! - unconfirmed, when it was sent and the server never said — the turn or the server ended
@@ -149,7 +150,6 @@
 //! dropped, and the ids the setup answers name are still read, so a codex release that moves a
 //! field agentmux does not use is loud without being fatal.
 //!
-//! [`STEER_EVENT`]: crate::stream::codex::STEER_EVENT
 
 mod driver;
 pub mod mailbox;
@@ -161,10 +161,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::delegate::{AppServerSettings, Billing, SessionRef};
+use crate::run::layout::TurnDir;
 
 pub use driver::{Deadlines, Ending, STOP_BUDGET, drive, drive_with};
 pub(crate) use protocol::initialize_params;
-pub use translate::UNDECODED_EVENT;
 
 /// What to do when a driven Codex turn fails or codex sends what agentmux cannot read: run the
 /// consultation with `codex exec`, which does not depend on the app-server protocol.
@@ -197,12 +197,9 @@ pub struct Plan {
     ///
     /// Under [`Billing::Subscription`] the driver scrubs the server's environment again.
     pub billing: Billing,
-    /// Where the closing message is written, as `codex exec --output-last-message` would.
-    pub last_message: PathBuf,
-    /// The marker `cancel` creates, which makes the driver interrupt the turn.
-    pub cancel_marker: PathBuf,
-    /// The directory steered messages arrive in.
-    pub mailbox: PathBuf,
+    /// The turn's directory, which holds every file the driver reads or writes besides its
+    /// capture.
+    pub turn_dir: PathBuf,
 }
 
 impl Plan {
@@ -214,5 +211,29 @@ impl Plan {
     pub fn read(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         serde_json::from_str(&text).map_err(std::io::Error::other)
+    }
+
+    fn turn(&self) -> TurnDir {
+        TurnDir {
+            root: self.turn_dir.clone(),
+        }
+    }
+
+    /// Where the closing message is written, as `codex exec --output-last-message` would.
+    #[must_use]
+    pub fn last_message(&self) -> PathBuf {
+        self.turn().last_message()
+    }
+
+    /// The marker `cancel` creates, which makes the driver interrupt the turn.
+    #[must_use]
+    pub fn cancel_marker(&self) -> PathBuf {
+        self.turn().cancelling()
+    }
+
+    /// The directory steered messages arrive in.
+    #[must_use]
+    pub fn mailbox(&self) -> PathBuf {
+        self.turn().steer()
     }
 }

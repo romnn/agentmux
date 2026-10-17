@@ -780,3 +780,77 @@ fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
         );
     }
 }
+
+/// A Codex capture in the shapes an older agentmux wrote folds as it always did.
+///
+/// The fold re-reads every turn on every `status`, and the render it publishes must not change
+/// under a consultation that is already finished, so every line an older translator wrote has to
+/// read now exactly as it read then: nothing dropped, nothing newly counted as drift.
+#[gtest]
+fn a_capture_an_older_agentmux_wrote_folds_as_it_did() {
+    // A web search without the action `exec` writes, a tool result without its `_meta`, a
+    // command whose fields are not what codex writes now, a note and salvaged replies with no id,
+    // a null one or one of another type, and a turn that completed with no usage.
+    let completed = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"turn.started"}
+        {"type":"item.completed","item":{"id":"ws_1","type":"web_search","query":"rust","results":null}}
+        {"type":"item.completed","item":{"id":"i2","type":"mcp_tool_call","server":"s","tool":"t","arguments":{},"result":{"content":[],"structured_content":null},"error":null,"status":"completed"}}
+        {"type":"item.completed","item":{"id":"i3","type":"command_execution","command":["ls"],"exit_code":"0","status":"timed_out"}}
+        {"type":"item.completed","item":{"type":"error","message":"careful"}}
+        {"type":"item.completed","item":{"id":null,"type":"agent_message","text":"SALVAGED"}}
+        {"type":"item.completed","item":{"id":7,"type":"agent_message","text":"AND THIS"}}
+        {"type":"turn.completed","usage":null}
+    "#};
+    let Fold { turn, session, .. } = stream::fold(Vendor::Codex, 0, "q", completed);
+
+    assert_that!(session, some(anything()));
+    assert_that!(turn.unrecognised.summary(), none());
+    assert_that!(
+        turn.messages
+            .iter()
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![
+            eq("delegate warning: careful"),
+            eq("SALVAGED"),
+            eq("AND THIS")
+        ]
+    );
+    // No usage is no accounting, not an account of zero tokens.
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Completed {
+            usage: eq(&agentmux::transcript::Usage::default()),
+            ..
+        })
+    );
+
+    // An error and a failure that say nothing readable still say there was one, and the failure
+    // still ends the turn.
+    let failed = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":5}
+        {"type":"error","message":null}
+        {"type":"error","message":7}
+        {"type":"turn.failed","error":{"message":7}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", failed);
+    assert_that!(turn.unrecognised.summary(), none());
+    assert_that!(
+        turn.messages
+            .iter()
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![
+            eq("delegate error: delegate reported an error"),
+            eq("delegate error: delegate reported an error")
+        ]
+    );
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            detail: eq("delegate reported an error"),
+            ..
+        })
+    );
+}

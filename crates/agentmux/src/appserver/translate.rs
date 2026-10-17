@@ -31,20 +31,20 @@
 //! - Any other notification the pinned schema names is left out, as `exec` leaves it out.
 //!
 //! A notification that does not decode, or whose method the pinned schema never had, is written
-//! as [`UNDECODED_EVENT`] with its payload, which the fold counts as drift: a codex whose protocol
-//! moved away from the generated types is loud rather than lossy, the raw capture still holds what
-//! it said, a reply is still kept, and a turn that ended is still ended.
+//! as [`CaptureEvent::Undecoded`] with its payload, which the fold counts as drift: a codex whose
+//! protocol moved away from the generated types is loud rather than lossy, the raw capture still
+//! holds what it said, a reply is still kept, and a turn that ended is still ended.
+//!
+//! What is written is [`CaptureEvent`], the one model the fold reads too, and its `exec` events
+//! are the [`exec`] mirror of codex's own types.
 
+use codex_app_server_protocol::exec::{self, ThreadEvent as Exec, ThreadItemDetails as Details};
 use codex_app_server_protocol::methods::{self as m, AnyServerNotification as Any};
 use codex_app_server_protocol::{Method as _, Payload, types as wire};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::protocol::{ThreadId, TurnId};
-use crate::stream::codex::STEER_EVENT;
-
-/// The event written in place of a message that does not match the generated types, or of a line
-/// that is no message at all.
-pub const UNDECODED_EVENT: &str = "agentmux.undecoded";
+use crate::stream::codex::{CaptureEvent, Undecoded};
 
 /// How the turn ended, as far as the stream says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +58,10 @@ pub(super) enum Finish {
 }
 
 /// What one notification became.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct Translated {
-    /// Lines to append to the capture, in order.
-    pub(super) lines: Vec<String>,
+    /// Events to append to the capture, in order.
+    pub(super) lines: Vec<CaptureEvent>,
     /// Set when the notification closed the turn.
     pub(super) finish: Option<Finish>,
 }
@@ -76,42 +76,48 @@ pub(super) struct Translator {
     last_message: Option<String>,
     last_plan: Option<String>,
     last_error: Option<String>,
+    /// How many items agentmux has written of its own, which numbers the next one.
+    written: u32,
 }
 
 /// An instruction the server accepted into the running turn.
-pub(super) fn steer(text: &str) -> String {
-    json!({"type": STEER_EVENT, "text": text}).to_string()
-}
-
-/// A reply, as `exec` writes the delegate's own message.
-pub(super) fn reply(text: &str) -> String {
-    json!({"type": "item.completed", "item": {"type": "agent_message", "text": text}}).to_string()
-}
-
-/// An advisory note, in the shape `exec` uses for a warning that does not end the turn.
-pub(super) fn note(text: &str) -> String {
-    json!({"type": "item.completed", "item": {"type": "error", "message": text}}).to_string()
+pub(super) fn steer(text: &str) -> CaptureEvent {
+    CaptureEvent::Steer {
+        text: text.to_owned(),
+    }
 }
 
 /// A message codex sent that the generated types could not read, with what it said.
-pub(super) fn undecoded(method: &str, reason: &str, payload: &Value) -> String {
-    json!({"type": UNDECODED_EVENT, "method": method, "reason": reason, "payload": payload})
-        .to_string()
+pub(super) fn undecoded(method: &str, reason: &str, payload: &Value) -> CaptureEvent {
+    CaptureEvent::Undecoded(Undecoded::Message {
+        method: method.to_owned(),
+        reason: reason.to_owned(),
+        payload: payload.clone(),
+    })
 }
 
 /// What a line from the server that is no JSON-RPC message becomes, so the capture keeps it.
-pub(super) fn unreadable(line: &str, reason: &str) -> String {
-    json!({"type": UNDECODED_EVENT, "reason": reason, "line": line}).to_string()
+pub(super) fn unreadable(line: &str, reason: &str) -> CaptureEvent {
+    CaptureEvent::Undecoded(Undecoded::Line {
+        reason: reason.to_owned(),
+        line: line.to_owned(),
+    })
 }
 
 /// The terminal event for a turn the server ended badly.
-fn failed(message: &str) -> String {
-    json!({"type": "turn.failed", "error": {"message": message}}).to_string()
+fn failed(message: String) -> CaptureEvent {
+    CaptureEvent::Exec(Exec::TurnFailed(exec::TurnFailedEvent {
+        error: Some(exec::ThreadErrorEvent {
+            message: Some(message),
+        }),
+    }))
 }
 
 /// One `exec` item, as `item.completed` carries it.
-fn completed_item(item: &Value) -> String {
-    json!({"type": "item.completed", "item": item}).to_string()
+fn completed_item(id: Option<String>, details: Details) -> CaptureEvent {
+    CaptureEvent::Exec(Exec::ItemCompleted(exec::ItemCompletedEvent {
+        item: exec::ThreadItem { id, details },
+    }))
 }
 
 /// A summary and its details, as `exec` joins them.
@@ -122,30 +128,46 @@ fn with_details(summary: String, details: Option<String>) -> String {
     }
 }
 
-/// A wire value such as `inProgress`, spelled as `exec` spells it (`in_progress`).
-fn snake(wire: &str) -> String {
-    let mut out = String::with_capacity(wire.len() + 4);
-    for c in wire.chars() {
-        if c.is_ascii_uppercase() {
-            out.push('_');
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 impl Translator {
+    /// An id for an item agentmux writes of its own, which codex never names.
+    fn own_id(&mut self) -> Option<String> {
+        self.written += 1;
+        Some(format!("agentmux_{}", self.written))
+    }
+
+    /// A reply, as `exec` writes the delegate's own message.
+    pub(super) fn reply(&mut self, text: &str) -> CaptureEvent {
+        let id = self.own_id();
+        completed_item(
+            id,
+            Details::AgentMessage(exec::AgentMessageItem {
+                text: Some(text.to_owned()),
+            }),
+        )
+    }
+
+    /// An advisory note, in the shape `exec` uses for a warning that does not end the turn.
+    pub(super) fn note(&mut self, text: &str) -> CaptureEvent {
+        let id = self.own_id();
+        completed_item(
+            id,
+            Details::Error(exec::ErrorItem {
+                message: Some(text.to_owned()),
+            }),
+        )
+    }
+
     /// The turn this translation is for, once the server has named it.
     pub(super) fn turn_id(&self) -> Option<&TurnId> {
         self.turn_id.as_ref()
     }
 
     /// Learn the thread the consultation runs in, and return `exec`'s announcement of it.
-    pub(super) fn thread_began(&mut self, id: &ThreadId) -> String {
+    pub(super) fn thread_began(&mut self, id: &ThreadId) -> CaptureEvent {
         self.thread_id = Some(id.clone());
-        json!({"type": "thread.started", "thread_id": id.as_str()}).to_string()
+        CaptureEvent::Exec(Exec::ThreadStarted(exec::ThreadStartedEvent {
+            thread_id: Some(id.as_str().to_owned()),
+        }))
     }
 
     /// Whether a notification is about this consultation's own thread and turn, as `exec`
@@ -177,12 +199,13 @@ impl Translator {
     /// Returns `exec`'s `turn.started` the first time, for the capture.
     /// The store reads that event as the driver following the turn, which is when it delivers a
     /// steer, so it is written as soon as either source names the turn and never twice.
-    pub(super) fn turn_began(&mut self, id: &TurnId) -> Option<String> {
+    pub(super) fn turn_began(&mut self, id: &TurnId) -> Option<CaptureEvent> {
         if self.turn_id.is_none() {
             self.turn_id = Some(id.clone());
         }
-        (!std::mem::replace(&mut self.announced, true))
-            .then(|| json!({"type": "turn.started"}).to_string())
+        (!std::mem::replace(&mut self.announced, true)).then_some(CaptureEvent::Exec(
+            Exec::TurnStarted(exec::TurnStartedEvent {}),
+        ))
     }
 
     /// The turn's closing message, for the closing-message file: its last reply, or, for a turn
@@ -240,22 +263,24 @@ impl Translator {
             Any::Error(error) => error.decode().map(|error| {
                 let message = with_details(error.error.message, error.error.additional_details);
                 out.lines
-                    .push(json!({"type": "error", "message": message}).to_string());
+                    .push(CaptureEvent::Exec(Exec::Error(exec::ThreadErrorEvent {
+                        message: Some(message.clone()),
+                    })));
                 self.last_error = Some(message);
             }),
             Any::Warning(warning) => warning
                 .decode()
-                .map(|warning| out.lines.push(note(&warning.message))),
+                .map(|warning| out.lines.push(self.note(&warning.message))),
             Any::ConfigWarning(warning) => warning.decode().map(|warning| {
-                out.lines
-                    .push(note(&with_details(warning.summary, warning.details)));
+                let note = self.note(&with_details(warning.summary, warning.details));
+                out.lines.push(note);
             }),
             Any::DeprecationNotice(notice) => notice.decode().map(|notice| {
-                out.lines
-                    .push(note(&with_details(notice.summary, notice.details)));
+                let note = self.note(&with_details(notice.summary, notice.details));
+                out.lines.push(note);
             }),
             Any::ModelRerouted(reroute) => reroute.decode().map(|reroute| {
-                out.lines.push(note(&format!(
+                out.lines.push(self.note(&format!(
                     "model rerouted: {} -> {} ({})",
                     reroute.from_model,
                     reroute.to_model,
@@ -285,11 +310,7 @@ impl Translator {
     fn item_completed(&mut self, completed: Payload<'_, m::ItemCompleted>, out: &mut Translated) {
         let params = completed.raw();
         match completed.decode() {
-            Ok(completed) => {
-                if let Some(item) = self.item(completed.item) {
-                    out.lines.push(completed_item(&item));
-                }
-            }
+            Ok(completed) => out.lines.extend(self.item(completed.item)),
             Err(reason) => {
                 // Said as drift first, with the whole payload; then a reply still readable is
                 // written as one, so the transcript keeps the report.
@@ -303,11 +324,13 @@ impl Translator {
                     if !text.trim().is_empty() {
                         self.last_message = Some(text.to_owned());
                     }
-                    out.lines.push(completed_item(&json!({
-                        "id": raw.get("id"),
-                        "type": "agent_message",
-                        "text": text,
-                    })));
+                    let id = raw.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+                    out.lines.push(completed_item(
+                        id,
+                        Details::AgentMessage(exec::AgentMessageItem {
+                            text: Some(text.to_owned()),
+                        }),
+                    ));
                 }
             }
         }
@@ -328,7 +351,7 @@ impl Translator {
                 // The turn is over either way; how it ended is the part that could not be read.
                 out.lines
                     .push(undecoded(m::TurnCompleted::METHOD, &reason, params));
-                out.lines.push(failed(&format!(
+                out.lines.push(failed(format!(
                     "codex ended the turn, but agentmux could not read how: {reason}"
                 )));
                 out.finish = Some(Finish::Failed);
@@ -346,21 +369,24 @@ impl Translator {
                 self.close_from_items(&turn.items);
                 // Zero when the server reported none, as `exec` writes it.
                 let usage = self.usage.clone().unwrap_or_default();
-                out.lines.push(
-                    json!({"type": "turn.completed", "usage": {
-                        "input_tokens": usage.input_tokens,
-                        "cached_input_tokens": usage.cached_input_tokens,
-                        "cache_write_input_tokens": usage.cache_write_input_tokens.unwrap_or(0),
-                        "output_tokens": usage.output_tokens,
-                        "reasoning_output_tokens": usage.reasoning_output_tokens,
-                    }})
-                    .to_string(),
-                );
+                out.lines.push(CaptureEvent::Exec(Exec::TurnCompleted(
+                    exec::TurnCompletedEvent {
+                        usage: Some(exec::Usage {
+                            input_tokens: Some(usage.input_tokens),
+                            cached_input_tokens: Some(usage.cached_input_tokens),
+                            cache_write_input_tokens: Some(
+                                usage.cache_write_input_tokens.unwrap_or(0),
+                            ),
+                            output_tokens: Some(usage.output_tokens),
+                            reasoning_output_tokens: Some(usage.reasoning_output_tokens),
+                        }),
+                    },
+                )));
                 out.finish = Some(Finish::Completed);
             }
             wire::TurnStatus::Interrupted if cancelling => out.finish = Some(Finish::Interrupted),
             wire::TurnStatus::Interrupted => {
-                out.lines.push(failed(&reason.unwrap_or_else(|| {
+                out.lines.push(failed(reason.unwrap_or_else(|| {
                     "the turn was interrupted before it finished".to_owned()
                 })));
                 out.finish = Some(Finish::Failed);
@@ -368,7 +394,7 @@ impl Translator {
             wire::TurnStatus::Failed => {
                 out.lines.push(failed(
                     // `exec`'s words, for a failure nothing named.
-                    &reason.unwrap_or_else(|| "turn failed".to_owned()),
+                    reason.unwrap_or_else(|| "turn failed".to_owned()),
                 ));
                 out.finish = Some(Finish::Failed);
             }
@@ -399,69 +425,117 @@ impl Translator {
     /// The `exec` item for one completed item, or `None` for a kind `exec` does not report.
     ///
     /// Every kind is named, so a kind the schema gains is a compile error here once the types are
-    /// regenerated, rather than a silent default.
-    fn item(&mut self, item: wire::ThreadItem) -> Option<Value> {
+    /// regenerated, rather than a silent default; each mapping follows `exec`'s own.
+    fn item(&mut self, item: wire::ThreadItem) -> Option<CaptureEvent> {
         use wire::ThreadItem as Item;
-        Some(match item {
+        let (id, details) = match item {
             Item::AgentMessageThreadItem(message) => {
                 if !message.text.trim().is_empty() {
                     self.last_message = Some(message.text.clone());
                 }
-                json!({"id": message.id, "type": "agent_message", "text": message.text})
+                (
+                    message.id,
+                    Details::AgentMessage(exec::AgentMessageItem {
+                        text: Some(message.text),
+                    }),
+                )
             }
             Item::ReasoningThreadItem(reasoning) => {
                 let text = reasoning.summary.unwrap_or_default().join("\n");
                 if text.trim().is_empty() {
                     return None;
                 }
-                json!({"id": reasoning.id, "type": "reasoning", "text": text})
+                (
+                    reasoning.id,
+                    Details::Reasoning(exec::ReasoningItem { text }),
+                )
             }
-            Item::CommandExecutionThreadItem(command) => json!({
-                "id": command.id,
-                "type": "command_execution",
-                "command": command.command,
-                "aggregated_output": command.aggregated_output.unwrap_or_default(),
-                "exit_code": command.exit_code,
-                "status": snake(command.status.as_str()),
-            }),
-            Item::FileChangeThreadItem(change) => json!({
-                "id": change.id,
-                "type": "file_change",
-                "changes": change
-                    .changes
-                    .iter()
-                    .map(|file| json!({"path": file.path, "kind": match &file.kind {
-                        wire::PatchChangeKind::AddPatchChangeKind(_) => "add",
-                        wire::PatchChangeKind::DeletePatchChangeKind(_) => "delete",
-                        wire::PatchChangeKind::UpdatePatchChangeKind(_) => "update",
-                    }}))
-                    .collect::<Vec<_>>(),
-                // `exec` has no `declined`; a declined patch is one that failed to apply.
-                "status": match change.status {
-                    wire::PatchApplyStatus::Declined => "failed".to_owned(),
-                    other => snake(other.as_str()),
-                },
-            }),
-            Item::McpToolCallThreadItem(call) => json!({
-                "id": call.id,
-                "type": "mcp_tool_call",
-                "server": call.server,
-                "tool": call.tool,
-                "arguments": call.arguments,
-                "result": call.result.map(|result| json!({
-                    "content": result.content,
-                    "structured_content": result.structured_content,
-                })),
-                "error": call.error.map(|error| json!({"message": error.message})),
-                "status": snake(call.status.as_str()),
-            }),
-            Item::CollabAgentToolCallThreadItem(call) => collab_tool_call(*call)?,
-            Item::WebSearchThreadItem(search) => json!({
-                "id": search.id,
-                "type": "web_search",
-                "query": search.query,
-                "results": search.results,
-            }),
+            Item::CommandExecutionThreadItem(command) => (
+                command.id,
+                Details::CommandExecution(exec::CommandExecutionItem {
+                    command: command.command,
+                    aggregated_output: command.aggregated_output.unwrap_or_default(),
+                    exit_code: command.exit_code.and_then(|code| i32::try_from(code).ok()),
+                    status: match command.status {
+                        wire::CommandExecutionStatus::InProgress => {
+                            exec::CommandExecutionStatus::InProgress
+                        }
+                        wire::CommandExecutionStatus::Completed => {
+                            exec::CommandExecutionStatus::Completed
+                        }
+                        wire::CommandExecutionStatus::Failed => {
+                            exec::CommandExecutionStatus::Failed
+                        }
+                        wire::CommandExecutionStatus::Declined => {
+                            exec::CommandExecutionStatus::Declined
+                        }
+                    },
+                }),
+            ),
+            Item::FileChangeThreadItem(change) => (
+                change.id,
+                Details::FileChange(exec::FileChangeItem {
+                    changes: change
+                        .changes
+                        .into_iter()
+                        .map(|file| exec::FileUpdateChange {
+                            path: file.path,
+                            kind: match file.kind {
+                                wire::PatchChangeKind::AddPatchChangeKind(_) => {
+                                    exec::PatchChangeKind::Add
+                                }
+                                wire::PatchChangeKind::DeletePatchChangeKind(_) => {
+                                    exec::PatchChangeKind::Delete
+                                }
+                                wire::PatchChangeKind::UpdatePatchChangeKind(_) => {
+                                    exec::PatchChangeKind::Update
+                                }
+                            },
+                        })
+                        .collect(),
+                    // `exec` has no `declined`; a declined patch is one that failed to apply.
+                    status: match change.status {
+                        wire::PatchApplyStatus::InProgress => exec::PatchApplyStatus::InProgress,
+                        wire::PatchApplyStatus::Completed => exec::PatchApplyStatus::Completed,
+                        wire::PatchApplyStatus::Failed | wire::PatchApplyStatus::Declined => {
+                            exec::PatchApplyStatus::Failed
+                        }
+                    },
+                }),
+            ),
+            Item::McpToolCallThreadItem(call) => (
+                call.id,
+                Details::McpToolCall(exec::McpToolCallItem {
+                    server: call.server,
+                    tool: call.tool,
+                    arguments: call.arguments,
+                    result: call.result.map(|result| exec::McpToolCallItemResult {
+                        content: result.content,
+                        meta: result.meta,
+                        structured_content: result.structured_content,
+                    }),
+                    error: call.error.map(|error| exec::McpToolCallItemError {
+                        message: error.message,
+                    }),
+                    status: match call.status {
+                        wire::McpToolCallStatus::InProgress => exec::McpToolCallStatus::InProgress,
+                        wire::McpToolCallStatus::Completed => exec::McpToolCallStatus::Completed,
+                        wire::McpToolCallStatus::Failed => exec::McpToolCallStatus::Failed,
+                    },
+                }),
+            ),
+            Item::CollabAgentToolCallThreadItem(call) => {
+                let id = call.id.clone();
+                (id, collab_tool_call(*call)?)
+            }
+            Item::WebSearchThreadItem(search) => (
+                search.id,
+                Details::WebSearch(exec::WebSearchItem {
+                    query: search.query,
+                    action: web_search_action(search.action),
+                    results: search.results,
+                }),
+            ),
             Item::PlanThreadItem(plan) => {
                 self.last_plan = Some(plan.text);
                 return None;
@@ -477,7 +551,26 @@ impl Translator {
             | Item::ImageGenerationThreadItem(_)
             | Item::EnteredReviewModeThreadItem(_)
             | Item::ExitedReviewModeThreadItem(_) => return None,
-        })
+        };
+        Some(completed_item(Some(id), details))
+    }
+}
+
+/// What a web search did, as `exec` names it; one that says nothing is `Other`, as in `exec`.
+fn web_search_action(action: Option<wire::WebSearchAction>) -> exec::WebSearchAction {
+    match action {
+        Some(wire::WebSearchAction::SearchWebSearchAction(action)) => {
+            let wire::SearchWebSearchAction { query, queries, .. } = *action;
+            exec::WebSearchAction::Search { query, queries }
+        }
+        Some(wire::WebSearchAction::OpenPageWebSearchAction(action)) => {
+            exec::WebSearchAction::OpenPage { url: action.url }
+        }
+        Some(wire::WebSearchAction::FindInPageWebSearchAction(action)) => {
+            let wire::FindInPageWebSearchAction { url, pattern, .. } = *action;
+            exec::WebSearchAction::FindInPage { url, pattern }
+        }
+        Some(wire::WebSearchAction::OtherWebSearchAction(_)) | None => exec::WebSearchAction::Other,
     }
 }
 
@@ -485,37 +578,47 @@ impl Translator {
 ///
 /// `exec` names four tools and folds `resumeAgent` into `wait`; it reports neither the other tools
 /// nor an interrupted call.
-fn collab_tool_call(call: wire::CollabAgentToolCallThreadItem) -> Option<Value> {
+fn collab_tool_call(call: wire::CollabAgentToolCallThreadItem) -> Option<Details> {
     use wire::CollabAgentTool as Tool;
     let tool = match call.tool {
-        Tool::SpawnAgent => "spawn_agent",
-        Tool::SendInput => "send_input",
-        Tool::ResumeAgent | Tool::Wait => "wait",
-        Tool::CloseAgent => "close_agent",
+        Tool::SpawnAgent => exec::CollabTool::SpawnAgent,
+        Tool::SendInput => exec::CollabTool::SendInput,
+        Tool::ResumeAgent | Tool::Wait => exec::CollabTool::Wait,
+        Tool::CloseAgent => exec::CollabTool::CloseAgent,
         Tool::SendMessage | Tool::FollowupTask | Tool::InterruptAgent | Tool::ListAgents => {
             return None;
         }
     };
-    if call.status == wire::CollabAgentToolCallStatus::Interrupted {
-        return None;
-    }
-    let states: serde_json::Map<String, Value> = call
+    let status = match call.status {
+        wire::CollabAgentToolCallStatus::InProgress => exec::CollabToolCallStatus::InProgress,
+        wire::CollabAgentToolCallStatus::Completed => exec::CollabToolCallStatus::Completed,
+        wire::CollabAgentToolCallStatus::Failed => exec::CollabToolCallStatus::Failed,
+        wire::CollabAgentToolCallStatus::Interrupted => return None,
+    };
+    let agents_states = call
         .agents_states
         .into_iter()
         .map(|(thread, state)| {
-            let status = snake(state.status.as_str());
-            (thread, json!({"status": status, "message": state.message}))
+            let status = match state.status {
+                wire::CollabAgentStatus::PendingInit => exec::CollabAgentStatus::PendingInit,
+                wire::CollabAgentStatus::Running => exec::CollabAgentStatus::Running,
+                wire::CollabAgentStatus::Interrupted => exec::CollabAgentStatus::Interrupted,
+                wire::CollabAgentStatus::Completed => exec::CollabAgentStatus::Completed,
+                wire::CollabAgentStatus::Errored => exec::CollabAgentStatus::Errored,
+                wire::CollabAgentStatus::Shutdown => exec::CollabAgentStatus::Shutdown,
+                wire::CollabAgentStatus::NotFound => exec::CollabAgentStatus::NotFound,
+            };
+            let message = state.message;
+            (thread, exec::CollabAgentState { status, message })
         })
         .collect();
-    Some(json!({
-        "id": call.id,
-        "type": "collab_tool_call",
-        "tool": tool,
-        "sender_thread_id": call.sender_thread_id,
-        "receiver_thread_ids": call.receiver_thread_ids,
-        "prompt": call.prompt,
-        "agents_states": states,
-        "status": snake(call.status.as_str()),
+    Some(Details::CollabToolCall(exec::CollabToolCallItem {
+        tool,
+        sender_thread_id: call.sender_thread_id,
+        receiver_thread_ids: call.receiver_thread_ids,
+        prompt: call.prompt,
+        agents_states,
+        status,
     }))
 }
 
@@ -524,15 +627,18 @@ mod tests {
     use googletest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::{Finish, Translator, TurnId, UNDECODED_EVENT};
+    use super::{Finish, Translator, TurnId};
+    use crate::stream::codex::CaptureEvent;
+
+    fn written(events: &[CaptureEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|event| serde_json::to_value(event).ok())
+            .collect()
+    }
 
     fn lines(translator: &mut Translator, method: &str, params: &Value) -> Vec<Value> {
-        translator
-            .notification(method, params, false)
-            .lines
-            .iter()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        written(&translator.notification(method, params, false).lines)
     }
 
     fn turn(id: &str, status: &str) -> Value {
@@ -606,8 +712,7 @@ mod tests {
         let ended = t.notification("turn/completed", &turn("tu", "completed"), false);
 
         assert_that!(ended.finish, some(eq(Finish::Completed)));
-        let event: Value = serde_json::from_str(ended.lines.first().map_or("", String::as_str))
-            .unwrap_or_default();
+        let event = written(&ended.lines).into_iter().next().unwrap_or_default();
         assert_that!(event["type"], eq(&json!("turn.completed")));
         assert_that!(event["usage"]["input_tokens"], eq(&json!(120)));
         assert_that!(event["usage"]["output_tokens"], eq(&json!(7)));
@@ -641,13 +746,8 @@ mod tests {
                 false,
             );
             assert_that!(out.finish, none());
-            let written: Vec<Value> = out
-                .lines
-                .iter()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
             assert_that!(
-                written,
+                written(&out.lines),
                 elements_are![eq(&json!({"type": "error", "message": message}))]
             );
         }
@@ -655,10 +755,9 @@ mod tests {
         let ended = t.notification("turn/completed", &turn("tu", "failed"), false);
         assert_that!(ended.finish, some(eq(Finish::Failed)));
         assert_that!(
-            ended.lines,
+            written(&ended.lines),
             elements_are![eq(&json!({"type": "turn.failed",
-                "error": {"message": "model not supported"}})
-            .to_string())]
+                "error": {"message": "model not supported"}}))]
         );
     }
 
@@ -674,7 +773,13 @@ mod tests {
         let mut unasked = Translator::default();
         let out = unasked.notification("turn/completed", &turn("tu", "interrupted"), false);
         assert_that!(out.finish, some(eq(Finish::Failed)));
-        assert_that!(out.lines, elements_are![contains_substring("turn.failed")]);
+        assert_that!(
+            written(&out.lines)
+                .iter()
+                .map(|event| event["type"].clone())
+                .collect::<Vec<_>>(),
+            elements_are![eq(&json!("turn.failed"))]
+        );
     }
 
     /// The turn is announced once, by whichever names it first: the answer to `turn/start` or the
@@ -685,8 +790,12 @@ mod tests {
 
         let mut t = Translator::default();
         assert_that!(
-            t.turn_began(&TurnId::new("tu")),
-            some(eq(&started.to_string()))
+            written(
+                &t.turn_began(&TurnId::new("tu"))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            ),
+            elements_are![eq(&started)]
         );
         assert_that!(
             lines(&mut t, "turn/started", &turn("tu", "inProgress")),
@@ -724,7 +833,7 @@ mod tests {
         let novel = json!({"threadId": "th", "said": "something new"});
         let drift = lines(&mut t, "thread/somethingNew", &novel);
         assert_that!(drift.len(), eq(1));
-        assert_that!(drift[0]["type"], eq(&json!(UNDECODED_EVENT)));
+        assert_that!(drift[0]["type"], eq(&json!("agentmux.undecoded")));
         assert_that!(drift[0]["payload"], eq(&novel));
     }
 
@@ -741,7 +850,7 @@ mod tests {
             out.iter()
                 .filter_map(|e| e["type"].as_str().map(str::to_owned))
                 .collect::<Vec<_>>(),
-            elements_are![eq(UNDECODED_EVENT), eq("item.completed")]
+            elements_are![eq("agentmux.undecoded"), eq("item.completed")]
         );
         assert_that!(out[0]["payload"], eq(&params));
         assert_that!(out[1]["item"]["text"], eq(&json!("STILL HERE")));

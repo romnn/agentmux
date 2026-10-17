@@ -27,9 +27,10 @@ use std::fmt::Write as _;
 
 use chrono::DateTime;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::delegate::SessionRef;
-use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines, probe};
+use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines};
 use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Role, Turn, Usage};
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
@@ -40,42 +41,117 @@ use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Role, Turn, Us
 /// of the note changes.
 const HOOK_FEEDBACK_MARKER: &str = "hook feedback:";
 
-/// `system` subtypes that have been observed with the exact flags [`crate::delegate`] builds.
+/// One line of the stream, by its `type`.
 ///
-/// Deliberately short.
-/// Every name here is an event the drift counter will never report, so a name added on a guess is
-/// a hole in the guarantee.
-/// A new subtype shows up as a counted note in `status`, which is loud and harmless; the
-/// alternative is silence.
-const KNOWN_SYSTEM_SUBTYPES: &[&str] = &[
-    "init",
-    "thinking_tokens",
-    "notification",
-    "hook_started",
-    "hook_response",
-    // A backgrounded tool starting and finishing. Both carry a description and a status and no
-    // part of the answer: what the task actually produced arrives as an ordinary `tool_result`.
-    "task_started",
-    "task_notification",
-    // The same task's status changing, and the set of running background tasks changing. A
-    // status patch and a task list; still nothing a reader of the answer needs.
-    "task_updated",
-    "background_tasks_changed",
-];
+/// Every variant is one that has been observed with the exact flags [`crate::delegate`] builds,
+/// and deliberately no more: each is an event the drift counter will never report, so a name
+/// added on a guess is a hole in the guarantee.
+/// A new one reads as `Unknown` and is counted, which is loud and harmless; the alternative is
+/// silence.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Event {
+    System(SystemEvent),
+    Assistant(MessageEvent),
+    User(MessageEvent),
+    /// A heartbeat while a tool runs, carrying only how long it has been going.
+    /// It says nothing the transcript keeps, but it has to be named: an event type nobody names
+    /// is reported as drift, and a turn that merely ran a slow command would report some.
+    ToolProgress {},
+    RateLimitEvent(RateLimitEvent),
+    Result(ResultEvent),
+    #[serde(other)]
+    Unknown,
+}
+
+/// A `system` event, by its `subtype`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+enum SystemEvent {
+    Init(Init),
+    ThinkingTokens {},
+    Notification {},
+    HookStarted {},
+    HookResponse {},
+    /// A backgrounded tool starting and finishing.
+    /// Both carry a description and a status and no part of the answer: what the task actually
+    /// produced arrives as an ordinary `tool_result`.
+    TaskStarted {},
+    TaskNotification {},
+    /// The same task's status changing, and the set of running background tasks changing.
+    /// A status patch and a task list; still nothing a reader of the answer needs.
+    TaskUpdated {},
+    BackgroundTasksChanged {},
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Deserialize)]
-struct SystemEvent {
-    subtype: Option<String>,
+struct Init {
     session_id: Option<String>,
-    /// Where the CLI found an API key, on `init`; `"none"` when it runs on a logged-in
-    /// subscription.
+    /// Where the CLI found an API key.
     ///
     /// The environment agentmux hands a subscription delegate carries no key, but the CLI has
     /// other sources an inheriting delegate may load — a settings file's `env` table or its
     /// `apiKeyHelper`, or a login made with a Console key — and this is the CLI's own report of
     /// which one it used.
     #[serde(default, rename = "apiKeySource")]
-    api_key_source: Option<String>,
+    api_key_source: Option<ApiKeySource>,
+}
+
+/// Where the CLI found an API key, which it says is `none`, in any case, when it runs on a
+/// logged-in subscription.
+#[derive(Debug, Deserialize)]
+#[serde(from = "String")]
+enum ApiKeySource {
+    None,
+    Named(String),
+}
+
+impl From<String> for ApiKeySource {
+    fn from(source: String) -> Self {
+        if source.eq_ignore_ascii_case("none") {
+            Self::None
+        } else {
+            Self::Named(source)
+        }
+    }
+}
+
+/// Enough of a line to name it in the drift count.
+#[derive(Debug, Deserialize)]
+struct Named {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// The one event whose shape its `subtype` decides, which its drift name carries too.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Subtyped {
+    System {
+        subtype: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// What the drift count calls a line it cannot read: its `type`.
+fn unparsable(value: &Value) -> String {
+    match Named::deserialize(value) {
+        Ok(Named { kind }) => format!("{kind}.<unparsable>"),
+        Err(_) => MALFORMED_LINE.to_owned(),
+    }
+}
+
+/// What the drift count calls a line, or a content block: its `type`, and a `system` event's
+/// `subtype`.
+fn name(value: &Value) -> String {
+    match (Named::deserialize(value), Subtyped::deserialize(value)) {
+        (Ok(Named { kind }), Ok(Subtyped::System { subtype })) => format!("{kind}.{subtype}"),
+        (Ok(Named { kind }), _) => kind,
+        (Err(_), _) => MALFORMED_LINE.to_owned(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,13 +175,13 @@ struct MessageBody {
 ///
 /// There is deliberately no catch-all variant: a third shape would fail the whole event and be
 /// counted as drift, which is the loud outcome.
-/// Unknown *block* types are handled — they parse and are filtered by `kind` — so only a genuine
-/// change to `content` itself trips this.
+/// The blocks are kept as JSON values and read one by one, so a block in a shape the parser does
+/// not know is counted without taking the message's prose with it.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Content {
     Text(String),
-    Blocks(Vec<ContentBlock>),
+    Blocks(Vec<Value>),
 }
 
 impl Default for Content {
@@ -114,55 +190,65 @@ impl Default for Content {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    /// Absent on every non-text block; absent on a *text* block only if the vendor renamed it,
-    /// which is counted rather than read as an empty message.
-    #[serde(default)]
-    text: Option<String>,
-}
-
-/// Content block types that carry no prose and are dropped on purpose.
+/// One content block, by its `type`.
 ///
-/// Named so that a block type outside this list is counted rather than filtered.
+/// The blocks besides `text` carry no prose and are dropped on purpose, but named, so that a
+/// block type outside this list is counted rather than filtered.
 /// A renamed text block — `output_text` in place of `text`, say — would otherwise parse cleanly,
 /// be dropped by the filter, and take the report with it without a single diagnostic.
-const KNOWN_SILENT_BLOCKS: &[&str] = &["tool_use", "tool_result", "thinking", "image"];
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlock {
+    /// Prose; a text block without its text is not an empty message, and is counted.
+    Text {
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// A tool call, which means the turn was not over when the message was sent.
+    ToolUse {},
+    ToolResult {},
+    Thinking {},
+    Image {},
+    #[serde(other)]
+    Unknown,
+}
 
 /// What one message's content amounts to.
 #[derive(Debug, Default)]
-struct Inspected<'a> {
+struct Inspected {
     /// The prose, in order.
-    texts: Vec<&'a str>,
+    texts: Vec<String>,
     /// Block shapes the parser does not account for, for the drift counter.
-    unknown: Vec<&'a str>,
+    unknown: Vec<String>,
     /// Whether the message called a tool, which means the turn was not over when it was sent.
     calls_a_tool: bool,
 }
 
 impl Content {
     /// The prose of a message, plus any block shape the parser does not account for.
-    fn inspect(&self) -> Inspected<'_> {
+    fn inspect(self) -> Inspected {
         match self {
             Self::Text(text) => Inspected {
-                texts: vec![text.as_str()],
+                texts: vec![text],
                 ..Inspected::default()
             },
             Self::Blocks(blocks) => {
                 let mut inspected = Inspected::default();
                 for block in blocks {
-                    match (block.kind.as_str(), block.text.as_deref()) {
-                        ("text", Some(text)) => inspected.texts.push(text),
-                        // A text block without its text is not an empty message; it is the
-                        // payload field renamed, and dropping it would drop the report.
-                        ("text", None) => inspected.unknown.push("text.<missing>"),
-                        ("tool_use", _) => inspected.calls_a_tool = true,
-                        (kind, _) if !KNOWN_SILENT_BLOCKS.contains(&kind) => {
-                            inspected.unknown.push(kind);
+                    match ContentBlock::deserialize(&block) {
+                        Ok(ContentBlock::Text { text: Some(text) }) => inspected.texts.push(text),
+                        // The payload field renamed, and dropping it would drop the report.
+                        Ok(ContentBlock::Text { text: None }) => {
+                            inspected.unknown.push("text.<missing>".to_owned());
                         }
-                        _ => {}
+                        Ok(ContentBlock::ToolUse {}) => inspected.calls_a_tool = true,
+                        Ok(
+                            ContentBlock::ToolResult {}
+                            | ContentBlock::Thinking {}
+                            | ContentBlock::Image {},
+                        ) => {}
+                        Ok(ContentBlock::Unknown) => inspected.unknown.push(name(&block)),
+                        Err(_) => inspected.unknown.push(unparsable(&block)),
                     }
                 }
                 inspected
@@ -242,7 +328,7 @@ struct RateLimitEvent {
 #[derive(Debug, Deserialize)]
 struct RateLimitInfo {
     #[serde(default)]
-    status: Option<String>,
+    status: Option<RateLimitStatus>,
     /// Unix seconds at which the window reopens.
     #[serde(default, rename = "resetsAt")]
     resets_at: Option<i64>,
@@ -250,16 +336,21 @@ struct RateLimitInfo {
     rate_limit_type: Option<String>,
 }
 
+/// Whether the account may still send, as the CLI says it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RateLimitStatus {
+    Allowed,
+    #[serde(untagged)]
+    Refused(String),
+}
+
 /// Record what a `rate_limit_event` says about the account's usage window.
 ///
 /// The window is kept whatever the status says, because a run that succeeded against a nearly
 /// closed window still tells the caller what to expect from the next question.
 /// Only a refusal earns a line in the transcript.
-fn fold_rate_limit(turn: &mut Turn, line: &str) {
-    let Ok(event) = serde_json::from_str::<RateLimitEvent>(line) else {
-        turn.unrecognised.record("rate_limit_event.<unparsable>");
-        return;
-    };
+fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
     let info = event.rate_limit_info;
 
     if let Some(resets_at) = info.resets_at.and_then(DateTime::from_timestamp_secs) {
@@ -269,7 +360,7 @@ fn fold_rate_limit(turn: &mut Turn, line: &str) {
         });
     }
 
-    if let Some(status) = info.status.filter(|s| s != "allowed") {
+    if let Some(RateLimitStatus::Refused(status)) = info.status {
         let mut note = format!("delegate rate limit status: {status}");
         if let Some(limit) = &turn.rate_limit {
             match &limit.window {
@@ -288,32 +379,42 @@ fn fold_rate_limit(turn: &mut Turn, line: &str) {
 
 /// Fold one `system` event: the session it announces on `init`, the key it authenticated with,
 /// and a subtype the parser does not name.
-fn fold_system(line: &str, turn: &mut Turn, session: &mut Option<SessionRef>) {
-    let Ok(event) = serde_json::from_str::<SystemEvent>(line) else {
-        turn.unrecognised.record("system.<unparsable>");
-        return;
+fn fold_system(
+    event: SystemEvent,
+    line: &Value,
+    turn: &mut Turn,
+    session: &mut Option<SessionRef>,
+) {
+    let init = match event {
+        SystemEvent::Init(init) => init,
+        SystemEvent::Unknown => {
+            turn.unrecognised.record(name(line));
+            return;
+        }
+        SystemEvent::ThinkingTokens {}
+        | SystemEvent::Notification {}
+        | SystemEvent::HookStarted {}
+        | SystemEvent::HookResponse {}
+        | SystemEvent::TaskStarted {}
+        | SystemEvent::TaskNotification {}
+        | SystemEvent::TaskUpdated {}
+        | SystemEvent::BackgroundTasksChanged {} => return,
     };
-    let subtype = event.subtype.as_deref().unwrap_or("");
-    if subtype == "init"
-        && let Some(id) = event.session_id.as_deref()
-        && let Ok(parsed) = SessionRef::parse(id)
+    if let Some(parsed) = init
+        .session_id
+        .as_deref()
+        .and_then(|id| SessionRef::parse(id).ok())
     {
         *session = Some(parsed);
     }
     // Said in the transcript rather than refused, because by the time the stream says it the CLI
     // has already chosen; a reader comparing it with the turn's billing note sees whether that was
     // the account's own opt-in.
-    if subtype == "init"
-        && let Some(source) = event.api_key_source.as_deref()
-        && !source.eq_ignore_ascii_case("none")
-    {
+    if let Some(ApiKeySource::Named(source)) = init.api_key_source {
         turn.messages.push(Message::synthetic(format!(
             "the delegate authenticated with an API key (apiKeySource: {source}), so this turn is \
              charged at API prices rather than to a subscription"
         )));
-    }
-    if !KNOWN_SYSTEM_SUBTYPES.contains(&subtype) {
-        turn.unrecognised.record(format!("system.{subtype}"));
     }
 }
 
@@ -328,18 +429,22 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut delegate = DelegateActivity::Silent;
 
     for line in complete_lines(events) {
-        let Some(kind) = probe(line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             turn.unrecognised.record(MALFORMED_LINE);
             continue;
         };
+        let event = match Event::deserialize(&value) {
+            Ok(event) => event,
+            // An event this parser names, in a shape it does not.
+            Err(_) => {
+                turn.unrecognised.record(unparsable(&value));
+                continue;
+            }
+        };
 
-        match kind.as_str() {
-            "system" => fold_system(line, &mut turn, &mut session),
-            "assistant" => {
-                let Ok(event) = serde_json::from_str::<MessageEvent>(line) else {
-                    turn.unrecognised.record("assistant.<unparsable>");
-                    continue;
-                };
+        match event {
+            Event::System(event) => fold_system(event, &value, &mut turn, &mut session),
+            Event::Assistant(event) => {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
@@ -365,11 +470,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     turn.messages.push(Message::delegate(Role::Assistant, text));
                 }
             }
-            "user" => {
-                let Ok(event) = serde_json::from_str::<MessageEvent>(line) else {
-                    turn.unrecognised.record("user.<unparsable>");
-                    continue;
-                };
+            Event::User(event) => {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
@@ -382,7 +483,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                         continue;
                     }
                     turn.messages
-                        .push(match classify_injection(text, delegate) {
+                        .push(match classify_injection(&text, delegate) {
                             Injection::Reopening => {
                                 reopened = true;
                                 Message::hook_injection(text)
@@ -392,16 +493,9 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                         });
                 }
             }
-            // A heartbeat while a tool runs, carrying only how long it has been going. It says
-            // nothing the transcript keeps, but it has to be named: an event type nobody names is
-            // reported as drift, and a turn that merely ran a slow command would report some.
-            "tool_progress" => {}
-            "rate_limit_event" => fold_rate_limit(&mut turn, line),
-            "result" => {
-                let Ok(event) = serde_json::from_str::<ResultEvent>(line) else {
-                    turn.unrecognised.record("result.<unparsable>");
-                    continue;
-                };
+            Event::ToolProgress {} => {}
+            Event::RateLimitEvent(event) => fold_rate_limit(&mut turn, event),
+            Event::Result(event) => {
                 // A turn that failed before announcing a session still names one here, and
                 // without it the fold reports a turn whose continuity cannot be checked — drift,
                 // for a stream that in fact said which conversation it meant.
@@ -418,7 +512,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 // `tail`'s byte cursor relies on.
                 break;
             }
-            other => turn.unrecognised.record(other),
+            Event::Unknown => turn.unrecognised.record(name(&value)),
         }
     }
 
@@ -485,6 +579,18 @@ fn names_a_hook(text: &str) -> bool {
         .is_some_and(|first| first.to_ascii_lowercase().contains(HOOK_FEEDBACK_MARKER))
 }
 
+/// The terminal reasons that say what kind of failure a turn was, as the CLI spells them.
+///
+/// Read from the text rather than in place of it, because the text is also the failure's detail
+/// and a reason this does not name is still worth quoting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum TerminalReason {
+    MaxTurns,
+    TurnLimit,
+    Refusal,
+}
+
 /// Decide a turn's outcome from the terminal `result` event.
 ///
 /// `is_error` is authoritative; `subtype` is not, because an unknown model reports
@@ -498,6 +604,7 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
     }
 
     let reason = event.terminal_reason.as_deref().unwrap_or("");
+    let stated = reason.parse::<TerminalReason>().ok();
     // `subtype` is deliberately left out of the detail.
     // It reads `success` on a failed turn, so quoting it produces "failed … : success", which
     // invites a reader to doubt the failure rather than act on it.
@@ -515,13 +622,13 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
         .collect::<Vec<_>>()
         .join(": ");
 
-    let kind = match (reason, event.api_error_status) {
+    let kind = match (stated, event.api_error_status) {
         (_, Some(404)) => FailureKind::ModelUnavailable,
         (_, Some(429)) => FailureKind::RateLimited,
         (_, Some(402)) => FailureKind::BudgetExceeded,
-        ("max_turns" | "turn_limit", _) => FailureKind::TurnLimit,
-        ("refusal", _) => FailureKind::ContentFlagged,
-        _ => classify(&detail),
+        (Some(TerminalReason::MaxTurns | TerminalReason::TurnLimit), _) => FailureKind::TurnLimit,
+        (Some(TerminalReason::Refusal), _) => FailureKind::ContentFlagged,
+        (None, _) => classify(&detail),
     };
 
     Outcome::Failed {

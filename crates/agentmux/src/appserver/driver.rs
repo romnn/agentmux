@@ -18,7 +18,7 @@ use codex_app_server_protocol::envelope::{
     INTERNAL_ERROR, METHOD_NOT_FOUND, Message, RequestId, RpcError,
 };
 use codex_app_server_protocol::methods::{self as m, AnyServerRequest};
-use codex_app_server_protocol::{ClientRequest, Method as _, Request as _};
+use codex_app_server_protocol::{Answered, ClientRequest, Method as _, Typed};
 use serde_json::Value;
 
 use super::Plan;
@@ -27,6 +27,7 @@ use super::protocol;
 use super::protocol::{ThreadId, TurnId, TurnTarget};
 use super::translate::{self, Finish, Translator};
 use crate::delegate::{Billing, scrub_billing_env};
+use crate::stream::codex::CaptureEvent;
 
 /// How often the cancel marker, the mailbox and the server process are looked at while a turn
 /// runs.
@@ -215,7 +216,7 @@ pub fn drive_with(
         boundary: Some(boundary),
         next_id: 0,
         translator: Translator::default(),
-        mailbox: Mailbox::new(&plan.mailbox),
+        mailbox: Mailbox::new(plan.mailbox()),
         pending: HashMap::new(),
         finished: None,
         cancelled_at: None,
@@ -363,7 +364,7 @@ impl Answer<String> {
 /// settled, so that an accepted one is recorded before the event the fold stops at.
 struct Finished {
     finish: Finish,
-    lines: Vec<String>,
+    lines: Vec<CaptureEvent>,
 }
 
 struct Session<'a> {
@@ -396,11 +397,14 @@ impl Session<'_> {
     /// Flushed at once: the capture is what every reader folds, and a line held in a buffer is a
     /// line a `tail` cannot see.
     /// A capture that cannot be written ends the turn, because the transcript is the deliverable.
-    fn record(&mut self, lines: &[String]) -> Result<(), String> {
-        lines
+    fn record(&mut self, events: &[CaptureEvent]) -> Result<(), String> {
+        events
             .iter()
-            .try_for_each(|line| writeln!(self.out, "{line}"))
-            .and_then(|()| self.out.flush())
+            .try_for_each(|event| {
+                serde_json::to_writer(&mut self.out, event)?;
+                writeln!(self.out).map_err(serde_json::Error::io)
+            })
+            .and_then(|()| self.out.flush().map_err(serde_json::Error::io))
             .map_err(|error| format!("cannot write the event capture: {error}"))
     }
 
@@ -410,7 +414,10 @@ impl Session<'_> {
             .map_err(|_| "codex app-server closed its input".to_owned())
     }
 
-    fn request<M: ClientRequest>(&mut self, params: &M::Params) -> Result<RequestId, String> {
+    fn request<M: ClientRequest + Typed>(
+        &mut self,
+        params: &M::Params,
+    ) -> Result<RequestId, String> {
         self.next_id += 1;
         let id = RequestId::Integer(self.next_id);
         let request = Message::request::<M>(id.clone(), params)
@@ -420,7 +427,7 @@ impl Session<'_> {
     }
 
     fn cancel_requested(&self) -> bool {
-        self.plan.cancel_marker.exists()
+        self.plan.cancel_marker().exists()
     }
 
     /// The next message from the server, waiting up to `wait` for one.
@@ -486,10 +493,11 @@ impl Session<'_> {
         };
         // A server that has gone cannot be answered, and its departure is reported on its own.
         let _ = self.send(&answer);
-        self.record(&[translate::note(&format!(
+        let note = self.translator.note(&format!(
             "agentmux declined codex's `{method}` request: a consultation runs with nobody to \
              approve or answer it"
-        ))])
+        ));
+        self.record(&[note])
     }
 
     /// Translate one notification into the capture, holding back the end of the turn.
@@ -526,7 +534,10 @@ impl Session<'_> {
     ///
     /// An answer that does not decode as `M`'s response is recorded as drift and handed back as
     /// it arrived, for the caller to salvage what it needs.
-    fn call<M: ClientRequest>(&mut self, params: &M::Params) -> Result<Answer<M::Response>, Setup> {
+    fn call<M: ClientRequest + Answered>(
+        &mut self,
+        params: &M::Params,
+    ) -> Result<Answer<M::Response>, Setup> {
         let method = M::METHOD;
         let starts_the_turn = method == m::TurnStart::METHOD;
         if self.cancel_requested() {
@@ -864,9 +875,12 @@ impl Session<'_> {
                 Ok(())
             }
             (Pending::Interrupt, Ok(_)) => Ok(()),
-            (Pending::Interrupt, Err(reason)) => self.record(&[translate::note(&format!(
-                "codex refused to interrupt the turn: {reason}"
-            ))]),
+            (Pending::Interrupt, Err(reason)) => {
+                let note = self
+                    .translator
+                    .note(&format!("codex refused to interrupt the turn: {reason}"));
+                self.record(&[note])
+            }
         }
     }
 
@@ -887,13 +901,13 @@ impl Session<'_> {
         let Some(text) = self.translator.last_message() else {
             return Ok(());
         };
-        if let Err(error) = std::fs::write(&self.plan.last_message, text) {
+        if let Err(error) = std::fs::write(self.plan.last_message(), text) {
             eprintln!(
                 "agentmux: cannot write the closing message to {}: {error}",
-                self.plan.last_message.display()
+                self.plan.last_message().display()
             );
-            if let Some(plan) = self.translator.uncaptured_last_message() {
-                let kept = translate::reply(plan);
+            if let Some(plan) = self.translator.uncaptured_last_message().map(str::to_owned) {
+                let kept = self.translator.reply(&plan);
                 self.record(&[kept])?;
             }
         }

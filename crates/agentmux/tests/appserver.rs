@@ -15,7 +15,7 @@ use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Letter, Mailbox, Reply};
-use agentmux::appserver::{Deadlines, Ending, Plan, UNDECODED_EVENT, drive_with};
+use agentmux::appserver::{Deadlines, Ending, Plan, drive_with};
 use agentmux::delegate::{
     AccountChoice, AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor,
 };
@@ -94,9 +94,7 @@ fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<Plan> {
         cwd: dir.to_path_buf(),
         resume: resume.map(SessionRef::parse).transpose().or_fail()?,
         billing,
-        last_message: dir.join("last-message.md"),
-        cancel_marker: dir.join("cancelling"),
-        mailbox: dir.join("steer"),
+        turn_dir: dir.to_path_buf(),
     })
 }
 
@@ -223,7 +221,7 @@ fn signal(reached: &Sender<()>) {
 
 /// Submit a steer and wait for the driver's reply.
 fn steer(plan: &Plan, text: &str) -> Option<Reply> {
-    let mailbox = Mailbox::new(&plan.mailbox);
+    let mailbox = Mailbox::new(plan.mailbox());
     let letter: Letter = mailbox.submit(text).ok()?;
     replied(&mailbox, &letter)
 }
@@ -424,7 +422,7 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
 
     // The closing message is written where `--output-last-message` would have put it.
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq("Narrowed to auth: no findings.")
     );
     Ok(())
@@ -533,7 +531,7 @@ fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
         |plan| {
             // Cancelled only once the turn is running, as `cancel` would find it.
             if reached(&turn_running) {
-                std::fs::write(&plan.cancel_marker, "").ok();
+                std::fs::write(plan.cancel_marker(), "").ok();
             }
         },
     )?;
@@ -730,7 +728,7 @@ fn a_turn_that_ends_before_turn_start_answers_still_ends() -> Result<()> {
     assert_that!(run.ending, eq(&Ending::Finished));
     assert_that!(count(&run.capture, "turn.completed"), eq(1));
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq("Done before you asked.")
     );
     Ok(())
@@ -909,7 +907,7 @@ fn a_line_that_is_no_message_is_kept_as_drift() -> Result<()> {
 fn a_cancellation_during_setup_starts_no_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let marker = plan.cancel_marker.clone();
+    let marker = plan.cancel_marker();
 
     let run = run(
         &plan,
@@ -1086,7 +1084,7 @@ fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
 
     assert_that!(reached(&started), eq(true));
     // Far more than a pipe holds, so writing it blocks for as long as the server does not read.
-    let mailbox = Mailbox::new(&plan.mailbox);
+    let mailbox = Mailbox::new(plan.mailbox());
     let letter = mailbox.submit(&"x".repeat(4 << 20)).or_fail()?;
     assert_that!(eventually(|| mailbox.is_claimed(&letter)), eq(true));
     go_tx.send(()).or_fail()?;
@@ -1195,7 +1193,7 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
 fn a_turn_cancelled_before_turn_start_answers_is_interrupted_by_its_announced_id() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let marker = plan.cancel_marker.clone();
+    let marker = plan.cancel_marker();
 
     // The answer never comes, so a driver that waited for it would never finish, and fail.
     let run = run(
@@ -1337,7 +1335,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let witness = WitnessAtEnd {
         capture: Vec::new(),
-        last_message: plan.last_message.clone(),
+        last_message: plan.last_message(),
         ended: false,
         seen: None,
     };
@@ -1383,7 +1381,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
         .join("runs")
         .join(started.run_id.as_str())
         .join("turns/0000");
-    std::fs::copy(&plan.last_message, turn.join("last-message.md")).or_fail()?;
+    std::fs::copy(plan.last_message(), turn.join("last-message.md")).or_fail()?;
 
     let (_, first) = store.view(&started.run_id, 0, 1_000_000).or_fail()?;
     assert_that!(first.text.matches(PLAN).count(), eq(1));
@@ -1468,7 +1466,7 @@ fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()
     // Nothing the child said reached the capture, and the plan is the closing message.
     assert_that!(run.capture, not(contains_substring("CHILD-")));
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq(PLAN)
     );
     Ok(())
@@ -1536,9 +1534,9 @@ fn a_completion_queued_before_the_server_exits_still_ends_the_turn() -> Result<(
 #[gtest]
 fn a_plan_report_survives_a_closing_message_that_cannot_be_written() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut plan = plan(dir.path(), Billing::Subscription, None)?;
-    // A directory that does not exist, so the file cannot be created.
-    plan.last_message = dir.path().join("missing/last-message.md");
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    // A directory where the file belongs, so the file cannot be written.
+    std::fs::create_dir(plan.last_message()).or_fail()?;
 
     let run = run(&plan, plan_only, |_| {})?;
 
@@ -1575,7 +1573,7 @@ fn a_completed_plan_survives_a_server_that_dies() -> Result<()> {
 
     assert_that!(run.ending, matches_pattern!(Ending::Broken(_)));
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq(PLAN)
     );
     Ok(())
@@ -1602,8 +1600,8 @@ impl std::io::Write for RefusesReplies {
 #[gtest]
 fn a_plan_nothing_could_keep_breaks_the_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut plan = plan(dir.path(), Billing::Subscription, None)?;
-    plan.last_message = dir.path().join("missing/last-message.md");
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    std::fs::create_dir(plan.last_message()).or_fail()?;
 
     let driven = run_with(
         &plan,
@@ -1676,8 +1674,8 @@ impl std::io::Write for RefusesFirstEnd {
 #[gtest]
 fn a_plan_fallback_is_recorded_once_if_the_end_cannot_be_written() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let mut plan = plan(dir.path(), Billing::Subscription, None)?;
-    plan.last_message = dir.path().join("missing/last-message.md");
+    let plan = plan(dir.path(), Billing::Subscription, None)?;
+    std::fs::create_dir(plan.last_message()).or_fail()?;
     let capture = RefusesFirstEnd {
         capture: Vec::new(),
         refused: false,
@@ -1792,7 +1790,7 @@ fn a_cancellation_before_the_turn_is_known_interrupts_nothing() -> Result<()> {
         },
         |plan| {
             if reached(&starting) {
-                std::fs::write(&plan.cancel_marker, "").ok();
+                std::fs::write(plan.cancel_marker(), "").ok();
             }
         },
     )?;
@@ -1827,7 +1825,7 @@ fn an_interrupt_the_server_refuses_is_noted() -> Result<()> {
         },
         |plan| {
             if reached(&turn_running) {
-                std::fs::write(&plan.cancel_marker, "").ok();
+                std::fs::write(plan.cancel_marker(), "").ok();
             }
         },
     )?;
@@ -1862,7 +1860,7 @@ fn an_interrupt_never_answered_ends_the_turn_at_its_grace() -> Result<()> {
         },
         |plan| {
             if reached(&turn_running) {
-                std::fs::write(&plan.cancel_marker, "").ok();
+                std::fs::write(plan.cancel_marker(), "").ok();
             }
         },
     )?;
@@ -1914,7 +1912,7 @@ fn concurrent_steers_are_each_answered_with_their_own_outcome() -> Result<()> {
             finish(peer, "done")
         },
         |plan| {
-            let mailbox = Mailbox::new(&plan.mailbox);
+            let mailbox = Mailbox::new(plan.mailbox());
             let (Ok(keep), Ok(drop)) = (mailbox.submit("KEEP"), mailbox.submit("DROP")) else {
                 return;
             };
@@ -2079,7 +2077,7 @@ fn what_the_server_says_after_the_end_changes_nothing() -> Result<()> {
     assert_that!(count(&run.capture, "turn.failed"), eq(0));
     assert_that!(run.capture, not(contains_substring("LATE")));
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq("FIRST")
     );
     Ok(())
@@ -2125,7 +2123,7 @@ fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
     assert_that!(capture, contains_substring("SPLIT"));
     assert_that!(capture, contains_substring("JOINED"));
     assert_that!(
-        std::fs::read_to_string(&plan.last_message).or_fail()?,
+        std::fs::read_to_string(plan.last_message()).or_fail()?,
         eq(&large)
     );
     Ok(())
@@ -2201,7 +2199,7 @@ fn a_thread_start_answer_that_drifted_is_drift_but_its_id_is_kept() -> Result<()
             .capture
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|event| event["type"] == UNDECODED_EVENT)
+            .filter(|event| event["type"] == "agentmux.undecoded")
             .collect();
         if works {
             expect_that!(run.ending, eq(&Ending::Finished));

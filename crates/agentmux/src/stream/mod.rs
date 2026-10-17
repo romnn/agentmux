@@ -18,8 +18,6 @@
 pub mod claude;
 pub mod codex;
 
-use serde::Deserialize;
-
 use crate::delegate::{SessionRef, Vendor};
 use crate::transcript::Turn;
 
@@ -72,20 +70,6 @@ pub(crate) fn complete_lines(events: &str) -> impl Iterator<Item = &str> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-}
-
-/// Just enough of a line to know which typed shape to parse it as.
-#[derive(Debug, Deserialize)]
-pub(crate) struct TypeProbe {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-}
-
-/// Read the top-level `type` of a JSONL line.
-pub(crate) fn probe(line: &str) -> Option<String> {
-    serde_json::from_str::<TypeProbe>(line)
-        .ok()
-        .map(|probe| probe.kind)
 }
 
 /// Classify a vendor's error text into a [`crate::transcript::FailureKind`].
