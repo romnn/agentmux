@@ -30,7 +30,7 @@ use strum::VariantArray;
 ///
 /// The fields carry the core crate's own enums, and the values listed are those enums' variants
 /// as serde spells them, so the schema offers exactly what the field deserializes.
-fn string_choice<T: VariantArray + Serialize>(description: &str) -> Schema {
+fn string_enum_schema<T: VariantArray + Serialize>(description: &str) -> Schema {
     let values: Vec<serde_json::Value> = T::VARIANTS
         .iter()
         .filter_map(|variant| serde_json::to_value(variant).ok())
@@ -43,15 +43,17 @@ fn string_choice<T: VariantArray + Serialize>(description: &str) -> Schema {
 }
 
 fn vendor_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice::<Vendor>("Which delegate CLI to run.")
+    string_enum_schema::<Vendor>("Which delegate CLI to run.")
 }
 
 fn billing_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice::<Billing>("The pricing to run on: `subscription` or `api`.")
+    string_enum_schema::<Billing>("The pricing to run on: `subscription` or `api`.")
 }
 
 fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice::<CodexSandbox>("How much of the working directory a Codex delegate may write.")
+    string_enum_schema::<CodexSandbox>(
+        "How much of the working directory a Codex delegate may write.",
+    )
 }
 
 /// Who to consult, and on what terms.
@@ -136,8 +138,8 @@ pub struct DelegateParams {
     /// A consultation run this way cannot be steered.
     /// Use it when an earlier Codex consultation failed with a protocol error, which means the
     /// installed codex no longer speaks the app-server protocol this agentmux was built for.
-    #[serde(default)]
-    pub codex_exec: bool,
+    #[serde(rename = "codex_exec", default)]
+    pub force_codex_exec: bool,
 }
 
 impl DelegateParams {

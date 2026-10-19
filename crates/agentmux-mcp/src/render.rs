@@ -170,7 +170,7 @@ pub fn warnings(status: &RunStatus) -> String {
             // Said in the header's state line, which reports the newest turn and would otherwise
             // present the consultation as completed.
             Warning::EarlierFailure { .. } => {}
-            Warning::SessionNotSaved { store } => {
+            Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
                     warning:    this consultation cannot be followed up: {fact}.
                                 Launching from an agent's sandboxed shell does that, because the delegate
@@ -178,7 +178,7 @@ pub fn warnings(status: &RunStatus) -> String {
                                 new consultation through the agentmux MCP server, which runs outside the
                                 sandbox.
                     ",
-                    fact = describe_unsaved_session_store(store),
+                    fact = describe_unsaved_session_store(session_store_path),
                 });
             }
             Warning::BrokeContinuity => out.push_str(
@@ -203,17 +203,17 @@ pub fn warnings(status: &RunStatus) -> String {
             Warning::Unrecognised {
                 total,
                 summary,
-                events,
-                another_protocol,
+                events_path,
+                has_undecoded_app_server_messages,
             } => {
                 let _ = write!(
                     out,
                     "warning:    agentmux did not recognise {total} event(s) from the delegate CLI ({summary}).\n\
                      \x20           The CLI may have changed its output format and this transcript may be\n\
                      \x20           missing content. The raw stream is at {}.\n",
-                    events.display(),
+                    events_path.display(),
                 );
-                if another_protocol {
+                if has_undecoded_app_server_messages {
                     let _ = writeln!(
                         out,
                         "            codex sent messages agentmux could not read: {}.",
@@ -245,7 +245,7 @@ fn recovery_advice(
     rate_limit: Option<&RateLimit>,
     quota: &[AccountQuota],
     vendor: agentmux::delegate::Vendor,
-    ran_as: Option<&agentmux::delegate::AccountAlias>,
+    consultation_account: Option<&agentmux::delegate::AccountAlias>,
 ) -> Cow<'static, str> {
     // A rate limit is the only failure whose advice inverts on a number, so it is decided before
     // the table of fixed answers below.
@@ -270,7 +270,7 @@ fn recovery_advice(
                 // an alias the caller will pass back as `account`, and an alias from the other
                 // vendor's table resolves to nothing but a paid round trip.
                 entry.vendor == vendor
-                    && entry.account.as_ref() != ran_as
+                    && entry.account.as_ref() != consultation_account
                     && matches!(entry.observation, Observation::Reported { .. })
             })
             .filter_map(|entry| entry.account.as_ref().map(ToString::to_string))
@@ -285,7 +285,7 @@ fn recovery_advice(
             // A run on the CLI's own login cannot be told apart from an alias that points at
             // that same login, so the aliases are offered as candidates, not as different
             // subscriptions.
-            let candidates = if ran_as.is_some() {
+            let candidates = if consultation_account.is_some() {
                 format!(
                     "you also have {} configured for this vendor",
                     alternatives.join(", ")
@@ -397,17 +397,17 @@ fn follow_up_step(status: &RunStatus, lead: &str) -> String {
 pub fn next_steps(status: &RunStatus) -> String {
     let id = &status.run_id;
     if status.is_terminal() {
-        let mut out = indoc::formatdoc! {r#"
+        let mut next_steps_text = indoc::formatdoc! {r#"
 
             next:       result {{"run_id": "{id}"}}
         "#};
         if status.resumable {
-            out.push_str(&follow_up_step(status, "            "));
+            next_steps_text.push_str(&follow_up_step(status, "            "));
         }
-        out
+        next_steps_text
     } else {
         let cursor = status.transcript_bytes;
-        let mut out = indoc::formatdoc! {r#"
+        let mut next_steps_text = indoc::formatdoc! {r#"
 
             Still working. The delegate is detached and survives an agentmux restart.
             next:       tail {{"run_id": "{id}", "cursor": {cursor}}} — new output only
@@ -417,17 +417,17 @@ pub fn next_steps(status: &RunStatus) -> String {
         // Offered only where it would be accepted, because a caller that takes the suggestion
         // otherwise spends a call on a refusal.
         if status.steerable {
-            out.push_str(&indoc::formatdoc! {r#"
+            next_steps_text.push_str(&indoc::formatdoc! {r#"
                             steer {{"run_id": "{id}", "message": "…"}} — redirect the running turn
             "#});
         }
-        out
+        next_steps_text
     }
 }
 
 /// What `steer` returns: the confirmation, then the consultation's state.
 #[must_use]
-pub fn steered(status: &RunStatus) -> String {
+pub fn steer_confirmation(status: &RunStatus) -> String {
     format!(
         "steered:    the delegate accepted the message into its running turn; the transcript \
          records it as `### user (steer)`\n{}",

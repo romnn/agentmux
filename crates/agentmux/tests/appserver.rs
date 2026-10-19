@@ -14,18 +14,18 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use agentmux::appserver::mailbox::{Letter, Mailbox, Reply};
-use agentmux::appserver::{Deadlines, Ending, Plan, drive_with};
+use agentmux::appserver::mailbox::{Mailbox, SteerId, SteerReply};
+use agentmux::appserver::{DriverOutcome, DriverPlan, DriverTimeouts, drive_with};
 use agentmux::delegate::{
     AccountChoice, AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor,
 };
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
 use codex_app_server_mock::conformance::{self, Side};
-use codex_app_server_mock::fixtures::{self, THREAD, TURN, Tokens};
+use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID, TokenCounts};
 use codex_app_server_mock::{Peer, PeerError};
 use codex_app_server_protocol::envelope::{METHOD_NOT_FOUND, Message, RequestId};
-use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::methods;
 use codex_app_server_protocol::types::{TurnStatus, UserInput};
 use googletest::prelude::*;
 use serde_json::{Value, json};
@@ -37,54 +37,54 @@ const QUESTION: &str = "Review the auth module.";
 type Script<R> = Box<dyn FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send>;
 
 /// One finished run of the driver.
-struct Run<R = ()> {
-    ending: Ending,
+struct CapturedDriverRun<R = ()> {
+    outcome: DriverOutcome,
     /// The capture the driver wrote, which the store would have folded.
     capture: String,
     /// Every message the server received, in order.
-    requests: Vec<Value>,
+    client_messages: Vec<Value>,
     /// What the script returned.
-    script: R,
+    script_result: R,
 }
 
 /// How the driver runs, beyond the plan: where it captures to, how it learns the server has
 /// exited, how long it waits, and how much of the server's output it reads at once.
-struct Driver<W> {
-    out: W,
+struct DriverTestConfig<W> {
+    capture_writer: W,
     exited: Box<dyn FnMut() -> bool + Send>,
-    deadlines: Deadlines,
+    timeouts: DriverTimeouts,
     read_capacity: usize,
 }
 
-impl Driver<Vec<u8>> {
+impl DriverTestConfig<Vec<u8>> {
     /// A driver capturing into memory, whose server never exits, on the production deadlines.
     fn standard() -> Self {
         Self::capturing(Vec::new())
     }
 }
 
-impl<W> Driver<W> {
-    fn capturing(out: W) -> Self {
+impl<W> DriverTestConfig<W> {
+    fn capturing(capture_writer: W) -> Self {
         Self {
-            out,
+            capture_writer,
             exited: Box::new(|| false),
-            deadlines: Deadlines::default(),
+            timeouts: DriverTimeouts::default(),
             read_capacity: 8 << 10,
         }
     }
 }
 
-/// One finished run of a [`Driver`], with the capture it was given back.
-struct Driven<W, R> {
-    ending: Ending,
-    out: W,
-    requests: Vec<Value>,
-    script: R,
+/// One finished run of a [`DriverTestConfig`], with the capture it was given back.
+struct DriverRunResult<W, R> {
+    outcome: DriverOutcome,
+    capture_writer: W,
+    client_messages: Vec<Value>,
+    script_result: R,
 }
 
 /// A plan whose files live in `dir`.
-fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<Plan> {
-    Ok(Plan {
+fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<DriverPlan> {
+    Ok(DriverPlan {
         settings: AppServerSettings {
             program: "codex".to_owned(),
             args: vec!["app-server".to_owned()],
@@ -92,7 +92,7 @@ fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<Plan> {
             sandbox: CodexSandbox::ReadOnly,
         },
         cwd: dir.to_path_buf(),
-        resume: resume.map(SessionRef::parse).transpose().or_fail()?,
+        resume_thread_id: resume.map(SessionRef::parse).transpose().or_fail()?,
         billing,
         turn_dir: dir.to_path_buf(),
     })
@@ -101,16 +101,16 @@ fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<Plan> {
 /// Run the driver against `script`, capturing into memory, while `during` acts on the running
 /// turn from outside.
 fn run<R: Send + 'static>(
-    plan: &Plan,
+    plan: &DriverPlan,
     script: impl FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send + 'static,
-    during: impl FnOnce(&Plan),
-) -> Result<Run<R>> {
-    let driven = run_with(plan, Driver::standard(), script, during)?;
-    Ok(Run {
-        ending: driven.ending,
-        capture: String::from_utf8(driven.out).or_fail()?,
-        requests: driven.requests,
-        script: driven.script,
+    during: impl FnOnce(&DriverPlan),
+) -> Result<CapturedDriverRun<R>> {
+    let driven = run_with(plan, DriverTestConfig::standard(), script, during)?;
+    Ok(CapturedDriverRun {
+        outcome: driven.outcome,
+        capture: String::from_utf8(driven.capture_writer).or_fail()?,
+        client_messages: driven.client_messages,
+        script_result: driven.script_result,
     })
 }
 
@@ -121,77 +121,77 @@ fn run<R: Send + 'static>(
 /// ends, and the script's failure is the test's.
 /// Every message the driver sent must be one codex's own schema allows.
 fn run_with<W: std::io::Write + Send + 'static, R: Send + 'static>(
-    plan: &Plan,
-    driver: Driver<W>,
+    plan: &DriverPlan,
+    driver: DriverTestConfig<W>,
     script: impl FnOnce(&mut Peer) -> std::result::Result<R, PeerError> + Send + 'static,
-    during: impl FnOnce(&Plan),
-) -> Result<Driven<W, R>> {
+    during: impl FnOnce(&DriverPlan),
+) -> Result<DriverRunResult<W, R>> {
     let (server_in, to_server) = std::io::pipe().or_fail()?;
     let (from_server, server_out) = std::io::pipe().or_fail()?;
     let script: Script<R> = Box::new(script);
     let server = std::thread::spawn(move || {
         let mut peer = Peer::new(BufReader::new(server_in), server_out);
-        let outcome = script(&mut peer);
-        let drained = match &outcome {
-            Ok(_) => peer.wait_until_closed(),
+        let script_outcome = script(&mut peer);
+        let drained = match &script_outcome {
+            Ok(_) => peer.drain_until_closed(),
             Err(_) => Ok(()),
         };
-        let received = peer.received().to_vec();
-        (outcome, drained, received)
+        let received = peer.received_lines().to_vec();
+        (script_outcome, drained, received)
     });
-    let Driver {
-        out,
+    let DriverTestConfig {
+        capture_writer,
         mut exited,
-        deadlines,
+        timeouts,
         read_capacity,
     } = driver;
     let driving = std::thread::spawn({
         let plan = plan.clone();
         move || {
-            let mut out = out;
-            let ending = drive_with(
+            let mut capture_writer = capture_writer;
+            let outcome = drive_with(
                 &plan,
                 QUESTION,
-                &mut out,
+                &mut capture_writer,
                 to_server,
                 BufReader::with_capacity(read_capacity, from_server),
                 &mut exited,
-                deadlines,
+                timeouts,
             );
-            (ending, out)
+            (outcome, capture_writer)
         }
     });
 
     during(plan);
 
-    let (ending, out) = finished(driving, "the driver")?;
-    let (outcome, drained, received) = finished(server, "the scripted server")?;
-    let script = outcome.or_fail()?;
+    let (outcome, capture_writer) = join_with_timeout(driving, "the driver")?;
+    let (script_outcome, drained, received) = join_with_timeout(server, "the scripted server")?;
+    let script_result = script_outcome.or_fail()?;
     drained.or_fail()?;
-    let mut requests = Vec::new();
+    let mut client_messages = Vec::new();
     for line in &received {
-        let request: Value = serde_json::from_str(line).or_fail()?;
-        if let Err(reason) = conformance::check(Side::Client, &request) {
+        let message: Value = serde_json::from_str(line).or_fail()?;
+        if let Err(reason) = conformance::check(Side::Client, &message) {
             fail!(
                 "{}",
                 indoc::formatdoc! {"
-                    the driver sent what codex's schema refuses: {request}
+                    the driver sent what codex's schema refuses: {message}
                     {reason}"}
             )?;
         }
-        requests.push(request);
+        client_messages.push(message);
     }
-    Ok(Driven {
-        ending,
-        out,
-        requests,
-        script,
+    Ok(DriverRunResult {
+        outcome,
+        capture_writer,
+        client_messages,
+        script_result,
     })
 }
 
 /// Join `thread`, failing the test rather than hanging it when it has not finished within a
 /// minute.
-fn finished<T>(thread: std::thread::JoinHandle<T>, what: &str) -> Result<T> {
+fn join_with_timeout<T>(thread: std::thread::JoinHandle<T>, what: &str) -> Result<T> {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !thread.is_finished() {
         if Instant::now() >= deadline {
@@ -203,7 +203,7 @@ fn finished<T>(thread: std::thread::JoinHandle<T>, what: &str) -> Result<T> {
 }
 
 /// Wait for `condition`, for at most ten seconds.
-fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if condition() {
@@ -215,7 +215,7 @@ fn eventually(mut condition: impl FnMut() -> bool) -> bool {
 }
 
 /// Wait for the script to say a point was reached, for at most ten seconds.
-fn reached(signal: &Receiver<()>) -> bool {
+fn wait_for_signal(signal: &Receiver<()>) -> bool {
     signal.recv_timeout(Duration::from_secs(10)).is_ok()
 }
 
@@ -225,25 +225,25 @@ fn signal(reached: &Sender<()>) {
 }
 
 /// Submit a steer and wait for the driver's reply.
-fn steer(plan: &Plan, text: &str) -> Option<Reply> {
-    let mailbox = Mailbox::new(plan.mailbox());
-    let letter: Letter = mailbox.submit(text).ok()?;
-    replied(&mailbox, &letter)
+fn steer(plan: &DriverPlan, text: &str) -> Option<SteerReply> {
+    let mailbox = Mailbox::new(plan.mailbox_dir());
+    let steer_id: SteerId = mailbox.submit(text).ok()?;
+    wait_for_steer_reply(&mailbox, &steer_id)
 }
 
-/// Wait for the driver's reply to `letter`.
-fn replied(mailbox: &Mailbox, letter: &Letter) -> Option<Reply> {
+/// Wait for the driver's reply to `steer_id`.
+fn wait_for_steer_reply(mailbox: &Mailbox, steer_id: &SteerId) -> Option<SteerReply> {
     let mut reply = None;
-    eventually(|| {
-        reply = mailbox.reply(letter).ok().flatten();
+    wait_until(|| {
+        reply = mailbox.reply(steer_id).ok().flatten();
         reply.is_some()
     });
     reply
 }
 
 /// The requests the server received with `name`.
-fn sent<'a, R>(run: &'a Run<R>, name: &str) -> Vec<&'a Value> {
-    run.requests
+fn client_messages_for_method<'a, R>(run: &'a CapturedDriverRun<R>, name: &str) -> Vec<&'a Value> {
+    run.client_messages
         .iter()
         .filter(|request| request.get("method").and_then(Value::as_str) == Some(name))
         .collect()
@@ -264,42 +264,44 @@ fn count(capture: &str, kind: &str) -> usize {
 }
 
 /// One reply the delegate gives while its turn goes on.
-fn says(peer: &mut Peer, id: &str, text: &str) -> std::result::Result<(), PeerError> {
-    peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
-        THREAD,
-        TURN,
+fn send_agent_message(peer: &mut Peer, id: &str, text: &str) -> std::result::Result<(), PeerError> {
+    peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
+        THREAD_ID,
+        TURN_ID,
         fixtures::agent_message(id, text),
     ))
 }
 
 /// The delegate's reply, the token total, and the end of the turn, as codex sends them.
-fn finish(peer: &mut Peer, text: &str) -> std::result::Result<(), PeerError> {
-    says(peer, "i-reply", text)?;
-    peer.notify::<m::ThreadTokenUsageUpdated>(&fixtures::token_usage(
-        THREAD,
-        TURN,
-        Tokens {
+fn complete_turn_with_reply(peer: &mut Peer, text: &str) -> std::result::Result<(), PeerError> {
+    send_agent_message(peer, "i-reply", text)?;
+    peer.notify::<methods::ThreadTokenUsageUpdated>(&fixtures::token_usage(
+        THREAD_ID,
+        TURN_ID,
+        TokenCounts {
             input: 10,
             output: 5,
-            ..Tokens::default()
+            ..TokenCounts::default()
         },
-        Tokens {
+        TokenCounts {
             input: 900,
             cached_input: 100,
             output: 50,
             reasoning_output: 7,
         },
     ))?;
-    end(peer, TurnStatus::Completed, Vec::new())
+    send_turn_completion(peer, TurnStatus::Completed, Vec::new())
 }
 
 /// The end of the turn, in `status`, with the items the turn records.
-fn end(
+fn send_turn_completion(
     peer: &mut Peer,
     status: TurnStatus,
     items: Vec<codex_app_server_protocol::types::ThreadItem>,
 ) -> std::result::Result<(), PeerError> {
-    peer.notify::<m::TurnCompleted>(&fixtures::turn_completed(THREAD, TURN, status, items))
+    peer.notify::<methods::TurnCompleted>(&fixtures::turn_completed(
+        THREAD_ID, TURN_ID, status, items,
+    ))
 }
 
 /// A turn that answers only with a plan, carried in `turn/completed`'s items.
@@ -323,42 +325,42 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
     let run = run(
         &plan,
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             // Something already said, so the steer has a place to land after it.
-            says(peer, "i-before", "Reading the whole repository.")?;
+            send_agent_message(peer, "i-before", "Reading the whole repository.")?;
             signal(&started);
-            let steer = peer.expect::<m::TurnSteer>()?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
-            finish(peer, "Narrowed to auth: no findings.")
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))?;
+            complete_turn_with_reply(peer, "Narrowed to auth: no findings.")
         },
         |plan| {
             // Steered once the turn has said something, as a caller reading `tail` would.
-            if reached(&turn_running) {
+            if wait_for_signal(&turn_running) {
                 reply = steer(plan, "Only look at the auth module.");
             }
         },
     )?;
 
     // The caller heard that the instruction was accepted, and the turn then ended normally.
-    assert_that!(reply, some(eq(&Reply::Accepted)));
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(reply, some(eq(&SteerReply::Accepted)));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
 
     // The steer named the turn that was running, in the thread the driver opened.
-    let steers = sent(&run, "turn/steer");
+    let steers = client_messages_for_method(&run, "turn/steer");
     assert_that!(steers.len(), eq(1));
     assert_that!(
-        steers.first().and_then(|m| m.get("params")),
+        steers.first().and_then(|message| message.get("params")),
         some(eq(&json!({
-            "threadId": THREAD,
-            "expectedTurnId": TURN,
+            "threadId": THREAD_ID,
+            "expectedTurnId": TURN_ID,
             "input": [{"type": "text", "text": "Only look at the auth module."}],
         })))
     );
     // The handshake asked the server to leave out the token-by-token deltas.
-    let opted_out = sent(&run, "initialize")
+    let opted_out = client_messages_for_method(&run, "initialize")
         .first()
-        .and_then(|m| m.pointer("/params/capabilities/optOutNotificationMethods"))
+        .and_then(|message| message.pointer("/params/capabilities/optOutNotificationMethods"))
         .cloned();
     assert_that!(
         opted_out.and_then(|list| list.as_array().cloned()),
@@ -381,9 +383,15 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
     // Folded like any Codex turn: the instruction is a steer between the two replies, and the
     // usage is the server's running total.
     let Fold { turn, session, .. } = stream::fold(Vendor::Codex, 0, QUESTION, &run.capture);
-    assert_that!(session.as_ref().map(SessionRef::as_str), some(eq(THREAD)));
     assert_that!(
-        turn.messages.iter().map(|m| m.source).collect::<Vec<_>>(),
+        session.as_ref().map(SessionRef::as_str),
+        some(eq(THREAD_ID))
+    );
+    assert_that!(
+        turn.messages
+            .iter()
+            .map(|message| message.source)
+            .collect::<Vec<_>>(),
         elements_are![
             eq(&MessageSource::Delegate),
             eq(&MessageSource::Steer),
@@ -438,7 +446,7 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
 
     // The closing message is written where `--output-last-message` would have put it.
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq("Narrowed to auth: no findings.")
     );
     Ok(())
@@ -454,22 +462,22 @@ fn a_steer_the_server_refuses_is_answered_and_not_recorded() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
             peer.refuse(&steer, -32600, "expected turn tu-0 but tu-1 is active")?;
-            finish(peer, "done")
+            complete_turn_with_reply(peer, "done")
         },
         |plan| reply = steer(plan, "REFUSED-SENTINEL"),
     )?;
 
     assert_that!(
         reply,
-        some(matches_pattern!(Reply::Rejected {
+        some(matches_pattern!(SteerReply::Rejected {
             reason: contains_substring("expected turn tu-0")
         }))
     );
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     // Not in the capture under any name, and so in nothing a reader is shown.
     assert_that!(run.capture, not(contains_substring("REFUSED-SENTINEL")));
     let folded = stream::fold(Vendor::Codex, 0, "q", &run.capture);
@@ -499,25 +507,25 @@ fn a_steer_acknowledged_for_another_turn_or_unreadably_is_unconfirmed() -> Resul
         let run = run(
             &plan,
             move |peer| {
-                peer.open_thread(THREAD)?;
-                peer.start_turn(THREAD, TURN)?;
-                let steer = peer.expect::<m::TurnSteer>()?;
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
+                let steer = peer.expect_request::<methods::TurnSteer>()?;
                 peer.send(&Message::Response {
                     id: steer.id,
                     outcome: Ok(answer),
                 })?;
-                finish(peer, "done")
+                complete_turn_with_reply(peer, "done")
             },
             |plan| reply = steer(plan, "UNCONFIRMED-SENTINEL"),
         )?;
 
         assert_that!(
             reply,
-            some(matches_pattern!(Reply::Unconfirmed {
+            some(matches_pattern!(SteerReply::Unconfirmed {
                 reason: contains_substring(reason)
             }))
         );
-        assert_that!(run.ending, eq(&Ending::Finished));
+        assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
         // Never recorded as an instruction the turn took.
         assert_that!(count(&run.capture, "agentmux.steer"), eq(0));
     }
@@ -537,27 +545,27 @@ fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
     let run = run(
         &plan,
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             signal(&started);
-            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            let interrupt = peer.expect_request::<methods::TurnInterrupt>()?;
             peer.reply(&interrupt, &fixtures::turn_interrupt_response())?;
-            end(peer, TurnStatus::Interrupted, Vec::new())
+            send_turn_completion(peer, TurnStatus::Interrupted, Vec::new())
         },
         |plan| {
             // Cancelled only once the turn is running, as `cancel` would find it.
-            if reached(&turn_running) {
-                std::fs::write(plan.cancel_marker(), "").ok();
+            if wait_for_signal(&turn_running) {
+                std::fs::write(plan.cancel_marker_path(), "").ok();
             }
         },
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Cancelled));
+    assert_that!(run.outcome, eq(&DriverOutcome::Cancelled));
     assert_that!(
-        sent(&run, "turn/interrupt")
+        client_messages_for_method(&run, "turn/interrupt")
             .first()
-            .and_then(|m| m.get("params")),
-        some(eq(&json!({"threadId": THREAD, "turnId": TURN})))
+            .and_then(|message| message.get("params")),
+        some(eq(&json!({"threadId": THREAD_ID, "turnId": TURN_ID})))
     );
     assert_that!(run.capture, not(contains_substring("turn.completed")));
     assert_that!(run.capture, not(contains_substring("turn.failed")));
@@ -568,26 +576,26 @@ fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
 #[gtest]
 fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let plan = plan(dir.path(), Billing::Subscription, Some(THREAD))?;
+    let plan = plan(dir.path(), Billing::Subscription, Some(THREAD_ID))?;
 
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            finish(peer, "BANANAPHONE")
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            complete_turn_with_reply(peer, "BANANAPHONE")
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
-    assert_that!(sent(&run, "thread/start"), is_empty());
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
+    assert_that!(client_messages_for_method(&run, "thread/start"), is_empty());
     assert_that!(
-        sent(&run, "thread/resume")
+        client_messages_for_method(&run, "thread/resume")
             .first()
-            .and_then(|m| m.get("params")),
+            .and_then(|message| message.get("params")),
         some(eq(&json!({
-            "threadId": THREAD,
+            "threadId": THREAD_ID,
             "model": "gpt-6-astra",
             "cwd": dir.path().to_string_lossy(),
             "sandbox": "read-only",
@@ -597,7 +605,10 @@ fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
     );
     // The resumed thread is announced, which is what the fold checks continuity against.
     let Fold { session, .. } = stream::fold(Vendor::Codex, 1, "q", &run.capture);
-    assert_that!(session.as_ref().map(SessionRef::as_str), some(eq(THREAD)));
+    assert_that!(
+        session.as_ref().map(SessionRef::as_str),
+        some(eq(THREAD_ID))
+    );
     Ok(())
 }
 
@@ -613,30 +624,30 @@ fn an_approval_request_is_declined_and_noted() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let approval = peer.request::<m::ItemCommandExecutionRequestApproval>(
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let approval = peer.request::<methods::ItemCommandExecutionRequestApproval>(
                 RequestId::from("srv-1"),
-                &fixtures::command_approval(THREAD, TURN, "c1"),
+                &fixtures::command_approval_params(THREAD_ID, TURN_ID, "c1"),
             )?;
             // The turn carries on once it is answered, and finishes.
-            let answer = peer.expect_answer(&approval)?;
-            finish(peer, "ran without it")?;
+            let answer = peer.expect_response(&approval)?;
+            complete_turn_with_reply(peer, "ran without it")?;
             Ok(answer)
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     // The answer decodes as the method's own response type, and declines.
-    assert_that!(run.script, ok(anything()));
+    assert_that!(run.script_result, ok(anything()));
     let answer = run
-        .requests
+        .client_messages
         .iter()
-        .find(|m| m.get("id") == Some(&json!("srv-1")))
+        .find(|message| message.get("id") == Some(&json!("srv-1")))
         .cloned();
     assert_that!(
-        answer.and_then(|m| m.get("result").cloned()),
+        answer.and_then(|message| message.get("result").cloned()),
         some(eq(&json!({"decision": "decline"})))
     );
     let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &run.capture);
@@ -659,20 +670,22 @@ fn a_server_that_exits_mid_turn_breaks_the_turn() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             // Its output closing is the server exiting.
-            peer.close();
+            peer.close_output();
             Ok(())
         },
         |_| {},
     )?;
 
     assert_that!(
-        run.ending,
-        matches_pattern!(Ending::Broken(contains_substring("exited while the turn")))
+        run.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring(
+            "exited while the turn"
+        )))
     );
-    assert_that!(run.ending.exit_code(), eq(1));
+    assert_that!(run.outcome.exit_code(), eq(1));
     Ok(())
 }
 
@@ -686,18 +699,18 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            finish(peer, "ok")
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            complete_turn_with_reply(peer, "ok")
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     assert_that!(
-        sent(&run, "thread/start")
+        client_messages_for_method(&run, "thread/start")
             .first()
-            .and_then(|m| m.get("params")),
+            .and_then(|message| message.get("params")),
         some(eq(&json!({
             "model": "gpt-6-astra",
             "cwd": dir.path().to_string_lossy(),
@@ -709,11 +722,11 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
         })))
     );
     assert_that!(
-        sent(&run, "turn/start")
+        client_messages_for_method(&run, "turn/start")
             .first()
-            .and_then(|m| m.get("params")),
+            .and_then(|message| message.get("params")),
         some(eq(&json!({
-            "threadId": THREAD,
+            "threadId": THREAD_ID,
             "input": [{"type": "text", "text": QUESTION}],
         })))
     );
@@ -732,19 +745,19 @@ fn a_turn_that_ends_before_turn_start_answers_still_ends() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            let start = peer.expect::<m::TurnStart>()?;
-            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
-            finish(peer, "Done before you asked.")?;
-            peer.reply(&start, &fixtures::turn_start_response(TURN))
+            peer.open_thread(THREAD_ID)?;
+            let start = peer.expect_request::<methods::TurnStart>()?;
+            peer.notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
+            complete_turn_with_reply(peer, "Done before you asked.")?;
+            peer.reply(&start, &fixtures::turn_start_response(TURN_ID))
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     assert_that!(count(&run.capture, "turn.completed"), eq(1));
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq("Done before you asked.")
     );
     Ok(())
@@ -761,17 +774,17 @@ fn a_steer_accepted_as_the_turn_ends_is_recorded_before_its_end() -> Result<()> 
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
             // The completion overtakes the steer's own answer.
-            finish(peer, "finished anyway")?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+            complete_turn_with_reply(peer, "finished anyway")?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))
         },
         |plan| reply = steer(plan, "last word"),
     )?;
 
-    assert_that!(reply, some(eq(&Reply::Accepted)));
+    assert_that!(reply, some(eq(&SteerReply::Accepted)));
     let order = kinds(&run.capture);
     let steer_at = order.iter().position(|kind| kind == "agentmux.steer");
     let end_at = order.iter().position(|kind| kind == "turn.completed");
@@ -790,27 +803,30 @@ fn a_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            peer.expect::<m::TurnSteer>()?;
-            finish(peer, "ended without a word about it")
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            peer.expect_request::<methods::TurnSteer>()?;
+            complete_turn_with_reply(peer, "ended without a word about it")
         },
         |plan| reply = steer(plan, "lost in transit"),
     )?;
 
-    assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
+    assert_that!(
+        reply,
+        some(matches_pattern!(SteerReply::Unconfirmed { .. }))
+    );
     assert_that!(run.capture, not(contains_substring("lost in transit")));
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     Ok(())
 }
 
 /// A capture that refuses any line containing its marker, as a full disk would.
-struct Refuses {
+struct RejectingCaptureWriter {
     marker: &'static str,
     bytes: Vec<u8>,
 }
 
-impl std::io::Write for Refuses {
+impl std::io::Write for RejectingCaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if String::from_utf8_lossy(buf).contains(self.marker) {
             return Err(std::io::Error::other("disk full"));
@@ -834,28 +850,28 @@ fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> 
     let mut reply = None;
     let driven = run_with(
         &plan,
-        Driver::capturing(Refuses {
+        DriverTestConfig::capturing(RejectingCaptureWriter {
             marker: "agentmux.steer",
             bytes: Vec::new(),
         }),
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))
         },
         |plan| reply = steer(plan, "unrecordable"),
     )?;
 
     assert_that!(
         reply,
-        some(matches_pattern!(Reply::Unconfirmed {
+        some(matches_pattern!(SteerReply::Unconfirmed {
             reason: contains_substring("could not record")
         }))
     );
     assert_that!(
-        driven.ending,
-        matches_pattern!(Ending::Broken(contains_substring("capture")))
+        driven.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring("capture")))
     );
     Ok(())
 }
@@ -870,14 +886,14 @@ fn an_unreadable_steer_answer_is_replied_to_when_its_drift_cannot_be_recorded() 
     let mut reply = None;
     let driven = run_with(
         &plan,
-        Driver::capturing(Refuses {
+        DriverTestConfig::capturing(RejectingCaptureWriter {
             marker: "agentmux.undecoded",
             bytes: Vec::new(),
         }),
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
             peer.send(&Message::Response {
                 id: steer.id,
                 outcome: Ok(json!({})),
@@ -888,13 +904,13 @@ fn an_unreadable_steer_answer_is_replied_to_when_its_drift_cannot_be_recorded() 
 
     assert_that!(
         reply,
-        some(matches_pattern!(Reply::Unconfirmed {
+        some(matches_pattern!(SteerReply::Unconfirmed {
             reason: contains_substring("does not match the schema")
         }))
     );
     assert_that!(
-        driven.ending,
-        matches_pattern!(Ending::Broken(contains_substring("capture")))
+        driven.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring("capture")))
     );
     Ok(())
 }
@@ -909,17 +925,17 @@ fn a_line_that_is_no_message_is_kept_as_drift() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             peer.send_bytes(indoc::indoc! {br#"
                 {"method":["turn/completed"]}
             "#})?;
-            finish(peer, "done")
+            complete_turn_with_reply(peer, "done")
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     assert_that!(count(&run.capture, "agentmux.undecoded"), eq(1));
     assert_that!(
         run.capture,
@@ -933,24 +949,24 @@ fn a_line_that_is_no_message_is_kept_as_drift() -> Result<()> {
 fn a_cancellation_during_setup_starts_no_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let marker = plan.cancel_marker();
+    let marker = plan.cancel_marker_path();
 
     let run = run(
         &plan,
         move |peer| {
-            let initialize = peer.expect::<m::Initialize>()?;
+            let initialize = peer.expect_request::<methods::Initialize>()?;
             peer.reply(&initialize, &fixtures::initialize_response())?;
-            peer.expect_notification::<m::Initialized>()?;
-            let start = peer.expect::<m::ThreadStart>()?;
+            peer.expect_notification::<methods::Initialized>()?;
+            let start = peer.expect_request::<methods::ThreadStart>()?;
             // `cancel` marks the turn while the server is still opening the thread.
             std::fs::write(&marker, "").ok();
-            peer.reply(&start, &fixtures::thread_start_response(THREAD))
+            peer.reply(&start, &fixtures::thread_start_response(THREAD_ID))
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Cancelled));
-    assert_that!(sent(&run, "turn/start"), is_empty());
+    assert_that!(run.outcome, eq(&DriverOutcome::Cancelled));
+    assert_that!(client_messages_for_method(&run, "turn/start"), is_empty());
     Ok(())
 }
 
@@ -1006,20 +1022,20 @@ fn every_request_the_server_can_make_is_refused() -> Result<()> {
         }
         Ok(())
     };
-    let asked = kinds.len();
+    let request_count = kinds.len();
 
     let run = run(
         &plan,
         move |peer| {
             // Asked as soon as the handshake is answered, so the driver answers while it opens
             // the thread.
-            let initialize = peer.expect::<m::Initialize>()?;
+            let initialize = peer.expect_request::<methods::Initialize>()?;
             peer.reply(&initialize, &fixtures::initialize_response())?;
             ask(peer, "setup")?;
             let mut answered = 0;
             let mut thread_start = None;
-            while answered < asked || thread_start.is_none() {
-                match peer.recv()? {
+            while answered < request_count || thread_start.is_none() {
+                match peer.receive_message()? {
                     Message::Response { .. } => answered += 1,
                     Message::Request { id, method, .. } if method == "thread/start" => {
                         thread_start = Some(id);
@@ -1028,30 +1044,30 @@ fn every_request_the_server_can_make_is_refused() -> Result<()> {
                 }
             }
             if let Some(id) = thread_start {
-                peer.send(&Message::result::<m::ThreadStart>(
+                peer.send(&Message::success_response::<methods::ThreadStart>(
                     id,
-                    &fixtures::thread_start_response(THREAD),
+                    &fixtures::thread_start_response(THREAD_ID),
                 )?)?;
             }
             // And again while the turn runs, which ends once every request is answered.
-            peer.start_turn(THREAD, TURN)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             ask(peer, "turn")?;
-            for _ in 0..asked {
-                peer.recv()?;
+            for _ in 0..request_count {
+                peer.receive_message()?;
             }
-            finish(peer, "carried on")
+            complete_turn_with_reply(peer, "carried on")
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     for phase in ["setup", "turn"] {
         for (kind, expected) in &kinds {
             let id = json!(format!("{phase}:{kind}"));
             let mut answer = run
-                .requests
+                .client_messages
                 .iter()
-                .find(|m| m.get("id") == Some(&id))
+                .find(|message| message.get("id") == Some(&id))
                 .cloned()
                 .unwrap_or_default();
             if let Some(fields) = answer.as_object_mut() {
@@ -1076,52 +1092,61 @@ fn a_server_that_stops_reading_cannot_stall_the_turn() -> Result<()> {
     let (server_in, to_server) = std::io::pipe().or_fail()?;
     let (from_server, server_out) = std::io::pipe().or_fail()?;
     let (started_tx, started) = channel();
-    let (go_tx, go) = channel::<()>();
-    let (stop_tx, stop) = channel::<()>();
+    let (complete_turn_sender, complete_turn_receiver) = channel::<()>();
+    let (release_server_sender, release_server_receiver) = channel::<()>();
 
     // Answers setup, then reads nothing more until the test has seen the driver finish.
     let server = std::thread::spawn(move || -> std::result::Result<(), PeerError> {
         let mut peer = Peer::new(BufReader::new(server_in), server_out);
-        peer.open_thread(THREAD)?;
-        peer.start_turn(THREAD, TURN)?;
+        peer.open_thread(THREAD_ID)?;
+        peer.start_turn(THREAD_ID, TURN_ID)?;
         signal(&started_tx);
-        go.recv_timeout(Duration::from_secs(20)).ok();
-        finish(&mut peer, "ended regardless")?;
-        stop.recv_timeout(Duration::from_secs(20)).ok();
+        complete_turn_receiver
+            .recv_timeout(Duration::from_secs(20))
+            .ok();
+        complete_turn_with_reply(&mut peer, "ended regardless")?;
+        release_server_receiver
+            .recv_timeout(Duration::from_secs(20))
+            .ok();
         Ok(())
     });
-    let (done_tx, done) = channel();
+    let (driver_result_sender, driver_result_receiver) = channel();
     std::thread::spawn({
         let plan = plan.clone();
         move || {
             let mut capture = Vec::new();
-            let ending = drive_with(
+            let outcome = drive_with(
                 &plan,
                 "q",
                 &mut capture,
                 to_server,
                 BufReader::new(from_server),
                 &mut || false,
-                Deadlines::default(),
+                DriverTimeouts::default(),
             );
-            done_tx.send(ending).ok();
+            driver_result_sender.send(outcome).ok();
         }
     });
 
-    assert_that!(reached(&started), eq(true));
+    assert_that!(wait_for_signal(&started), eq(true));
     // Far more than a pipe holds, so writing it blocks for as long as the server does not read.
-    let mailbox = Mailbox::new(plan.mailbox());
-    let letter = mailbox.submit(&"x".repeat(4 << 20)).or_fail()?;
-    assert_that!(eventually(|| mailbox.is_claimed(&letter)), eq(true));
-    go_tx.send(()).or_fail()?;
+    let mailbox = Mailbox::new(plan.mailbox_dir());
+    let steer_id = mailbox.submit(&"x".repeat(4 << 20)).or_fail()?;
+    assert_that!(wait_until(|| mailbox.is_claimed(&steer_id)), eq(true));
+    complete_turn_sender.send(()).or_fail()?;
 
-    let ending = done.recv_timeout(Duration::from_secs(20)).or_fail()?;
-    let reply = mailbox.reply(&letter).or_fail()?;
-    stop_tx.send(()).ok();
-    finished(server, "the scripted server")?.or_fail()?;
+    let outcome = driver_result_receiver
+        .recv_timeout(Duration::from_secs(20))
+        .or_fail()?;
+    let reply = mailbox.reply(&steer_id).or_fail()?;
+    release_server_sender.send(()).ok();
+    join_with_timeout(server, "the scripted server")?.or_fail()?;
 
-    assert_that!(ending, eq(&Ending::Finished));
-    assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
+    assert_that!(outcome, eq(&DriverOutcome::TurnEnded));
+    assert_that!(
+        reply,
+        some(matches_pattern!(SteerReply::Unconfirmed { .. }))
+    );
     Ok(())
 }
 
@@ -1141,19 +1166,24 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
         (
             "a completed turn, with a warning and a retried error",
             |peer| {
-                peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
-                    THREAD,
-                    TURN,
+                peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
+                    THREAD_ID,
+                    TURN_ID,
                     fixtures::reasoning("r", &["thinking"]),
                 ))?;
-                peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
-                    THREAD,
-                    TURN,
+                peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
+                    THREAD_ID,
+                    TURN_ID,
                     fixtures::command("c", "ls", "src", 0),
                 ))?;
-                peer.notify::<m::Warning>(&fixtures::warning(THREAD, "heads up"))?;
-                peer.notify::<m::Error>(&fixtures::error(THREAD, TURN, true, "reconnecting"))?;
-                finish(peer, "FINDINGS")
+                peer.notify::<methods::Warning>(&fixtures::warning(THREAD_ID, "heads up"))?;
+                peer.notify::<methods::Error>(&fixtures::error(
+                    THREAD_ID,
+                    TURN_ID,
+                    true,
+                    "reconnecting",
+                ))?;
+                complete_turn_with_reply(peer, "FINDINGS")
             },
             indoc::indoc! {r#"
                 {"type":"thread.started","thread_id":"th-fake"}
@@ -1169,13 +1199,13 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
         (
             "a turn that failed on an error it did not retry",
             |peer| {
-                peer.notify::<m::Error>(&fixtures::error(
-                    THREAD,
-                    TURN,
+                peer.notify::<methods::Error>(&fixtures::error(
+                    THREAD_ID,
+                    TURN_ID,
                     false,
                     "model not supported",
                 ))?;
-                end(peer, TurnStatus::Failed, Vec::new())
+                send_turn_completion(peer, TurnStatus::Failed, Vec::new())
             },
             indoc::indoc! {r#"
                 {"type":"thread.started","thread_id":"th-fake"}
@@ -1191,8 +1221,8 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
         let run = run(
             &plan,
             move |peer| {
-                peer.open_thread(THREAD)?;
-                peer.start_turn(THREAD, TURN)?;
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
                 during(peer)
             },
             |_| {},
@@ -1219,30 +1249,30 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
 fn a_turn_cancelled_before_turn_start_answers_is_interrupted_by_its_announced_id() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let marker = plan.cancel_marker();
+    let marker = plan.cancel_marker_path();
 
     // The answer never comes, so a driver that waited for it would never finish, and fail.
     let run = run(
         &plan,
         move |peer| {
-            peer.open_thread(THREAD)?;
+            peer.open_thread(THREAD_ID)?;
             // The turn starts and is announced, but its answer never comes; the caller cancels.
-            peer.expect::<m::TurnStart>()?;
+            peer.expect_request::<methods::TurnStart>()?;
             std::fs::write(&marker, "").ok();
-            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
-            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            peer.notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
+            let interrupt = peer.expect_request::<methods::TurnInterrupt>()?;
             peer.reply(&interrupt, &fixtures::turn_interrupt_response())?;
-            end(peer, TurnStatus::Interrupted, Vec::new())
+            send_turn_completion(peer, TurnStatus::Interrupted, Vec::new())
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Cancelled));
+    assert_that!(run.outcome, eq(&DriverOutcome::Cancelled));
     assert_that!(
-        sent(&run, "turn/interrupt")
+        client_messages_for_method(&run, "turn/interrupt")
             .first()
-            .and_then(|m| m.get("params")),
-        some(eq(&json!({"threadId": THREAD, "turnId": TURN})))
+            .and_then(|message| message.get("params")),
+        some(eq(&json!({"threadId": THREAD_ID, "turnId": TURN_ID})))
     );
     Ok(())
 }
@@ -1261,19 +1291,19 @@ fn a_turn_start_left_unanswered_is_followed_from_turn_started() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.expect::<m::TurnStart>()?;
-            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
-            let steer = peer.expect::<m::TurnSteer>()?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
-            finish(peer, "STEERED")
+            peer.open_thread(THREAD_ID)?;
+            peer.expect_request::<methods::TurnStart>()?;
+            peer.notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))?;
+            complete_turn_with_reply(peer, "STEERED")
         },
         |plan| reply = steer(plan, "only auth"),
     )?;
 
-    assert_that!(reply, some(eq(&Reply::Accepted)));
-    assert_that!(run.ending, eq(&Ending::Finished));
-    assert_that!(sent(&run, "turn/steer").len(), eq(1));
+    assert_that!(reply, some(eq(&SteerReply::Accepted)));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
+    assert_that!(client_messages_for_method(&run, "turn/steer").len(), eq(1));
     assert_that!(
         kinds(&run.capture),
         elements_are![
@@ -1298,34 +1328,35 @@ fn a_turn_finished_before_turn_start_is_ever_answered_ends_at_once() -> Result<(
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.expect::<m::TurnStart>()?;
-            finish(peer, "Done unasked.")
+            peer.open_thread(THREAD_ID)?;
+            peer.expect_request::<methods::TurnStart>()?;
+            complete_turn_with_reply(peer, "Done unasked.")
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     assert_that!(began.elapsed() < Duration::from_secs(30), eq(true));
     assert_that!(count(&run.capture, "turn.completed"), eq(1));
     Ok(())
 }
 
 /// A capture that notes, as the terminal event is written, what the closing-message file holds.
-struct WitnessAtEnd {
+struct ClosingMessageProbeWriter {
     capture: Vec<u8>,
-    last_message: std::path::PathBuf,
+    last_message_path: std::path::PathBuf,
     /// Whether the terminal event has been written.
-    ended: bool,
+    completion_observed: bool,
     /// The file's contents when the terminal event was written, if it had any.
-    seen: Option<String>,
+    closing_message_at_completion: Option<String>,
 }
 
-impl std::io::Write for WitnessAtEnd {
+impl std::io::Write for ClosingMessageProbeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.ended && String::from_utf8_lossy(buf).contains("turn.completed") {
-            self.ended = true;
-            self.seen = std::fs::read_to_string(&self.last_message).ok();
+        if !self.completion_observed && String::from_utf8_lossy(buf).contains("turn.completed") {
+            self.completion_observed = true;
+            self.closing_message_at_completion =
+                std::fs::read_to_string(&self.last_message_path).ok();
         }
         self.capture.write(buf)
     }
@@ -1336,10 +1367,10 @@ impl std::io::Write for WitnessAtEnd {
 }
 
 /// The server's side of a turn that answers only with a plan, which arrives in `turn/completed`.
-fn plan_only(peer: &mut Peer) -> std::result::Result<(), PeerError> {
-    peer.open_thread(THREAD)?;
-    peer.start_turn(THREAD, TURN)?;
-    end(
+fn complete_turn_with_plan(peer: &mut Peer) -> std::result::Result<(), PeerError> {
+    peer.open_thread(THREAD_ID)?;
+    peer.start_turn(THREAD_ID, TURN_ID)?;
+    send_turn_completion(
         peer,
         TurnStatus::Completed,
         vec![fixtures::plan("p1", PLAN)],
@@ -1355,33 +1386,38 @@ fn plan_only(peer: &mut Peer) -> std::result::Result<(), PeerError> {
 #[gtest]
 fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
     use agentmux::run::{Retention, RunStore, StartRequest};
-    use agentmux::testing::{Script as Child, ScriptedLauncher};
+    use agentmux::testing::{Script as LaunchScript, ScriptedLauncher};
 
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let witness = WitnessAtEnd {
+    let witness = ClosingMessageProbeWriter {
         capture: Vec::new(),
-        last_message: plan.last_message(),
-        ended: false,
-        seen: None,
+        last_message_path: plan.last_message_path(),
+        completion_observed: false,
+        closing_message_at_completion: None,
     };
 
-    let driven = run_with(&plan, Driver::capturing(witness), plan_only, |_| {})?;
-    let witness = driven.out;
+    let driven = run_with(
+        &plan,
+        DriverTestConfig::capturing(witness),
+        complete_turn_with_plan,
+        |_| {},
+    )?;
+    let witness = driven.capture_writer;
 
-    assert_that!(driven.ending, eq(&Ending::Finished));
-    assert_that!(witness.ended, eq(true));
-    assert_that!(witness.seen, some(eq(PLAN)));
+    assert_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
+    assert_that!(witness.completion_observed, eq(true));
+    assert_that!(witness.closing_message_at_completion, some(eq(PLAN)));
 
     // The store reads the same two files the driver left.
     let state = tempfile::tempdir().or_fail()?;
     let capture = String::from_utf8(witness.capture).or_fail()?;
     let store = RunStore::open(
         state.path(),
-        Arc::new(ScriptedLauncher::new([Child::completed(capture)])),
+        Arc::new(ScriptedLauncher::new([LaunchScript::completed(capture)])),
         [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
             .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect(),
     )
     .or_fail()?;
@@ -1399,7 +1435,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
             retention: Retention::Ttl,
             env: std::collections::BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
     let turn = state
@@ -1407,7 +1443,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
         .join("runs")
         .join(started.run_id.as_str())
         .join("turns/0000");
-    std::fs::copy(plan.last_message(), turn.join("last-message.md")).or_fail()?;
+    std::fs::copy(plan.last_message_path(), turn.join("last-message.md")).or_fail()?;
 
     let (_, first) = store.view(&started.run_id, 0, 1_000_000).or_fail()?;
     assert_that!(first.text.matches(PLAN).count(), eq(1));
@@ -1430,10 +1466,10 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
 fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()> {
     const CHILD: &str = "th-child";
     let usage = |thread: &str, turn: &str, input: i64| {
-        let tokens = Tokens {
+        let tokens = TokenCounts {
             input,
             output: 1,
-            ..Tokens::default()
+            ..TokenCounts::default()
         };
         fixtures::token_usage(thread, turn, tokens, tokens)
     };
@@ -1443,31 +1479,40 @@ fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()
     let run = run(
         &plan,
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(THREAD, TURN, 300))?;
-            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            peer.notify::<methods::ThreadTokenUsageUpdated>(&usage(THREAD_ID, TURN_ID, 300))?;
+            peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
                 CHILD,
                 "tu-child",
                 fixtures::agent_message("c1", "CHILD-ANSWER"),
             ))?;
-            peer.notify::<m::Error>(&fixtures::error(CHILD, "tu-child", false, "CHILD-ERROR"))?;
-            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(CHILD, "tu-child", 9_000))?;
+            peer.notify::<methods::Error>(&fixtures::error(
+                CHILD,
+                "tu-child",
+                false,
+                "CHILD-ERROR",
+            ))?;
+            peer.notify::<methods::ThreadTokenUsageUpdated>(&usage(CHILD, "tu-child", 9_000))?;
             // Each id on its own: this thread's earlier turn, and another thread that happens to
             // name this turn's id.
-            peer.notify::<m::ThreadTokenUsageUpdated>(&usage(THREAD, "tu-earlier", 7_000))?;
-            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
+            peer.notify::<methods::ThreadTokenUsageUpdated>(&usage(
+                THREAD_ID,
+                "tu-earlier",
+                7_000,
+            ))?;
+            peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
                 CHILD,
-                TURN,
+                TURN_ID,
                 fixtures::agent_message("c2", "CHILD-SAME-TURN-ID"),
             ))?;
-            peer.notify::<m::TurnCompleted>(&fixtures::turn_completed(
+            peer.notify::<methods::TurnCompleted>(&fixtures::turn_completed(
                 CHILD,
                 "tu-child",
                 TurnStatus::Failed,
                 Vec::new(),
             ))?;
-            end(
+            send_turn_completion(
                 peer,
                 TurnStatus::Completed,
                 vec![fixtures::plan("p1", PLAN)],
@@ -1477,7 +1522,7 @@ fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()
     )?;
 
     // The consultation's own turn ended, once, with its own usage.
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     let ends: Vec<Value> = run
         .capture
         .lines()
@@ -1492,7 +1537,7 @@ fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()
     // Nothing the child said reached the capture, and the plan is the closing message.
     assert_that!(run.capture, not(contains_substring("CHILD-")));
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq(PLAN)
     );
     Ok(())
@@ -1519,11 +1564,11 @@ impl std::io::Write for SlowCapture {
 }
 
 /// A driver capturing slowly, whose server counts as exited once `exited` is set.
-fn slow_until_exited(exited: &Arc<AtomicBool>) -> Driver<SlowCapture> {
+fn slow_until_exited(exited: &Arc<AtomicBool>) -> DriverTestConfig<SlowCapture> {
     let exited = Arc::clone(exited);
-    Driver {
+    DriverTestConfig {
         exited: Box::new(move || exited.load(Ordering::Acquire)),
-        ..Driver::capturing(SlowCapture(Vec::new()))
+        ..DriverTestConfig::capturing(SlowCapture(Vec::new()))
     }
 }
 
@@ -1542,20 +1587,23 @@ fn a_completion_queued_before_the_server_exits_still_ends_the_turn() -> Result<(
         &plan,
         slow_until_exited(&exited),
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             for n in 0..8 {
-                peer.notify::<m::Warning>(&fixtures::warning(THREAD, &format!("busy {n}")))?;
+                peer.notify::<methods::Warning>(&fixtures::warning(
+                    THREAD_ID,
+                    &format!("busy {n}"),
+                ))?;
             }
-            finish(peer, "QUEUED-ANSWER")?;
+            complete_turn_with_reply(peer, "QUEUED-ANSWER")?;
             exited.store(true, Ordering::Release);
             Ok(())
         },
         |_| {},
     )?;
 
-    assert_that!(driven.ending, eq(&Ending::Finished));
-    let capture = String::from_utf8(driven.out.into_inner()).or_fail()?;
+    assert_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
+    let capture = String::from_utf8(driven.capture_writer.into_inner()).or_fail()?;
     assert_that!(capture, contains_substring("QUEUED-ANSWER"));
     assert_that!(count(&capture, "turn.completed"), eq(1));
     Ok(())
@@ -1568,11 +1616,11 @@ fn a_plan_report_survives_a_closing_message_that_cannot_be_written() -> Result<(
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     // A directory where the file belongs, so the file cannot be written.
-    std::fs::create_dir(plan.last_message()).or_fail()?;
+    std::fs::create_dir(plan.last_message_path()).or_fail()?;
 
-    let run = run(&plan, plan_only, |_| {})?;
+    let run = run(&plan, complete_turn_with_plan, |_| {})?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &run.capture);
     assert_that!(render_turn(&turn).matches(PLAN).count(), eq(1));
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
@@ -1589,38 +1637,38 @@ fn a_completed_plan_survives_a_server_that_dies() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            peer.notify::<m::ItemCompleted>(&fixtures::item_completed(
-                THREAD,
-                TURN,
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            peer.notify::<methods::ItemCompleted>(&fixtures::item_completed(
+                THREAD_ID,
+                TURN_ID,
                 fixtures::plan("p1", PLAN),
             ))?;
             // Its output closing is the server dying, with the turn unfinished.
-            peer.close();
+            peer.close_output();
             Ok(())
         },
         |_| {},
     )?;
 
-    assert_that!(run.ending, matches_pattern!(Ending::Broken(_)));
+    assert_that!(run.outcome, matches_pattern!(DriverOutcome::Failed(_)));
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq(PLAN)
     );
     Ok(())
 }
 
 /// A capture that refuses the line carrying a reply and takes every other.
-struct RefusesReplies(Vec<u8>);
+struct ReplyRejectingCaptureWriter(Vec<u8>);
 
-impl RefusesReplies {
+impl ReplyRejectingCaptureWriter {
     fn into_inner(self) -> Vec<u8> {
         self.0
     }
 }
 
-impl std::io::Write for RefusesReplies {
+impl std::io::Write for ReplyRejectingCaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if String::from_utf8_lossy(buf).contains("agent_message") {
             return Err(std::io::Error::other("disk full, for now"));
@@ -1639,17 +1687,17 @@ impl std::io::Write for RefusesReplies {
 fn a_plan_nothing_could_keep_breaks_the_turn() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    std::fs::create_dir(plan.last_message()).or_fail()?;
+    std::fs::create_dir(plan.last_message_path()).or_fail()?;
 
     let driven = run_with(
         &plan,
-        Driver::capturing(RefusesReplies(Vec::new())),
-        plan_only,
+        DriverTestConfig::capturing(ReplyRejectingCaptureWriter(Vec::new())),
+        complete_turn_with_plan,
         |_| {},
     )?;
 
-    assert_that!(driven.ending, matches_pattern!(Ending::Broken(_)));
-    let capture = String::from_utf8(driven.out.into_inner()).or_fail()?;
+    assert_that!(driven.outcome, matches_pattern!(DriverOutcome::Failed(_)));
+    let capture = String::from_utf8(driven.capture_writer.into_inner()).or_fail()?;
     assert_that!(capture, not(contains_substring("turn.completed")));
     Ok(())
 }
@@ -1667,12 +1715,12 @@ fn a_dead_servers_continuous_output_cannot_extend_the_drain() -> Result<()> {
         &plan,
         slow_until_exited(&exited),
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             // The server is gone; what it started keeps writing until nobody reads.
             exited.store(true, Ordering::Release);
-            let chatter = fixtures::warning(THREAD, "still here");
-            while peer.notify::<m::Warning>(&chatter).is_ok() {
+            let chatter = fixtures::warning(THREAD_ID, "still here");
+            while peer.notify::<methods::Warning>(&chatter).is_ok() {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(())
@@ -1681,19 +1729,19 @@ fn a_dead_servers_continuous_output_cannot_extend_the_drain() -> Result<()> {
     )?;
 
     assert_that!(
-        driven.ending,
-        matches_pattern!(Ending::Broken(contains_substring("exited")))
+        driven.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring("exited")))
     );
     Ok(())
 }
 
 /// A capture that refuses the first terminal event written to it and takes everything else.
-struct RefusesFirstEnd {
+struct FirstCompletionRejectingCaptureWriter {
     capture: Vec<u8>,
     refused: bool,
 }
 
-impl std::io::Write for RefusesFirstEnd {
+impl std::io::Write for FirstCompletionRejectingCaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if !self.refused && String::from_utf8_lossy(buf).contains("turn.completed") {
             self.refused = true;
@@ -1713,16 +1761,21 @@ impl std::io::Write for RefusesFirstEnd {
 fn a_plan_fallback_is_recorded_once_if_the_end_cannot_be_written() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    std::fs::create_dir(plan.last_message()).or_fail()?;
-    let capture = RefusesFirstEnd {
+    std::fs::create_dir(plan.last_message_path()).or_fail()?;
+    let capture = FirstCompletionRejectingCaptureWriter {
         capture: Vec::new(),
         refused: false,
     };
 
-    let driven = run_with(&plan, Driver::capturing(capture), plan_only, |_| {})?;
+    let driven = run_with(
+        &plan,
+        DriverTestConfig::capturing(capture),
+        complete_turn_with_plan,
+        |_| {},
+    )?;
 
-    assert_that!(driven.ending, matches_pattern!(Ending::Broken(_)));
-    let capture = String::from_utf8(driven.out.capture).or_fail()?;
+    assert_that!(driven.outcome, matches_pattern!(DriverOutcome::Failed(_)));
+    let capture = String::from_utf8(driven.capture_writer.capture).or_fail()?;
     let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &capture);
     assert_that!(render_turn(&turn).matches(PLAN).count(), eq(1));
     Ok(())
@@ -1730,7 +1783,7 @@ fn a_plan_fallback_is_recorded_once_if_the_end_cannot_be_written() -> Result<()>
 
 /// A deadline short enough for a test to wait out; only the one a test reaches is shortened, so a
 /// loaded machine cannot fail the steps before it.
-const SHORT: Duration = Duration::from_millis(500);
+const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A setup request the server never answers breaks the turn at its deadline, naming the request,
 /// rather than holding the consultation for ever.
@@ -1738,19 +1791,19 @@ const SHORT: Duration = Duration::from_millis(500);
 fn a_setup_request_left_unanswered_breaks_the_turn_at_its_deadline() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let mut driver = Driver::standard();
-    driver.deadlines.setup = SHORT;
+    let mut driver = DriverTestConfig::standard();
+    driver.timeouts.setup_response = SHORT_TIMEOUT;
 
     let driven = run_with(
         &plan,
         driver,
-        |peer| peer.expect::<m::Initialize>().map(|_| ()),
+        |peer| peer.expect_request::<methods::Initialize>().map(|_| ()),
         |_| {},
     )?;
 
     assert_that!(
-        driven.ending,
-        matches_pattern!(Ending::Broken(contains_substring(
+        driven.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring(
             "did not answer `initialize` within 500ms"
         )))
     );
@@ -1761,14 +1814,14 @@ fn a_setup_request_left_unanswered_breaks_the_turn_at_its_deadline() -> Result<(
 /// gave none; an answer to a request the driver never made is passed over on the way.
 #[gtest]
 fn a_refused_setup_request_breaks_the_turn_with_the_servers_reason() -> Result<()> {
-    for (resume, reason, said) in [
+    for (resume, reason, expected_error_fragment) in [
         (
             None,
             "no such model",
             "refused `thread/start`: no such model",
         ),
         (
-            Some(THREAD),
+            Some(THREAD_ID),
             "",
             "refused `thread/resume`: the server gave no reason",
         ),
@@ -1779,10 +1832,10 @@ fn a_refused_setup_request_breaks_the_turn_with_the_servers_reason() -> Result<(
         let run = run(
             &plan,
             move |peer| {
-                let initialize = peer.expect::<m::Initialize>()?;
+                let initialize = peer.expect_request::<methods::Initialize>()?;
                 peer.reply(&initialize, &fixtures::initialize_response())?;
-                peer.expect_notification::<m::Initialized>()?;
-                let Message::Request { id, .. } = peer.recv()? else {
+                peer.expect_notification::<methods::Initialized>()?;
+                let Message::Request { id, .. } = peer.receive_message()? else {
                     return Ok(());
                 };
                 // An answer to nothing the driver asked.
@@ -1790,17 +1843,23 @@ fn a_refused_setup_request_breaks_the_turn_with_the_servers_reason() -> Result<(
                     id: RequestId::Integer(999),
                     outcome: Ok(json!({})),
                 })?;
-                peer.send(&Message::error(id, -32600, reason))
+                peer.send(&Message::error_response(id, -32600, reason))
             },
             |_| {},
         )?;
 
         expect_that!(
-            run.ending,
-            matches_pattern!(Ending::Broken(contains_substring(said))),
-            "{said}"
+            run.outcome,
+            matches_pattern!(DriverOutcome::Failed(contains_substring(
+                expected_error_fragment
+            ))),
+            "{expected_error_fragment}"
         );
-        expect_that!(sent(&run, "turn/start"), is_empty(), "{said}");
+        expect_that!(
+            client_messages_for_method(&run, "turn/start"),
+            is_empty(),
+            "{expected_error_fragment}"
+        );
     }
     Ok(())
 }
@@ -1812,30 +1871,30 @@ fn a_refused_setup_request_breaks_the_turn_with_the_servers_reason() -> Result<(
 fn a_cancellation_before_the_turn_is_known_interrupts_nothing() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let mut driver = Driver::standard();
-    driver.deadlines.interrupt = SHORT;
+    let mut driver = DriverTestConfig::standard();
+    driver.timeouts.interrupt_completion = SHORT_TIMEOUT;
     let (asked, starting) = channel();
 
     let driven = run_with(
         &plan,
         driver,
         move |peer| {
-            peer.open_thread(THREAD)?;
+            peer.open_thread(THREAD_ID)?;
             // Neither answered nor announced.
-            peer.expect::<m::TurnStart>()?;
+            peer.expect_request::<methods::TurnStart>()?;
             signal(&asked);
             Ok(())
         },
         |plan| {
-            if reached(&starting) {
-                std::fs::write(plan.cancel_marker(), "").ok();
+            if wait_for_signal(&starting) {
+                std::fs::write(plan.cancel_marker_path(), "").ok();
             }
         },
     )?;
 
-    assert_that!(driven.ending, eq(&Ending::Cancelled));
+    assert_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
     let interrupts = driven
-        .requests
+        .client_messages
         .iter()
         .filter(|request| request.get("method") == Some(&json!("turn/interrupt")))
         .count();
@@ -1854,21 +1913,21 @@ fn an_interrupt_the_server_refuses_is_noted() -> Result<()> {
     let run = run(
         &plan,
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             signal(&started);
-            let interrupt = peer.expect::<m::TurnInterrupt>()?;
+            let interrupt = peer.expect_request::<methods::TurnInterrupt>()?;
             peer.refuse(&interrupt, -32600, "the turn is already finishing")?;
-            end(peer, TurnStatus::Interrupted, Vec::new())
+            send_turn_completion(peer, TurnStatus::Interrupted, Vec::new())
         },
         |plan| {
-            if reached(&turn_running) {
-                std::fs::write(plan.cancel_marker(), "").ok();
+            if wait_for_signal(&turn_running) {
+                std::fs::write(plan.cancel_marker_path(), "").ok();
             }
         },
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Cancelled));
+    assert_that!(run.outcome, eq(&DriverOutcome::Cancelled));
     assert_that!(
         run.capture,
         contains_substring("codex refused to interrupt the turn: the turn is already finishing")
@@ -1883,28 +1942,28 @@ fn an_interrupt_the_server_refuses_is_noted() -> Result<()> {
 fn an_interrupt_never_answered_ends_the_turn_at_its_grace() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
-    let mut driver = Driver::standard();
-    driver.deadlines.interrupt = SHORT;
+    let mut driver = DriverTestConfig::standard();
+    driver.timeouts.interrupt_completion = SHORT_TIMEOUT;
     let (started, turn_running) = channel();
 
     let driven = run_with(
         &plan,
         driver,
         move |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             signal(&started);
-            peer.expect::<m::TurnInterrupt>().map(|_| ())
+            peer.expect_request::<methods::TurnInterrupt>().map(|_| ())
         },
         |plan| {
-            if reached(&turn_running) {
-                std::fs::write(plan.cancel_marker(), "").ok();
+            if wait_for_signal(&turn_running) {
+                std::fs::write(plan.cancel_marker_path(), "").ok();
             }
         },
     )?;
 
-    assert_that!(driven.ending, eq(&Ending::Cancelled));
-    let capture = String::from_utf8(driven.out).or_fail()?;
+    assert_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
+    let capture = String::from_utf8(driven.capture_writer).or_fail()?;
     assert_that!(count(&capture, "turn.completed"), eq(0));
     assert_that!(count(&capture, "turn.failed"), eq(0));
     Ok(())
@@ -1918,50 +1977,52 @@ fn concurrent_steers_are_each_answered_with_their_own_outcome() -> Result<()> {
     let plan = plan(dir.path(), Billing::Subscription, None)?;
 
     let mut replies = (None, None);
-    let run = run(
-        &plan,
-        |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let first = peer.expect::<m::TurnSteer>()?;
-            let second = peer.expect::<m::TurnSteer>()?;
-            let text = |steer: &codex_app_server_mock::Received<m::TurnSteer>| match steer
-                .params
-                .input
-                .first()
-            {
-                Some(UserInput::Text(input)) => Some(input.text.clone()),
-                _ => None,
-            };
-            let (accept, refuse) = if text(&first).as_deref() == Some("KEEP") {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            // Answered in the opposite order to the asking, the accepted one twice.
-            peer.refuse(&refuse, -32600, "one instruction at a time")?;
-            peer.reply(&accept, &fixtures::turn_steer_response(TURN))?;
-            peer.reply(&accept, &fixtures::turn_steer_response(TURN))?;
-            peer.send(&Message::Response {
-                id: RequestId::Integer(424_242),
-                outcome: Ok(json!({"turnId": TURN})),
-            })?;
-            finish(peer, "done")
-        },
-        |plan| {
-            let mailbox = Mailbox::new(plan.mailbox());
-            let (Ok(keep), Ok(drop)) = (mailbox.submit("KEEP"), mailbox.submit("DROP")) else {
-                return;
-            };
-            replies = (replied(&mailbox, &keep), replied(&mailbox, &drop));
-        },
-    )?;
+    let run =
+        run(
+            &plan,
+            |peer| {
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
+                let first = peer.expect_request::<methods::TurnSteer>()?;
+                let second = peer.expect_request::<methods::TurnSteer>()?;
+                let text = |steer: &codex_app_server_mock::ReceivedRequest<methods::TurnSteer>| {
+                    match steer.params.input.first() {
+                        Some(UserInput::Text(input)) => Some(input.text.clone()),
+                        _ => None,
+                    }
+                };
+                let (accept, refuse) = if text(&first).as_deref() == Some("KEEP") {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                // Answered in the opposite order to the asking, the accepted one twice.
+                peer.refuse(&refuse, -32600, "one instruction at a time")?;
+                peer.reply(&accept, &fixtures::turn_steer_response(TURN_ID))?;
+                peer.reply(&accept, &fixtures::turn_steer_response(TURN_ID))?;
+                peer.send(&Message::Response {
+                    id: RequestId::Integer(424_242),
+                    outcome: Ok(json!({"turnId": TURN_ID})),
+                })?;
+                complete_turn_with_reply(peer, "done")
+            },
+            |plan| {
+                let mailbox = Mailbox::new(plan.mailbox_dir());
+                let (Ok(keep), Ok(drop)) = (mailbox.submit("KEEP"), mailbox.submit("DROP")) else {
+                    return;
+                };
+                replies = (
+                    wait_for_steer_reply(&mailbox, &keep),
+                    wait_for_steer_reply(&mailbox, &drop),
+                );
+            },
+        )?;
 
     let (keep, drop) = replies;
-    assert_that!(keep, some(eq(&Reply::Accepted)));
+    assert_that!(keep, some(eq(&SteerReply::Accepted)));
     assert_that!(
         drop,
-        some(matches_pattern!(Reply::Rejected {
+        some(matches_pattern!(SteerReply::Rejected {
             reason: contains_substring("one instruction at a time")
         }))
     );
@@ -1969,7 +2030,7 @@ fn concurrent_steers_are_each_answered_with_their_own_outcome() -> Result<()> {
     assert_that!(count(&run.capture, "agentmux.steer"), eq(1));
     assert_that!(run.capture, contains_substring("KEEP"));
     assert_that!(run.capture, not(contains_substring("DROP")));
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     Ok(())
 }
 
@@ -1983,26 +2044,26 @@ fn a_request_during_setup_is_answered_and_its_id_kept_apart() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            let initialize = peer.expect::<m::Initialize>()?;
+            let initialize = peer.expect_request::<methods::Initialize>()?;
             // The same id the driver gave `initialize`.
-            let approval = peer.request::<m::ItemCommandExecutionRequestApproval>(
+            let approval = peer.request::<methods::ItemCommandExecutionRequestApproval>(
                 initialize.id.clone(),
-                &fixtures::command_approval(THREAD, TURN, "c0"),
+                &fixtures::command_approval_params(THREAD_ID, TURN_ID, "c0"),
             )?;
-            let answer = peer.expect_answer(&approval)?;
+            let answer = peer.expect_response(&approval)?;
             peer.reply(&initialize, &fixtures::initialize_response())?;
-            peer.expect_notification::<m::Initialized>()?;
-            let start = peer.expect::<m::ThreadStart>()?;
-            peer.reply(&start, &fixtures::thread_start_response(THREAD))?;
-            peer.start_turn(THREAD, TURN)?;
-            finish(peer, "set up")?;
+            peer.expect_notification::<methods::Initialized>()?;
+            let start = peer.expect_request::<methods::ThreadStart>()?;
+            peer.reply(&start, &fixtures::thread_start_response(THREAD_ID))?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            complete_turn_with_reply(peer, "set up")?;
             Ok(answer)
         },
         |_| {},
     )?;
 
-    assert_that!(run.script, ok(anything()));
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.script_result, ok(anything()));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     Ok(())
 }
 
@@ -2017,31 +2078,31 @@ fn a_request_while_the_turn_settles_is_still_answered() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
-            finish(peer, "ended")?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            complete_turn_with_reply(peer, "ended")?;
             let late = RequestId::from("late");
             peer.send(&Message::Request {
                 id: late.clone(),
                 method: "item/tool/call".to_owned(),
                 params: json!({}),
             })?;
-            let answer = peer.expect_raw_answer(&late)?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
+            let answer = peer.expect_raw_response(&late)?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))?;
             Ok(answer)
         },
         |plan| reply = steer(plan, "while it settles"),
     )?;
 
     assert_that!(
-        run.script,
+        run.script_result,
         err(field!(
             codex_app_server_protocol::envelope::RpcError.code,
             eq(&METHOD_NOT_FOUND)
         ))
     );
-    assert_that!(reply, some(eq(&Reply::Accepted)));
+    assert_that!(reply, some(eq(&SteerReply::Accepted)));
     let order = kinds(&run.capture);
     let steer_at = order.iter().position(|kind| kind == "agentmux.steer");
     let end_at = order.iter().position(|kind| kind == "turn.completed");
@@ -2060,18 +2121,18 @@ fn a_turn_known_from_its_answer_alone_takes_steers() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            let start = peer.expect::<m::TurnStart>()?;
-            peer.reply(&start, &fixtures::turn_start_response(TURN))?;
-            let steer = peer.expect::<m::TurnSteer>()?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))?;
-            peer.notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
-            finish(peer, "steered")
+            peer.open_thread(THREAD_ID)?;
+            let start = peer.expect_request::<methods::TurnStart>()?;
+            peer.reply(&start, &fixtures::turn_start_response(TURN_ID))?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))?;
+            peer.notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
+            complete_turn_with_reply(peer, "steered")
         },
         |plan| reply = steer(plan, "only auth"),
     )?;
 
-    assert_that!(reply, some(eq(&Reply::Accepted)));
+    assert_that!(reply, some(eq(&SteerReply::Accepted)));
     assert_that!(
         kinds(&run.capture),
         elements_are![
@@ -2095,26 +2156,26 @@ fn what_the_server_says_after_the_end_changes_nothing() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
             // A steer still unanswered holds the end, so what follows arrives while it is held.
-            let steer = peer.expect::<m::TurnSteer>()?;
-            finish(peer, "FIRST")?;
-            says(peer, "i-late", "LATE")?;
-            end(peer, TurnStatus::Failed, Vec::new())?;
-            peer.reply(&steer, &fixtures::turn_steer_response(TURN))
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
+            complete_turn_with_reply(peer, "FIRST")?;
+            send_agent_message(peer, "i-late", "LATE")?;
+            send_turn_completion(peer, TurnStatus::Failed, Vec::new())?;
+            peer.reply(&steer, &fixtures::turn_steer_response(TURN_ID))
         },
         |plan| {
             steer(plan, "hold the end");
         },
     )?;
 
-    assert_that!(run.ending, eq(&Ending::Finished));
+    assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     assert_that!(count(&run.capture, "turn.completed"), eq(1));
     assert_that!(count(&run.capture, "turn.failed"), eq(0));
     assert_that!(run.capture, not(contains_substring("LATE")));
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq("FIRST")
     );
     Ok(())
@@ -2128,7 +2189,7 @@ fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let plan = plan(dir.path(), Billing::Subscription, None)?;
     let large = "y".repeat(3 << 20);
-    let mut driver = Driver::standard();
+    let mut driver = DriverTestConfig::standard();
     driver.read_capacity = 16;
 
     let driven = run_with(
@@ -2137,8 +2198,8 @@ fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
         {
             let large = large.clone();
             move |peer| {
-                peer.open_thread(THREAD)?;
-                peer.start_turn(THREAD, TURN)?;
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
                 let line = |message: Message| {
                     indoc::formatdoc!(
                         "
@@ -2147,27 +2208,31 @@ fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
                         message.to_line()
                     )
                 };
-                let split = line(Message::notification::<m::ItemCompleted>(
-                    &fixtures::item_completed(THREAD, TURN, fixtures::agent_message("a", "SPLIT")),
+                let split = line(Message::notification::<methods::ItemCompleted>(
+                    &fixtures::item_completed(
+                        THREAD_ID,
+                        TURN_ID,
+                        fixtures::agent_message("a", "SPLIT"),
+                    ),
                 )?);
-                let joined = line(Message::notification::<m::Warning>(&fixtures::warning(
-                    THREAD, "JOINED",
-                ))?);
+                let joined = line(Message::notification::<methods::Warning>(
+                    &fixtures::warning(THREAD_ID, "JOINED"),
+                )?);
                 let (head, tail) = split.split_at(split.len() / 2);
                 peer.send_bytes(head.as_bytes())?;
                 peer.send_bytes(format!("{tail}{joined}").as_bytes())?;
-                finish(peer, &large)
+                complete_turn_with_reply(peer, &large)
             }
         },
         |_| {},
     )?;
 
-    assert_that!(driven.ending, eq(&Ending::Finished));
-    let capture = String::from_utf8(driven.out).or_fail()?;
+    assert_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
+    let capture = String::from_utf8(driven.capture_writer).or_fail()?;
     assert_that!(capture, contains_substring("SPLIT"));
     assert_that!(capture, contains_substring("JOINED"));
     assert_that!(
-        std::fs::read_to_string(plan.last_message()).or_fail()?,
+        std::fs::read_to_string(plan.last_message_path()).or_fail()?,
         eq(&large)
     );
     Ok(())
@@ -2183,26 +2248,26 @@ fn a_message_cut_off_by_the_servers_exit_breaks_the_turn() -> Result<()> {
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let end = Message::notification::<m::TurnCompleted>(&fixtures::turn_completed(
-                THREAD,
-                TURN,
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let end = Message::notification::<methods::TurnCompleted>(&fixtures::turn_completed(
+                THREAD_ID,
+                TURN_ID,
                 TurnStatus::Completed,
                 Vec::new(),
             ))?
             .to_line();
             let (head, _) = end.split_at(end.len() / 2);
             peer.send_bytes(head.as_bytes())?;
-            peer.close();
+            peer.close_output();
             Ok(())
         },
         |_| {},
     )?;
 
     assert_that!(
-        run.ending,
-        matches_pattern!(Ending::Broken(contains_substring("exited")))
+        run.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring("exited")))
     );
     assert_that!(count(&run.capture, "turn.completed"), eq(0));
     Ok(())
@@ -2212,8 +2277,8 @@ fn a_message_cut_off_by_the_servers_exit_breaks_the_turn() -> Result<()> {
 /// thread id it still carries is used; one without a thread id breaks the turn, naming why.
 #[gtest]
 fn a_thread_start_answer_that_drifted_is_drift_but_its_id_is_kept() -> Result<()> {
-    for (answer, works) in [
-        (json!({"thread": {"id": THREAD}}), true),
+    for (answer, has_thread_id) in [
+        (json!({"thread": {"id": THREAD_ID}}), true),
         (json!({"thread": {}}), false),
     ] {
         let dir = tempfile::tempdir().or_fail()?;
@@ -2222,17 +2287,17 @@ fn a_thread_start_answer_that_drifted_is_drift_but_its_id_is_kept() -> Result<()
         let run = run(
             &plan,
             move |peer| {
-                let initialize = peer.expect::<m::Initialize>()?;
+                let initialize = peer.expect_request::<methods::Initialize>()?;
                 peer.reply(&initialize, &fixtures::initialize_response())?;
-                peer.expect_notification::<m::Initialized>()?;
-                let start = peer.expect::<m::ThreadStart>()?;
+                peer.expect_notification::<methods::Initialized>()?;
+                let start = peer.expect_request::<methods::ThreadStart>()?;
                 peer.send(&Message::Response {
                     id: start.id,
                     outcome: Ok(answer),
                 })?;
-                if works {
-                    peer.start_turn(THREAD, TURN)?;
-                    finish(peer, "despite it")?;
+                if has_thread_id {
+                    peer.start_turn(THREAD_ID, TURN_ID)?;
+                    complete_turn_with_reply(peer, "despite it")?;
                 }
                 Ok(())
             },
@@ -2245,16 +2310,16 @@ fn a_thread_start_answer_that_drifted_is_drift_but_its_id_is_kept() -> Result<()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|event| event["type"] == "agentmux.undecoded")
             .collect();
-        if works {
-            expect_that!(run.ending, eq(&Ending::Finished));
+        if has_thread_id {
+            expect_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
             expect_that!(
                 drift.first().map(|event| event["method"].clone()),
                 some(eq(&json!("thread/start")))
             );
         } else {
             expect_that!(
-                run.ending,
-                matches_pattern!(Ending::Broken(contains_substring("no thread id")))
+                run.outcome,
+                matches_pattern!(DriverOutcome::Failed(contains_substring("no thread id")))
             );
         }
     }
@@ -2272,9 +2337,9 @@ fn an_answer_with_neither_result_nor_error_acknowledges_no_steer() -> Result<()>
     let run = run(
         &plan,
         |peer| {
-            peer.open_thread(THREAD)?;
-            peer.start_turn(THREAD, TURN)?;
-            let steer = peer.expect::<m::TurnSteer>()?;
+            peer.open_thread(THREAD_ID)?;
+            peer.start_turn(THREAD_ID, TURN_ID)?;
+            let steer = peer.expect_request::<methods::TurnSteer>()?;
             peer.send_bytes(
                 indoc::formatdoc!(
                     r#"
@@ -2284,12 +2349,15 @@ fn an_answer_with_neither_result_nor_error_acknowledges_no_steer() -> Result<()>
                 )
                 .as_bytes(),
             )?;
-            finish(peer, "ended")
+            complete_turn_with_reply(peer, "ended")
         },
         |plan| reply = steer(plan, "ACKNOWLEDGED-BY-NOTHING"),
     )?;
 
-    assert_that!(reply, some(matches_pattern!(Reply::Unconfirmed { .. })));
+    assert_that!(
+        reply,
+        some(matches_pattern!(SteerReply::Unconfirmed { .. }))
+    );
     assert_that!(
         run.capture,
         not(contains_substring("ACKNOWLEDGED-BY-NOTHING"))

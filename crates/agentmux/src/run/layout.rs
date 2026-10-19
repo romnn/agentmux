@@ -44,7 +44,7 @@ impl TurnDir {
     /// # Errors
     ///
     /// Returns an error when the record is there but cannot be read or parsed.
-    pub(crate) fn launched(&self) -> Result<Option<Launched>, RunError> {
+    pub(crate) fn read_launch_identity(&self) -> Result<Option<Launched>, RunError> {
         Ok(read_json::<LaunchRecord>(&self.launch())?.map(|record| record.launched))
     }
     pub(super) fn invocation(&self) -> PathBuf {
@@ -70,15 +70,15 @@ impl TurnDir {
         self.root.join("cancelling")
     }
     /// The plan a turn driven over the app-server runs under.
-    pub(super) fn app_server_plan(&self) -> PathBuf {
+    pub(super) fn app_server_plan_path(&self) -> PathBuf {
         self.root.join("app-server.json")
     }
     /// Where steered messages wait for the driver of a turn driven over the app-server.
-    pub(crate) fn steer(&self) -> PathBuf {
+    pub(crate) fn steer_dir(&self) -> PathBuf {
         self.root.join("steer")
     }
     pub(super) fn mailbox(&self) -> Mailbox {
-        Mailbox::new(self.steer())
+        Mailbox::new(self.steer_dir())
     }
 }
 

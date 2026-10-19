@@ -2,13 +2,13 @@
 
 use std::time::Duration;
 
-use crate::appserver::mailbox::{Letter, Mailbox, Reply};
+use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Delegate, Isolation};
 use crate::launch::{Launched, Liveness};
 use crate::transcript::Outcome;
 
 use super::RunStore;
-use super::error::{Idle, RunError, SteerRefused, Unsteerable};
+use super::error::{NotRunningReason, RunError, SteerError, UnsteerableReason};
 use super::id::RunId;
 use super::layout::TurnDir;
 use super::records::LaunchMode;
@@ -19,13 +19,13 @@ impl RunStore {
     ///
     /// The driver looks every tenth of a second, so this is only ever reached by a driver that has
     /// stopped looking.
-    pub(super) const STEER_PICKUP: Duration = Duration::from_secs(15);
+    pub(super) const STEER_PICKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// How long a picked-up message may wait for the delegate CLI to confirm it.
-    pub(super) const STEER_CONFIRM: Duration = Duration::from_secs(30);
+    pub(super) const STEER_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// How often a steer looks for its reply.
-    pub(super) const STEER_POLL: Duration = Duration::from_millis(100);
+    pub(super) const STEER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Add an instruction to a consultation's running turn, for the delegate to see before its
     /// next model call.
@@ -44,70 +44,70 @@ impl RunStore {
     /// CLI did not confirm it in time.
     pub async fn steer(&self, run_id: &RunId, message: &str) -> Result<RunStatus, RunError> {
         if message.trim().is_empty() {
-            return Err(SteerRefused::Empty.into());
+            return Err(SteerError::Empty.into());
         }
-        let Submitted {
+        let SubmittedSteer {
             mailbox,
-            letter,
-            launched,
+            steer_id,
+            driver_process,
         } = self.submit_steer(run_id, message)?;
         let submitted = tokio::time::Instant::now();
         let mut claimed_at: Option<tokio::time::Instant> = None;
         loop {
             if let Some(reply) = mailbox
-                .reply(&letter)
+                .reply(&steer_id)
                 .map_err(RunError::io("reading the reply to a steered message"))?
             {
                 return match reply {
-                    Reply::Accepted => self.status(run_id),
-                    Reply::Rejected { reason } => Err(SteerRefused::Rejected {
+                    SteerReply::Accepted => self.status(run_id),
+                    SteerReply::Rejected { reason } => Err(SteerError::Rejected {
                         run_id: run_id.clone(),
                         detail: reason,
                     }
                     .into()),
-                    Reply::Unconfirmed { reason } => Err(SteerRefused::Unconfirmed {
+                    SteerReply::Unconfirmed { reason } => Err(SteerError::Unconfirmed {
                         run_id: run_id.clone(),
                         why: reason,
                     }
                     .into()),
                 };
             }
-            if claimed_at.is_none() && mailbox.is_claimed(&letter) {
+            if claimed_at.is_none() && mailbox.is_claimed(&steer_id) {
                 claimed_at = Some(tokio::time::Instant::now());
             }
-            let gone = self.launcher.reap(launched).is_some()
-                || self.launcher.liveness(launched) == Liveness::Gone;
+            let gone = self.launcher.reap(driver_process).is_some()
+                || self.launcher.liveness(driver_process) == Liveness::Gone;
             match claimed_at {
                 // Claimed and then never answered: the driver went, or the CLI is silent.
-                Some(at) if gone || at.elapsed() >= Self::STEER_CONFIRM => {
-                    return Err(SteerRefused::Unconfirmed {
+                Some(at) if gone || at.elapsed() >= Self::STEER_CONFIRM_TIMEOUT => {
+                    return Err(SteerError::Unconfirmed {
                         run_id: run_id.clone(),
                         why: if gone {
                             "the turn's driver left without answering".to_owned()
                         } else {
                             format!(
                                 "the delegate did not confirm it within {}s",
-                                Self::STEER_CONFIRM.as_secs()
+                                Self::STEER_CONFIRM_TIMEOUT.as_secs()
                             )
                         },
                     }
                     .into());
                 }
-                None if gone || submitted.elapsed() >= Self::STEER_PICKUP => {
+                None if gone || submitted.elapsed() >= Self::STEER_PICKUP_TIMEOUT => {
                     // Withdrawn by creating the decision file the driver claims with, so a
                     // message that was not taken back is one the driver has and will answer.
                     if mailbox
-                        .withdraw(&letter)
+                        .withdraw(&steer_id)
                         .map_err(RunError::io("withdrawing a steered message"))?
                     {
-                        return Err(SteerRefused::Withdrawn {
+                        return Err(SteerError::Withdrawn {
                             run_id: run_id.clone(),
                             why: if gone {
                                 "the turn ended before its driver picked it up".to_owned()
                             } else {
                                 format!(
                                     "the turn's driver did not pick it up within {}s",
-                                    Self::STEER_PICKUP.as_secs()
+                                    Self::STEER_PICKUP_TIMEOUT.as_secs()
                                 )
                             },
                         }
@@ -117,7 +117,7 @@ impl RunStore {
                 }
                 Some(_) | None => {}
             }
-            tokio::time::sleep(Self::STEER_POLL).await;
+            tokio::time::sleep(Self::STEER_POLL_INTERVAL).await;
         }
     }
 
@@ -126,48 +126,53 @@ impl RunStore {
     ///
     /// Submitted under the run's lock, so the turn cannot end and its run be removed between the
     /// check and the write, which would leave a mailbox behind in a run that is gone.
-    fn submit_steer(&self, run_id: &RunId, message: &str) -> Result<Submitted, RunError> {
+    fn submit_steer(&self, run_id: &RunId, message: &str) -> Result<SubmittedSteer, RunError> {
         let meta = self.meta(run_id)?;
-        let not_running = |state| SteerRefused::NotRunning {
+        let not_running = |state| SteerError::NotRunning {
             run_id: run_id.clone(),
             state,
         };
         let run = self.lock(run_id)?;
         let Some(newest) = self.turn_files(run_id)?.into_iter().last() else {
-            return Err(not_running(Idle::NotLaunched).into());
+            return Err(not_running(NotRunningReason::NotLaunched).into());
         };
         let folded = run.fold_turn(&meta, &newest)?;
         let outcome = folded.turn.outcome;
         if outcome.is_terminal() {
-            return Err(not_running(Idle::Ended(outcome.state())).into());
+            return Err(not_running(NotRunningReason::Ended(outcome.state())).into());
         }
-        if folded.mode != LaunchMode::AppServer {
-            return Err(SteerRefused::NotSteerable {
+        if folded.launch_mode != LaunchMode::AppServer {
+            return Err(SteerError::NotSteerable {
                 run_id: run_id.clone(),
                 reason: why_not_steerable(&meta.delegate),
             }
             .into());
         }
         if newest.dir.cancelling().exists() {
-            return Err(not_running(Idle::Cancelling).into());
+            return Err(not_running(NotRunningReason::Cancelling).into());
         }
-        if !Self::accepts_steers(&outcome, folded.mode, folded.turn_started, &newest.dir) {
-            return Err(SteerRefused::Starting {
+        if !Self::accepts_steers(
+            &outcome,
+            folded.launch_mode,
+            folded.turn_started,
+            &newest.dir,
+        ) {
+            return Err(SteerError::Starting {
                 run_id: run_id.clone(),
             }
             .into());
         }
-        let Some(launched) = newest.launch.as_ref().map(|record| record.launched) else {
-            return Err(not_running(Idle::NotLaunched).into());
+        let Some(driver_process) = newest.launch.as_ref().map(|record| record.launched) else {
+            return Err(not_running(NotRunningReason::NotLaunched).into());
         };
         let mailbox = newest.dir.mailbox();
-        let letter = mailbox
+        let steer_id = mailbox
             .submit(message)
             .map_err(RunError::io("submitting the steered message"))?;
-        Ok(Submitted {
+        Ok(SubmittedSteer {
             mailbox,
-            letter,
-            launched,
+            steer_id,
+            driver_process,
         })
     }
 
@@ -193,20 +198,20 @@ impl RunStore {
 }
 
 /// A steered message in its turn's mailbox, and the driver that is to answer it.
-struct Submitted {
+struct SubmittedSteer {
     mailbox: Mailbox,
-    letter: Letter,
-    launched: Launched,
+    steer_id: SteerId,
+    driver_process: Launched,
 }
 
 /// Why a turn of this delegate that was not driven over the app-server offers no way in.
-pub(super) fn why_not_steerable(delegate: &Delegate) -> Unsteerable {
+pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
     match delegate {
-        Delegate::Claude { .. } => Unsteerable::ClaudePrint,
+        Delegate::Claude { .. } => UnsteerableReason::ClaudePrint,
         Delegate::Codex {
             isolation: Some(Isolation::Inherit),
             ..
-        } => Unsteerable::CodexExec,
-        Delegate::Codex { .. } => Unsteerable::CodexIsolated,
+        } => UnsteerableReason::CodexExec,
+        Delegate::Codex { .. } => UnsteerableReason::CodexIsolated,
     }
 }

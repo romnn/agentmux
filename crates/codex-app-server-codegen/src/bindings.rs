@@ -1,14 +1,14 @@
-//! Renders `methods.rs`: a marker type per method, bound to its payload types, and per direction
+//! Renders `methods.rs`: a marker type per method, bound to its payload types, and per message kind
 //! an `Any*` enum that classifies an incoming message by its method.
 
 use indoc::{formatdoc, indoc};
 
-use crate::methods::{Direction, Method, Params, Typed};
+use crate::methods::{MessageKind, MethodBinding, ParamsSpec, PayloadSchemas};
 
 /// The source of `methods.rs`, without its header.
 #[must_use]
-pub fn render(methods: &[Method], codex_version: &str) -> String {
-    let mut out = indoc! {"
+pub fn render(methods: &[MethodBinding], codex_version: &str) -> String {
+    let mut source_text = indoc! {"
         //! Every method of the codex app-server protocol, each bound to its payload types.
         //!
         //! Each marker type stands for one JSON-RPC method and names it on the wire; the direction
@@ -24,143 +24,167 @@ pub fn render(methods: &[Method], codex_version: &str) -> String {
 
         use crate::types;
         use crate::{
-            Answered, ClientNotification, ClientRequest, Method, Notification, Payload, Request,
-            ServerNotification, ServerRequest, Typed,
+            ClientNotification, ClientRequest, Method, Notification, RawParams, Request,
+            ServerNotification, ServerRequest, TypedParams, TypedResponse,
         };
     "}
     .to_owned();
-    out.push_str(&formatdoc! {"
+    source_text.push_str(&formatdoc! {"
 
         /// The codex release this protocol was generated from.
         pub const CODEX_VERSION: &str = {codex_version:?};
     "});
 
     for method in methods {
-        out.push('\n');
-        out.push_str(&binding(method));
+        source_text.push('\n');
+        source_text.push_str(&render_method_binding(method));
     }
-    for direction in Direction::ALL {
-        let members: Vec<&Method> = methods
+    for kind in MessageKind::ALL {
+        let members: Vec<&MethodBinding> = methods
             .iter()
-            .filter(|method| method.direction == direction)
+            .filter(|method| method.kind == kind)
             .collect();
-        out.push('\n');
-        out.push_str(&dispatch(direction, &members, codex_version));
+        source_text.push('\n');
+        source_text.push_str(&render_dispatch_enum(kind, &members, codex_version));
     }
-    out
+    source_text
 }
 
 /// The marker type and trait implementations for one method.
-fn binding(method: &Method) -> String {
-    let Method {
-        wire, name, typed, ..
+fn render_method_binding(method: &MethodBinding) -> String {
+    let MethodBinding {
+        wire_name,
+        rust_type_name,
+        payload_schemas,
+        ..
     } = method;
-    let direction = method.direction.union();
-    let (what, kind) = if method.direction.is_request() {
+    let direction_trait_name = method.kind.union_name();
+    let (message_kind_label, message_trait_name) = if method.kind.is_request() {
         ("request", "Request")
     } else {
         ("notification", "Notification")
     };
-    let typed = typed
+    let payload_impls = payload_schemas
         .as_ref()
-        .map_or_else(String::new, |typed| bound(name, typed));
+        .map_or_else(String::new, |payload_schemas| {
+            render_payload_impls(rust_type_name, payload_schemas)
+        });
     formatdoc! {"
-        /// The `{wire}` {what}.
+        /// The `{wire_name}` {message_kind_label}.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct {name};
+        pub struct {rust_type_name};
 
-        impl Method for {name} {{
-            const METHOD: &'static str = {wire:?};
+        impl Method for {rust_type_name} {{
+            const METHOD: &'static str = {wire_name:?};
         }}
 
-        {typed}impl {kind} for {name} {{}}
+        {payload_impls}impl {message_trait_name} for {rust_type_name} {{}}
 
-        impl {direction} for {name} {{}}
+        impl {direction_trait_name} for {rust_type_name} {{}}
     "}
 }
 
 /// The trait implementations that bind a method agentmux uses to its payload types.
-fn bound(name: &str, typed: &Typed) -> String {
-    let params = match &typed.params {
-        Params::None => "()".to_owned(),
-        Params::Required(schema) => format!("types::{schema}"),
-        Params::Optional(schema) => format!("Option<types::{schema}>"),
+fn render_payload_impls(rust_type_name: &str, payload_schemas: &PayloadSchemas) -> String {
+    let params = match &payload_schemas.params {
+        ParamsSpec::None => "()".to_owned(),
+        ParamsSpec::Required(schema) => format!("types::{schema}"),
+        ParamsSpec::Optional(schema) => format!("Option<types::{schema}>"),
     };
-    let answered = typed
+    let response_impl = payload_schemas
         .response
         .as_deref()
         .map_or_else(String::new, |response| {
             formatdoc! {"
-            impl Answered for {name} {{
+            impl TypedResponse for {rust_type_name} {{
                 type Response = types::{response};
             }}
 
         "}
         });
     formatdoc! {"
-        impl Typed for {name} {{
+        impl TypedParams for {rust_type_name} {{
             type Params = {params};
         }}
 
-        {answered}"}
+        {response_impl}"}
 }
 
-/// The `Any*` enum of one direction.
-fn dispatch(direction: Direction, members: &[&Method], codex_version: &str) -> String {
-    let union = direction.union();
-    let what = match direction {
-        Direction::ClientRequest => "A request the client sends",
-        Direction::ClientNotification => "A notification the client sends",
-        Direction::ServerRequest => "A request the server sends",
-        Direction::ServerNotification => "A notification the server sends",
+/// The `Any*` enum of one message kind.
+fn render_dispatch_enum(
+    kind: MessageKind,
+    members: &[&MethodBinding],
+    codex_version: &str,
+) -> String {
+    let union_name = kind.union_name();
+    let summary = match kind {
+        MessageKind::ClientRequest => "A request the client sends",
+        MessageKind::ClientNotification => "A notification the client sends",
+        MessageKind::ServerRequest => "A request the server sends",
+        MessageKind::ServerNotification => "A notification the server sends",
     };
-    let lines = |line: &dyn Fn(&Method) -> String| -> String {
-        members.iter().map(|method| line(method)).collect()
+    let render_members = |render_member: &dyn Fn(&MethodBinding) -> String| -> String {
+        members.iter().map(|method| render_member(method)).collect()
     };
-    let variants = lines(&|Method {
-                               wire, name, typed, ..
-                           }| {
-        match typed {
+    let variants = render_members(&|MethodBinding {
+                                        wire_name,
+                                        rust_type_name,
+                                        payload_schemas,
+                                        ..
+                                    }| {
+        match payload_schemas {
             Some(_) => formatdoc! {"
-            {indent}/// `{wire}`.
-            {indent}{name}(Payload<'a, {name}>),
+            {indent}/// `{wire_name}`.
+            {indent}{rust_type_name}(RawParams<'a, {rust_type_name}>),
         ", indent = "    "},
             None => formatdoc! {"
-            {indent}/// `{wire}`, which agentmux does not decode.
-            {indent}{name},
+            {indent}/// `{wire_name}`, which agentmux does not decode.
+            {indent}{rust_type_name},
         ", indent = "    "},
         }
     });
-    let classify = lines(&|Method { name, typed, .. }| match typed {
-        Some(_) => formatdoc! {"
-            {indent}{name}::METHOD => Self::{name}(Payload::new(params)),
+    let classification_arms = render_members(&|MethodBinding {
+                                                   rust_type_name,
+                                                   payload_schemas,
+                                                   ..
+                                               }| {
+        match payload_schemas {
+            Some(_) => formatdoc! {"
+            {indent}{rust_type_name}::METHOD => Self::{rust_type_name}(RawParams::new(params)),
         ", indent = "            "},
-        None => formatdoc! {"
-            {indent}{name}::METHOD => Self::{name},
+            None => formatdoc! {"
+            {indent}{rust_type_name}::METHOD => Self::{rust_type_name},
         ", indent = "            "},
+        }
     });
-    let names = lines(&|Method { name, typed, .. }| match typed {
-        Some(_) => formatdoc! {"
-            {indent}Self::{name}(_) => {name}::METHOD,
+    let method_name_arms = render_members(&|MethodBinding {
+                                                rust_type_name,
+                                                payload_schemas,
+                                                ..
+                                            }| {
+        match payload_schemas {
+            Some(_) => formatdoc! {"
+            {indent}Self::{rust_type_name}(_) => {rust_type_name}::METHOD,
         ", indent = "            "},
-        None => formatdoc! {"
-            {indent}Self::{name} => {name}::METHOD,
+            None => formatdoc! {"
+            {indent}Self::{rust_type_name} => {rust_type_name}::METHOD,
         ", indent = "            "},
+        }
     });
     formatdoc! {"
-        /// {what}, classified by its method, with the parameters of one agentmux decodes not yet
+        /// {summary}, classified by its method, with the parameters of one agentmux decodes not yet
         /// decoded.
         #[derive(Debug, Clone, Copy)]
-        pub enum Any{union}<'a> {{
+        pub enum Any{union_name}<'a> {{
         {variants}}}
 
-        impl<'a> Any{union}<'a> {{
+        impl<'a> Any{union_name}<'a> {{
             /// The message of `method` carrying `params`, or `None` when codex-cli {codex_version}
             /// sends no such method this way.
             #[must_use]
             pub fn classify(method: &str, params: &'a Value) -> Option<Self> {{
                 Some(match method {{
-        {classify}            _ => return None,
+        {classification_arms}            _ => return None,
                 }})
             }}
 
@@ -168,7 +192,7 @@ fn dispatch(direction: Direction, members: &[&Method], codex_version: &str) -> S
             #[must_use]
             pub fn method(self) -> &'static str {{
                 match self {{
-        {names}        }}
+        {method_name_arms}        }}
             }}
         }}
     "}
@@ -180,60 +204,62 @@ mod tests {
     use indoc::indoc;
 
     use super::render;
-    use crate::methods::{Direction, Method, Params, Typed};
+    use crate::methods::{MessageKind, MethodBinding, ParamsSpec, PayloadSchemas};
 
-    fn method(direction: Direction, wire: &str, name: &str, typed: Option<Typed>) -> Method {
-        Method {
-            direction,
-            wire: wire.to_owned(),
-            name: name.to_owned(),
-            typed,
+    fn method(
+        kind: MessageKind,
+        wire_name: &str,
+        rust_type_name: &str,
+        payload_schemas: Option<PayloadSchemas>,
+    ) -> MethodBinding {
+        MethodBinding {
+            kind,
+            wire_name: wire_name.to_owned(),
+            rust_type_name: rust_type_name.to_owned(),
+            payload_schemas,
         }
     }
 
-    fn typed(params: Params, response: Option<&str>) -> Typed {
-        Typed {
+    fn payload_schemas(params: ParamsSpec, response: Option<&str>) -> PayloadSchemas {
+        PayloadSchemas {
             params,
             response: response.map(ToOwned::to_owned),
         }
     }
 
-    /// A request agentmux uses binds its params and response, a notification it uses its params,
-    /// a method without params carries `()` and optional params an `Option`, a method it does not
-    /// use is named and nothing more, and every method is a variant of its direction's enum.
     #[gtest]
     fn each_method_becomes_a_marker_bound_to_what_agentmux_uses_of_it() {
         let source = render(
             &[
                 method(
-                    Direction::ClientRequest,
+                    MessageKind::ClientRequest,
                     "turn/start",
                     "TurnStart",
-                    Some(typed(
-                        Params::Required("TurnStartParams".to_owned()),
+                    Some(payload_schemas(
+                        ParamsSpec::Required("TurnStartParams".to_owned()),
                         Some("TurnStartResponse"),
                     )),
                 ),
                 method(
-                    Direction::ClientRequest,
+                    MessageKind::ClientRequest,
                     "account/rateLimits/read",
                     "AccountRateLimitsRead",
-                    Some(typed(
-                        Params::Optional("GetAccountRateLimitsParams".to_owned()),
+                    Some(payload_schemas(
+                        ParamsSpec::Optional("GetAccountRateLimitsParams".to_owned()),
                         Some("GetAccountRateLimitsResponse"),
                     )),
                 ),
                 method(
-                    Direction::ClientRequest,
+                    MessageKind::ClientRequest,
                     "account/logout",
                     "AccountLogout",
                     None,
                 ),
                 method(
-                    Direction::ClientNotification,
+                    MessageKind::ClientNotification,
                     "initialized",
                     "Initialized",
-                    Some(typed(Params::None, None)),
+                    Some(payload_schemas(ParamsSpec::None, None)),
                 ),
             ],
             "0.1.0",
@@ -247,11 +273,11 @@ mod tests {
                     const METHOD: &'static str = "turn/start";
                 }
 
-                impl Typed for TurnStart {
+                impl TypedParams for TurnStart {
                     type Params = types::TurnStartParams;
                 }
 
-                impl Answered for TurnStart {
+                impl TypedResponse for TurnStart {
                     type Response = types::TurnStartResponse;
                 }
 
@@ -280,7 +306,7 @@ mod tests {
         assert_that!(
             source,
             contains_substring(indoc! {"
-                impl Typed for Initialized {
+                impl TypedParams for Initialized {
                     type Params = ();
                 }
 
@@ -293,9 +319,9 @@ mod tests {
             contains_substring(indoc! {"
                 pub enum AnyClientRequest<'a> {
                     /// `turn/start`.
-                    TurnStart(Payload<'a, TurnStart>),
+                    TurnStart(RawParams<'a, TurnStart>),
                     /// `account/rateLimits/read`.
-                    AccountRateLimitsRead(Payload<'a, AccountRateLimitsRead>),
+                    AccountRateLimitsRead(RawParams<'a, AccountRateLimitsRead>),
                     /// `account/logout`, which agentmux does not decode.
                     AccountLogout,
                 }
@@ -304,7 +330,7 @@ mod tests {
         assert_that!(
             source,
             contains_substring(
-                "            TurnStart::METHOD => Self::TurnStart(Payload::new(params)),"
+                "            TurnStart::METHOD => Self::TurnStart(RawParams::new(params)),"
             )
         );
         assert_that!(

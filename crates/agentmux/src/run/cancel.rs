@@ -31,7 +31,7 @@ impl RunStore {
     ///
     /// The driver takes at most [`crate::appserver::STOP_BUDGET`] to interrupt the turn, let the
     /// server exit and stop what it left running, so this outlasts all of it.
-    pub(super) const INTERRUPT_GRACE: Duration =
+    pub(super) const DRIVER_EXIT_GRACE: Duration =
         crate::appserver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
 
     /// Stop a running consultation.
@@ -81,10 +81,10 @@ impl RunStore {
             // the server close the turn and save it; it is given the chance before any signal.
             // A driver whose turn has already ended may still be stopping what its server left
             // running, and is given the same chance to finish.
-            let driven = read_json::<InvocationRecord>(&newest.dir.invocation())?
-                .is_some_and(|invocation| invocation.mode == LaunchMode::AppServer);
-            if driven {
-                self.wait_for_departure(record.launched, Self::INTERRUPT_GRACE)
+            let uses_app_server = read_json::<InvocationRecord>(&newest.dir.invocation())?
+                .is_some_and(|invocation| invocation.launch_mode == LaunchMode::AppServer);
+            if uses_app_server {
+                self.wait_for_delegate_exit(record.launched, Self::DRIVER_EXIT_GRACE)
                     .await;
             }
             self.stop(record.launched).await;
@@ -107,17 +107,18 @@ impl RunStore {
     pub(super) async fn stop(&self, launched: Launched) {
         self.launcher.terminate(launched);
         if self
-            .wait_for_departure(launched, Self::TERMINATE_GRACE)
+            .wait_for_delegate_exit(launched, Self::TERMINATE_GRACE)
             .await
         {
             return;
         }
         self.launcher.kill(launched);
-        self.wait_for_departure(launched, Self::KILL_GRACE).await;
+        self.wait_for_delegate_exit(launched, Self::KILL_GRACE)
+            .await;
     }
 
     /// Whether the child left within `grace`.
-    pub(super) async fn wait_for_departure(&self, launched: Launched, grace: Duration) -> bool {
+    pub(super) async fn wait_for_delegate_exit(&self, launched: Launched, grace: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             if self.launcher.reap(launched).is_some()

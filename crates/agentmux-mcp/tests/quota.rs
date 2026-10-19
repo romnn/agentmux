@@ -20,7 +20,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -42,7 +42,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))

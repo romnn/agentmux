@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
-use codex_app_server_mock::fixtures::{self, THREAD, TURN};
-use codex_app_server_mock::scenario::{CONFIG_FILE, Config, Death, HELPER, Scenario};
-use codex_app_server_mock::{Peer, PeerError, Received};
+use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID};
+use codex_app_server_mock::scenario::{CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode};
+use codex_app_server_mock::{Peer, PeerError, ReceivedRequest};
 use codex_app_server_protocol::envelope::Message;
-use codex_app_server_protocol::methods::{self as m, AnyClientRequest as Any};
+use codex_app_server_protocol::methods::{self, AnyClientRequest};
 use codex_app_server_protocol::types::TurnStatus;
 
 /// How long a command the fake starts runs unless something stops it.
@@ -28,18 +28,18 @@ const COMMAND_SECONDS: u64 = 300;
 enum Failure {
     #[error(transparent)]
     Peer(#[from] PeerError),
-    #[error("cannot {what}")]
+    #[error("cannot {operation}")]
     Io {
-        what: String,
+        operation: String,
         #[source]
         source: std::io::Error,
     },
 }
 
 impl Failure {
-    fn io(what: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
-        let what = what.into();
-        move |source| Self::Io { what, source }
+    fn io(operation: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
+        let operation = operation.into();
+        move |source| Self::Io { operation, source }
     }
 }
 
@@ -75,7 +75,7 @@ fn serve() -> Result<ExitCode, String> {
             serde_json::from_str::<Config>(&json)
                 .map_err(|err| format!("{} is not a scenario: {err}", path.display()))
         })?;
-    if let Some(path) = &config.environment {
+    if let Some(path) = &config.environment_dump_path {
         let environment: Vec<String> = std::env::vars()
             .map(|(name, value)| format!("{name}={value}\n"))
             .collect();
@@ -88,23 +88,26 @@ fn serve() -> Result<ExitCode, String> {
     let mut server = Server {
         peer,
         config: &config,
-        logged: 0,
+        logged_line_count: 0,
     };
     let outcome = match &config.scenario {
-        Scenario::Steerable => server.steerable(),
-        Scenario::Dying { death, release } => server.dying(*death, release),
-        Scenario::Forking {
-            release,
-            helper_release,
-        } => server.forking(release, helper_release),
+        Scenario::Steerable => server.run_steerable_scenario(),
+        Scenario::ServerExit {
+            exit_mode,
+            exit_trigger_path,
+        } => server.run_exit_scenario(*exit_mode, exit_trigger_path),
+        Scenario::OrphanedHelper {
+            completion_trigger_path,
+            helper_exit_trigger_path,
+        } => server.run_orphaned_helper_scenario(completion_trigger_path, helper_exit_trigger_path),
     };
     // What the client said last is logged however the scenario ended.
-    let outcome = server.log().and(outcome);
+    let outcome = server.append_received_lines().and(outcome);
     match outcome {
         Ok(code) => Ok(code),
         // The client ending the conversation is how a scenario ends.
         Err(Failure::Peer(PeerError::Closed { .. })) => Ok(ExitCode::SUCCESS),
-        Err(Failure::Io { what, source }) => Err(format!("cannot {what}: {source}")),
+        Err(Failure::Io { operation, source }) => Err(format!("cannot {operation}: {source}")),
         Err(Failure::Peer(err)) => Err(err.to_string()),
     }
 }
@@ -113,79 +116,93 @@ struct Server<'a> {
     peer: Peer,
     config: &'a Config,
     /// How many of the client's lines are already in the log.
-    logged: usize,
+    logged_line_count: usize,
 }
 
 impl Server<'_> {
     /// Append what the client has sent since the last call to the log.
-    fn log(&mut self) -> Result<(), Failure> {
-        if let Some(log) = &self.config.log {
+    fn append_received_lines(&mut self) -> Result<(), Failure> {
+        if let Some(log) = &self.config.client_messages_path {
             let lines: Vec<String> = self
                 .peer
-                .received()
+                .received_lines()
                 .iter()
-                .skip(self.logged)
+                .skip(self.logged_line_count)
                 .map(|line| format!("{line}\n"))
                 .collect();
             append(log, &lines.concat()).map_err(Failure::io("append to the log"))?;
         }
-        self.logged = self.peer.received().len();
+        self.logged_line_count = self.peer.received_lines().len();
         Ok(())
     }
 
     /// Answer the handshake and open the thread, then wait for `turn/start`.
-    fn until_turn_start(&mut self) -> Result<Received<m::TurnStart>, Failure> {
-        self.peer.open_thread(THREAD)?;
-        self.log()?;
-        let start = self.peer.expect::<m::TurnStart>()?;
-        self.log()?;
+    fn setup_and_expect_turn_start(
+        &mut self,
+    ) -> Result<ReceivedRequest<methods::TurnStart>, Failure> {
+        self.peer.open_thread(THREAD_ID)?;
+        self.append_received_lines()?;
+        let start = self.peer.expect_request::<methods::TurnStart>()?;
+        self.append_received_lines()?;
         Ok(start)
     }
 
     fn end_turn(&mut self, status: TurnStatus) -> Result<(), PeerError> {
         self.peer
-            .notify::<m::TurnCompleted>(&fixtures::turn_completed(THREAD, TURN, status, Vec::new()))
+            .notify::<methods::TurnCompleted>(&fixtures::turn_completed(
+                THREAD_ID,
+                TURN_ID,
+                status,
+                Vec::new(),
+            ))
     }
 
-    fn steerable(&mut self) -> Result<ExitCode, Failure> {
-        let start = self.until_turn_start()?;
-        self.start(&Role::Detached)?;
+    fn run_steerable_scenario(&mut self) -> Result<ExitCode, Failure> {
+        let start = self.setup_and_expect_turn_start()?;
+        self.start_helper(&HelperBehavior::DetachedSleep)?;
         self.peer
-            .reply(&start, &fixtures::turn_start_response(TURN))?;
+            .reply(&start, &fixtures::turn_start_response(TURN_ID))?;
         self.peer
-            .notify::<m::TurnStarted>(&fixtures::turn_started(THREAD, TURN))?;
+            .notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
         // Ends once: what names the turn after that is refused, as codex refuses it.
         let mut running = true;
         loop {
-            let message = self.peer.recv()?;
-            self.log()?;
+            let message = self.peer.receive_message()?;
+            self.append_received_lines()?;
             let Message::Request { id, method, params } = message else {
                 continue;
             };
-            match Any::classify(&method, &params) {
-                Some(Any::TurnSteer(params)) => {
-                    let steer = Received::decode(id, params)?;
-                    let named = &steer.params;
-                    if !(running && named.thread_id == THREAD && named.expected_turn_id == TURN) {
-                        let refusal = format!("no turn {} is running", named.expected_turn_id);
+            match AnyClientRequest::classify(&method, &params) {
+                Some(AnyClientRequest::TurnSteer(params)) => {
+                    let steer = ReceivedRequest::decode(id, params)?;
+                    let steer_params = &steer.params;
+                    if !(running
+                        && steer_params.thread_id == THREAD_ID
+                        && steer_params.expected_turn_id == TURN_ID)
+                    {
+                        let refusal =
+                            format!("no turn {} is running", steer_params.expected_turn_id);
                         self.peer.refuse(&steer, -32600, &refusal)?;
                         continue;
                     }
                     self.peer
-                        .reply(&steer, &fixtures::turn_steer_response(TURN))?;
+                        .reply(&steer, &fixtures::turn_steer_response(TURN_ID))?;
                     let reply = fixtures::agent_message("i1", "STEERED: auth only");
                     self.peer
-                        .notify::<m::ItemCompleted>(&fixtures::item_completed(
-                            THREAD, TURN, reply,
+                        .notify::<methods::ItemCompleted>(&fixtures::item_completed(
+                            THREAD_ID, TURN_ID, reply,
                         ))?;
                     self.end_turn(TurnStatus::Completed)?;
                     running = false;
                 }
-                Some(Any::TurnInterrupt(params)) => {
-                    let interrupt = Received::decode(id, params)?;
-                    let named = &interrupt.params;
-                    if !(running && named.thread_id == THREAD && named.turn_id == TURN) {
-                        let refusal = format!("no turn {} is running", named.turn_id);
+                Some(AnyClientRequest::TurnInterrupt(params)) => {
+                    let interrupt = ReceivedRequest::decode(id, params)?;
+                    let interrupt_params = &interrupt.params;
+                    if !(running
+                        && interrupt_params.thread_id == THREAD_ID
+                        && interrupt_params.turn_id == TURN_ID)
+                    {
+                        let refusal = format!("no turn {} is running", interrupt_params.turn_id);
                         self.peer.refuse(&interrupt, -32600, &refusal)?;
                         continue;
                     }
@@ -199,57 +216,71 @@ impl Server<'_> {
         }
     }
 
-    fn dying(&mut self, death: Death, release: &Path) -> Result<ExitCode, Failure> {
-        let start = self.until_turn_start()?;
-        match death {
-            Death::Crash => self.start(&Role::Detached)?,
-            Death::Linger => {
+    fn run_exit_scenario(
+        &mut self,
+        exit_mode: ServerExitMode,
+        exit_trigger_path: &Path,
+    ) -> Result<ExitCode, Failure> {
+        let start = self.setup_and_expect_turn_start()?;
+        match exit_mode {
+            ServerExitMode::Crash => self.start_helper(&HelperBehavior::DetachedSleep)?,
+            ServerExitMode::LeaveOutputOpen => {
                 self.peer
-                    .reply(&start, &fixtures::turn_start_response(TURN))?;
-                self.start(&Role::Linger)?;
+                    .reply(&start, &fixtures::turn_start_response(TURN_ID))?;
+                self.start_helper(&HelperBehavior::HoldOutputOpen)?;
             }
-            Death::Chatter => {
+            ServerExitMode::LeaveWarningWriter => {
                 self.peer
-                    .reply(&start, &fixtures::turn_start_response(TURN))?;
-                self.start(&Role::Chatter)?;
+                    .reply(&start, &fixtures::turn_start_response(TURN_ID))?;
+                self.start_helper(&HelperBehavior::WriteWarnings)?;
             }
         }
-        wait_for(release);
-        Ok(match death {
-            Death::Crash => ExitCode::FAILURE,
-            Death::Linger | Death::Chatter => ExitCode::SUCCESS,
+        wait_until_path_exists(exit_trigger_path);
+        Ok(match exit_mode {
+            ServerExitMode::Crash => ExitCode::FAILURE,
+            ServerExitMode::LeaveOutputOpen | ServerExitMode::LeaveWarningWriter => {
+                ExitCode::SUCCESS
+            }
         })
     }
 
-    fn forking(&mut self, release: &Path, helper_release: &Path) -> Result<ExitCode, Failure> {
-        let start = self.until_turn_start()?;
+    fn run_orphaned_helper_scenario(
+        &mut self,
+        completion_trigger_path: &Path,
+        helper_exit_trigger_path: &Path,
+    ) -> Result<ExitCode, Failure> {
+        let start = self.setup_and_expect_turn_start()?;
         self.peer
-            .reply(&start, &fixtures::turn_start_response(TURN))?;
-        let mut fork = self.spawn(&Role::Fork {
-            release: helper_release.to_path_buf(),
+            .reply(&start, &fixtures::turn_start_response(TURN_ID))?;
+        let mut fork = self.spawn_helper(&HelperBehavior::SpawnOrphanHelper {
+            exit_trigger_path: helper_exit_trigger_path.to_path_buf(),
         })?;
         // The fork exits as soon as its helper is started, which orphans the helper.
         fork.wait().map_err(Failure::io("wait for the fork"))?;
-        wait_for(release);
+        wait_until_path_exists(completion_trigger_path);
         self.end_turn(TurnStatus::Completed)?;
-        self.peer.wait_until_closed()?;
+        self.peer.drain_until_closed()?;
         Ok(ExitCode::SUCCESS)
     }
 
     /// Start a command in `role`, which records its own pid once it is set up.
-    fn start(&self, role: &Role) -> Result<(), Failure> {
-        self.spawn(role).map(drop)
+    fn start_helper(&self, role: &HelperBehavior) -> Result<(), Failure> {
+        self.spawn_helper(role).map(drop)
     }
 
-    fn spawn(&self, role: &Role) -> Result<std::process::Child, Failure> {
-        let exe = std::env::current_exe().map_err(Failure::io("find the fake's executable"))?;
-        let mut command = Command::new(exe);
+    fn spawn_helper(&self, role: &HelperBehavior) -> Result<std::process::Child, Failure> {
+        let executable_path =
+            std::env::current_exe().map_err(Failure::io("find the fake's executable"))?;
+        let mut command = Command::new(executable_path);
         command
             .arg(HELPER)
-            .args(role.args(&self.config.commands))
+            .args(role.args(&self.config.command_pids_path))
             .stdin(Stdio::null());
         // A detached command holds nothing of the server's; the others keep its output open.
-        if matches!(role, Role::Detached | Role::Fork { .. }) {
+        if matches!(
+            role,
+            HelperBehavior::DetachedSleep | HelperBehavior::SpawnOrphanHelper { .. }
+        ) {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
         command.spawn().map_err(Failure::io("start a command"))
@@ -257,29 +288,29 @@ impl Server<'_> {
 }
 
 /// What a command the fake starts does.
-enum Role {
+enum HelperBehavior {
     /// Sleeps in a session of its own, holding nothing of the server's.
-    Detached,
+    DetachedSleep,
     /// Sleeps, holding the server's output open.
-    Linger,
+    HoldOutputOpen,
     /// Writes a valid notification to the server's output every 20 ms until nobody reads it.
-    Chatter,
-    /// Starts a helper that waits for `release`, and exits at once, orphaning it.
-    Fork { release: PathBuf },
+    WriteWarnings,
+    /// Starts a helper that waits for `exit_trigger_path`, and exits at once, orphaning it.
+    SpawnOrphanHelper { exit_trigger_path: PathBuf },
 }
 
-impl Role {
+impl HelperBehavior {
     /// The helper's arguments: its role, and the file it records its pid in.
-    fn args(&self, commands: &Path) -> Vec<String> {
-        let commands = commands.to_string_lossy().into_owned();
+    fn args(&self, command_pids_path: &Path) -> Vec<String> {
+        let command_pids_path = command_pids_path.to_string_lossy().into_owned();
         match self {
-            Self::Detached => vec!["detached".to_owned(), commands],
-            Self::Linger => vec!["linger".to_owned(), commands],
-            Self::Chatter => vec!["chatter".to_owned(), commands],
-            Self::Fork { release } => vec![
+            Self::DetachedSleep => vec!["detached".to_owned(), command_pids_path],
+            Self::HoldOutputOpen => vec!["linger".to_owned(), command_pids_path],
+            Self::WriteWarnings => vec!["chatter".to_owned(), command_pids_path],
+            Self::SpawnOrphanHelper { exit_trigger_path } => vec![
                 "fork".to_owned(),
-                commands,
-                release.to_string_lossy().into_owned(),
+                command_pids_path,
+                exit_trigger_path.to_string_lossy().into_owned(),
             ],
         }
     }
@@ -287,51 +318,56 @@ impl Role {
 
 /// Run in a helper role, as the fake's own commands do.
 fn helper(role: &[&str]) -> Result<ExitCode, String> {
-    let record = |commands: &str| {
-        append(Path::new(commands), &format!("{}\n", std::process::id()))
-            .map_err(|err| format!("cannot record the command: {err}"))
+    let record = |command_pids_path: &str| {
+        append(
+            Path::new(command_pids_path),
+            &format!("{}\n", std::process::id()),
+        )
+        .map_err(|err| format!("cannot record the command: {err}"))
     };
     let sleep = || std::thread::sleep(Duration::from_secs(COMMAND_SECONDS));
     match role {
-        ["detached", commands] => {
+        ["detached", command_pids_path] => {
             // A session of its own, as codex's sandbox gives every command, which no signal to
             // the server's process group reaches; recorded only once it is in it.
             #[cfg(unix)]
             nix::unistd::setsid().map_err(|err| format!("setsid: {err}"))?;
-            record(commands)?;
+            record(command_pids_path)?;
             sleep();
         }
-        ["linger", commands] => {
-            record(commands)?;
+        ["linger", command_pids_path] => {
+            record(command_pids_path)?;
             sleep();
         }
-        ["chatter", commands] => {
-            record(commands)?;
-            let warning =
-                Message::notification::<m::Warning>(&fixtures::warning(THREAD, "still here"))
-                    .map_err(|err| err.to_string())?
-                    .to_line();
-            let mut out = std::io::stdout();
-            while writeln!(out, "{warning}")
-                .and_then(|()| out.flush())
+        ["chatter", command_pids_path] => {
+            record(command_pids_path)?;
+            let warning = Message::notification::<methods::Warning>(&fixtures::warning(
+                THREAD_ID,
+                "still here",
+            ))
+            .map_err(|err| err.to_string())?
+            .to_line();
+            let mut stdout = std::io::stdout();
+            while writeln!(stdout, "{warning}")
+                .and_then(|()| stdout.flush())
                 .is_ok()
             {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        ["fork", commands, release] => {
-            let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-            Command::new(exe)
-                .args([HELPER, "helper", commands, release])
+        ["fork", command_pids_path, exit_trigger_path] => {
+            let executable_path = std::env::current_exe().map_err(|err| err.to_string())?;
+            Command::new(executable_path)
+                .args([HELPER, "helper", command_pids_path, exit_trigger_path])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|err| format!("cannot start the helper: {err}"))?;
         }
-        ["helper", commands, release] => {
-            record(commands)?;
-            wait_for(Path::new(release));
+        ["helper", command_pids_path, exit_trigger_path] => {
+            record(command_pids_path)?;
+            wait_until_path_exists(Path::new(exit_trigger_path));
         }
         _ => return Err(format!("no helper role {role:?}")),
     }
@@ -351,7 +387,7 @@ fn codex_home() -> Result<PathBuf, String> {
 }
 
 /// Wait for `path` to exist, for at most as long as a command runs.
-fn wait_for(path: &Path) {
+fn wait_until_path_exists(path: &Path) {
     let deadline = std::time::Instant::now() + Duration::from_secs(COMMAND_SECONDS);
     while !path.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));

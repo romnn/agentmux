@@ -20,5 +20,5 @@ pub mod fixtures;
 mod peer;
 pub mod scenario;
 
-pub use conversation::{Opened, OpenedThread};
-pub use peer::{DEFAULT_TIMEOUT, Peer, PeerError, Received, Sent};
+pub use conversation::{ThreadOpenParams, ThreadSetupParams};
+pub use peer::{DEFAULT_TIMEOUT, Peer, PeerError, ReceivedRequest, SentRequest};

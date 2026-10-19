@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::delegate::{DelegateError, Vendor};
 use crate::launch::LaunchError;
-use crate::transcript::{State, describe_unsaved_session_store};
+use crate::transcript::{TurnState, describe_unsaved_session_store};
 
 use super::id::{RunId, RunIdError};
 
@@ -86,7 +86,7 @@ pub enum RunError {
     NotResumable(#[from] NotResumable),
     /// A steer was refused, or could not be confirmed.
     #[error("{0}")]
-    Steer(#[from] SteerRefused),
+    Steer(#[from] SteerError),
     /// Another caller claimed this turn first.
     #[error(
         "consultation {run_id} already has a turn {index}, started by another caller. Only one \
@@ -158,7 +158,7 @@ pub enum NotResumable {
         /// Which consultation.
         run_id: RunId,
         /// How it ended.
-        state: State,
+        state: TurnState,
     },
 
     /// The newest turn is over, but its delegate has not left yet, and both CLIs save the session
@@ -167,7 +167,7 @@ pub enum NotResumable {
         "consultation {run_id} has answered, but its delegate is still saving the session a \
          follow-up would resume. Ask the follow-up again in a few seconds."
     )]
-    StillSaving {
+    AwaitingDelegateExit {
         /// Which consultation.
         run_id: RunId,
     },
@@ -204,7 +204,7 @@ pub enum NotResumable {
 /// follow-up instead, start the consultation differently, or read the transcript to see whether a
 /// message whose delivery could not be confirmed arrived after all.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum SteerRefused {
+pub enum SteerError {
     /// The message has no content.
     #[error("the steer message is empty. Say what the delegate should do differently.")]
     Empty,
@@ -218,7 +218,7 @@ pub enum SteerRefused {
         /// Which consultation.
         run_id: RunId,
         /// How it stands.
-        state: Idle,
+        state: NotRunningReason,
     },
 
     /// The running turn was launched in a way that takes no input once it has started.
@@ -227,7 +227,7 @@ pub enum SteerRefused {
         /// Which consultation.
         run_id: RunId,
         /// Why its delegate offers no channel into a running turn.
-        reason: Unsteerable,
+        reason: UnsteerableReason,
     },
 
     /// The delegate CLI refused the message; it was not delivered.
@@ -282,16 +282,16 @@ pub enum SteerRefused {
 
 /// Why a consultation has no turn running to steer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Idle {
+pub enum NotRunningReason {
     /// No turn has been launched yet.
     NotLaunched,
     /// A cancellation is stopping the turn.
     Cancelling,
     /// The turn is over.
-    Ended(State),
+    Ended(TurnState),
 }
 
-impl std::fmt::Display for Idle {
+impl std::fmt::Display for NotRunningReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotLaunched => f.write_str("not yet launched"),
@@ -303,7 +303,7 @@ impl std::fmt::Display for Idle {
 
 /// Why a running turn takes no message: its delegate reads its question once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unsteerable {
+pub enum UnsteerableReason {
     /// A Claude delegate, which runs in print mode.
     ClaudePrint,
     /// An inheriting Codex delegate this agentmux launched with `codex exec`.
@@ -312,7 +312,7 @@ pub enum Unsteerable {
     CodexIsolated,
 }
 
-impl std::fmt::Display for Unsteerable {
+impl std::fmt::Display for UnsteerableReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::ClaudePrint => {

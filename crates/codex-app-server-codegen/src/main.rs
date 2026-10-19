@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use codex_app_server_codegen::{
-    Error, File, Inputs, Layout, generate, pinned_codex_version, upstream,
+    Error, GeneratorPaths, Inputs, OutputFile, generate, pinned_codex_version, upstream,
 };
 
 #[derive(Debug, Parser)]
@@ -39,11 +39,11 @@ enum Command {
 
 fn main() -> ExitCode {
     let options = Options::parse();
-    let layout = Layout::of_this_checkout();
+    let paths = GeneratorPaths::of_this_checkout();
     let outcome = match options.command {
-        Command::Generate { check } => regenerate(&layout, check),
-        Command::Refresh { check } => refresh(&layout, check),
-        Command::Pin => pinned_codex_version(&layout).map(|version| {
+        Command::Generate { check } => regenerate(&paths, check),
+        Command::Refresh { check } => refresh(&paths, check),
+        Command::Pin => pinned_codex_version(&paths).map(|version| {
             println!("{version}");
             true
         }),
@@ -67,10 +67,10 @@ fn main() -> ExitCode {
 /// Generate the sources and write them, or with `check`, report the ones that differ.
 ///
 /// Returns whether everything is current.
-fn regenerate(layout: &Layout, check: bool) -> Result<bool, Error> {
-    let files = generate(&Inputs::read(layout)?, layout)?;
+fn regenerate(paths: &GeneratorPaths, check: bool) -> Result<bool, Error> {
+    let files = generate(&Inputs::read(paths)?, paths)?;
     if !check {
-        files.iter().try_for_each(File::write)?;
+        files.iter().try_for_each(OutputFile::write)?;
         return Ok(true);
     }
     let mut current = true;
@@ -88,10 +88,10 @@ fn regenerate(layout: &Layout, check: bool) -> Result<bool, Error> {
 
 /// Export the vendored bundle from the pinned release and regenerate, or with `check`, report
 /// whether it is what that release exports.
-fn refresh(layout: &Layout, check: bool) -> Result<bool, Error> {
-    let pinned = pinned_codex_version(layout)?;
-    let exported = File {
-        path: layout.bundle(),
+fn refresh(paths: &GeneratorPaths, check: bool) -> Result<bool, Error> {
+    let pinned = pinned_codex_version(paths)?;
+    let exported = OutputFile {
+        path: paths.bundle(),
         contents: String::from_utf8_lossy(&upstream::export(&pinned)?).into_owned(),
     };
     if check {
@@ -105,5 +105,5 @@ fn refresh(layout: &Layout, check: bool) -> Result<bool, Error> {
         return Ok(current);
     }
     exported.write()?;
-    regenerate(layout, false)
+    regenerate(paths, false)
 }

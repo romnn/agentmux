@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 /// Returns the error of writing the contents, or of creating the file for a reason other than
 /// its existing.
 pub(crate) fn create_once(path: &Path, contents: &[u8]) -> std::io::Result<bool> {
-    let temp = temporary(path);
+    let temp = temporary_path(path);
     std::fs::write(&temp, contents)?;
     let placed = match std::fs::hard_link(&temp, path) {
         Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -70,7 +70,7 @@ pub(crate) fn create_once(path: &Path, contents: &[u8]) -> std::io::Result<bool>
 ///
 /// Returns the error of writing the contents or of renaming them into place.
 pub(crate) fn write_whole(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let temp = temporary(path);
+    let temp = temporary_path(path);
     let written = std::fs::write(&temp, contents).and_then(|()| std::fs::rename(&temp, path));
     if written.is_err() {
         std::fs::remove_file(&temp)
@@ -85,7 +85,7 @@ pub(crate) fn write_whole(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 /// A name beside `path` that nothing else uses: its file name with a unique `.tmp` suffix.
-fn temporary(path: &Path) -> PathBuf {
+fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
     path.with_file_name(name)

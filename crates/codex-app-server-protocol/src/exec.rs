@@ -33,7 +33,7 @@ use serde_json::Value;
 ///
 /// For what no reader takes from a line, or takes only when it can: an older reader skipped
 /// these without looking, so a value of the wrong type must not now fail the line around it.
-fn forgiving<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+fn deserialize_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned + Default,
@@ -80,7 +80,7 @@ pub struct ThreadStartedEvent {
     /// The thread's id.
     #[serde(
         default,
-        deserialize_with = "forgiving",
+        deserialize_with = "deserialize_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub thread_id: Option<String>,
@@ -104,7 +104,7 @@ pub struct TurnFailedEvent {
     /// What went wrong.
     #[serde(
         default,
-        deserialize_with = "forgiving",
+        deserialize_with = "deserialize_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub error: Option<ThreadErrorEvent>,
@@ -162,7 +162,7 @@ pub struct ThreadErrorEvent {
     /// The error, in codex's words.
     #[serde(
         default,
-        deserialize_with = "forgiving",
+        deserialize_with = "deserialize_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub message: Option<String>,
@@ -179,7 +179,7 @@ pub struct ThreadItem {
     /// as `null`.
     #[serde(
         default,
-        deserialize_with = "forgiving",
+        deserialize_with = "deserialize_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub id: Option<String>,
@@ -195,25 +195,25 @@ pub enum ThreadItemDetails {
     /// A message from the agent: the answer.
     AgentMessage(AgentMessageItem),
     /// A summary of the agent's reasoning.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     Reasoning(ReasoningItem),
     /// A command the agent ran.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     CommandExecution(CommandExecutionItem),
     /// Files the agent changed.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     FileChange(FileChangeItem),
     /// A call to an MCP tool.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     McpToolCall(McpToolCallItem),
     /// A call to a sub-agent tool.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     CollabToolCall(CollabToolCallItem),
     /// A web search.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     WebSearch(WebSearchItem),
     /// The agent's to-do list.
-    #[serde(deserialize_with = "forgiving")]
+    #[serde(deserialize_with = "deserialize_or_default")]
     TodoList(TodoListItem),
     /// A warning that does not end the turn.
     Error(ErrorItem),

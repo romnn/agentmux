@@ -62,7 +62,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         retention: Retention::UntilReleased,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     })?;
     let id = started.run_id.clone();
     eprintln!(
@@ -70,7 +70,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         started.transcript_path.display()
     );
     // The turn takes a steer once the driver has announced it.
-    until(&store, &id, "the turn never started", |status| {
+    wait_for_status(&store, &id, "the turn never started", |status| {
         status.steerable
     })
     .await?;
@@ -94,7 +94,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     // A follow-up resumes the same thread; its replies are read from below its question.
     // The driver saves the session on its way out, after the turn's last event, so a follow-up
     // waits for it to leave.
-    until(&store, &id, "the driver never left", |status| {
+    wait_for_status(&store, &id, "the driver never left", |status| {
         status.resumable
     })
     .await?;
@@ -112,7 +112,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     assert_that!(replies, contains_substring("LIVE_AGAIN"));
 
     // A long turn is cancelled over the protocol once it is running, and the store records it.
-    until(&store, &id, "the driver never left", |status| {
+    wait_for_status(&store, &id, "the driver never left", |status| {
         status.resumable
     })
     .await?;
@@ -120,15 +120,15 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         &id,
         "Run the shell command `sleep 120`, then reply with exactly LIVE_LATE.",
     )?;
-    until(&store, &id, "the turn never started", |status| {
+    wait_for_status(&store, &id, "the turn never started", |status| {
         status.steerable
     })
     .await?;
     // Time for the model to start the command, which the transcript does not show running.
     tokio::time::sleep(Duration::from_secs(10)).await;
-    let asked = Instant::now();
+    let cancel_started_at = Instant::now();
     let cancelled = store.cancel(&id).await?;
-    eprintln!("cancel took {:?}", asked.elapsed());
+    eprintln!("cancel took {:?}", cancel_started_at.elapsed());
     assert_that!(cancelled.outcome, eq(&Outcome::Cancelled));
     let page = store.page(&id, followed.transcript_bytes, usize::MAX)?;
     assert_that!(page.text, contains_substring("_Turn 3 cancelled."));
@@ -148,7 +148,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
 }
 
 /// Poll the consultation until `ready` holds of its status, failing with `what` after a minute.
-async fn until(
+async fn wait_for_status(
     store: &RunStore,
     id: &RunId,
     what: &str,

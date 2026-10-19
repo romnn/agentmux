@@ -19,7 +19,7 @@ impl RunStore {
     ///   nothing here may ever carry state, elapsed time or a message count;
     /// - each turn's body grows only at its end, which
     ///   [`crate::transcript::render_turn`] documents and enforces, and the fold behind it never
-    ///   reads past a turn's settlement, which [`settle`] documents and enforces.
+    ///   reads past a turn's settlement, which [`super::settle`] documents and enforces.
     ///
     /// Adding a mutable field to the header would silently invalidate every outstanding cursor.
     pub(super) fn render(meta: &Meta, state: &RunState) -> String {
@@ -54,7 +54,7 @@ impl LockedRun<'_> {
     /// something that folded more, such as an older agentmux that does not fold under the lock
     /// and is still serving while a newer one runs, and the render is append-only, so the
     /// prefix is simply older.
-    pub(super) fn publish(&self, text: &str) -> Result<(), RunError> {
+    pub(super) fn publish_transcript(&self, text: &str) -> Result<(), RunError> {
         let path = self.store.transcript_path(&self.run_id);
         // The published length is checked before the published text is read: a render that has
         // grown — every poll of a live consultation — never needs the old file read at all, and
@@ -67,7 +67,7 @@ impl LockedRun<'_> {
         {
             return Ok(());
         }
-        crate::once::write_whole(&path, text.as_bytes())
+        crate::atomic_file::write_whole(&path, text.as_bytes())
             .map_err(RunError::io("replacing the rendered transcript"))
     }
 }

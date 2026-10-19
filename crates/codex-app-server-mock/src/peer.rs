@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId, RpcError};
 use codex_app_server_protocol::{
-    Answered, ClientNotification, ClientRequest, DecodeError, Method, Payload, ServerNotification,
-    ServerRequest, Typed,
+    ClientNotification, ClientRequest, DecodeError, Method, RawParams, ServerNotification,
+    ServerRequest, TypedParams, TypedResponse,
 };
 use serde_json::Value;
 
@@ -24,36 +24,48 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
     /// The client sent nothing in time.
-    #[error("the client sent nothing within {waited:?}; it had sent {}", transcript(.received))]
+    #[error(
+        "the client sent nothing within {waited:?}; it had sent {}",
+        format_received_lines(.received_lines)
+    )]
     Timeout {
         /// How long the peer waited.
         waited: Duration,
         /// Everything the client sent.
-        received: Vec<String>,
+        received_lines: Vec<String>,
     },
     /// The client closed its output.
-    #[error("the client closed its output; it had sent {}", transcript(.received))]
+    #[error(
+        "the client closed its output; it had sent {}",
+        format_received_lines(.received_lines)
+    )]
     Closed {
         /// Everything the client sent.
-        received: Vec<String>,
+        received_lines: Vec<String>,
     },
     /// The client's output could not be read.
-    #[error("cannot read the client: {reason}; it had sent {}", transcript(.received))]
+    #[error(
+        "cannot read the client: {reason}; it had sent {}",
+        format_received_lines(.received_lines)
+    )]
     Read {
         /// What the read said.
         reason: String,
         /// Everything the client sent.
-        received: Vec<String>,
+        received_lines: Vec<String>,
     },
     /// The client sent something other than what the script expected next.
-    #[error("expected {expected}, but the client sent {got}; it had sent {}", transcript(.received))]
+    #[error(
+        "expected {expected}, but the client sent {actual_text}; it had sent {}",
+        format_received_lines(.received_lines)
+    )]
     Unexpected {
         /// What the script expected.
         expected: String,
         /// The line that arrived instead.
-        got: String,
+        actual_text: String,
         /// Everything the client sent.
-        received: Vec<String>,
+        received_lines: Vec<String>,
     },
     /// The client's payload does not match the type generated for it.
     #[error("the client's `{method}` does not match the protocol")]
@@ -81,30 +93,33 @@ pub enum PeerError {
 }
 
 /// Every line the client sent, as an error message lists them.
-fn transcript(received: &[String]) -> String {
-    if received.is_empty() {
+fn format_received_lines(received_lines: &[String]) -> String {
+    if received_lines.is_empty() {
         return "nothing".to_owned();
     }
-    let lines: Vec<String> = received.iter().map(|line| format!("\n  {line}")).collect();
+    let lines: Vec<String> = received_lines
+        .iter()
+        .map(|line| format!("\n  {line}"))
+        .collect();
     lines.concat()
 }
 
 /// A request the client sent, decoded into its method's parameters.
 #[derive(Debug)]
-pub struct Received<M: Typed> {
+pub struct ReceivedRequest<M: TypedParams> {
     /// The client's id for it, which its answer must carry.
     pub id: RequestId,
     /// Its parameters.
     pub params: M::Params,
 }
 
-impl<M: ClientRequest + Typed> Received<M> {
+impl<M: ClientRequest + TypedParams> ReceivedRequest<M> {
     /// Request `M`, from its id and its parameters as they arrived.
     ///
     /// # Errors
     ///
     /// Returns [`PeerError::Undecodable`] when the parameters do not match `M`'s.
-    pub fn decode(id: RequestId, params: Payload<'_, M>) -> Result<Self, PeerError> {
+    pub fn decode(id: RequestId, params: RawParams<'_, M>) -> Result<Self, PeerError> {
         let params = params.decode().map_err(|source| PeerError::Undecodable {
             method: M::METHOD.to_owned(),
             source,
@@ -113,16 +128,16 @@ impl<M: ClientRequest + Typed> Received<M> {
     }
 }
 
-/// A request the peer sent, whose answer [`Peer::expect_answer`] waits for.
+/// A request the peer sent, whose answer [`Peer::expect_response`] waits for.
 #[derive(Debug)]
-pub struct Sent<M: Method> {
+pub struct SentRequest<M: Method> {
     /// The peer's id for it.
     pub id: RequestId,
     method: PhantomData<M>,
 }
 
 /// What the reading thread hands over.
-enum Line {
+enum LineReadResult {
     Text(String),
     Closed,
     Failed(String),
@@ -130,10 +145,10 @@ enum Line {
 
 /// The reading thread, which reads one line each time it is asked to.
 struct Reader {
-    asks: Sender<()>,
-    lines: Receiver<Line>,
+    requests: Sender<()>,
+    results: Receiver<LineReadResult>,
     /// Whether a line has been asked for and has not arrived yet.
-    asked: bool,
+    request_pending: bool,
 }
 
 /// The server's end of a conversation over newline-delimited JSON-RPC, scripted step by step.
@@ -149,7 +164,7 @@ struct Reader {
 pub struct Peer {
     reader: Reader,
     to_client: Option<Box<dyn Write + Send>>,
-    received: Vec<String>,
+    received_lines: Vec<String>,
     timeout: Duration,
 }
 
@@ -162,31 +177,31 @@ impl Peer {
         from_client: impl BufRead + Send + 'static,
         to_client: impl Write + Send + 'static,
     ) -> Self {
-        let (asks, asked) = channel::<()>();
-        let (sender, lines) = channel();
+        let (read_requests_sender, read_requests_receiver) = channel::<()>();
+        let (read_results_sender, read_results_receiver) = channel();
         std::thread::spawn(move || {
             let mut from_client = from_client;
-            for () in asked {
+            for () in read_requests_receiver {
                 let mut line = String::new();
                 let read = match from_client.read_line(&mut line) {
-                    Ok(0) => Line::Closed,
-                    Ok(_) => Line::Text(line.trim_end_matches(['\n', '\r']).to_owned()),
-                    Err(err) => Line::Failed(err.to_string()),
+                    Ok(0) => LineReadResult::Closed,
+                    Ok(_) => LineReadResult::Text(line.trim_end_matches(['\n', '\r']).to_owned()),
+                    Err(err) => LineReadResult::Failed(err.to_string()),
                 };
-                let last = !matches!(read, Line::Text(_));
-                if sender.send(read).is_err() || last {
+                let last = !matches!(read, LineReadResult::Text(_));
+                if read_results_sender.send(read).is_err() || last {
                     return;
                 }
             }
         });
         Self {
             reader: Reader {
-                asks,
-                lines,
-                asked: false,
+                requests: read_requests_sender,
+                results: read_results_receiver,
+                request_pending: false,
             },
             to_client: Some(Box::new(to_client)),
-            received: Vec::new(),
+            received_lines: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -200,8 +215,8 @@ impl Peer {
 
     /// Every line the client has sent so far, in order.
     #[must_use]
-    pub fn received(&self) -> &[String] {
-        &self.received
+    pub fn received_lines(&self) -> &[String] {
+        &self.received_lines
     }
 
     /// The client's next message.
@@ -210,12 +225,12 @@ impl Peer {
     ///
     /// Returns [`PeerError::Timeout`] when none arrives in time, [`PeerError::Closed`] when the
     /// client closed its output, and [`PeerError::Unexpected`] for a line that is not JSON-RPC.
-    pub fn recv(&mut self) -> Result<Message, PeerError> {
-        match self.recv_within(self.timeout)? {
+    pub fn receive_message(&mut self) -> Result<Message, PeerError> {
+        match self.receive_message_within(self.timeout)? {
             Some(message) => Ok(message),
             None => Err(PeerError::Timeout {
                 waited: self.timeout,
-                received: self.received.clone(),
+                received_lines: self.received_lines.clone(),
             }),
         }
     }
@@ -230,29 +245,31 @@ impl Peer {
     ///
     /// Returns [`PeerError::Closed`] when the client closed its output, and
     /// [`PeerError::Unexpected`] for a line that is not JSON-RPC.
-    pub fn recv_within(&mut self, wait: Duration) -> Result<Option<Message>, PeerError> {
+    pub fn receive_message_within(&mut self, wait: Duration) -> Result<Option<Message>, PeerError> {
         let closed = || PeerError::Closed {
-            received: self.received.clone(),
+            received_lines: self.received_lines.clone(),
         };
-        if !self.reader.asked {
+        if !self.reader.request_pending {
             // The reading thread has gone once the client closed its output.
-            self.reader.asks.send(()).map_err(|_| closed())?;
-            self.reader.asked = true;
+            self.reader.requests.send(()).map_err(|_| closed())?;
+            self.reader.request_pending = true;
         }
-        let line = match self.reader.lines.recv_timeout(wait) {
-            Ok(Line::Text(line)) => line,
+        let line = match self.reader.results.recv_timeout(wait) {
+            Ok(LineReadResult::Text(line)) => line,
             // Still asked for: the line is read when it comes, and taken by the next wait.
             Err(RecvTimeoutError::Timeout) => return Ok(None),
-            Ok(Line::Closed) | Err(RecvTimeoutError::Disconnected) => return Err(closed()),
-            Ok(Line::Failed(reason)) => {
+            Ok(LineReadResult::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                return Err(closed());
+            }
+            Ok(LineReadResult::Failed(reason)) => {
                 return Err(PeerError::Read {
                     reason,
-                    received: self.received.clone(),
+                    received_lines: self.received_lines.clone(),
                 });
             }
         };
-        self.reader.asked = false;
-        self.received.push(line.clone());
+        self.reader.request_pending = false;
+        self.received_lines.push(line.clone());
         match Message::parse(&line) {
             Ok(message) => Ok(Some(message)),
             Err(_) => Err(self.unexpected("a JSON-RPC message", line)),
@@ -266,7 +283,7 @@ impl Peer {
     /// Returns [`PeerError::Unexpected`] when it sends anything first, and
     /// [`PeerError::Timeout`] when it does neither in time.
     pub fn expect_closed(&mut self) -> Result<(), PeerError> {
-        match self.recv() {
+        match self.receive_message() {
             Err(PeerError::Closed { .. }) => Ok(()),
             Ok(message) => Err(self.unexpected("the client to close its output", message)),
             Err(err) => Err(err),
@@ -279,9 +296,9 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Timeout`] when the client neither sends nor closes in time.
-    pub fn wait_until_closed(&mut self) -> Result<(), PeerError> {
+    pub fn drain_until_closed(&mut self) -> Result<(), PeerError> {
         loop {
-            match self.recv() {
+            match self.receive_message() {
                 Ok(_) | Err(PeerError::Unexpected { .. }) => {}
                 Err(PeerError::Closed { .. }) => return Ok(()),
                 Err(err) => return Err(err),
@@ -294,11 +311,13 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
-    /// its parameters do not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect<M: ClientRequest + Typed>(&mut self) -> Result<Received<M>, PeerError> {
-        match self.recv()? {
+    /// its parameters do not match `M`'s, and the errors of [`Peer::receive_message`].
+    pub fn expect_request<M: ClientRequest + TypedParams>(
+        &mut self,
+    ) -> Result<ReceivedRequest<M>, PeerError> {
+        match self.receive_message()? {
             Message::Request { id, method, params } if method == M::METHOD => {
-                Received::decode(id, Payload::new(&params))
+                ReceivedRequest::decode(id, RawParams::new(&params))
             }
             other => Err(self.unexpected(&format!("a `{}` request", M::METHOD), other)),
         }
@@ -309,13 +328,13 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
-    /// its parameters do not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect_notification<M: ClientNotification + Typed>(
+    /// its parameters do not match `M`'s, and the errors of [`Peer::receive_message`].
+    pub fn expect_notification<M: ClientNotification + TypedParams>(
         &mut self,
     ) -> Result<M::Params, PeerError> {
-        match self.recv()? {
+        match self.receive_message()? {
             Message::Notification { method, params } if method == M::METHOD => {
-                <M as Typed>::params(&params)
+                <M as TypedParams>::decode_params(&params)
                     .map_err(|source| PeerError::Undecodable { method, source })
             }
             other => Err(self.unexpected(&format!("a `{}` notification", M::METHOD), other)),
@@ -328,18 +347,20 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, [`PeerError::Undecodable`] when
-    /// the result does not match `M`'s, and the errors of [`Peer::recv`].
-    pub fn expect_answer<M: ServerRequest + Answered>(
+    /// the result does not match `M`'s, and the errors of [`Peer::receive_message`].
+    pub fn expect_response<M: ServerRequest + TypedResponse>(
         &mut self,
-        request: &Sent<M>,
+        request: &SentRequest<M>,
     ) -> Result<Result<M::Response, RpcError>, PeerError> {
-        match self.expect_raw_answer(&request.id)? {
-            Ok(result) => M::response(&result)
-                .map(Ok)
-                .map_err(|source| PeerError::Undecodable {
-                    method: M::METHOD.to_owned(),
-                    source,
-                }),
+        match self.expect_raw_response(&request.id)? {
+            Ok(result) => {
+                M::decode_response(&result)
+                    .map(Ok)
+                    .map_err(|source| PeerError::Undecodable {
+                        method: M::METHOD.to_owned(),
+                        source,
+                    })
+            }
             Err(error) => Ok(Err(error)),
         }
     }
@@ -349,16 +370,16 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Unexpected`] for any other message, and the errors of
-    /// [`Peer::recv`].
-    pub fn expect_raw_answer(
+    /// [`Peer::receive_message`].
+    pub fn expect_raw_response(
         &mut self,
         id: &RequestId,
     ) -> Result<Result<Value, RpcError>, PeerError> {
-        match self.recv()? {
+        match self.receive_message()? {
             Message::Response {
-                id: answered,
+                id: response_id,
                 outcome,
-            } if answered == *id => Ok(outcome),
+            } if response_id == *id => Ok(outcome),
             other => Err(self.unexpected(&format!("the answer to request {id}"), other)),
         }
     }
@@ -368,12 +389,15 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the answer cannot be encoded or written.
-    pub fn reply<M: ClientRequest + Answered>(
+    pub fn reply<M: ClientRequest + TypedResponse>(
         &mut self,
-        request: &Received<M>,
+        request: &ReceivedRequest<M>,
         response: &M::Response,
     ) -> Result<(), PeerError> {
-        self.send(&Message::result::<M>(request.id.clone(), response)?)
+        self.send(&Message::success_response::<M>(
+            request.id.clone(),
+            response,
+        )?)
     }
 
     /// Refuse the client's request with a JSON-RPC error.
@@ -381,13 +405,13 @@ impl Peer {
     /// # Errors
     ///
     /// Returns [`PeerError::Write`] when the client cannot be written to.
-    pub fn refuse<M: ClientRequest + Typed>(
+    pub fn refuse<M: ClientRequest + TypedParams>(
         &mut self,
-        request: &Received<M>,
+        request: &ReceivedRequest<M>,
         code: i64,
         message: &str,
     ) -> Result<(), PeerError> {
-        self.send(&Message::error(request.id.clone(), code, message))
+        self.send(&Message::error_response(request.id.clone(), code, message))
     }
 
     /// Send notification `M`.
@@ -395,7 +419,7 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the notification cannot be encoded or written.
-    pub fn notify<M: ServerNotification + Typed>(
+    pub fn notify<M: ServerNotification + TypedParams>(
         &mut self,
         params: &M::Params,
     ) -> Result<(), PeerError> {
@@ -407,13 +431,13 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when the request cannot be encoded or written.
-    pub fn request<M: ServerRequest + Typed>(
+    pub fn request<M: ServerRequest + TypedParams>(
         &mut self,
         id: RequestId,
         params: &M::Params,
-    ) -> Result<Sent<M>, PeerError> {
+    ) -> Result<SentRequest<M>, PeerError> {
         self.send_conforming(&Message::request::<M>(id.clone(), params)?)?;
-        Ok(Sent {
+        Ok(SentRequest {
             id,
             method: PhantomData,
         })
@@ -468,35 +492,35 @@ impl Peer {
     }
 
     /// Close the peer's output, as a server that exits does; the client reads the end of it.
-    pub fn close(&mut self) {
+    pub fn close_output(&mut self) {
         self.to_client = None;
     }
 
-    fn unexpected(&self, expected: &str, got: impl Into<Got>) -> PeerError {
+    fn unexpected(&self, expected: &str, actual: impl Into<ReceivedText>) -> PeerError {
         PeerError::Unexpected {
             expected: expected.to_owned(),
-            got: got.into().into_inner(),
-            received: self.received.clone(),
+            actual_text: actual.into().into_inner(),
+            received_lines: self.received_lines.clone(),
         }
     }
 }
 
 /// What arrived instead of what a script expected, as an error message names it.
-struct Got(String);
+struct ReceivedText(String);
 
-impl Got {
+impl ReceivedText {
     fn into_inner(self) -> String {
         self.0
     }
 }
 
-impl From<Message> for Got {
+impl From<Message> for ReceivedText {
     fn from(message: Message) -> Self {
         Self(message.to_line())
     }
 }
 
-impl From<String> for Got {
+impl From<String> for ReceivedText {
     fn from(line: String) -> Self {
         Self(line)
     }
@@ -508,7 +532,7 @@ mod tests {
     use std::time::Duration;
 
     use codex_app_server_protocol::envelope::{Message, RequestId};
-    use codex_app_server_protocol::methods as m;
+    use codex_app_server_protocol::methods;
     use googletest::prelude::*;
 
     use super::{Peer, PeerError};
@@ -516,20 +540,20 @@ mod tests {
 
     struct Connection {
         peer: Peer,
-        client: std::io::PipeWriter,
-        answers: BufReader<std::io::PipeReader>,
+        client_writer: std::io::PipeWriter,
+        client_reader: BufReader<std::io::PipeReader>,
     }
 
     /// A peer wired to pipes, with the client's ends.
-    fn peer() -> Result<Connection> {
+    fn test_connection() -> Result<Connection> {
         let (from_client, to_peer) = std::io::pipe().or_fail()?;
         let (from_peer, to_client) = std::io::pipe().or_fail()?;
         let peer =
             Peer::new(BufReader::new(from_client), to_client).with_timeout(Duration::from_secs(5));
         Ok(Connection {
             peer,
-            client: to_peer,
-            answers: BufReader::new(from_peer),
+            client_writer: to_peer,
+            client_reader: BufReader::new(from_peer),
         })
     }
 
@@ -538,22 +562,22 @@ mod tests {
     fn a_request_is_received_typed_and_answered_under_its_id() -> Result<()> {
         let Connection {
             mut peer,
-            mut client,
-            mut answers,
-        } = peer()?;
+            mut client_writer,
+            mut client_reader,
+        } = test_connection()?;
         let params = fixtures::turn_interrupt_params("th", "tu");
-        let line = Message::request::<m::TurnInterrupt>(RequestId::Integer(4), &params)
+        let line = Message::request::<methods::TurnInterrupt>(RequestId::Integer(4), &params)
             .or_fail()?
             .to_line();
-        writeln!(client, "{line}").or_fail()?;
+        writeln!(client_writer, "{line}").or_fail()?;
 
-        let received = peer.expect::<m::TurnInterrupt>().or_fail()?;
+        let received = peer.expect_request::<methods::TurnInterrupt>().or_fail()?;
         assert_that!(received.params, eq(&params));
         peer.reply(&received, &fixtures::turn_interrupt_response())
             .or_fail()?;
 
         let mut answer = String::new();
-        answers.read_line(&mut answer).or_fail()?;
+        client_reader.read_line(&mut answer).or_fail()?;
         assert_that!(
             Message::parse(&answer),
             ok(matches_pattern!(Message::Response {
@@ -569,17 +593,24 @@ mod tests {
     fn an_unexpected_message_names_what_arrived() -> Result<()> {
         let Connection {
             mut peer,
-            mut client,
-            answers: _answers,
-        } = peer()?;
-        writeln!(client, r#"{{"id":1,"method":"turn/steer","params":{{}}}}"#).or_fail()?;
+            mut client_writer,
+            client_reader: _client_reader,
+        } = test_connection()?;
+        writeln!(
+            client_writer,
+            r#"{{"id":1,"method":"turn/steer","params":{{}}}}"#
+        )
+        .or_fail()?;
 
-        let refused = peer.expect::<m::TurnStart>().err().or_fail()?;
+        let unexpected_message_error = peer
+            .expect_request::<methods::TurnStart>()
+            .err()
+            .or_fail()?;
         assert_that!(
-            refused,
+            unexpected_message_error,
             matches_pattern!(PeerError::Unexpected {
                 expected: contains_substring("turn/start"),
-                got: contains_substring("turn/steer"),
+                actual_text: contains_substring("turn/steer"),
                 ..
             })
         );
@@ -592,11 +623,14 @@ mod tests {
     fn a_read_that_fails_is_not_the_end() -> Result<()> {
         let Connection {
             mut peer,
-            mut client,
-            answers: _answers,
-        } = peer()?;
-        client.write_all(b"\xff\xfe not text\n").or_fail()?;
-        assert_that!(peer.recv(), err(matches_pattern!(PeerError::Read { .. })));
+            mut client_writer,
+            client_reader: _client_reader,
+        } = test_connection()?;
+        client_writer.write_all(b"\xff\xfe not text\n").or_fail()?;
+        assert_that!(
+            peer.receive_message(),
+            err(matches_pattern!(PeerError::Read { .. }))
+        );
         Ok(())
     }
 
@@ -606,16 +640,17 @@ mod tests {
     fn a_line_after_an_empty_wait_is_the_next_message() -> Result<()> {
         let Connection {
             mut peer,
-            mut client,
-            answers: _answers,
-        } = peer()?;
+            mut client_writer,
+            client_reader: _client_reader,
+        } = test_connection()?;
         assert_that!(
-            peer.recv_within(Duration::from_millis(50)).or_fail()?,
+            peer.receive_message_within(Duration::from_millis(50))
+                .or_fail()?,
             none()
         );
-        writeln!(client, r#"{{"method":"initialized"}}"#).or_fail()?;
+        writeln!(client_writer, r#"{{"method":"initialized"}}"#).or_fail()?;
         assert_that!(
-            peer.recv().or_fail()?,
+            peer.receive_message().or_fail()?,
             matches_pattern!(Message::Notification {
                 method: eq("initialized"),
                 ..
@@ -629,10 +664,10 @@ mod tests {
     fn a_client_that_closes_is_seen_to() -> Result<()> {
         let Connection {
             mut peer,
-            client,
-            answers: _answers,
-        } = peer()?;
-        drop(client);
+            client_writer,
+            client_reader: _client_reader,
+        } = test_connection()?;
+        drop(client_writer);
         assert_that!(peer.expect_closed(), ok(anything()));
         Ok(())
     }

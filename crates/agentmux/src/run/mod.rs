@@ -52,7 +52,7 @@
 //! Several agentmux processes may address one consultation — an MCP server and a terminal, or a
 //! server restarted underneath a `tail` — and every change to a run's shape is a check followed
 //! by a write that another process could act between.
-//! So each runs while a [`lock::LockedRun`] holds the run's advisory lock, either as one of its
+//! So each runs while a `LockedRun` holds the run's advisory lock, either as one of its
 //! methods or inside a store method that holds one; the module says which are which.
 
 mod cancel;
@@ -82,7 +82,7 @@ use layout::create_private_dir;
 use records::{ExitRecord, LaunchRecord, TurnFiles, read_json, tail_of_file};
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, page_of};
 
-pub use error::{Idle, NotResumable, RunError, SteerRefused, Unsteerable};
+pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
 pub use records::{LaunchMode, Meta};
 pub use retention::Retention;
@@ -268,7 +268,7 @@ impl RunStore {
     /// write beside the process still saving it.
     /// A child whose identity cannot be checked has not gone: it may be the delegate still
     /// saving, and the uncertainty clears once nothing holds its pid.
-    fn departed(&self, files: &TurnFiles) -> bool {
+    fn delegate_has_exited(&self, files: &TurnFiles) -> bool {
         match (&files.exit, &files.launch) {
             (Some(ExitRecord::Exited { .. }), _) | (_, None) => true,
             (_, Some(record)) => {
@@ -308,7 +308,8 @@ impl RunStore {
 
     /// One page of the rendered transcript, from the same single fold as [`RunStore::view`].
     ///
-    /// Most callers want only the page, and each would otherwise discard the state half of the pair.
+    /// Most callers want only the page, and each would otherwise discard the state half of the
+    /// pair.
     ///
     /// # Errors
     ///
@@ -334,10 +335,10 @@ impl RunStore {
             let run = self.lock(run_id)?;
             let state = run.fold_run(&meta)?;
             let full = Self::render(&meta, &state);
-            run.publish(&full)?;
+            run.publish_transcript(&full)?;
             (state, full)
         };
-        self.read_rollouts(&meta, &mut state);
+        self.resolve_rate_limit_lookups(&meta, &mut state);
 
         // A run with no turn yet describes where its first one will be.
         let turn = self.turn_dir(
@@ -353,7 +354,7 @@ impl RunStore {
                 if state
                     .newest
                     .as_ref()
-                    .is_none_or(|newest| newest.settled_by != Some(SettledBy::Record)) =>
+                    .is_none_or(|newest| newest.settled_by != Some(SettledBy::ExitRecord)) =>
             {
                 tail_of_file(&turn.stderr(), STATUS_STDERR_TAIL)
                     .ok()
@@ -397,11 +398,11 @@ impl RunStore {
                 .turns
                 .iter()
                 .any(|turn| turn.broke_continuity),
-            undecoded_messages: state
+            has_undecoded_app_server_messages: state
                 .transcript
                 .turns
                 .iter()
-                .any(|turn| turn.undecoded_messages),
+                .any(|turn| turn.has_undecoded_app_server_messages),
             transcript_path: self.transcript_path(run_id),
             events_path: turn.events(),
             stderr_path: turn.stderr(),
@@ -410,7 +411,7 @@ impl RunStore {
             // this into a recommendation and a caller that takes it pays for the turn.
             resumable: Self::resumable_session(run_id, &state).is_ok(),
             steerable: state.newest.as_ref().is_some_and(|newest| {
-                Self::accepts_steers(&outcome, newest.mode, newest.turn_started, &turn)
+                Self::accepts_steers(&outcome, newest.launch_mode, newest.turn_started, &turn)
             }),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             outcome,
@@ -450,7 +451,7 @@ impl RunStore {
                 // folded.
                 let newest = self
                     .lock(&meta.run_id)
-                    .and_then(|run| run.newest_turn(&meta))
+                    .and_then(|run| run.fold_newest_turn(&meta))
                     .ok()?;
                 let outcome = newest
                     .as_ref()
@@ -535,7 +536,7 @@ impl RunStore {
         // A run with no turn at all has nothing to wait for.
         while self
             .lock(run_id)?
-            .newest_turn(&meta)?
+            .fold_newest_turn(&meta)?
             .is_some_and(|turn| !turn.outcome.is_terminal())
         {
             let now = tokio::time::Instant::now();
@@ -580,8 +581,8 @@ pub(super) struct RunState {
     /// What the fold established about the newest turn, or `None` for a run with no turn.
     pub(super) newest: Option<NewestTurn>,
     pub(super) last_activity: Option<SystemTime>,
-    /// The usage windows the fold left to [`RunStore::read_rollouts`].
-    rollouts: Vec<settle::RolloutSearch>,
+    /// The usage windows the fold left to [`RunStore::resolve_rate_limit_lookups`].
+    pending_rate_limit_lookups: Vec<settle::RateLimitLookup>,
 }
 
 /// What the fold established about a run's newest turn, which is the one `status` describes, a
@@ -593,20 +594,21 @@ pub(super) struct NewestTurn {
     /// What decided its outcome, once something has.
     pub(super) settled_by: Option<SettledBy>,
     /// How its delegate was launched.
-    pub(super) mode: LaunchMode,
+    pub(super) launch_mode: LaunchMode,
     /// Whether its capture says the turn itself began.
     pub(super) turn_started: bool,
-    /// Whether its delegate has gone, which a follow-up waits for: see [`RunStore::departed`].
-    pub(super) departed: bool,
+    /// Whether its delegate has gone, which a follow-up waits for: see
+    /// [`RunStore::delegate_has_exited`].
+    pub(super) delegate_has_exited: bool,
 }
 
 /// What decided a turn's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettledBy {
     /// A terminal event in its stream.
-    Stream,
+    TerminalEvent,
     /// Its exit record, because the stream carried no terminal event.
-    Record,
+    ExitRecord,
 }
 
 impl RunState {

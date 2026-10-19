@@ -79,7 +79,7 @@ fn host_session_env() -> BTreeMap<String, String> {
         ("TERM", "xterm-256color"),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
     .collect()
 }
 
@@ -1142,14 +1142,14 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
 }
 
 /// Build against `config` with a request environment, as a caller's `env` would arrive.
-fn build_requesting(
+fn build_invocation_with_request_env(
     delegate: &Delegate,
     config: &Config,
     requested: &[(&str, &str)],
 ) -> std::result::Result<Invocation, DelegateError> {
     let requested: BTreeMap<String, String> = requested
         .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     let plan = TurnPlan {
         question_path: Path::new("/runs/r/turns/0000/question.md"),
@@ -1162,20 +1162,19 @@ fn build_requesting(
 }
 
 /// A configuration with one account per vendor, `named`, as `account` describes it.
-fn config_with_account(named: &str, account: &Account) -> Result<Config> {
+fn config_with_account(account_alias: &str, account: &Account) -> Result<Config> {
     let mut config = Config::default();
     for vendor in [Vendor::Claude, Vendor::Codex] {
-        config
-            .accounts
-            .entry(vendor)
-            .or_default()
-            .insert(AccountAlias::parse(named).or_fail()?, account.clone());
+        config.accounts.entry(vendor).or_default().insert(
+            AccountAlias::parse(account_alias).or_fail()?,
+            account.clone(),
+        );
     }
     Ok(config)
 }
 
 /// A delegate of either vendor on the named account.
-fn on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
+fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
     let account = AccountChoice::Named(AccountAlias::parse(alias).or_fail()?);
     Ok(match vendor {
         Vendor::Claude => Delegate::Claude {
@@ -1222,15 +1221,15 @@ fn a_subscription_delegate_carries_no_billing_variable_from_any_layer() -> Resul
     );
 
     let mut delegates = every_delegate()?;
-    delegates.push(on_account(Vendor::Claude, "personal")?);
-    delegates.push(on_account(Vendor::Codex, "personal")?);
+    delegates.push(delegate_on_account(Vendor::Claude, "personal")?);
+    delegates.push(delegate_on_account(Vendor::Codex, "personal")?);
     for delegate in delegates {
         let invocation = build_with(&delegate, None, &config)?;
         let label = delegate.summary();
         let leaked: Vec<&String> = invocation
             .env()
             .keys()
-            .filter(|name| agentmux::delegate::is_billing_name(name))
+            .filter(|name| agentmux::delegate::is_billing_env_name(name))
             .collect();
         assert_that!(leaked, is_empty(), "{label} carries a billing variable");
         assert_that!(invocation.billing(), eq(Billing::Subscription), "{label}");
@@ -1255,7 +1254,7 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "CODEX_ACCESS_TOKEN",
     ] {
         expect_that!(
-            agentmux::delegate::is_billing_name(name),
+            agentmux::delegate::is_billing_env_name(name),
             eq(true),
             "{name} is not a billing name"
         );
@@ -1269,7 +1268,7 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "HTTPS_PROXY",
     ] {
         expect_that!(
-            agentmux::delegate::is_billing_name(name),
+            agentmux::delegate::is_billing_env_name(name),
             eq(false),
             "{name} is a billing name"
         );
@@ -1310,7 +1309,8 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
             "claude" => every_delegate()?.swap_remove(0),
             _ => every_delegate()?.swap_remove(2),
         };
-        let refused = build_requesting(&delegate, &config, &[(name, "sk-smuggled")]);
+        let refused =
+            build_invocation_with_request_env(&delegate, &config, &[(name, "sk-smuggled")]);
         assert_that!(
             refused.map(|_| ()),
             err(displays_as(contains_substring("API pricing"))),
@@ -1334,14 +1334,17 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         extra_env: &requested,
         billing: None,
     };
-    let opted_in = on_account(Vendor::Codex, "metered")?
+    let api_invocation = delegate_on_account(Vendor::Codex, "metered")?
         .invocation(&plan, &host, &config)
         .or_fail()?;
     assert_that!(
-        opted_in.env().get("OPENAI_BASE_URL").map(String::as_str),
+        api_invocation
+            .env()
+            .get("OPENAI_BASE_URL")
+            .map(String::as_str),
         some(eq("http://localhost:8080/v1"))
     );
-    assert_that!(opted_in.billing(), eq(Billing::Api));
+    assert_that!(api_invocation.billing(), eq(Billing::Api));
     Ok(())
 }
 
@@ -1368,13 +1371,19 @@ fn an_account_that_names_a_key_must_opt_into_api_pricing() -> Result<()> {
         ),
     ] {
         let config = config_with_account("ci", &account)?;
-        let refused = build_requesting(&on_account(Vendor::Codex, "ci")?, &config, &[]);
+        let refused = build_invocation_with_request_env(
+            &delegate_on_account(Vendor::Codex, "ci")?,
+            &config,
+            &[],
+        );
         assert_that!(
             refused,
-            err(matches_pattern!(DelegateError::ApiBillingNotAllowed {
-                field: eq(&field),
-                ..
-            }))
+            err(matches_pattern!(
+                DelegateError::ApiOnlyFieldOnSubscription {
+                    field: eq(&field),
+                    ..
+                }
+            ))
         );
     }
     Ok(())
@@ -1404,8 +1413,10 @@ fn a_checkout_cannot_switch_on_api_pricing() -> Result<()> {
 
     let delegate = every_delegate()?.swap_remove(2);
     assert_that!(
-        build_requesting(&delegate, &config, &[]),
-        err(matches_pattern!(DelegateError::ApiBillingNotAllowed { .. }))
+        build_invocation_with_request_env(&delegate, &config, &[]),
+        err(matches_pattern!(
+            DelegateError::ApiOnlyFieldOnSubscription { .. }
+        ))
     );
     Ok(())
 }
@@ -1444,7 +1455,7 @@ fn only_an_inheriting_codex_delegate_runs_over_the_app_server() -> Result<()> {
 
 /// Build one turn's invocation of `delegate`, with `billing` as the pricing the consultation asks
 /// for.
-fn build_billed(
+fn build_invocation_with_billing(
     delegate: &Delegate,
     config: &Config,
     billing: Option<Billing>,
@@ -1465,8 +1476,8 @@ fn build_billed(
 #[gtest]
 fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    let codex = on_account(Vendor::Codex, "personal")?;
-    let allows_api = config_with_account(
+    let codex = delegate_on_account(Vendor::Codex, "personal")?;
+    let api_enabled_config = config_with_account(
         "personal",
         &Account {
             config_dir: Some(home.path().to_path_buf()),
@@ -1474,7 +1485,7 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
             ..Account::default()
         },
     )?;
-    let subscription_only = config_with_account(
+    let subscription_config = config_with_account(
         "personal",
         &Account {
             config_dir: Some(home.path().to_path_buf()),
@@ -1484,25 +1495,29 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
 
     // The account's opt-in decides when nothing is asked, and a caller may ask for less.
     assert_that!(
-        build_billed(&codex, &allows_api, None).map(|i| i.billing()),
+        build_invocation_with_billing(&codex, &api_enabled_config, None)
+            .map(|invocation| invocation.billing()),
         ok(eq(&Billing::Api))
     );
     assert_that!(
-        build_billed(&codex, &allows_api, Some(Billing::Subscription)).map(|i| i.billing()),
+        build_invocation_with_billing(&codex, &api_enabled_config, Some(Billing::Subscription))
+            .map(|invocation| invocation.billing()),
         ok(eq(&Billing::Subscription))
     );
     // Asking for more than the account allows, or with no account at all, is refused.
     assert_that!(
-        build_billed(&codex, &subscription_only, Some(Billing::Api)),
-        err(matches_pattern!(DelegateError::ApiBillingNotOptedIn { .. }))
+        build_invocation_with_billing(&codex, &subscription_config, Some(Billing::Api)),
+        err(matches_pattern!(
+            DelegateError::ApiBillingNotPermitted { .. }
+        ))
     );
     let unnamed = every_delegate()?.swap_remove(2);
     assert_that!(
-        build_billed(&unnamed, &Config::default(), Some(Billing::Api)),
+        build_invocation_with_billing(&unnamed, &Config::default(), Some(Billing::Api)),
         err(displays_as(contains_substring("no codex account is named")))
     );
     // An account that authenticates only with a key cannot serve a subscription.
-    let keyed = config_with_account(
+    let api_key_config = config_with_account(
         "personal",
         &Account {
             api_key: Some(Secret::new("sk-account".to_owned())),
@@ -1511,7 +1526,7 @@ fn a_requested_pricing_is_honoured_only_within_the_accounts_opt_in() -> Result<(
         },
     )?;
     assert_that!(
-        build_billed(&codex, &keyed, Some(Billing::Subscription)),
+        build_invocation_with_billing(&codex, &api_key_config, Some(Billing::Subscription)),
         err(displays_as(contains_substring(
             "asked for subscription pricing"
         )))

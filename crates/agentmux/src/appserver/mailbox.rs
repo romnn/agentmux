@@ -14,7 +14,7 @@
 //! accepted, rejected, or, when it was sent and the server never said, unconfirmed.
 //! Stems sort by the time they were submitted, so the driver sends them in that order.
 //!
-//! The decision is created with [`crate::once::create_once`], which says why a rename could not
+//! The decision is created with `atomic_file::create_once`, which says why a rename could not
 //! arbitrate it.
 
 use std::path::PathBuf;
@@ -31,15 +31,15 @@ pub struct Mailbox {
     dir: PathBuf,
 }
 
-/// One submitted message, as its sender tracks it.
+/// The id of one submitted message, by which its sender tracks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Letter {
+pub struct SteerId {
     stem: String,
 }
 
 /// One message the driver has claimed and must answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Claim {
+pub struct ClaimedSteer {
     stem: String,
     /// The instruction to deliver.
     pub text: String,
@@ -48,7 +48,7 @@ pub struct Claim {
 /// What the driver says about a message it claimed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum Reply {
+pub enum SteerReply {
     /// The server accepted it into the running turn.
     Accepted,
     /// The server, or the driver, refused it; it was not delivered.
@@ -86,8 +86,8 @@ impl Mailbox {
         Self { dir: dir.into() }
     }
 
-    fn path(&self, stem: &str, state: &str) -> PathBuf {
-        self.dir.join(format!("{stem}.{state}"))
+    fn path(&self, stem: &str, file_suffix: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.{file_suffix}"))
     }
 
     /// Submit an instruction.
@@ -95,30 +95,33 @@ impl Mailbox {
     /// # Errors
     ///
     /// Returns an error when the mailbox cannot be created or written.
-    pub fn submit(&self, text: &str) -> std::io::Result<Letter> {
+    pub fn submit(&self, text: &str) -> std::io::Result<SteerId> {
         std::fs::create_dir_all(&self.dir)?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let tail = uuid::Uuid::new_v4().simple().to_string();
-        let stem = format!("{nanos:024}-{}", tail.get(..8).unwrap_or("00000000"));
+        let unique_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stem = format!(
+            "{nanos:024}-{}",
+            unique_suffix.get(..8).unwrap_or("00000000")
+        );
         let body = serde_json::to_string(&Request {
             text: text.to_owned(),
         })
         .map_err(std::io::Error::other)?;
         // Only its sender writes a request, and only the driver a reply, so neither rename has
         // anything to arbitrate.
-        crate::once::write_whole(&self.path(&stem, REQUEST), body.as_bytes())?;
-        Ok(Letter { stem })
+        crate::atomic_file::write_whole(&self.path(&stem, REQUEST), body.as_bytes())?;
+        Ok(SteerId { stem })
     }
 
-    /// Whether the driver has taken this letter.
+    /// Whether the driver has taken this steer.
     ///
     /// A decision that cannot be read counts as not claimed: it is created whole, so only a
     /// mailbox damaged from outside has one.
     #[must_use]
-    pub fn is_claimed(&self, letter: &Letter) -> bool {
-        self.decision(&letter.stem) == Some(Decision::Claimed)
+    pub fn is_claimed(&self, steer_id: &SteerId) -> bool {
+        self.decision(&steer_id.stem) == Some(Decision::Claimed)
     }
 
     fn decision(&self, stem: &str) -> Option<Decision> {
@@ -131,16 +134,16 @@ impl Mailbox {
     /// Returns `false` when it was already made, by anyone.
     fn decide(&self, stem: &str, decision: Decision) -> std::io::Result<bool> {
         let body = serde_json::to_string(&decision).map_err(std::io::Error::other)?;
-        crate::once::create_once(&self.path(stem, DECISION), body.as_bytes())
+        crate::atomic_file::create_once(&self.path(stem, DECISION), body.as_bytes())
     }
 
-    /// The driver's reply to a letter, once there is one.
+    /// The driver's reply to a steer, once there is one.
     ///
     /// # Errors
     ///
     /// Returns an error when a reply exists but cannot be read.
-    pub fn reply(&self, letter: &Letter) -> std::io::Result<Option<Reply>> {
-        match std::fs::read_to_string(self.path(&letter.stem, REPLY)) {
+    pub fn reply(&self, steer_id: &SteerId) -> std::io::Result<Option<SteerReply>> {
+        match std::fs::read_to_string(self.path(&steer_id.stem, REPLY)) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
                 .map_err(std::io::Error::other),
@@ -149,15 +152,15 @@ impl Mailbox {
         }
     }
 
-    /// Take a letter back before the driver claims it.
+    /// Take a steer back before the driver claims it.
     ///
     /// Returns `false` when the driver claimed it first, in which case it will be answered.
     ///
     /// # Errors
     ///
     /// Returns an error when the decision cannot be written.
-    pub fn withdraw(&self, letter: &Letter) -> std::io::Result<bool> {
-        self.decide(&letter.stem, Decision::Withdrawn)
+    pub fn withdraw(&self, steer_id: &SteerId) -> std::io::Result<bool> {
+        self.decide(&steer_id.stem, Decision::Withdrawn)
     }
 
     /// Claim every waiting request, oldest first.
@@ -165,7 +168,7 @@ impl Mailbox {
     /// A request that cannot be read after it was claimed is answered as rejected on the spot,
     /// so its sender is not left waiting on a message nobody will send.
     #[must_use]
-    pub fn claim_all(&self) -> Vec<Claim> {
+    pub fn claim_all(&self) -> Vec<ClaimedSteer> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -203,17 +206,17 @@ impl Mailbox {
                     serde_json::from_str::<Request>(&text).map_err(|error| error.to_string())
                 });
             match request {
-                Ok(request) => claims.push(Claim {
+                Ok(request) => claims.push(ClaimedSteer {
                     stem,
                     text: request.text,
                 }),
                 // Its sender waits for a reply until it gives up on the driver, so one that
                 // cannot be written leaves it waiting that long, and says why here.
                 Err(reason) => {
-                    let rejected = Reply::Rejected {
+                    let rejected = SteerReply::Rejected {
                         reason: format!("the request could not be read: {reason}"),
                     };
-                    self.answer_stem(&stem, &rejected)
+                    self.write_reply_for_stem(&stem, &rejected)
                         .inspect_err(|err| tracing::warn!(?err, %stem, "cannot reject a steer"))
                         .ok();
                 }
@@ -227,13 +230,13 @@ impl Mailbox {
     /// # Errors
     ///
     /// Returns an error when the reply cannot be written.
-    pub fn answer(&self, claim: &Claim, reply: &Reply) -> std::io::Result<()> {
-        self.answer_stem(&claim.stem, reply)
+    pub fn write_reply(&self, claim: &ClaimedSteer, reply: &SteerReply) -> std::io::Result<()> {
+        self.write_reply_for_stem(&claim.stem, reply)
     }
 
-    fn answer_stem(&self, stem: &str, reply: &Reply) -> std::io::Result<()> {
+    fn write_reply_for_stem(&self, stem: &str, reply: &SteerReply) -> std::io::Result<()> {
         let body = serde_json::to_string(reply).map_err(std::io::Error::other)?;
-        crate::once::write_whole(&self.path(stem, REPLY), body.as_bytes())
+        crate::atomic_file::write_whole(&self.path(stem, REPLY), body.as_bytes())
     }
 }
 
@@ -241,7 +244,7 @@ impl Mailbox {
 mod tests {
     use googletest::prelude::*;
 
-    use super::{Mailbox, Reply};
+    use super::{Mailbox, SteerReply};
 
     /// A message travels request, claim, reply, and its sender reads the reply back.
     #[gtest]
@@ -249,19 +252,21 @@ mod tests {
         let dir = tempfile::tempdir().or_fail()?;
         let mailbox = Mailbox::new(dir.path().join("steer"));
 
-        let letter = mailbox.submit("narrow it to auth").or_fail()?;
-        assert_that!(mailbox.is_claimed(&letter), eq(false));
+        let steer_id = mailbox.submit("narrow it to auth").or_fail()?;
+        assert_that!(mailbox.is_claimed(&steer_id), eq(false));
 
         let claims = mailbox.claim_all();
         assert_that!(claims.len(), eq(1));
         let claim = claims.first().or_fail()?;
         assert_that!(claim.text, eq("narrow it to auth"));
-        assert_that!(mailbox.is_claimed(&letter), eq(true));
+        assert_that!(mailbox.is_claimed(&steer_id), eq(true));
 
-        mailbox.answer(claim, &Reply::Accepted).or_fail()?;
+        mailbox
+            .write_reply(claim, &SteerReply::Accepted)
+            .or_fail()?;
         assert_that!(
-            mailbox.reply(&letter).or_fail()?,
-            some(eq(&Reply::Accepted))
+            mailbox.reply(&steer_id).or_fail()?,
+            some(eq(&SteerReply::Accepted))
         );
         Ok(())
     }
@@ -294,7 +299,7 @@ mod tests {
         let dir = tempfile::tempdir().or_fail()?;
         for round in 0..200 {
             let path = dir.path().join(round.to_string());
-            let letter = Mailbox::new(&path).submit("racing").or_fail()?;
+            let steer_id = Mailbox::new(&path).submit("racing").or_fail()?;
             let start = Arc::new(Barrier::new(3));
             let claimer = || {
                 let (mailbox, start) = (Mailbox::new(&path), Arc::clone(&start));
@@ -305,11 +310,11 @@ mod tests {
             };
             let (first, second) = (claimer(), claimer());
             let withdrawer = {
-                let (mailbox, start, letter) =
-                    (Mailbox::new(&path), Arc::clone(&start), letter.clone());
+                let (mailbox, start, steer_id) =
+                    (Mailbox::new(&path), Arc::clone(&start), steer_id.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    mailbox.withdraw(&letter)
+                    mailbox.withdraw(&steer_id)
                 })
             };
 

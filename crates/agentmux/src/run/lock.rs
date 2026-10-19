@@ -10,6 +10,9 @@
 //! steer are methods of [`RunStore`] that hold one across their check and write.
 //! Nothing reachable from a [`LockedRun`] takes the lock again, because a second lock on the same
 //! file from one process waits on the first for ever.
+//!
+//! Creating a run and removing what a failed start left happen without it, and so does writing a
+//! turn's usage cache, which is written once and never changed.
 
 use std::fs::File;
 use std::path::PathBuf;

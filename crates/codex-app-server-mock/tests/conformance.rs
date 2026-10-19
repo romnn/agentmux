@@ -2,7 +2,7 @@
 //! promise: progeny's header in the protocol crate lists the constraints they do not express.
 
 use codex_app_server_mock::conformance::{Side, check, check_definition};
-use codex_app_server_mock::fixtures::{self, THREAD, TURN, Tokens};
+use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID, TokenCounts};
 use codex_app_server_protocol::types::TurnStatus;
 use googletest::prelude::*;
 use serde::Serialize;
@@ -15,7 +15,7 @@ fn conforms(definition: &str, payload: &impl Serialize) -> Result<()> {
 /// Each builder against the definition of what it builds.
 #[gtest]
 fn every_fixture_conforms_to_codexs_schema() -> Result<()> {
-    let tokens = Tokens {
+    let tokens = TokenCounts {
         input: 3,
         cached_input: 1,
         output: 2,
@@ -30,48 +30,51 @@ fn every_fixture_conforms_to_codexs_schema() -> Result<()> {
     conforms("InitializeResponse", &fixtures::initialize_response())?;
     conforms(
         "ThreadStartResponse",
-        &fixtures::thread_start_response(THREAD),
+        &fixtures::thread_start_response(THREAD_ID),
     )?;
     conforms(
         "ThreadResumeResponse",
-        &fixtures::thread_resume_response(THREAD),
+        &fixtures::thread_resume_response(THREAD_ID),
     )?;
-    conforms("TurnStartResponse", &fixtures::turn_start_response(TURN))?;
+    conforms("TurnStartResponse", &fixtures::turn_start_response(TURN_ID))?;
     conforms(
         "TurnStartedNotification",
-        &fixtures::turn_started(THREAD, TURN),
+        &fixtures::turn_started(THREAD_ID, TURN_ID),
     )?;
     conforms(
         "TurnCompletedNotification",
-        &fixtures::turn_completed(THREAD, TURN, TurnStatus::Completed, items.to_vec()),
+        &fixtures::turn_completed(THREAD_ID, TURN_ID, TurnStatus::Completed, items.to_vec()),
     )?;
-    conforms("TurnSteerResponse", &fixtures::turn_steer_response(TURN))?;
+    conforms("TurnSteerResponse", &fixtures::turn_steer_response(TURN_ID))?;
     conforms(
         "TurnInterruptResponse",
         &fixtures::turn_interrupt_response(),
     )?;
     conforms(
         "TurnInterruptParams",
-        &fixtures::turn_interrupt_params(THREAD, TURN),
+        &fixtures::turn_interrupt_params(THREAD_ID, TURN_ID),
     )?;
     for item in items {
         conforms(
             "ItemCompletedNotification",
-            &fixtures::item_completed(THREAD, TURN, item),
+            &fixtures::item_completed(THREAD_ID, TURN_ID, item),
         )?;
     }
     conforms(
         "ThreadTokenUsageUpdatedNotification",
-        &fixtures::token_usage(THREAD, TURN, tokens, tokens),
+        &fixtures::token_usage(THREAD_ID, TURN_ID, tokens, tokens),
     )?;
-    conforms("WarningNotification", &fixtures::warning(THREAD, "careful"))?;
+    conforms(
+        "WarningNotification",
+        &fixtures::warning(THREAD_ID, "careful"),
+    )?;
     conforms(
         "ErrorNotification",
-        &fixtures::error(THREAD, TURN, true, "retrying"),
+        &fixtures::error(THREAD_ID, TURN_ID, true, "retrying"),
     )?;
     conforms(
         "CommandExecutionRequestApprovalParams",
-        &fixtures::command_approval(THREAD, TURN, "c"),
+        &fixtures::command_approval_params(THREAD_ID, TURN_ID, "c"),
     )
 }
 

@@ -62,7 +62,7 @@ fn the_closest_project_file_chooses_the_account() -> Result<()> {
     );
     // The machine file still supplied the account itself.
     assert_that!(
-        config.alias_names(agentmux::delegate::Vendor::Claude),
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
         elements_are![eq("clientx")]
     );
     Ok(())
@@ -235,7 +235,7 @@ fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
         config
             .unknown
             .iter()
-            .map(|u| u.key.clone())
+            .map(|unknown_key| unknown_key.key.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("accounts.claude.personal.configdir")]
     );
@@ -270,12 +270,12 @@ fn an_unknown_vendor_is_reported_and_the_file_still_loads() -> Result<()> {
         config
             .unknown
             .iter()
-            .map(|u| u.key.clone())
+            .map(|unknown_key| unknown_key.key.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("accounts.gemini"), eq("defaults.gemini")]
     );
     assert_that!(
-        config.alias_names(agentmux::delegate::Vendor::Claude),
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
         elements_are![eq("personal")]
     );
     Ok(())
@@ -322,12 +322,15 @@ fn a_key_from_a_newer_agentmux_is_reported_and_ignored() -> Result<()> {
         config
             .unknown
             .iter()
-            .map(|u| u.key.clone())
+            .map(|unknown_key| unknown_key.key.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("some_table_from_the_future")]
     );
     assert_that!(
-        config.unknown.first().map(|u| u.file.clone()),
+        config
+            .unknown
+            .first()
+            .map(|unknown_key| unknown_key.file.clone()),
         some(eq(&home.path().join("agentmux.toml")))
     );
     Ok(())
@@ -627,8 +630,11 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     assert_that!(named.resolved_isolation(&config), eq(Isolation::Isolated));
 
     // Only the caller asking for it outright switches it on.
-    let asked = named.with_isolation(Isolation::Inherit);
-    assert_that!(asked.resolved_isolation(&config), eq(Isolation::Inherit));
+    let inheriting_delegate = named.with_isolation(Isolation::Inherit);
+    assert_that!(
+        inheriting_delegate.resolved_isolation(&config),
+        eq(Isolation::Inherit)
+    );
     Ok(())
 }
 
@@ -699,7 +705,7 @@ fn an_explicit_machine_file_inside_the_checkout_keeps_its_role() -> Result<()> {
     let config = Config::load(&host, &repo).or_fail()?;
 
     assert_that!(
-        config.alias_names(agentmux::delegate::Vendor::Claude),
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
         elements_are![eq("clientx")]
     );
     assert_that!(config.project_source, none());

@@ -6,8 +6,8 @@
 //! thread runs under, and that a consultation declines everything it is asked.
 
 use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId};
-use codex_app_server_protocol::methods::{self as m, AnyServerRequest as Any};
-use codex_app_server_protocol::{Answered, Method as _, ServerRequest, types as wire};
+use codex_app_server_protocol::methods::{self, AnyServerRequest};
+use codex_app_server_protocol::{Method as _, ServerRequest, TypedResponse, types as wire};
 
 use crate::delegate::{CodexSandbox, SessionRef};
 
@@ -15,16 +15,16 @@ use crate::delegate::{CodexSandbox, SessionRef};
 ///
 /// Every one of them is a token-by-token delta of something that also arrives whole in
 /// `item/completed`, and the driver writes only whole items.
-pub(super) const OPTED_OUT: &[&str] = &[
-    m::ItemAgentMessageDelta::METHOD,
-    m::ItemReasoningSummaryTextDelta::METHOD,
-    m::ItemReasoningSummaryPartAdded::METHOD,
-    m::ItemReasoningTextDelta::METHOD,
-    m::ItemCommandExecutionOutputDelta::METHOD,
-    m::ItemFileChangeOutputDelta::METHOD,
-    m::ItemPlanDelta::METHOD,
-    m::CommandExecOutputDelta::METHOD,
-    m::ProcessOutputDelta::METHOD,
+pub(super) const SUPPRESSED_NOTIFICATION_METHODS: &[&str] = &[
+    methods::ItemAgentMessageDelta::METHOD,
+    methods::ItemReasoningSummaryTextDelta::METHOD,
+    methods::ItemReasoningSummaryPartAdded::METHOD,
+    methods::ItemReasoningTextDelta::METHOD,
+    methods::ItemCommandExecutionOutputDelta::METHOD,
+    methods::ItemFileChangeOutputDelta::METHOD,
+    methods::ItemPlanDelta::METHOD,
+    methods::CommandExecOutputDelta::METHOD,
+    methods::ProcessOutputDelta::METHOD,
 ];
 
 /// codex's id for the thread a consultation runs in.
@@ -75,7 +75,10 @@ pub(crate) fn initialize_params() -> wire::InitializeParams {
         },
         capabilities: Some(wire::InitializeCapabilities {
             opt_out_notification_methods: Some(
-                OPTED_OUT.iter().map(|&method| method.to_owned()).collect(),
+                SUPPRESSED_NOTIFICATION_METHODS
+                    .iter()
+                    .map(|&method| method.to_owned())
+                    .collect(),
             ),
             ..wire::InitializeCapabilities::default()
         }),
@@ -161,10 +164,10 @@ fn text_input(text: &str) -> Vec<wire::UserInput> {
 }
 
 /// `turn/start`'s parameters.
-pub(super) fn turn_start_params(thread: &ThreadId, question: &str) -> wire::TurnStartParams {
+pub(super) fn turn_start_params(thread_id: &ThreadId, question: &str) -> wire::TurnStartParams {
     // Everything else is the thread's, which `thread/start` or `thread/resume` already set.
     wire::TurnStartParams {
-        thread_id: thread.as_str().to_owned(),
+        thread_id: thread_id.as_str().to_owned(),
         input: text_input(question),
         approval_policy: None,
         approvals_reviewer: None,
@@ -208,7 +211,8 @@ pub(super) fn turn_interrupt_params(target: TurnTarget<'_>) -> wire::TurnInterru
 }
 
 /// The reason every decline gives.
-const UNATTENDED: &str = "agentmux runs consultations unattended, with nobody to approve this";
+const UNATTENDED_DECLINE_REASON: &str =
+    "agentmux runs consultations unattended, with nobody to approve this";
 
 /// The answer to request `id`, when it is an approval or an input request, or `None` for a
 /// request a consultation does not answer at all.
@@ -218,70 +222,85 @@ const UNATTENDED: &str = "agentmux runs consultations unattended, with nobody to
 /// Each is built through the method's own binding, so it is always the type that method expects,
 /// and every request codex can send is named, so a regeneration that adds one fails to build
 /// until it is decided here.
-pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message, EncodeError>> {
-    fn answer<M: ServerRequest + Answered>(
+pub(super) fn decline_response(
+    id: &RequestId,
+    request: AnyServerRequest<'_>,
+) -> Option<Result<Message, EncodeError>> {
+    fn response_message<M: ServerRequest + TypedResponse>(
         id: &RequestId,
         response: &M::Response,
     ) -> Result<Message, EncodeError> {
-        Message::result::<M>(id.clone(), response)
+        Message::success_response::<M>(id.clone(), response)
     }
     let denied = || {
         wire::ReviewDecision::Denied(Box::new(wire::ReviewDecisionDenied {
-            rejection: UNATTENDED.to_owned(),
+            rejection: UNATTENDED_DECLINE_REASON.to_owned(),
         }))
     };
     Some(match request {
-        Any::ItemCommandExecutionRequestApproval(_) => {
-            answer::<m::ItemCommandExecutionRequestApproval>(
+        AnyServerRequest::ItemCommandExecutionRequestApproval(_) => {
+            response_message::<methods::ItemCommandExecutionRequestApproval>(
                 id,
                 &wire::CommandExecutionRequestApprovalResponse {
                     decision: wire::CommandExecutionApprovalDecision::Decline,
                 },
             )
         }
-        Any::ItemFileChangeRequestApproval(_) => answer::<m::ItemFileChangeRequestApproval>(
-            id,
-            &wire::FileChangeRequestApprovalResponse {
-                decision: wire::FileChangeApprovalDecision::Decline,
-            },
-        ),
-        Any::ExecCommandApproval(_) => answer::<m::ExecCommandApproval>(
-            id,
-            &wire::ExecCommandApprovalResponse { decision: denied() },
-        ),
-        Any::ApplyPatchApproval(_) => answer::<m::ApplyPatchApproval>(
+        AnyServerRequest::ItemFileChangeRequestApproval(_) => {
+            response_message::<methods::ItemFileChangeRequestApproval>(
+                id,
+                &wire::FileChangeRequestApprovalResponse {
+                    decision: wire::FileChangeApprovalDecision::Decline,
+                },
+            )
+        }
+        AnyServerRequest::ExecCommandApproval(_) => {
+            response_message::<methods::ExecCommandApproval>(
+                id,
+                &wire::ExecCommandApprovalResponse { decision: denied() },
+            )
+        }
+        AnyServerRequest::ApplyPatchApproval(_) => response_message::<methods::ApplyPatchApproval>(
             id,
             &wire::ApplyPatchApprovalResponse { decision: denied() },
         ),
-        Any::McpServerElicitationRequest(_) => answer::<m::McpServerElicitationRequest>(
-            id,
-            &wire::McpServerElicitationRequestResponse {
-                meta: None,
-                action: wire::McpServerElicitationAction::Decline,
-                content: None,
-            },
-        ),
-        Any::ItemToolRequestUserInput(_) => answer::<m::ItemToolRequestUserInput>(
-            id,
-            &wire::ToolRequestUserInputResponse {
-                answers: std::collections::BTreeMap::new(),
-            },
-        ),
-        // An empty grant: no file system and no network beyond what the sandbox already allows.
-        Any::ItemPermissionsRequestApproval(_) => answer::<m::ItemPermissionsRequestApproval>(
-            id,
-            &wire::PermissionsRequestApprovalResponse {
-                permissions: wire::GrantedPermissionProfile {
-                    file_system: None,
-                    network: None,
+        AnyServerRequest::McpServerElicitationRequest(_) => {
+            response_message::<methods::McpServerElicitationRequest>(
+                id,
+                &wire::McpServerElicitationRequestResponse {
+                    meta: None,
+                    action: wire::McpServerElicitationAction::Decline,
+                    content: None,
                 },
-                scope: None,
-                strict_auto_review: None,
-            },
-        ),
+            )
+        }
+        AnyServerRequest::ItemToolRequestUserInput(_) => {
+            response_message::<methods::ItemToolRequestUserInput>(
+                id,
+                &wire::ToolRequestUserInputResponse {
+                    answers: std::collections::BTreeMap::new(),
+                },
+            )
+        }
+        // An empty grant: no file system and no network beyond what the sandbox already allows.
+        AnyServerRequest::ItemPermissionsRequestApproval(_) => {
+            response_message::<methods::ItemPermissionsRequestApproval>(
+                id,
+                &wire::PermissionsRequestApprovalResponse {
+                    permissions: wire::GrantedPermissionProfile {
+                        file_system: None,
+                        network: None,
+                    },
+                    scope: None,
+                    strict_auto_review: None,
+                },
+            )
+        }
         // Asks the client for credentials, an attestation, or the result of a tool the client
         // provides, none of which a consultation has.
-        Any::AccountChatgptAuthTokensRefresh | Any::AttestationGenerate | Any::ItemToolCall => {
+        AnyServerRequest::AccountChatgptAuthTokensRefresh
+        | AnyServerRequest::AttestationGenerate
+        | AnyServerRequest::ItemToolCall => {
             return None;
         }
     })
@@ -290,11 +309,11 @@ pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::envelope::{Message, RequestId};
-    use codex_app_server_protocol::methods::{self as m, AnyServerRequest};
+    use codex_app_server_protocol::methods::{self, AnyServerRequest};
     use googletest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::{ThreadId, TurnId, TurnTarget, decline, turn_steer_params};
+    use super::{ThreadId, TurnId, TurnTarget, decline_response, turn_steer_params};
 
     /// A steer names the turn it is for and carries the instruction as one text input.
     #[gtest]
@@ -304,7 +323,7 @@ mod tests {
             turn: &TurnId::new("tu-2"),
         };
         let params = turn_steer_params(target, "only auth");
-        let line = Message::request::<m::TurnSteer>(RequestId::Integer(7), &params)
+        let line = Message::request::<methods::TurnSteer>(RequestId::Integer(7), &params)
             .or_fail()?
             .to_line();
         let message: Value = serde_json::from_str(&line).or_fail()?;
@@ -330,7 +349,7 @@ mod tests {
     fn approvals_are_declined_in_the_schemas_own_words() -> Result<()> {
         let request = |method: &str| AnyServerRequest::classify(method, &Value::Null).or_fail();
         let result = |method: &str| -> Result<Value> {
-            match decline(&RequestId::Integer(1), request(method)?)
+            match decline_response(&RequestId::Integer(1), request(method)?)
                 .or_fail()?
                 .or_fail()?
             {
@@ -352,7 +371,7 @@ mod tests {
         // The v1 review decision denies with an object that carries the reason.
         assert_that!(
             result("execCommandApproval")?,
-            eq(&json!({"decision": {"denied": {"rejection": super::UNATTENDED}}}))
+            eq(&json!({"decision": {"denied": {"rejection": super::UNATTENDED_DECLINE_REASON}}}))
         );
         assert_that!(
             result("mcpServer/elicitation/request")?,
@@ -360,7 +379,7 @@ mod tests {
         );
         // A request no consultation could answer is not declined: it is refused outright.
         assert_that!(
-            decline(&RequestId::Integer(1), request("item/tool/call")?),
+            decline_response(&RequestId::Integer(1), request("item/tool/call")?),
             none()
         );
         Ok(())

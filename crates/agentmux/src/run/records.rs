@@ -28,7 +28,8 @@ pub enum LaunchMode {
     ///
     /// Nothing can reach the turn once it has started.
     #[default]
-    Exec,
+    #[serde(rename = "exec")]
+    DirectCli,
     /// The turn is driven over `codex app-server` by [`crate::appserver`], and can be steered.
     AppServer,
 }
@@ -71,8 +72,12 @@ pub struct Meta {
     pub billing: Option<Billing>,
     /// Whether every Codex turn runs with `codex exec`, because the caller asked or the store that
     /// started the consultation drives none, kept for the follow-ups.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub codex_exec: bool,
+    #[serde(
+        rename = "codex_exec",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub force_codex_exec: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,8 +155,8 @@ pub(super) struct InvocationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) unsaved_session_store: Option<PathBuf>,
     /// How the delegate was run, which decides whether the turn can be steered.
-    #[serde(default)]
-    pub(super) mode: LaunchMode,
+    #[serde(rename = "mode", default)]
+    pub(super) launch_mode: LaunchMode,
     /// The pricing the delegate was launched on; absent from a record older than agentmux
     /// keeping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,7 +182,7 @@ pub(super) struct InvocationRecord {
 /// Write a record, replacing any there before, so that a reader never sees a partial one.
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunError> {
     let text = json_text(path, value)?;
-    crate::once::write_whole(path, text.as_bytes())
+    crate::atomic_file::write_whole(path, text.as_bytes())
         .map_err(RunError::io(format!("writing {}", path.display())))
 }
 
@@ -185,15 +190,15 @@ pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Run
 ///
 /// When another caller got there first, its record is returned rather than overwritten, so two
 /// observers of one departure settle on one story.
-/// [`crate::once::create_once`] says how: on a filesystem without hard links a reader can glimpse
-/// a partial record — loudly, as one that cannot be parsed, never quietly as one that is not
-/// there.
+/// [`crate::atomic_file::create_once`] says how: on a filesystem without hard links a reader can
+/// glimpse a partial record — loudly, as one that cannot be parsed, never quietly as one that is
+/// not there.
 pub(super) fn write_json_once<T: Serialize + for<'de> Deserialize<'de>>(
     path: &Path,
     value: &T,
 ) -> Result<T, RunError> {
     let text = json_text(path, value)?;
-    crate::once::create_once(path, text.as_bytes())
+    crate::atomic_file::create_once(path, text.as_bytes())
         .map_err(RunError::io(format!("writing {}", path.display())))?;
     read_json(path)?.ok_or_else(|| RunError::Io {
         context: format!("reading back {}", path.display()),

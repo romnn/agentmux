@@ -36,7 +36,7 @@ use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Role, Turn, Us
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
 ///
 /// Used only to *name* the injection in the transcript.
-/// Detection does not depend on it: see [`is_reopening`].
+/// Detection does not depend on it: see [`classify_injection`].
 /// If the CLI rewords this, the injection is still caught and still marked, and only the wording
 /// of the note changes.
 const HOOK_FEEDBACK_MARKER: &str = "hook feedback:";
@@ -120,7 +120,7 @@ impl From<String> for ApiKeySource {
 
 /// Enough of a line to name it in the drift count.
 #[derive(Debug, Deserialize)]
-struct Named {
+struct EventTypeProbe {
     #[serde(rename = "type")]
     kind: String,
 }
@@ -128,7 +128,7 @@ struct Named {
 /// The one event whose shape its `subtype` decides, which its drift name carries too.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Subtyped {
+enum SystemSubtypeProbe {
     System {
         subtype: String,
     },
@@ -137,19 +137,24 @@ enum Subtyped {
 }
 
 /// What the drift count calls a line it cannot read: its `type`.
-fn unparsable(value: &Value) -> String {
-    match Named::deserialize(value) {
-        Ok(Named { kind }) => format!("{kind}.<unparsable>"),
+fn unparsable_drift_label(value: &Value) -> String {
+    match EventTypeProbe::deserialize(value) {
+        Ok(EventTypeProbe { kind }) => format!("{kind}.<unparsable>"),
         Err(_) => MALFORMED_LINE.to_owned(),
     }
 }
 
 /// What the drift count calls a line, or a content block: its `type`, and a `system` event's
 /// `subtype`.
-fn name(value: &Value) -> String {
-    match (Named::deserialize(value), Subtyped::deserialize(value)) {
-        (Ok(Named { kind }), Ok(Subtyped::System { subtype })) => format!("{kind}.{subtype}"),
-        (Ok(Named { kind }), _) => kind,
+fn drift_label(value: &Value) -> String {
+    match (
+        EventTypeProbe::deserialize(value),
+        SystemSubtypeProbe::deserialize(value),
+    ) {
+        (Ok(EventTypeProbe { kind }), Ok(SystemSubtypeProbe::System { subtype })) => {
+            format!("{kind}.{subtype}")
+        }
+        (Ok(EventTypeProbe { kind }), _) => kind,
         (Err(_), _) => MALFORMED_LINE.to_owned(),
     }
 }
@@ -215,43 +220,51 @@ enum ContentBlock {
 
 /// What one message's content amounts to.
 #[derive(Debug, Default)]
-struct Inspected {
+struct ContentSummary {
     /// The prose, in order.
     texts: Vec<String>,
     /// Block shapes the parser does not account for, for the drift counter.
-    unknown: Vec<String>,
+    unrecognised_block_labels: Vec<String>,
     /// Whether the message called a tool, which means the turn was not over when it was sent.
     calls_a_tool: bool,
 }
 
 impl Content {
     /// The prose of a message, plus any block shape the parser does not account for.
-    fn inspect(self) -> Inspected {
+    fn inspect(self) -> ContentSummary {
         match self {
-            Self::Text(text) => Inspected {
+            Self::Text(text) => ContentSummary {
                 texts: vec![text],
-                ..Inspected::default()
+                ..ContentSummary::default()
             },
             Self::Blocks(blocks) => {
-                let mut inspected = Inspected::default();
+                let mut content_summary = ContentSummary::default();
                 for block in blocks {
                     match ContentBlock::deserialize(&block) {
-                        Ok(ContentBlock::Text { text: Some(text) }) => inspected.texts.push(text),
+                        Ok(ContentBlock::Text { text: Some(text) }) => {
+                            content_summary.texts.push(text);
+                        }
                         // The payload field renamed, and dropping it would drop the report.
                         Ok(ContentBlock::Text { text: None }) => {
-                            inspected.unknown.push("text.<missing>".to_owned());
+                            content_summary
+                                .unrecognised_block_labels
+                                .push("text.<missing>".to_owned());
                         }
-                        Ok(ContentBlock::ToolUse {}) => inspected.calls_a_tool = true,
+                        Ok(ContentBlock::ToolUse {}) => content_summary.calls_a_tool = true,
                         Ok(
                             ContentBlock::ToolResult {}
                             | ContentBlock::Thinking {}
                             | ContentBlock::Image {},
                         ) => {}
-                        Ok(ContentBlock::Unknown) => inspected.unknown.push(name(&block)),
-                        Err(_) => inspected.unknown.push(unparsable(&block)),
+                        Ok(ContentBlock::Unknown) => content_summary
+                            .unrecognised_block_labels
+                            .push(drift_label(&block)),
+                        Err(_) => content_summary
+                            .unrecognised_block_labels
+                            .push(unparsable_drift_label(&block)),
                     }
                 }
-                inspected
+                content_summary
             }
         }
     }
@@ -342,7 +355,7 @@ struct RateLimitInfo {
 enum RateLimitStatus {
     Allowed,
     #[serde(untagged)]
-    Refused(String),
+    NotAllowed(String),
 }
 
 /// Record what a `rate_limit_event` says about the account's usage window.
@@ -360,7 +373,7 @@ fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
         });
     }
 
-    if let Some(RateLimitStatus::Refused(status)) = info.status {
+    if let Some(RateLimitStatus::NotAllowed(status)) = info.status {
         let mut note = format!("delegate rate limit status: {status}");
         if let Some(limit) = &turn.rate_limit {
             match &limit.window {
@@ -388,7 +401,7 @@ fn fold_system(
     let init = match event {
         SystemEvent::Init(init) => init,
         SystemEvent::Unknown => {
-            turn.unrecognised.record(name(line));
+            turn.unrecognised.record(drift_label(line));
             return;
         }
         SystemEvent::ThinkingTokens {}
@@ -435,7 +448,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         };
         // An event this parser names, in a shape it does not.
         let Ok(event) = Event::deserialize(&value) else {
-            turn.unrecognised.record(unparsable(&value));
+            turn.unrecognised.record(unparsable_drift_label(&value));
             continue;
         };
 
@@ -450,17 +463,17 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 if turn.resolved_model.is_none() {
                     turn.resolved_model.clone_from(&event.message.model);
                 }
-                let inspected = event.message.content.inspect();
-                for kind in inspected.unknown {
+                let content_summary = event.message.content.inspect();
+                for kind in content_summary.unrecognised_block_labels {
                     turn.unrecognised
                         .record(format!("assistant.content.{kind}"));
                 }
-                delegate = if inspected.calls_a_tool {
+                delegate = if content_summary.calls_a_tool {
                     DelegateActivity::CallingATool
                 } else {
                     DelegateActivity::Finished
                 };
-                for text in inspected.texts {
+                for text in content_summary.texts {
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -471,11 +484,11 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
-                let inspected = event.message.content.inspect();
-                for kind in inspected.unknown {
+                let content_summary = event.message.content.inspect();
+                for kind in content_summary.unrecognised_block_labels {
                     turn.unrecognised.record(format!("user.content.{kind}"));
                 }
-                for text in inspected.texts {
+                for text in content_summary.texts {
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -509,7 +522,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 // `tail`'s byte cursor relies on.
                 break;
             }
-            Event::Unknown => turn.unrecognised.record(name(&value)),
+            Event::Unknown => turn.unrecognised.record(drift_label(&value)),
         }
     }
 
@@ -601,7 +614,7 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
     }
 
     let reason = event.terminal_reason.as_deref().unwrap_or("");
-    let stated = reason.parse::<TerminalReason>().ok();
+    let parsed_terminal_reason = reason.parse::<TerminalReason>().ok();
     // `subtype` is deliberately left out of the detail.
     // It reads `success` on a failed turn, so quoting it produces "failed … : success", which
     // invites a reader to doubt the failure rather than act on it.
@@ -619,7 +632,7 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
         .collect::<Vec<_>>()
         .join(": ");
 
-    let kind = match (stated, event.api_error_status) {
+    let kind = match (parsed_terminal_reason, event.api_error_status) {
         (_, Some(404)) => FailureKind::ModelUnavailable,
         (_, Some(429)) => FailureKind::RateLimited,
         (_, Some(402)) => FailureKind::BudgetExceeded,

@@ -19,7 +19,7 @@ use googletest::prelude::*;
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
 
@@ -67,7 +67,7 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         retention: Retention::Ttl,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     }
 }
 
@@ -115,26 +115,26 @@ fn a_follow_up_appends_a_turn_to_the_same_run() -> Result<()> {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"BANANAPHONE"}}
         {"type":"turn.completed","usage":{"input_tokens":19000,"output_tokens":8}}
     "#};
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(second_turn),
     ])?;
 
-    let started = h.store.start(&request(
+    let started = harness.store.start(&request(
         codex()?,
         "Remember BANANAPHONE. Reply FIXTURE_OK.",
     ))?;
     assert_that!(started.turns, eq(1));
     assert_that!(started.resumable, eq(true));
 
-    let followed = h
+    let followed = harness
         .store
         .follow_up(&started.run_id, "What was the secret word?")?;
     assert_that!(followed.run_id, eq(&started.run_id));
     assert_that!(followed.turns, eq(2));
 
     // The second launch resumes the delegate's own session rather than restating the brief.
-    let launches = h.launcher.launches();
+    let launches = harness.launcher.launches();
     assert_that!(launches.len(), eq(2));
     let resume = launches.get(1).expect("second launch");
     assert_that!(resume.has_flag("resume"), eq(true));
@@ -145,7 +145,7 @@ fn a_follow_up_appends_a_turn_to_the_same_run() -> Result<()> {
     assert_that!(resume.question, eq("What was the secret word?"));
 
     // Both turns are in one transcript, in order.
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("FIXTURE_OK"));
     assert_that!(page.text, contains_substring("BANANAPHONE"));
     assert_that!(page.text, contains_substring("Turn 1 — question"));
@@ -170,20 +170,21 @@ fn the_bytes_before_a_follow_up_cut_cleanly_between_turns() -> Result<()> {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"BANANAPHONE"}}
         {"type":"turn.completed","usage":{"input_tokens":19000,"output_tokens":8}}
     "#};
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(second_turn),
     ])?;
 
-    let started = h.store.start(&request(
+    let started = harness.store.start(&request(
         codex()?,
         "Remember BANANAPHONE. Reply FIXTURE_OK.",
     ))?;
     let before = started.transcript_bytes;
 
-    h.store
+    harness
+        .store
         .follow_up(&started.run_id, "What was the secret word?")?;
-    let page = h.store.page(&started.run_id, before, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, before, 1_000_000)?;
 
     assert_that!(page.text, contains_substring("Turn 2 — question"));
     assert_that!(page.text, contains_substring("BANANAPHONE"));
@@ -195,8 +196,8 @@ fn the_bytes_before_a_follow_up_cut_cleanly_between_turns() -> Result<()> {
 /// A follow-up must not silently start a fresh conversation.
 #[gtest]
 fn a_follow_up_is_refused_when_there_is_nothing_to_resume() -> Result<()> {
-    let h = harness([Script::exited("", "claude: command not found\n", 127)])?;
-    let started = h.store.start(&request(claude()?, "review this"))?;
+    let harness = harness([Script::exited("", "claude: command not found\n", 127)])?;
+    let started = harness.store.start(&request(claude()?, "review this"))?;
     assert_that!(
         started.outcome,
         matches_pattern!(Outcome::Failed {
@@ -205,10 +206,10 @@ fn a_follow_up_is_refused_when_there_is_nothing_to_resume() -> Result<()> {
         })
     );
 
-    let refused = h.store.follow_up(&started.run_id, "and now?");
+    let refused = harness.store.follow_up(&started.run_id, "and now?");
     assert_that!(refused.map(|_| ()), err(anything()));
     // Only the original launch happened; no second child was started against a dead session.
-    assert_that!(h.launcher.launches().len(), eq(1));
+    assert_that!(harness.launcher.launches().len(), eq(1));
     Ok(())
 }
 
@@ -218,29 +219,33 @@ fn a_follow_up_is_refused_when_there_is_nothing_to_resume() -> Result<()> {
 fn a_follow_up_waits_for_the_delegate_to_leave() -> Result<()> {
     // The first child answers and stays, as a CLI still saving its session does; the second is
     // the follow-up's.
-    let h = harness([
+    let harness = harness([
         Script::running(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "review this"))?;
+    let started = harness.store.start(&request(codex()?, "review this"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
 
     // Answered, and not yet resumable: a follow-up now is refused, and launches nothing.
     assert_that!(started.resumable, eq(false));
     assert_that!(
-        h.store.follow_up(&started.run_id, "and the session code?"),
+        harness
+            .store
+            .follow_up(&started.run_id, "and the session code?"),
         err(matches_pattern!(RunError::NotResumable(eq(
-            &NotResumable::StillSaving {
+            &NotResumable::AwaitingDelegateExit {
                 run_id: started.run_id.clone()
             }
         ))))
     );
-    assert_that!(h.launcher.launches().len(), eq(1));
+    assert_that!(harness.launcher.launches().len(), eq(1));
 
     // Once the delegate has gone, the same follow-up is a new turn.
-    h.launcher.terminate(h.launcher.launched(0));
-    assert_that!(h.store.status(&started.run_id)?.resumable, eq(true));
-    let followed = h
+    harness
+        .launcher
+        .terminate(harness.launcher.launch_handle(0));
+    assert_that!(harness.store.status(&started.run_id)?.resumable, eq(true));
+    let followed = harness
         .store
         .follow_up(&started.run_id, "and the session code?")?;
     assert_that!(followed.turns, eq(2));
@@ -251,26 +256,30 @@ fn a_follow_up_waits_for_the_delegate_to_leave() -> Result<()> {
 /// nothing holds its pid.
 #[gtest]
 fn a_follow_up_waits_for_a_delegate_it_cannot_identify() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::unidentifiable(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "review this"))?;
+    let started = harness.store.start(&request(codex()?, "review this"))?;
 
     // Unknown is not gone: the follow-up is refused, and launches nothing.
     assert_that!(
-        h.store.follow_up(&started.run_id, "and the session code?"),
+        harness
+            .store
+            .follow_up(&started.run_id, "and the session code?"),
         err(matches_pattern!(RunError::NotResumable(eq(
-            &NotResumable::StillSaving {
+            &NotResumable::AwaitingDelegateExit {
                 run_id: started.run_id.clone()
             }
         ))))
     );
-    assert_that!(h.launcher.launches().len(), eq(1));
+    assert_that!(harness.launcher.launches().len(), eq(1));
 
     // Once the pid is free, the same follow-up is a new turn.
-    h.launcher.vanish(h.launcher.launched(0));
-    let followed = h
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+    let followed = harness
         .store
         .follow_up(&started.run_id, "and the session code?")?;
     assert_that!(followed.turns, eq(2));
@@ -280,12 +289,12 @@ fn a_follow_up_waits_for_a_delegate_it_cannot_identify() -> Result<()> {
 /// A child that dies without a terminal event must say what the CLI said.
 #[gtest]
 fn a_child_that_dies_reports_its_stderr() -> Result<()> {
-    let h = harness([Script::exited(
+    let harness = harness([Script::exited(
         "",
         "error: unexpected argument '--sandbox' found\n",
         2,
     )])?;
-    let status = h.store.start(&request(codex()?, "review this"))?;
+    let status = harness.store.start(&request(codex()?, "review this"))?;
 
     let Outcome::Failed { detail, .. } = &status.outcome else {
         panic!("expected a failure, got {:?}", status.outcome);
@@ -298,11 +307,12 @@ fn a_child_that_dies_reports_its_stderr() -> Result<()> {
 /// so a capture that reads differently can be traced to the release that wrote it.
 #[gtest]
 fn a_turn_records_the_versions_that_wrote_it() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "review this"))?;
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "review this"))?;
 
     let record = std::fs::read_to_string(
-        h.store
+        harness
+            .store
             .root()
             .join("runs")
             .join(started.run_id.as_str())
@@ -325,8 +335,8 @@ fn a_turn_records_the_versions_that_wrote_it() -> Result<()> {
 /// A CLI that exits cleanly but says nothing is drift, and must not read as a silent success.
 #[gtest]
 fn a_clean_exit_with_no_completion_event_is_not_a_success() -> Result<()> {
-    let h = harness([Script::completed("{\"type\":\"turn.started\"}\n")])?;
-    let status = h.store.start(&request(codex()?, "review this"))?;
+    let harness = harness([Script::completed("{\"type\":\"turn.started\"}\n")])?;
+    let status = harness.store.start(&request(codex()?, "review this"))?;
     assert_that!(
         status.outcome,
         matches_pattern!(Outcome::Failed {
@@ -346,15 +356,15 @@ async fn cancelling_keeps_what_was_collected() -> Result<()> {
         {"type":"turn.started"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial findings"}}
     "#};
-    let h = harness([Script::running(partial)])?;
-    let started = h.store.start(&request(codex()?, "long review"))?;
+    let harness = harness([Script::running(partial)])?;
+    let started = harness.store.start(&request(codex()?, "long review"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Running));
 
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
-    assert_that!(h.launcher.terminated().len(), eq(1));
+    assert_that!(harness.launcher.terminated().len(), eq(1));
 
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("partial findings"));
     assert_that!(page.text, contains_substring("cancelled"));
     Ok(())
@@ -363,15 +373,15 @@ async fn cancelling_keeps_what_was_collected() -> Result<()> {
 /// `tail` pages the same rendered bytes `result` returns, and the cursor only ever moves forward.
 #[gtest]
 fn a_transcript_cursor_only_moves_forward() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CLAUDE_STOP_HOOK)])?;
-    let started = h
+    let harness = harness([Script::completed(fixtures::CLAUDE_STOP_HOOK)])?;
+    let started = harness
         .store
         .start(&request(claude()?, "Reply with exactly: THE_REPORT_BODY"))?;
 
     let mut cursor = 0;
     let mut assembled = String::new();
     loop {
-        let page = h.store.page(&started.run_id, cursor, 512)?;
+        let page = harness.store.page(&started.run_id, cursor, 512)?;
         assembled.push_str(&page.text);
         assert_that!(page.next_offset >= cursor, eq(true));
         if page.at_end {
@@ -385,7 +395,7 @@ fn a_transcript_cursor_only_moves_forward() -> Result<()> {
         cursor = page.next_offset;
     }
 
-    let whole = h.store.page(&started.run_id, 0, 10_000_000)?;
+    let whole = harness.store.page(&started.run_id, 0, 10_000_000)?;
     assert_that!(assembled, eq(&whole.text));
     assert_that!(assembled, contains_substring("THE_REPORT_BODY"));
     Ok(())
@@ -399,13 +409,13 @@ fn a_transcript_cursor_never_splits_a_character() -> Result<()> {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"— ünïcödé — 日本語 — 🎉"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let h = harness([Script::completed(unicode)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let harness = harness([Script::completed(unicode)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
     let mut cursor = 0;
     let mut assembled = String::new();
     loop {
-        let page = h.store.page(&started.run_id, cursor, 7)?;
+        let page = harness.store.page(&started.run_id, cursor, 7)?;
         assembled.push_str(&page.text);
         if page.at_end {
             break;
@@ -419,16 +429,18 @@ fn a_transcript_cursor_never_splits_a_character() -> Result<()> {
 /// A consultation can be found again without having kept its id.
 #[gtest]
 fn recent_consultations_are_listed_newest_first() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let first = h
+    let first = harness
         .store
         .start(&request(codex()?, "the first question\nwith a second line"))?;
-    let second = h.store.start(&request(codex()?, "the second question"))?;
+    let second = harness
+        .store
+        .start(&request(codex()?, "the second question"))?;
 
-    let listed = h.store.list(10)?;
+    let listed = harness.store.list(10)?;
     assert_that!(listed.len(), eq(2));
     let ids: Vec<String> = listed.iter().map(|r| r.run_id.to_string()).collect();
     assert_that!(
@@ -448,9 +460,9 @@ fn recent_consultations_are_listed_newest_first() -> Result<()> {
 /// Everything a caller needs to poll a long review is in `status`.
 #[gtest]
 fn status_surfaces_drift_and_hook_interference() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CLAUDE_STOP_HOOK)])?;
-    let started = h.store.start(&request(claude()?, "q"))?;
-    let status = h.store.status(&started.run_id)?;
+    let harness = harness([Script::completed(fixtures::CLAUDE_STOP_HOOK)])?;
+    let started = harness.store.start(&request(claude()?, "q"))?;
+    let status = harness.store.status(&started.run_id)?;
 
     assert_that!(status.hook_reopening, some(eq(HookReopening::Unexpected)));
     assert_that!(status.unrecognised.is_empty(), eq(true));
@@ -465,15 +477,16 @@ fn status_surfaces_drift_and_hook_interference() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn waiting_past_the_cap_leaves_the_consultation_running() -> Result<()> {
-    let h = harness([Script::running("{\"type\":\"turn.started\"}\n")])?;
-    let started = h
+    let harness = harness([Script::running("{\"type\":\"turn.started\"}\n")])?;
+    let started = harness
         .store
         .start(&request(codex()?, "a ninety minute review"))?;
 
-    h.store
+    harness
+        .store
         .wait_until_terminal(&started.run_id, Duration::from_millis(50))
         .await?;
-    let waited = h.store.status(&started.run_id)?;
+    let waited = harness.store.status(&started.run_id)?;
     assert_that!(waited.outcome, matches_pattern!(Outcome::Running));
     assert_that!(waited.run_id, eq(&started.run_id));
     Ok(())
@@ -482,23 +495,23 @@ async fn waiting_past_the_cap_leaves_the_consultation_running() -> Result<()> {
 /// A finished `ttl` run is swept; a kept one and a running one are not.
 #[gtest]
 fn the_sweep_keeps_what_must_be_kept() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
         Script::running("{\"type\":\"turn.started\"}\n"),
     ])?;
-    let expiring = h.store.start(&request(codex()?, "old"))?;
-    let kept = h.store.start(&StartRequest {
+    let expiring = harness.store.start(&request(codex()?, "old"))?;
+    let kept = harness.store.start(&StartRequest {
         retention: Retention::UntilReleased,
         ..request(codex()?, "kept")
     })?;
-    let running = h.store.start(&request(codex()?, "still going"))?;
+    let running = harness.store.start(&request(codex()?, "still going"))?;
 
     // Age all three past the TTL: the recorded creation time, and the capture files' own
     // timestamps, because the clock runs from the last thing the delegate wrote to any of them.
     let long_ago = std::time::SystemTime::now() - Duration::from_hours(48);
     for id in [&expiring.run_id, &kept.run_id, &running.run_id] {
-        let run = h.store.root().join("runs").join(id.as_str());
+        let run = harness.store.root().join("runs").join(id.as_str());
         let path = run.join("meta.json");
         let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         meta["created_at"] =
@@ -512,13 +525,19 @@ fn the_sweep_keeps_what_must_be_kept() -> Result<()> {
         }
     }
 
-    assert_that!(h.store.sweep()?, eq(1));
+    assert_that!(harness.store.sweep()?, eq(1));
     assert_that!(
-        h.store.status(&expiring.run_id).map(|_| ()),
+        harness.store.status(&expiring.run_id).map(|_| ()),
         err(anything())
     );
-    assert_that!(h.store.status(&kept.run_id).map(|_| ()), ok(anything()));
-    assert_that!(h.store.status(&running.run_id).map(|_| ()), ok(anything()));
+    assert_that!(
+        harness.store.status(&kept.run_id).map(|_| ()),
+        ok(anything())
+    );
+    assert_that!(
+        harness.store.status(&running.run_id).map(|_| ()),
+        ok(anything())
+    );
     Ok(())
 }
 
@@ -535,17 +554,20 @@ async fn a_cancelled_consultation_is_not_resumable() -> Result<()> {
         {"type":"turn.started"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"halfway through"}}
     "#};
-    let h = harness([Script::running(partial)])?;
-    let started = h.store.start(&request(codex()?, "long review"))?;
+    let harness = harness([Script::running(partial)])?;
+    let started = harness.store.start(&request(codex()?, "long review"))?;
 
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.resumable, eq(false));
     assert_that!(
-        h.store.follow_up(&started.run_id, "and now?").map(|_| ()),
+        harness
+            .store
+            .follow_up(&started.run_id, "and now?")
+            .map(|_| ()),
         err(anything())
     );
     // Everything collected is still there.
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("halfway through"));
     Ok(())
 }
@@ -559,9 +581,9 @@ fn status_reports_an_unrecognised_event() -> Result<()> {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the answer"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let h = harness([Script::completed(drifted)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    let status = h.store.status(&started.run_id)?;
+    let harness = harness([Script::completed(drifted)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let status = harness.store.status(&started.run_id)?;
 
     assert_that!(status.unrecognised.total(), eq(1));
     assert_that!(
@@ -569,7 +591,7 @@ fn status_reports_an_unrecognised_event() -> Result<()> {
         some(contains_substring("a_shape_nobody_has_seen"))
     );
     // And the transcript tells a reader the same thing, so it survives being read from the file.
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("did not recognise"));
     Ok(())
 }
@@ -584,19 +606,19 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
     // type or malformed lines — are both counted.
     // A fixture without the drift note would leave the ordering this test exists to check
     // untested.
-    let h = harness([Script::completed(indoc::indoc! {r#"
+    let harness = harness([Script::completed(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"the findings, in full"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#})])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
     // What a caller would already have seen, and paged past, before the file appeared.
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let before_recovery = page.text;
 
     // The codex process writes this file directly, so it survives what the stream does not.
-    let last = h
+    let last = harness
         .store
         .root()
         .join("runs")
@@ -604,7 +626,7 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
         .join("turns/0000/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
 
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("the findings, in full"));
     assert_that!(page.text, contains_substring("recovered"));
     // The drift note is part of what was already handed out, so it must still be above.
@@ -638,19 +660,19 @@ fn a_terminal_event_flushed_as_the_child_exits_is_not_settled_as_a_failure() -> 
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the findings"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let h = harness([Script::flushes_as_it_exits(started_only, flushed_at_exit)])?;
+    let harness = harness([Script::flushes_as_it_exits(started_only, flushed_at_exit)])?;
 
     // The very first status is the one that races: the store folds a stream with no terminal
     // event, then asks about a child that has just finished writing one.
-    let status = h.store.start(&request(codex()?, "q"))?;
+    let status = harness.store.start(&request(codex()?, "q"))?;
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
 
-    let page = h.store.page(&status.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&status.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("the findings"));
     assert_that!(page.text, not(contains_substring("launch failed")));
 
     // And the second read agrees with the first, byte for byte.
-    let again = h.store.page(&status.run_id, 0, 1_000_000)?;
+    let again = harness.store.page(&status.run_id, 0, 1_000_000)?;
     assert_that!(again.text, eq(&page.text));
     Ok(())
 }
@@ -658,16 +680,16 @@ fn a_terminal_event_flushed_as_the_child_exits_is_not_settled_as_a_failure() -> 
 /// The rendered transcript may only ever grow at its end, because `tail` hands out byte offsets.
 #[gtest]
 fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
-    let h = harness([Script::running(indoc::indoc! {r#"
+    let harness = harness([Script::running(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"turn.started"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"first finding"}}
     "#})])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
-    let page = h.store.page(&started.run_id, 0, usize::MAX)?;
+    let page = harness.store.page(&started.run_id, 0, usize::MAX)?;
     let mut previous = page.text;
-    let events = h
+    let events = harness
         .store
         .root()
         .join("runs")
@@ -684,7 +706,7 @@ fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
         stream.push('\n');
         std::fs::write(&events, &stream)?;
 
-        let page = h.store.page(&started.run_id, 0, usize::MAX)?;
+        let page = harness.store.page(&started.run_id, 0, usize::MAX)?;
         let now = page.text;
         assert_that!(
             now.starts_with(&previous),
@@ -705,17 +727,17 @@ fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
 /// messages would vanish and then reappear when the child finished the character.
 #[gtest]
 fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()> {
-    let h = harness([Script::running(indoc::indoc! {r#"
+    let harness = harness([Script::running(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the first finding"}}
     "#})])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let before = page.text;
     assert_that!(before, contains_substring("the first finding"));
 
     // Append a line that stops halfway through a four-byte character, as a partial write does.
-    let events = h
+    let events = harness
         .store
         .root()
         .join("runs")
@@ -726,7 +748,7 @@ fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()
     bytes.extend_from_slice(&"🎉".as_bytes()[..2]);
     std::fs::write(&events, &bytes)?;
 
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let after = page.text;
     assert_that!(after, contains_substring("the first finding"));
     assert_that!(
@@ -744,13 +766,13 @@ fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()
 /// reaches the report.
 #[gtest]
 fn a_page_smaller_than_one_character_still_makes_progress() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
     let mut cursor = 0;
     let mut steps = 0;
     loop {
-        let page = h.store.page(&started.run_id, cursor, 1)?;
+        let page = harness.store.page(&started.run_id, cursor, 1)?;
         assert_that!(
             page.next_offset > cursor,
             eq(true),
@@ -762,12 +784,15 @@ fn a_page_smaller_than_one_character_still_makes_progress() -> Result<()> {
             break;
         }
     }
-    assert_that!(page_reached_end(&h, &started.run_id, cursor)?, eq(true));
+    assert_that!(
+        page_reached_end(&harness, &started.run_id, cursor)?,
+        eq(true)
+    );
     Ok(())
 }
 
-fn page_reached_end(h: &Harness, run_id: &RunId, cursor: u64) -> Result<bool> {
-    let page = h.store.page(run_id, cursor, 1)?;
+fn page_reached_end(harness: &Harness, run_id: &RunId, cursor: u64) -> Result<bool> {
+    let page = harness.store.page(run_id, cursor, 1)?;
     Ok(page.at_end)
 }
 
@@ -787,17 +812,23 @@ fn page_reached_end(h: &Harness, run_id: &RunId, cursor: u64) -> Result<bool> {
 /// files, never shared.
 #[gtest]
 fn every_turn_owns_its_own_capture_files() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "the original brief"))?;
-    h.store.follow_up(&started.run_id, "first follow-up")?;
-    let third = h.store.follow_up(&started.run_id, "second follow-up")?;
+    let started = harness
+        .store
+        .start(&request(codex()?, "the original brief"))?;
+    harness
+        .store
+        .follow_up(&started.run_id, "first follow-up")?;
+    let third = harness
+        .store
+        .follow_up(&started.run_id, "second follow-up")?;
     assert_that!(third.turns, eq(3));
 
-    let turns = h
+    let turns = harness
         .store
         .root()
         .join("runs")
@@ -816,7 +847,7 @@ fn every_turn_owns_its_own_capture_files() -> Result<()> {
     );
 
     // Three children, three capture files, no sharing.
-    let events: std::collections::BTreeSet<_> = h
+    let events: std::collections::BTreeSet<_> = harness
         .launcher
         .launches()
         .into_iter()
@@ -837,13 +868,15 @@ fn a_rate_limited_follow_up_leaves_the_consultation_resumable() -> Result<()> {
         {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
         {"type":"turn.failed","error":{"message":"rate limit reached for this account"}}
     "#};
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(rate_limited),
     ])?;
-    let started = h.store.start(&request(codex()?, "the original brief"))?;
+    let started = harness
+        .store
+        .start(&request(codex()?, "the original brief"))?;
 
-    let followed = h.store.follow_up(&started.run_id, "and now?")?;
+    let followed = harness.store.follow_up(&started.run_id, "and now?")?;
     assert_that!(
         followed.outcome,
         matches_pattern!(Outcome::Failed {
@@ -866,7 +899,7 @@ fn a_rate_limited_follow_up_leaves_the_consultation_resumable() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_child_that_finishes_as_it_is_stopped_is_reported_finished() -> Result<()> {
-    let h = harness([Script::flushes_when_stopped(
+    let harness = harness([Script::flushes_when_stopped(
         indoc::indoc! {r#"
             {"type":"thread.started","thread_id":"01a0"}
             {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
@@ -876,16 +909,16 @@ async fn a_child_that_finishes_as_it_is_stopped_is_reported_finished() -> Result
             {"type":"turn.completed","usage":{"input_tokens":1}}
         "#},
     )])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Running));
 
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     assert_that!(
         cancelled.outcome,
         matches_pattern!(Outcome::Completed { .. })
     );
     assert_that!(cancelled.resumable, eq(true));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("the rest"));
     assert_that!(page.text, not(contains_substring("cancelled")));
     Ok(())
@@ -900,18 +933,18 @@ async fn a_child_that_finishes_as_it_is_stopped_is_reported_finished() -> Result
 #[gtest]
 #[tokio::test]
 async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
-    let h = harness([Script::running(indoc::indoc! {r#"
+    let harness = harness([Script::running(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
     "#})])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let published = page.text;
 
     // Something survived the kill and kept writing.
-    let events = h
+    let events = harness
         .store
         .root()
         .join("runs")
@@ -924,10 +957,10 @@ async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
     "#});
     std::fs::write(&events, stream)?;
 
-    let after = h.store.status(&started.run_id)?;
+    let after = harness.store.status(&started.run_id)?;
     assert_that!(after.outcome, matches_pattern!(Outcome::Cancelled));
     assert_that!(after.resumable, eq(false));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let again = page.text;
     assert_that!(again, eq(&published));
     assert_that!(again, not(contains_substring("from beyond")));
@@ -942,8 +975,8 @@ async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
 /// as far as the sweep is concerned — and `list` would show a phantom for ever.
 #[gtest]
 fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CLAUDE_HAPPY)])?;
-    let refused = h.store.start(&request(
+    let harness = harness([Script::completed(fixtures::CLAUDE_HAPPY)])?;
+    let refused = harness.store.start(&request(
         Delegate::Claude {
             model: ModelId::parse("claude-opus-5").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
@@ -953,9 +986,9 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
         "q",
     ));
     assert_that!(refused.map(|_| ()), err(anything()));
-    assert_that!(h.launcher.launches().len(), eq(0));
-    assert_that!(h.store.list(10)?, is_empty());
-    assert_that!(h.store.sweep()?, eq(0));
+    assert_that!(harness.launcher.launches().len(), eq(0));
+    assert_that!(harness.store.list(10)?, is_empty());
+    assert_that!(harness.store.sweep()?, eq(0));
     Ok(())
 }
 
@@ -965,11 +998,11 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
 /// reads as failed, and the next real turn is told an earlier one failed.
 #[gtest]
 fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
     // The environment the follow-up will re-apply now names something no request may set.
-    let meta_path = h
+    let meta_path = harness
         .store
         .root()
         .join("runs")
@@ -979,9 +1012,9 @@ fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
     meta["env"] = serde_json::json!({"PATH": "/tmp/attacker"});
     std::fs::write(&meta_path, serde_json::to_string(&meta)?)?;
 
-    let refused = h.store.follow_up(&started.run_id, "again");
+    let refused = harness.store.follow_up(&started.run_id, "again");
     assert_that!(refused.map(|_| ()), err(anything()));
-    let status = h.store.status(&started.run_id)?;
+    let status = harness.store.status(&started.run_id)?;
     assert_that!(status.turns, eq(1));
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(status.earlier_failure, none());
@@ -995,7 +1028,7 @@ fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
 /// follow it would then have bytes inserted above it.
 #[gtest]
 fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(indoc::indoc! {r#"
             {"type":"thread.started","thread_id":"01a0"}
             {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
@@ -1003,10 +1036,10 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
         "#}),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(started.resumable, eq(false));
-    let refused = h.store.follow_up(&started.run_id, "again");
+    let refused = harness.store.follow_up(&started.run_id, "again");
     assert_that!(
         refused.map(|_| ()),
         err(matches_pattern!(RunError::NotResumable(matches_pattern!(
@@ -1015,18 +1048,18 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
     );
 
     // Once the CLI's own file lands, the turn has said something and may be continued.
-    let last = h
+    let last = harness
         .store
         .root()
         .join("runs")
         .join(started.run_id.as_str())
         .join("turns/0000/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let before = page.text;
-    let followed = h.store.follow_up(&started.run_id, "again")?;
+    let followed = harness.store.follow_up(&started.run_id, "again")?;
     assert_that!(followed.turns, eq(2));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let after = page.text;
     assert_that!(after.starts_with(&before), eq(true));
     Ok(())
@@ -1035,13 +1068,16 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
 /// Deleting a running consultation would orphan its child, so it is refused.
 #[gtest]
 fn a_running_consultation_cannot_be_removed() -> Result<()> {
-    let h = harness([Script::running("{\"type\":\"turn.started\"}\n")])?;
-    let started = h.store.start(&request(codex()?, "long"))?;
+    let harness = harness([Script::running("{\"type\":\"turn.started\"}\n")])?;
+    let started = harness.store.start(&request(codex()?, "long"))?;
     assert_that!(
-        h.store.remove(&started.run_id),
+        harness.store.remove(&started.run_id),
         err(matches_pattern!(RunError::StillRunning { .. }))
     );
-    assert_that!(h.store.status(&started.run_id).map(|_| ()), ok(anything()));
+    assert_that!(
+        harness.store.status(&started.run_id).map(|_| ()),
+        ok(anything())
+    );
     Ok(())
 }
 
@@ -1054,12 +1090,12 @@ fn a_running_consultation_cannot_be_removed() -> Result<()> {
 /// of settling.
 #[gtest]
 fn a_child_that_died_without_a_terminal_event_settles_rather_than_polling_forever() -> Result<()> {
-    let h = harness([Script::exited(
+    let harness = harness([Script::exited(
         "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
         "error: unexpected argument '--sandbox' found\n",
         2,
     )])?;
-    let status = h.store.start(&request(codex()?, "q"))?;
+    let status = harness.store.start(&request(codex()?, "q"))?;
 
     assert_that!(status.outcome.is_terminal(), eq(true));
     let Outcome::Failed { detail, .. } = &status.outcome else {
@@ -1079,10 +1115,10 @@ fn a_child_that_died_without_a_terminal_event_settles_rather_than_polling_foreve
 /// there?" a sound test for staleness.
 #[gtest]
 fn a_stale_render_does_not_overwrite_a_newer_transcript() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
-    let path = h.store.status(&started.run_id)?.transcript_path;
+    let path = harness.store.status(&started.run_id)?.transcript_path;
     let complete = std::fs::read_to_string(&path)?;
     assert_that!(complete.as_str(), contains_substring("FIXTURE_OK"));
 
@@ -1092,12 +1128,12 @@ fn a_stale_render_does_not_overwrite_a_newer_transcript() -> Result<()> {
     std::fs::write(&path, &newer)?;
 
     // A read that folds the older state must leave the newer publication alone.
-    h.store.view(&started.run_id, 0, 1_000_000)?;
+    harness.store.view(&started.run_id, 0, 1_000_000)?;
     assert_that!(std::fs::read_to_string(&path)?, eq(&newer));
 
     // A file that is not a prefix of the render is not a newer snapshot, so it is repaired.
     std::fs::write(&path, "corrupted")?;
-    h.store.view(&started.run_id, 0, 1_000_000)?;
+    harness.store.view(&started.run_id, 0, 1_000_000)?;
     assert_that!(std::fs::read_to_string(&path)?, eq(&complete));
     Ok(())
 }
@@ -1208,7 +1244,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -1281,7 +1317,7 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
     // With no default configured, the record says the CLI's own login ran.
@@ -1420,7 +1456,7 @@ fn a_rollout_missed_while_the_delegate_saves_is_searched_again() -> Result<()> {
             {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1789303382}}}}
         "#},
     )?;
-    launcher.terminate(launcher.launched(0));
+    launcher.terminate(launcher.launch_handle(0));
 
     // The earlier miss was not remembered, so the window is found now.
     assert_that!(
@@ -1441,16 +1477,16 @@ fn a_rollout_missed_while_the_delegate_saves_is_searched_again() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_cancelled_run_whose_child_survives_is_not_removed() -> Result<()> {
-    let h = harness([Script::survives_stop(
+    let harness = harness([Script::survives_stop(
         "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
     )])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
 
     assert_that!(
-        h.store.remove(&started.run_id),
+        harness.store.remove(&started.run_id),
         err(matches_pattern!(RunError::StillRunning { .. }))
     );
     Ok(())
@@ -1463,12 +1499,12 @@ async fn a_cancelled_run_whose_child_survives_is_not_removed() -> Result<()> {
 /// every later follow-up as "already in flight" for good.
 #[gtest]
 fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    let abandoned = h
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let abandoned = harness
         .store
         .root()
         .join("runs")
@@ -1478,11 +1514,11 @@ fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
     std::fs::write(abandoned.join("question.md"), "never launched")?;
 
     // Not a turn: the consultation still reads as one finished turn, ready to continue.
-    let status = h.store.status(&started.run_id)?;
+    let status = harness.store.status(&started.run_id)?;
     assert_that!(status.turns, eq(1));
     assert_that!(status.resumable, eq(true));
 
-    let followed = h.store.follow_up(&started.run_id, "again")?;
+    let followed = harness.store.follow_up(&started.run_id, "again")?;
     assert_that!(followed.turns, eq(2));
     assert_that!(abandoned.join("launch.json").is_file(), eq(true));
     assert_that!(
@@ -1516,9 +1552,9 @@ fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn cancelling_a_consultation_with_no_recorded_turn_returns() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    let turn = h
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let turn = harness
         .store
         .root()
         .join("runs")
@@ -1526,9 +1562,12 @@ async fn cancelling_a_consultation_with_no_recorded_turn_returns() -> Result<()>
         .join("turns/0000");
     std::fs::remove_dir_all(&turn)?;
 
-    let cancelled = tokio::time::timeout(Duration::from_secs(5), h.store.cancel(&started.run_id))
-        .await
-        .or_fail()??;
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.store.cancel(&started.run_id),
+    )
+    .await
+    .or_fail()??;
     assert_that!(cancelled.turns, eq(0));
     Ok(())
 }
@@ -1539,12 +1578,12 @@ async fn cancelling_a_consultation_with_no_recorded_turn_returns() -> Result<()>
 /// underneath the delegate that opened the platform default instead would find nothing and serve.
 #[gtest]
 fn the_delegate_is_told_where_this_store_keeps_its_runs() -> Result<()> {
-    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
-    h.store.start(&request(codex()?, "q"))?;
-    let launch = h.launcher.launches().into_iter().next().or_fail()?;
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    harness.store.start(&request(codex()?, "q"))?;
+    let launch = harness.launcher.launches().into_iter().next().or_fail()?;
     assert_that!(
         launch.env.get(RunStore::STATE_DIR_ENV).map(PathBuf::from),
-        some(eq(&h.store.root().to_path_buf()))
+        some(eq(&harness.store.root().to_path_buf()))
     );
     Ok(())
 }
@@ -1599,7 +1638,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
                 .into_iter()
                 .collect(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
     };
 
@@ -1632,20 +1671,20 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
 /// re-read the file would move under a reader who had already been handed it.
 #[gtest]
 fn a_settled_failure_does_not_move_with_its_stderr() -> Result<()> {
-    let h = harness([Script::exited(
+    let harness = harness([Script::exited(
         "{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n",
         "boom: the first word\n",
         2,
     )])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
     let Outcome::Failed { detail, .. } = &started.outcome else {
         panic!("expected a failure, got {:?}", started.outcome);
     };
     assert_that!(detail.as_str(), contains_substring("the first word"));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let published = page.text;
 
-    let stderr = h
+    let stderr = harness
         .store
         .root()
         .join("runs")
@@ -1655,7 +1694,7 @@ fn a_settled_failure_does_not_move_with_its_stderr() -> Result<()> {
     text.push_str("and a second word, from beyond\n");
     std::fs::write(&stderr, text)?;
 
-    let (again, page) = h.store.view(&started.run_id, 0, 1_000_000)?;
+    let (again, page) = harness.store.view(&started.run_id, 0, 1_000_000)?;
     assert_that!(again.outcome, eq(&started.outcome));
     assert_that!(page.text, eq(&published));
     Ok(())
@@ -1673,19 +1712,19 @@ fn a_reply_landing_after_a_later_turn_is_not_recovered_into_the_earlier_one() ->
         {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(silent),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
-    h.store.follow_up(&started.run_id, "again")?;
-    let followed = h.store.follow_up(&started.run_id, "and again")?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    harness.store.follow_up(&started.run_id, "again")?;
+    let followed = harness.store.follow_up(&started.run_id, "and again")?;
     assert_that!(followed.turns, eq(3));
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let before = page.text;
 
-    let earlier = h
+    let earlier = harness
         .store
         .root()
         .join("runs")
@@ -1693,7 +1732,7 @@ fn a_reply_landing_after_a_later_turn_is_not_recovered_into_the_earlier_one() ->
         .join("turns/0001");
     std::fs::write(earlier.join("last-message.md"), "late findings")?;
 
-    let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let after = page.text;
     assert_that!(after, eq(&before));
     assert_that!(earlier.join("recovered.md").exists(), eq(false));
@@ -1707,17 +1746,17 @@ fn a_reply_landing_after_a_later_turn_is_not_recovered_into_the_earlier_one() ->
 #[gtest]
 #[tokio::test]
 async fn a_consultation_whose_child_still_lives_is_not_removed() -> Result<()> {
-    let h = harness([Script::running(fixtures::CODEX_HAPPY)])?;
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let harness = harness([Script::running(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
 
     assert_that!(
-        h.store.remove(&started.run_id),
+        harness.store.remove(&started.run_id),
         err(matches_pattern!(RunError::StillRunning { .. }))
     );
     // Once the child has been stopped, the run is an ordinary finished one.
-    h.store.cancel(&started.run_id).await?;
-    assert_that!(h.store.remove(&started.run_id), ok(anything()));
+    harness.store.cancel(&started.run_id).await?;
+    assert_that!(harness.store.remove(&started.run_id), ok(anything()));
     Ok(())
 }
 
@@ -1765,7 +1804,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
         retention: Retention::Ttl,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     })?;
 
     let launch = launcher.launches().into_iter().next().or_fail()?;
@@ -1845,7 +1884,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
     };
     let reasoning = |effort: &str| format!("model_reasoning_effort=\"{effort}\"");
@@ -1909,7 +1948,7 @@ fn a_failed_follow_up_quotes_what_its_cli_wrote_to_stderr() -> Result<()> {
     let refusal = indoc::formatdoc! {r#"
         {{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"{session}"}}
     "#};
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CLAUDE_HAPPY),
         Script::exited(
             refusal,
@@ -1920,8 +1959,8 @@ fn a_failed_follow_up_quotes_what_its_cli_wrote_to_stderr() -> Result<()> {
         ),
     ])?;
 
-    let started = h.store.start(&request(claude()?, "q"))?;
-    let followed = h.store.follow_up(&started.run_id, "and now?")?;
+    let started = harness.store.start(&request(claude()?, "q"))?;
+    let followed = harness.store.follow_up(&started.run_id, "and now?")?;
 
     // A turn that did not fail has nothing to quote.
     assert_that!(started.delegate_stderr, none());
@@ -1936,7 +1975,7 @@ fn a_failed_follow_up_quotes_what_its_cli_wrote_to_stderr() -> Result<()> {
 /// A failure settled by its exit record already quotes stderr in its detail, so it is not repeated.
 #[gtest]
 fn a_failure_whose_detail_quotes_stderr_does_not_repeat_it() -> Result<()> {
-    let h = harness([Script::exited(
+    let harness = harness([Script::exited(
         indoc::indoc! {r#"
             {"type":"thread.started","thread_id":"01a0"}
         "#},
@@ -1946,7 +1985,7 @@ fn a_failure_whose_detail_quotes_stderr_does_not_repeat_it() -> Result<()> {
         2,
     )])?;
 
-    let started = h.store.start(&request(codex()?, "q"))?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
 
     let Outcome::Failed { detail, .. } = &started.outcome else {
         return fail!("expected a failure, got {:?}", started.outcome);
@@ -1991,19 +2030,22 @@ fn a_session_store_agentmux_cannot_write_is_reported_and_not_followed_up() -> Re
     // Root writes through any mode bits, so there would be no refusal to observe.
     let refused = std::fs::File::create(projects.join("probe")).is_err();
     let checked = refused.then(|| -> Result<()> {
-        let h = store_with_home(home.path())?;
+        let harness = store_with_home(home.path())?;
 
-        let started = h.store.start(&request(claude()?, "q"))?;
+        let started = harness.store.start(&request(claude()?, "q"))?;
 
         verify_that!(started.unsaved_session_store, some(eq(&projects)))?;
         verify_that!(started.resumable, eq(false))?;
-        let page = h.store.page(&started.run_id, 0, 1_000_000)?;
+        let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
         verify_that!(
             page.text,
             contains_substring("**This turn's session was not saved.**")
         )?;
         verify_that!(
-            h.store.follow_up(&started.run_id, "and now?").map(|_| ()),
+            harness
+                .store
+                .follow_up(&started.run_id, "and now?")
+                .map(|_| ()),
             err(displays_as(contains_substring("could not write to")))
         )
     });
@@ -2085,9 +2127,9 @@ fn a_session_store_that_does_not_exist_yet_is_probed_where_the_cli_would_create_
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555))?;
     let refused = std::fs::File::create(config_dir.join("probe")).is_err();
     let checked = refused.then(|| -> Result<()> {
-        let h = store_with_home(home.path())?;
+        let harness = store_with_home(home.path())?;
 
-        let started = h.store.start(&request(claude()?, "q"))?;
+        let started = harness.store.start(&request(claude()?, "q"))?;
 
         verify_that!(
             started.unsaved_session_store,
@@ -2102,9 +2144,9 @@ fn a_session_store_that_does_not_exist_yet_is_probed_where_the_cli_would_create_
 #[gtest]
 fn a_missing_configuration_directory_raises_nothing() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    let h = store_with_home(home.path())?;
+    let harness = store_with_home(home.path())?;
 
-    let started = h.store.start(&request(claude()?, "q"))?;
+    let started = harness.store.start(&request(claude()?, "q"))?;
 
     assert_that!(started.unsaved_session_store, none());
     assert_that!(started.resumable, eq(true));
@@ -2118,9 +2160,9 @@ fn a_session_store_agentmux_can_write_raises_nothing_and_keeps_nothing() -> Resu
     let home = tempfile::tempdir().or_fail()?;
     let projects = home.path().join(".claude/projects");
     std::fs::create_dir_all(&projects)?;
-    let h = store_with_home(home.path())?;
+    let harness = store_with_home(home.path())?;
 
-    let started = h.store.start(&request(claude()?, "q"))?;
+    let started = harness.store.start(&request(claude()?, "q"))?;
 
     assert_that!(started.unsaved_session_store, none());
     assert_that!(started.resumable, eq(true));

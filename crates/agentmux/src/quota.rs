@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config, home_dir};
 use crate::delegate::{
-    AccountAlias, Vendor, base_env, credential_vars, is_billing_name, scrub_billing_env,
+    AccountAlias, Vendor, base_env, credential_vars, is_billing_env_name, scrub_billing_env,
 };
 
 /// How long a single account's probe may take before it is abandoned.
@@ -167,7 +167,7 @@ pub enum ProbeTarget {
     },
     /// An identity whose environment supplies an API credential, an endpoint, or a switch that
     /// routes it to another backend, so no subscription window of the vendor's describes it.
-    Credential,
+    NoSubscriptionWindow,
 }
 
 /// Whether a login stored on disk outranks a key in the environment, for this vendor.
@@ -235,20 +235,20 @@ impl ProbeTarget {
         // it onto API pricing or another backend, such as `CLAUDE_CODE_USE_BEDROCK`, means the
         // plain profile's window is not this account's.
         // A subscription identity has had every such name scrubbed already.
-        if vendor == Vendor::Claude && env.keys().any(|name| is_billing_name(name)) {
-            return Ok(Self::Credential);
+        if vendor == Vendor::Claude && env.keys().any(|name| is_billing_env_name(name)) {
+            return Ok(Self::NoSubscriptionWindow);
         }
         let vars = credential_vars(vendor);
         let config_dir = env.get(vars.config_dir).map(PathBuf::from);
         // An endpoint of the identity's own is not the vendor's window whatever the login says,
         // so it answers before the login is consulted at all.
         if env.contains_key(vars.base_url) {
-            return Ok(Self::Credential);
+            return Ok(Self::NoSubscriptionWindow);
         }
         let keyed = env.contains_key(vars.api_key)
             || vars.auth_token.is_some_and(|name| env.contains_key(name));
         if keyed && !stored_login_wins(vendor, config_dir.as_deref(), host_env) {
-            return Ok(Self::Credential);
+            return Ok(Self::NoSubscriptionWindow);
         }
         Ok(Self::Window { config_dir })
     }
@@ -258,7 +258,7 @@ impl ProbeTarget {
     pub fn config_dir(&self) -> Option<&Path> {
         match self {
             Self::Window { config_dir } => config_dir.as_deref(),
-            Self::Credential => None,
+            Self::NoSubscriptionWindow => None,
         }
     }
 }
@@ -305,7 +305,7 @@ pub fn probe_vendor(
     host_env: &BTreeMap<String, String>,
     probe: &dyn QuotaProbe,
 ) -> Vec<AccountQuota> {
-    enum Target<'a> {
+    enum ProbeAccount<'a> {
         Default,
         Named {
             alias: AccountAlias,
@@ -313,7 +313,7 @@ pub fn probe_vendor(
         },
     }
 
-    impl Target<'_> {
+    impl ProbeAccount<'_> {
         fn alias(&self) -> Option<&AccountAlias> {
             match self {
                 Self::Default => None,
@@ -324,13 +324,13 @@ pub fn probe_vendor(
 
     struct PendingProbe<'scope, 'account> {
         handle: std::thread::ScopedJoinHandle<'scope, Observation>,
-        target: Target<'account>,
+        account: ProbeAccount<'account>,
     }
 
-    let mut targets: Vec<Target<'_>> = config
+    let mut accounts: Vec<ProbeAccount<'_>> = config
         .accounts(vendor)
         .iter()
-        .map(|(alias, account)| Target::Named {
+        .map(|(alias, account)| ProbeAccount::Named {
             alias: alias.clone(),
             account,
         })
@@ -346,15 +346,15 @@ pub fn probe_vendor(
         .default_account(vendor)
         .is_some_and(|default| config.account(vendor, default.alias).is_some());
     if !default_is_defined {
-        targets.push(Target::Default);
+        accounts.push(ProbeAccount::Default);
     }
 
     std::thread::scope(|scope| {
-        let handles: Vec<_> = targets
+        let pending_probes: Vec<_> = accounts
             .into_iter()
-            .map(|target| {
+            .map(|account| {
                 let handle = scope.spawn({
-                    let alias = target.alias().cloned();
+                    let alias = account.alias().cloned();
                     move || match ProbeTarget::of(vendor, alias.as_ref(), config, host_env) {
                         Ok(target) => probe.probe(&ProbeRequest {
                             vendor,
@@ -368,20 +368,20 @@ pub fn probe_vendor(
                         },
                     }
                 });
-                PendingProbe { handle, target }
+                PendingProbe { handle, account }
             })
             .collect();
-        handles
+        pending_probes
             .into_iter()
-            .map(|PendingProbe { handle, target }| AccountQuota {
+            .map(|PendingProbe { handle, account }| AccountQuota {
                 vendor,
-                description: match &target {
-                    Target::Default => None,
-                    Target::Named { account, .. } => account.description.clone(),
+                description: match &account {
+                    ProbeAccount::Default => None,
+                    ProbeAccount::Named { account, .. } => account.description.clone(),
                 },
-                account: match target {
-                    Target::Default => None,
-                    Target::Named { alias, .. } => Some(alias),
+                account: match account {
+                    ProbeAccount::Default => None,
+                    ProbeAccount::Named { alias, .. } => Some(alias),
                 },
                 // A probe that panicked is reported as unavailable rather than dropped: an
                 // account missing from the list reads as "does not exist", which is a different
@@ -400,7 +400,7 @@ pub struct SystemProbe;
 
 impl QuotaProbe for SystemProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
-        if request.target == ProbeTarget::Credential {
+        if request.target == ProbeTarget::NoSubscriptionWindow {
             // Reported rather than skipped: a caller comparing accounts needs to see that this one
             // exists and simply has no window, not to find it missing from the list.
             return Observation::Unavailable {
@@ -439,7 +439,7 @@ impl QuotaProbe for SystemProbe {
 ///
 /// A probe reads a usage window and never needs a key, so its environment is scrubbed of every
 /// billing variable whatever the account says: the probe of an account on API pricing is never
-/// spawned at all, because [`ProbeTarget::Credential`] is answered without one.
+/// spawned at all, because [`ProbeTarget::NoSubscriptionWindow`] is answered without one.
 fn probe_command(request: &ProbeRequest<'_>, program: &str) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     command.env_clear();
@@ -481,7 +481,7 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     // A weekly window moves with every other session on the account, so figures from hours ago
     // answer a question nobody asked.
     let before = read_cached_usage(&path);
-    let refreshed = is_stale(before.as_ref()).then(|| refresh_claude_cache(request));
+    let refresh_process_outcome = is_stale(before.as_ref()).then(|| refresh_claude_cache(request));
 
     let Some(cached) = read_cached_usage(&path) else {
         return Observation::Unavailable {
@@ -498,23 +498,23 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     // dressed as a careful one.
     let fetched = fetched_at_ms(Some(&cached));
     let advanced = fetched > fetched_at_ms(before.as_ref());
-    let refresh = match refreshed {
+    let refresh = match refresh_process_outcome {
         None => Refresh::Skipped,
         Some(_) if advanced => Refresh::Succeeded,
-        Some(RefreshEnd::TimedOut) => Refresh::TimedOut,
-        Some(RefreshEnd::Exited(status)) if status.success() => Refresh::Failed {
+        Some(RefreshProcessOutcome::TimedOut) => Refresh::TimedOut,
+        Some(RefreshProcessOutcome::Exited(status)) if status.success() => Refresh::Failed {
             reason: format!(
                 "`{} --print /usage` exited cleanly, but the cached figures did not advance",
                 Vendor::Claude.program()
             ),
         },
-        Some(RefreshEnd::Exited(status)) => Refresh::Failed {
+        Some(RefreshProcessOutcome::Exited(status)) => Refresh::Failed {
             reason: format!(
                 "`{} --print /usage` exited with {status}",
                 Vendor::Claude.program()
             ),
         },
-        Some(RefreshEnd::Unrun(reason)) => Refresh::Failed { reason },
+        Some(RefreshProcessOutcome::ProcessError(reason)) => Refresh::Failed { reason },
     };
 
     Observation::Reported {
@@ -556,13 +556,13 @@ fn fetched_at_ms(cached: Option<&serde_json::Value>) -> Option<i64> {
 }
 
 /// How a cache refresh's process ended, which says nothing about whether the figures advanced.
-enum RefreshEnd {
+enum RefreshProcessOutcome {
     /// It exited with this status.
     Exited(std::process::ExitStatus),
     /// It was still running at the deadline and was stopped.
     TimedOut,
     /// It could not be started or waited on, for this reason.
-    Unrun(String),
+    ProcessError(String),
 }
 
 /// Ask the Claude CLI to refresh its usage cache.
@@ -574,7 +574,7 @@ enum RefreshEnd {
 ///
 /// What comes back is how the process ended.
 /// Whether the cache actually advanced is judged by `probe_claude` from the figures themselves.
-fn refresh_claude_cache(request: &ProbeRequest<'_>) -> RefreshEnd {
+fn refresh_claude_cache(request: &ProbeRequest<'_>) -> RefreshProcessOutcome {
     use std::process::Stdio;
 
     let mut command = probe_command(request, Vendor::Claude.program());
@@ -587,7 +587,7 @@ fn refresh_claude_cache(request: &ProbeRequest<'_>) -> RefreshEnd {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            return RefreshEnd::Unrun(format!(
+            return RefreshProcessOutcome::ProcessError(format!(
                 "`{} --print /usage` could not be run: {error}",
                 Vendor::Claude.program()
             ));
@@ -599,14 +599,16 @@ fn refresh_claude_cache(request: &ProbeRequest<'_>) -> RefreshEnd {
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return RefreshEnd::Exited(status),
+            Ok(Some(status)) => return RefreshProcessOutcome::Exited(status),
             Err(error) => {
-                return RefreshEnd::Unrun(format!("the refresh could not be waited on: {error}"));
+                return RefreshProcessOutcome::ProcessError(format!(
+                    "the refresh could not be waited on: {error}"
+                ));
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return RefreshEnd::TimedOut;
+                return RefreshProcessOutcome::TimedOut;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -679,20 +681,23 @@ fn exchange_rate_limits(
     use std::io::BufRead as _;
 
     use codex_app_server_protocol::envelope::{Message, RequestId};
-    use codex_app_server_protocol::methods as m;
+    use codex_app_server_protocol::methods;
 
-    const INITIALIZE: RequestId = RequestId::Integer(1);
-    const READ: RequestId = RequestId::Integer(2);
+    const INITIALIZE_REQUEST_ID: RequestId = RequestId::Integer(1);
+    const RATE_LIMITS_REQUEST_ID: RequestId = RequestId::Integer(2);
 
-    let encoded = [
-        Message::request::<m::Initialize>(INITIALIZE, &crate::appserver::initialize_params()),
-        Message::notification::<m::Initialized>(&()),
-        Message::request::<m::AccountRateLimitsRead>(READ, &None),
+    let outgoing_messages = [
+        Message::request::<methods::Initialize>(
+            INITIALIZE_REQUEST_ID,
+            &crate::appserver::initialize_params(),
+        ),
+        Message::notification::<methods::Initialized>(&()),
+        Message::request::<methods::AccountRateLimitsRead>(RATE_LIMITS_REQUEST_ID, &None),
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .map_err(|err| format!("{err}: {}", err.source))?;
-    encoded
+    outgoing_messages
         .iter()
         .try_for_each(|message| writeln!(stdin, "{}", message.to_line()))
         .and_then(|()| stdin.flush())
@@ -706,19 +711,19 @@ fn exchange_rate_limits(
             continue;
         };
         match (id, outcome) {
-            (id, Err(error)) if id == INITIALIZE => {
+            (id, Err(error)) if id == INITIALIZE_REQUEST_ID => {
                 return Err(format!(
                     "codex app-server refused the handshake: {}",
-                    refusal(&error.message)
+                    error_message_or_fallback(&error.message)
                 ));
             }
-            (id, Err(error)) if id == READ => {
+            (id, Err(error)) if id == RATE_LIMITS_REQUEST_ID => {
                 return Err(format!(
                     "codex app-server refused: {}",
-                    refusal(&error.message)
+                    error_message_or_fallback(&error.message)
                 ));
             }
-            (id, Ok(result)) if id == READ => return Ok(result),
+            (id, Ok(result)) if id == RATE_LIMITS_REQUEST_ID => return Ok(result),
             _ => {}
         }
     }
@@ -726,7 +731,7 @@ fn exchange_rate_limits(
 }
 
 /// What a JSON-RPC error said, or that it said nothing.
-fn refusal(message: &str) -> &str {
+fn error_message_or_fallback(message: &str) -> &str {
     if message.is_empty() {
         "no reason given"
     } else {

@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::types;
 use crate::{
-    Answered, ClientNotification, ClientRequest, Method, Notification, Payload, Request,
-    ServerNotification, ServerRequest, Typed,
+    ClientNotification, ClientRequest, Method, Notification, RawParams, Request,
+    ServerNotification, ServerRequest, TypedParams, TypedResponse,
 };
 
 /// The codex release this protocol was generated from.
@@ -114,11 +114,11 @@ impl Method for AccountRateLimitsRead {
     const METHOD: &'static str = "account/rateLimits/read";
 }
 
-impl Typed for AccountRateLimitsRead {
+impl TypedParams for AccountRateLimitsRead {
     type Params = Option<types::GetAccountRateLimitsParams>;
 }
 
-impl Answered for AccountRateLimitsRead {
+impl TypedResponse for AccountRateLimitsRead {
     type Response = types::GetAccountRateLimitsResponse;
 }
 
@@ -542,11 +542,11 @@ impl Method for Initialize {
     const METHOD: &'static str = "initialize";
 }
 
-impl Typed for Initialize {
+impl TypedParams for Initialize {
     type Params = types::InitializeParams;
 }
 
-impl Answered for Initialize {
+impl TypedResponse for Initialize {
     type Response = types::InitializeResponse;
 }
 
@@ -1102,11 +1102,11 @@ impl Method for ThreadResume {
     const METHOD: &'static str = "thread/resume";
 }
 
-impl Typed for ThreadResume {
+impl TypedParams for ThreadResume {
     type Params = types::ThreadResumeParams;
 }
 
-impl Answered for ThreadResume {
+impl TypedResponse for ThreadResume {
     type Response = types::ThreadResumeResponse;
 }
 
@@ -1158,11 +1158,11 @@ impl Method for ThreadStart {
     const METHOD: &'static str = "thread/start";
 }
 
-impl Typed for ThreadStart {
+impl TypedParams for ThreadStart {
     type Params = types::ThreadStartParams;
 }
 
-impl Answered for ThreadStart {
+impl TypedResponse for ThreadStart {
     type Response = types::ThreadStartResponse;
 }
 
@@ -1262,11 +1262,11 @@ impl Method for TurnInterrupt {
     const METHOD: &'static str = "turn/interrupt";
 }
 
-impl Typed for TurnInterrupt {
+impl TypedParams for TurnInterrupt {
     type Params = types::TurnInterruptParams;
 }
 
-impl Answered for TurnInterrupt {
+impl TypedResponse for TurnInterrupt {
     type Response = types::TurnInterruptResponse;
 }
 
@@ -1282,11 +1282,11 @@ impl Method for TurnStart {
     const METHOD: &'static str = "turn/start";
 }
 
-impl Typed for TurnStart {
+impl TypedParams for TurnStart {
     type Params = types::TurnStartParams;
 }
 
-impl Answered for TurnStart {
+impl TypedResponse for TurnStart {
     type Response = types::TurnStartResponse;
 }
 
@@ -1302,11 +1302,11 @@ impl Method for TurnSteer {
     const METHOD: &'static str = "turn/steer";
 }
 
-impl Typed for TurnSteer {
+impl TypedParams for TurnSteer {
     type Params = types::TurnSteerParams;
 }
 
-impl Answered for TurnSteer {
+impl TypedResponse for TurnSteer {
     type Response = types::TurnSteerResponse;
 }
 
@@ -1346,7 +1346,7 @@ impl Method for Initialized {
     const METHOD: &'static str = "initialized";
 }
 
-impl Typed for Initialized {
+impl TypedParams for Initialized {
     type Params = ();
 }
 
@@ -1374,11 +1374,11 @@ impl Method for ApplyPatchApproval {
     const METHOD: &'static str = "applyPatchApproval";
 }
 
-impl Typed for ApplyPatchApproval {
+impl TypedParams for ApplyPatchApproval {
     type Params = types::ApplyPatchApprovalParams;
 }
 
-impl Answered for ApplyPatchApproval {
+impl TypedResponse for ApplyPatchApproval {
     type Response = types::ApplyPatchApprovalResponse;
 }
 
@@ -1406,11 +1406,11 @@ impl Method for ExecCommandApproval {
     const METHOD: &'static str = "execCommandApproval";
 }
 
-impl Typed for ExecCommandApproval {
+impl TypedParams for ExecCommandApproval {
     type Params = types::ExecCommandApprovalParams;
 }
 
-impl Answered for ExecCommandApproval {
+impl TypedResponse for ExecCommandApproval {
     type Response = types::ExecCommandApprovalResponse;
 }
 
@@ -1426,11 +1426,11 @@ impl Method for ItemCommandExecutionRequestApproval {
     const METHOD: &'static str = "item/commandExecution/requestApproval";
 }
 
-impl Typed for ItemCommandExecutionRequestApproval {
+impl TypedParams for ItemCommandExecutionRequestApproval {
     type Params = types::CommandExecutionRequestApprovalParams;
 }
 
-impl Answered for ItemCommandExecutionRequestApproval {
+impl TypedResponse for ItemCommandExecutionRequestApproval {
     type Response = types::CommandExecutionRequestApprovalResponse;
 }
 
@@ -1446,11 +1446,11 @@ impl Method for ItemFileChangeRequestApproval {
     const METHOD: &'static str = "item/fileChange/requestApproval";
 }
 
-impl Typed for ItemFileChangeRequestApproval {
+impl TypedParams for ItemFileChangeRequestApproval {
     type Params = types::FileChangeRequestApprovalParams;
 }
 
-impl Answered for ItemFileChangeRequestApproval {
+impl TypedResponse for ItemFileChangeRequestApproval {
     type Response = types::FileChangeRequestApprovalResponse;
 }
 
@@ -1466,11 +1466,11 @@ impl Method for ItemPermissionsRequestApproval {
     const METHOD: &'static str = "item/permissions/requestApproval";
 }
 
-impl Typed for ItemPermissionsRequestApproval {
+impl TypedParams for ItemPermissionsRequestApproval {
     type Params = types::PermissionsRequestApprovalParams;
 }
 
-impl Answered for ItemPermissionsRequestApproval {
+impl TypedResponse for ItemPermissionsRequestApproval {
     type Response = types::PermissionsRequestApprovalResponse;
 }
 
@@ -1498,11 +1498,11 @@ impl Method for ItemToolRequestUserInput {
     const METHOD: &'static str = "item/tool/requestUserInput";
 }
 
-impl Typed for ItemToolRequestUserInput {
+impl TypedParams for ItemToolRequestUserInput {
     type Params = types::ToolRequestUserInputParams;
 }
 
-impl Answered for ItemToolRequestUserInput {
+impl TypedResponse for ItemToolRequestUserInput {
     type Response = types::ToolRequestUserInputResponse;
 }
 
@@ -1518,11 +1518,11 @@ impl Method for McpServerElicitationRequest {
     const METHOD: &'static str = "mcpServer/elicitation/request";
 }
 
-impl Typed for McpServerElicitationRequest {
+impl TypedParams for McpServerElicitationRequest {
     type Params = types::McpServerElicitationRequestParams;
 }
 
-impl Answered for McpServerElicitationRequest {
+impl TypedResponse for McpServerElicitationRequest {
     type Response = types::McpServerElicitationRequestResponse;
 }
 
@@ -1622,7 +1622,7 @@ impl Method for ConfigWarning {
     const METHOD: &'static str = "configWarning";
 }
 
-impl Typed for ConfigWarning {
+impl TypedParams for ConfigWarning {
     type Params = types::ConfigWarningNotification;
 }
 
@@ -1638,7 +1638,7 @@ impl Method for DeprecationNotice {
     const METHOD: &'static str = "deprecationNotice";
 }
 
-impl Typed for DeprecationNotice {
+impl TypedParams for DeprecationNotice {
     type Params = types::DeprecationNoticeNotification;
 }
 
@@ -1654,7 +1654,7 @@ impl Method for Error {
     const METHOD: &'static str = "error";
 }
 
-impl Typed for Error {
+impl TypedParams for Error {
     type Params = types::ErrorNotification;
 }
 
@@ -1826,7 +1826,7 @@ impl Method for ItemCompleted {
     const METHOD: &'static str = "item/completed";
 }
 
-impl Typed for ItemCompleted {
+impl TypedParams for ItemCompleted {
     type Params = types::ItemCompletedNotification;
 }
 
@@ -1974,7 +1974,7 @@ impl Method for ModelRerouted {
     const METHOD: &'static str = "model/rerouted";
 }
 
-impl Typed for ModelRerouted {
+impl TypedParams for ModelRerouted {
     type Params = types::ModelReroutedNotification;
 }
 
@@ -2446,7 +2446,7 @@ impl Method for ThreadTokenUsageUpdated {
     const METHOD: &'static str = "thread/tokenUsage/updated";
 }
 
-impl Typed for ThreadTokenUsageUpdated {
+impl TypedParams for ThreadTokenUsageUpdated {
     type Params = types::ThreadTokenUsageUpdatedNotification;
 }
 
@@ -2474,7 +2474,7 @@ impl Method for TurnCompleted {
     const METHOD: &'static str = "turn/completed";
 }
 
-impl Typed for TurnCompleted {
+impl TypedParams for TurnCompleted {
     type Params = types::TurnCompletedNotification;
 }
 
@@ -2526,7 +2526,7 @@ impl Method for TurnStarted {
     const METHOD: &'static str = "turn/started";
 }
 
-impl Typed for TurnStarted {
+impl TypedParams for TurnStarted {
     type Params = types::TurnStartedNotification;
 }
 
@@ -2542,7 +2542,7 @@ impl Method for Warning {
     const METHOD: &'static str = "warning";
 }
 
-impl Typed for Warning {
+impl TypedParams for Warning {
     type Params = types::WarningNotification;
 }
 
@@ -2593,7 +2593,7 @@ pub enum AnyClientRequest<'a> {
     /// `account/rateLimitResetCredit/consume`, which agentmux does not decode.
     AccountRateLimitResetCreditConsume,
     /// `account/rateLimits/read`.
-    AccountRateLimitsRead(Payload<'a, AccountRateLimitsRead>),
+    AccountRateLimitsRead(RawParams<'a, AccountRateLimitsRead>),
     /// `account/read`, which agentmux does not decode.
     AccountRead,
     /// `account/sendAddCreditsNudgeEmail`, which agentmux does not decode.
@@ -2663,7 +2663,7 @@ pub enum AnyClientRequest<'a> {
     /// `hooks/list`, which agentmux does not decode.
     HooksList,
     /// `initialize`.
-    Initialize(Payload<'a, Initialize>),
+    Initialize(RawParams<'a, Initialize>),
     /// `marketplace/add`, which agentmux does not decode.
     MarketplaceAdd,
     /// `marketplace/remove`, which agentmux does not decode.
@@ -2755,7 +2755,7 @@ pub enum AnyClientRequest<'a> {
     /// `thread/read`, which agentmux does not decode.
     ThreadRead,
     /// `thread/resume`.
-    ThreadResume(Payload<'a, ThreadResume>),
+    ThreadResume(RawParams<'a, ThreadResume>),
     /// `thread/revert`, which agentmux does not decode.
     ThreadRevert,
     /// `thread/section/move`, which agentmux does not decode.
@@ -2763,7 +2763,7 @@ pub enum AnyClientRequest<'a> {
     /// `thread/shellCommand`, which agentmux does not decode.
     ThreadShellCommand,
     /// `thread/start`.
-    ThreadStart(Payload<'a, ThreadStart>),
+    ThreadStart(RawParams<'a, ThreadStart>),
     /// `thread/turns/list`, which agentmux does not decode.
     ThreadTurnsList,
     /// `thread/unarchive`, which agentmux does not decode.
@@ -2779,11 +2779,11 @@ pub enum AnyClientRequest<'a> {
     /// `threadSection/update`, which agentmux does not decode.
     ThreadSectionUpdate,
     /// `turn/interrupt`.
-    TurnInterrupt(Payload<'a, TurnInterrupt>),
+    TurnInterrupt(RawParams<'a, TurnInterrupt>),
     /// `turn/start`.
-    TurnStart(Payload<'a, TurnStart>),
+    TurnStart(RawParams<'a, TurnStart>),
     /// `turn/steer`.
-    TurnSteer(Payload<'a, TurnSteer>),
+    TurnSteer(RawParams<'a, TurnSteer>),
     /// `windowsSandbox/readiness`, which agentmux does not decode.
     WindowsSandboxReadiness,
     /// `windowsSandbox/setupStart`, which agentmux does not decode.
@@ -2803,7 +2803,7 @@ impl<'a> AnyClientRequest<'a> {
             AccountLoginStart::METHOD => Self::AccountLoginStart,
             AccountLogout::METHOD => Self::AccountLogout,
             AccountRateLimitResetCreditConsume::METHOD => Self::AccountRateLimitResetCreditConsume,
-            AccountRateLimitsRead::METHOD => Self::AccountRateLimitsRead(Payload::new(params)),
+            AccountRateLimitsRead::METHOD => Self::AccountRateLimitsRead(RawParams::new(params)),
             AccountRead::METHOD => Self::AccountRead,
             AccountSendAddCreditsNudgeEmail::METHOD => Self::AccountSendAddCreditsNudgeEmail,
             AccountUsageRead::METHOD => Self::AccountUsageRead,
@@ -2838,7 +2838,7 @@ impl<'a> AnyClientRequest<'a> {
             FsWriteFile::METHOD => Self::FsWriteFile,
             FuzzyFileSearch::METHOD => Self::FuzzyFileSearch,
             HooksList::METHOD => Self::HooksList,
-            Initialize::METHOD => Self::Initialize(Payload::new(params)),
+            Initialize::METHOD => Self::Initialize(RawParams::new(params)),
             MarketplaceAdd::METHOD => Self::MarketplaceAdd,
             MarketplaceRemove::METHOD => Self::MarketplaceRemove,
             MarketplaceUpgrade::METHOD => Self::MarketplaceUpgrade,
@@ -2884,11 +2884,11 @@ impl<'a> AnyClientRequest<'a> {
             ThreadMetadataUpdate::METHOD => Self::ThreadMetadataUpdate,
             ThreadNameSet::METHOD => Self::ThreadNameSet,
             ThreadRead::METHOD => Self::ThreadRead,
-            ThreadResume::METHOD => Self::ThreadResume(Payload::new(params)),
+            ThreadResume::METHOD => Self::ThreadResume(RawParams::new(params)),
             ThreadRevert::METHOD => Self::ThreadRevert,
             ThreadSectionMove::METHOD => Self::ThreadSectionMove,
             ThreadShellCommand::METHOD => Self::ThreadShellCommand,
-            ThreadStart::METHOD => Self::ThreadStart(Payload::new(params)),
+            ThreadStart::METHOD => Self::ThreadStart(RawParams::new(params)),
             ThreadTurnsList::METHOD => Self::ThreadTurnsList,
             ThreadUnarchive::METHOD => Self::ThreadUnarchive,
             ThreadUnsubscribe::METHOD => Self::ThreadUnsubscribe,
@@ -2896,9 +2896,9 @@ impl<'a> AnyClientRequest<'a> {
             ThreadSectionDelete::METHOD => Self::ThreadSectionDelete,
             ThreadSectionList::METHOD => Self::ThreadSectionList,
             ThreadSectionUpdate::METHOD => Self::ThreadSectionUpdate,
-            TurnInterrupt::METHOD => Self::TurnInterrupt(Payload::new(params)),
-            TurnStart::METHOD => Self::TurnStart(Payload::new(params)),
-            TurnSteer::METHOD => Self::TurnSteer(Payload::new(params)),
+            TurnInterrupt::METHOD => Self::TurnInterrupt(RawParams::new(params)),
+            TurnStart::METHOD => Self::TurnStart(RawParams::new(params)),
+            TurnSteer::METHOD => Self::TurnSteer(RawParams::new(params)),
             WindowsSandboxReadiness::METHOD => Self::WindowsSandboxReadiness,
             WindowsSandboxSetupStart::METHOD => Self::WindowsSandboxSetupStart,
             _ => return None,
@@ -3023,7 +3023,7 @@ impl<'a> AnyClientRequest<'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum AnyClientNotification<'a> {
     /// `initialized`.
-    Initialized(Payload<'a, Initialized>),
+    Initialized(RawParams<'a, Initialized>),
 }
 
 impl<'a> AnyClientNotification<'a> {
@@ -3032,7 +3032,7 @@ impl<'a> AnyClientNotification<'a> {
     #[must_use]
     pub fn classify(method: &str, params: &'a Value) -> Option<Self> {
         Some(match method {
-            Initialized::METHOD => Self::Initialized(Payload::new(params)),
+            Initialized::METHOD => Self::Initialized(RawParams::new(params)),
             _ => return None,
         })
     }
@@ -3053,23 +3053,23 @@ pub enum AnyServerRequest<'a> {
     /// `account/chatgptAuthTokens/refresh`, which agentmux does not decode.
     AccountChatgptAuthTokensRefresh,
     /// `applyPatchApproval`.
-    ApplyPatchApproval(Payload<'a, ApplyPatchApproval>),
+    ApplyPatchApproval(RawParams<'a, ApplyPatchApproval>),
     /// `attestation/generate`, which agentmux does not decode.
     AttestationGenerate,
     /// `execCommandApproval`.
-    ExecCommandApproval(Payload<'a, ExecCommandApproval>),
+    ExecCommandApproval(RawParams<'a, ExecCommandApproval>),
     /// `item/commandExecution/requestApproval`.
-    ItemCommandExecutionRequestApproval(Payload<'a, ItemCommandExecutionRequestApproval>),
+    ItemCommandExecutionRequestApproval(RawParams<'a, ItemCommandExecutionRequestApproval>),
     /// `item/fileChange/requestApproval`.
-    ItemFileChangeRequestApproval(Payload<'a, ItemFileChangeRequestApproval>),
+    ItemFileChangeRequestApproval(RawParams<'a, ItemFileChangeRequestApproval>),
     /// `item/permissions/requestApproval`.
-    ItemPermissionsRequestApproval(Payload<'a, ItemPermissionsRequestApproval>),
+    ItemPermissionsRequestApproval(RawParams<'a, ItemPermissionsRequestApproval>),
     /// `item/tool/call`, which agentmux does not decode.
     ItemToolCall,
     /// `item/tool/requestUserInput`.
-    ItemToolRequestUserInput(Payload<'a, ItemToolRequestUserInput>),
+    ItemToolRequestUserInput(RawParams<'a, ItemToolRequestUserInput>),
     /// `mcpServer/elicitation/request`.
-    McpServerElicitationRequest(Payload<'a, McpServerElicitationRequest>),
+    McpServerElicitationRequest(RawParams<'a, McpServerElicitationRequest>),
 }
 
 impl<'a> AnyServerRequest<'a> {
@@ -3079,15 +3079,15 @@ impl<'a> AnyServerRequest<'a> {
     pub fn classify(method: &str, params: &'a Value) -> Option<Self> {
         Some(match method {
             AccountChatgptAuthTokensRefresh::METHOD => Self::AccountChatgptAuthTokensRefresh,
-            ApplyPatchApproval::METHOD => Self::ApplyPatchApproval(Payload::new(params)),
+            ApplyPatchApproval::METHOD => Self::ApplyPatchApproval(RawParams::new(params)),
             AttestationGenerate::METHOD => Self::AttestationGenerate,
-            ExecCommandApproval::METHOD => Self::ExecCommandApproval(Payload::new(params)),
-            ItemCommandExecutionRequestApproval::METHOD => Self::ItemCommandExecutionRequestApproval(Payload::new(params)),
-            ItemFileChangeRequestApproval::METHOD => Self::ItemFileChangeRequestApproval(Payload::new(params)),
-            ItemPermissionsRequestApproval::METHOD => Self::ItemPermissionsRequestApproval(Payload::new(params)),
+            ExecCommandApproval::METHOD => Self::ExecCommandApproval(RawParams::new(params)),
+            ItemCommandExecutionRequestApproval::METHOD => Self::ItemCommandExecutionRequestApproval(RawParams::new(params)),
+            ItemFileChangeRequestApproval::METHOD => Self::ItemFileChangeRequestApproval(RawParams::new(params)),
+            ItemPermissionsRequestApproval::METHOD => Self::ItemPermissionsRequestApproval(RawParams::new(params)),
             ItemToolCall::METHOD => Self::ItemToolCall,
-            ItemToolRequestUserInput::METHOD => Self::ItemToolRequestUserInput(Payload::new(params)),
-            McpServerElicitationRequest::METHOD => Self::McpServerElicitationRequest(Payload::new(params)),
+            ItemToolRequestUserInput::METHOD => Self::ItemToolRequestUserInput(RawParams::new(params)),
+            McpServerElicitationRequest::METHOD => Self::McpServerElicitationRequest(RawParams::new(params)),
             _ => return None,
         })
     }
@@ -3129,11 +3129,11 @@ pub enum AnyServerNotification<'a> {
     /// `command/exec/outputDelta`, which agentmux does not decode.
     CommandExecOutputDelta,
     /// `configWarning`.
-    ConfigWarning(Payload<'a, ConfigWarning>),
+    ConfigWarning(RawParams<'a, ConfigWarning>),
     /// `deprecationNotice`.
-    DeprecationNotice(Payload<'a, DeprecationNotice>),
+    DeprecationNotice(RawParams<'a, DeprecationNotice>),
     /// `error`.
-    Error(Payload<'a, Error>),
+    Error(RawParams<'a, Error>),
     /// `externalAgentConfig/import/completed`, which agentmux does not decode.
     ExternalAgentConfigImportCompleted,
     /// `externalAgentConfig/import/progress`, which agentmux does not decode.
@@ -3161,7 +3161,7 @@ pub enum AnyServerNotification<'a> {
     /// `item/commandExecution/terminalInteraction`, which agentmux does not decode.
     ItemCommandExecutionTerminalInteraction,
     /// `item/completed`.
-    ItemCompleted(Payload<'a, ItemCompleted>),
+    ItemCompleted(RawParams<'a, ItemCompleted>),
     /// `item/fileChange/outputDelta`, which agentmux does not decode.
     ItemFileChangeOutputDelta,
     /// `item/fileChange/patchUpdated`, which agentmux does not decode.
@@ -3185,7 +3185,7 @@ pub enum AnyServerNotification<'a> {
     /// `mcpServer/startupStatus/updated`, which agentmux does not decode.
     McpServerStartupStatusUpdated,
     /// `model/rerouted`.
-    ModelRerouted(Payload<'a, ModelRerouted>),
+    ModelRerouted(RawParams<'a, ModelRerouted>),
     /// `model/safetyBuffering/updated`, which agentmux does not decode.
     ModelSafetyBufferingUpdated,
     /// `model/verification`, which agentmux does not decode.
@@ -3263,11 +3263,11 @@ pub enum AnyServerNotification<'a> {
     /// `thread/status/changed`, which agentmux does not decode.
     ThreadStatusChanged,
     /// `thread/tokenUsage/updated`.
-    ThreadTokenUsageUpdated(Payload<'a, ThreadTokenUsageUpdated>),
+    ThreadTokenUsageUpdated(RawParams<'a, ThreadTokenUsageUpdated>),
     /// `thread/unarchived`, which agentmux does not decode.
     ThreadUnarchived,
     /// `turn/completed`.
-    TurnCompleted(Payload<'a, TurnCompleted>),
+    TurnCompleted(RawParams<'a, TurnCompleted>),
     /// `turn/diff/updated`, which agentmux does not decode.
     TurnDiffUpdated,
     /// `turn/moderationMetadata`, which agentmux does not decode.
@@ -3275,9 +3275,9 @@ pub enum AnyServerNotification<'a> {
     /// `turn/plan/updated`, which agentmux does not decode.
     TurnPlanUpdated,
     /// `turn/started`.
-    TurnStarted(Payload<'a, TurnStarted>),
+    TurnStarted(RawParams<'a, TurnStarted>),
     /// `warning`.
-    Warning(Payload<'a, Warning>),
+    Warning(RawParams<'a, Warning>),
     /// `windows/worldWritableWarning`, which agentmux does not decode.
     WindowsWorldWritableWarning,
     /// `windowsSandbox/setupCompleted`, which agentmux does not decode.
@@ -3297,9 +3297,9 @@ impl<'a> AnyServerNotification<'a> {
             AppListUpdated::METHOD => Self::AppListUpdated,
             AutoApprovalReviewStrictReviewRequired::METHOD => Self::AutoApprovalReviewStrictReviewRequired,
             CommandExecOutputDelta::METHOD => Self::CommandExecOutputDelta,
-            ConfigWarning::METHOD => Self::ConfigWarning(Payload::new(params)),
-            DeprecationNotice::METHOD => Self::DeprecationNotice(Payload::new(params)),
-            Error::METHOD => Self::Error(Payload::new(params)),
+            ConfigWarning::METHOD => Self::ConfigWarning(RawParams::new(params)),
+            DeprecationNotice::METHOD => Self::DeprecationNotice(RawParams::new(params)),
+            Error::METHOD => Self::Error(RawParams::new(params)),
             ExternalAgentConfigImportCompleted::METHOD => Self::ExternalAgentConfigImportCompleted,
             ExternalAgentConfigImportProgress::METHOD => Self::ExternalAgentConfigImportProgress,
             FsChanged::METHOD => Self::FsChanged,
@@ -3313,7 +3313,7 @@ impl<'a> AnyServerNotification<'a> {
             ItemAutoApprovalReviewStarted::METHOD => Self::ItemAutoApprovalReviewStarted,
             ItemCommandExecutionOutputDelta::METHOD => Self::ItemCommandExecutionOutputDelta,
             ItemCommandExecutionTerminalInteraction::METHOD => Self::ItemCommandExecutionTerminalInteraction,
-            ItemCompleted::METHOD => Self::ItemCompleted(Payload::new(params)),
+            ItemCompleted::METHOD => Self::ItemCompleted(RawParams::new(params)),
             ItemFileChangeOutputDelta::METHOD => Self::ItemFileChangeOutputDelta,
             ItemFileChangePatchUpdated::METHOD => Self::ItemFileChangePatchUpdated,
             ItemMcpToolCallProgress::METHOD => Self::ItemMcpToolCallProgress,
@@ -3325,7 +3325,7 @@ impl<'a> AnyServerNotification<'a> {
             McpServerEventStreamNotification::METHOD => Self::McpServerEventStreamNotification,
             McpServerOauthLoginCompleted::METHOD => Self::McpServerOauthLoginCompleted,
             McpServerStartupStatusUpdated::METHOD => Self::McpServerStartupStatusUpdated,
-            ModelRerouted::METHOD => Self::ModelRerouted(Payload::new(params)),
+            ModelRerouted::METHOD => Self::ModelRerouted(RawParams::new(params)),
             ModelSafetyBufferingUpdated::METHOD => Self::ModelSafetyBufferingUpdated,
             ModelVerification::METHOD => Self::ModelVerification,
             ModelProviderAuthRecoveryCompleted::METHOD => Self::ModelProviderAuthRecoveryCompleted,
@@ -3364,14 +3364,14 @@ impl<'a> AnyServerNotification<'a> {
             ThreadSettingsUpdated::METHOD => Self::ThreadSettingsUpdated,
             ThreadStarted::METHOD => Self::ThreadStarted,
             ThreadStatusChanged::METHOD => Self::ThreadStatusChanged,
-            ThreadTokenUsageUpdated::METHOD => Self::ThreadTokenUsageUpdated(Payload::new(params)),
+            ThreadTokenUsageUpdated::METHOD => Self::ThreadTokenUsageUpdated(RawParams::new(params)),
             ThreadUnarchived::METHOD => Self::ThreadUnarchived,
-            TurnCompleted::METHOD => Self::TurnCompleted(Payload::new(params)),
+            TurnCompleted::METHOD => Self::TurnCompleted(RawParams::new(params)),
             TurnDiffUpdated::METHOD => Self::TurnDiffUpdated,
             TurnModerationMetadata::METHOD => Self::TurnModerationMetadata,
             TurnPlanUpdated::METHOD => Self::TurnPlanUpdated,
-            TurnStarted::METHOD => Self::TurnStarted(Payload::new(params)),
-            Warning::METHOD => Self::Warning(Payload::new(params)),
+            TurnStarted::METHOD => Self::TurnStarted(RawParams::new(params)),
+            Warning::METHOD => Self::Warning(RawParams::new(params)),
             WindowsWorldWritableWarning::METHOD => Self::WindowsWorldWritableWarning,
             WindowsSandboxSetupCompleted::METHOD => Self::WindowsSandboxSetupCompleted,
             _ => return None,

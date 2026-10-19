@@ -56,7 +56,7 @@
 //!     retention: Retention::Ttl,
 //!     env: Default::default(),
 //!     billing: None,
-//!     codex_exec: false,
+//!     force_codex_exec: false,
 //! })?;
 //!
 //! println!("consultation {} started", status.run_id);
@@ -65,10 +65,10 @@
 //! ```
 
 pub mod appserver;
+mod atomic_file;
 pub mod config;
 pub mod delegate;
 pub mod launch;
-mod once;
 pub mod quota;
 pub mod report;
 pub mod run;

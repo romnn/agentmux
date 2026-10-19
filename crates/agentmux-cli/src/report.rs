@@ -75,22 +75,24 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
         Warning::Failed { stderr, .. } => stderr
             .iter()
             .map(|stderr| {
-                let last = stderr
+                let last_stderr_line = stderr
                     .lines()
                     .rev()
                     .find(|line| !line.trim().is_empty())
                     .unwrap_or(stderr);
-                format!("  stderr      {last}")
+                format!("  stderr      {last_stderr_line}")
             })
             .collect(),
-        Warning::EarlierFailure { turn, kind } => vec![format!(
+        Warning::EarlierFailure { turn_index, kind } => vec![format!(
             "  EARLIER     turn {} failed: {} — see the transcript",
-            turn.saturating_add(1),
+            turn_index.saturating_add(1),
             kind.label()
         )],
-        Warning::SessionNotSaved { store } => vec![format!(
+        Warning::SessionNotSaved {
+            store: session_store_path,
+        } => vec![format!(
             "  WARNING     {}",
-            agentmux::transcript::describe_unsaved_session_store(store)
+            agentmux::transcript::describe_unsaved_session_store(session_store_path)
         )],
         Warning::BrokeContinuity => vec![
             "  WARNING     a follow-up did not resume the earlier session; that turn answered with \
@@ -109,13 +111,13 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
         ],
         Warning::Unrecognised {
             summary,
-            another_protocol,
+            has_undecoded_app_server_messages,
             ..
         } => {
             let mut lines = vec![format!(
                 "  UNRECOGNISED {summary} — the delegate CLI may have changed its output format"
             )];
-            if *another_protocol {
+            if *has_undecoded_app_server_messages {
                 lines.push(format!(
                     "  FALLBACK    {}",
                     agentmux::appserver::EXEC_FALLBACK_HINT
@@ -271,10 +273,10 @@ pub fn accounts(
     if json {
         // The prose form names the files it read, so the machine form has to carry them too.
         let report = AccountsJson {
-            source: config.source.as_deref(),
-            project_source: config.project_source.as_deref(),
+            machine_config_path: config.source.as_deref(),
+            project_config_path: config.project_source.as_deref(),
             config,
-            unknown: &config.unknown,
+            unknown_keys: &config.unknown,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -317,8 +319,8 @@ pub fn accounts(
         // A credential name is marked, because a delegate that names an account does not get
         // it: the account's own login must not be outranked by a key meant for the default.
         // A name can be both, and then both rules withhold it.
-        let withheld = |name: &str| match (
-            agentmux::delegate::is_billing_name(name),
+        let withholding_note = |name: &str| match (
+            agentmux::delegate::is_billing_env_name(name),
             agentmux::delegate::is_credential_name(name),
         ) {
             (true, true) => {
@@ -329,12 +331,15 @@ pub fn accounts(
             (false, false) => "",
         };
         for name in config.launch.env.keys() {
-            println!("              {name} (set in config{})", withheld(name));
+            println!(
+                "              {name} (set in config{})",
+                withholding_note(name)
+            );
         }
         for name in &config.launch.env_passthrough {
             println!(
                 "              {name} (forwarded from this environment{})",
-                withheld(name)
+                withholding_note(name)
             );
         }
         if !config.launch.request_env.is_empty() {
@@ -425,7 +430,7 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
     }
     // Said only for the exception, like inheritance: the default is a subscription, and a
     // credential named without the opt-in is refused at launch, which `refused` makes visible here.
-    match (account.billing, account.api_credential_field()) {
+    match (account.billing, account.api_only_field()) {
         (Some(agentmux::delegate::Billing::Api), _) => how.push("billing=api".to_owned()),
         (_, Some(field)) => how.push(format!(
             "REFUSED at launch: sets {field} without billing = \"api\""
@@ -481,9 +486,12 @@ struct TailJson<'a> {
 /// `accounts --json`: the files read, what they configure, and the keys nothing reads.
 #[derive(Serialize)]
 struct AccountsJson<'a> {
-    source: Option<&'a Path>,
-    project_source: Option<&'a Path>,
+    #[serde(rename = "source")]
+    machine_config_path: Option<&'a Path>,
+    #[serde(rename = "project_source")]
+    project_config_path: Option<&'a Path>,
     #[serde(flatten)]
     config: &'a agentmux::config::Config,
-    unknown: &'a [agentmux::config::UnknownKey],
+    #[serde(rename = "unknown")]
+    unknown_keys: &'a [agentmux::config::UnknownKey],
 }

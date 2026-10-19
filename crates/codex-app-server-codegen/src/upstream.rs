@@ -17,14 +17,14 @@ const CODEX: &str = "codex";
 ///
 /// # Errors
 ///
-/// Returns [`Error::CodexVersion`] when the codex on `PATH` is another release,
-/// [`Error::IgnoreUserConfig`] when its app-server accepts `--ignore-user-config`, and an error
-/// when codex cannot be run or writes no bundle.
+/// Returns [`Error::CodexVersionMismatch`] when the codex on `PATH` is another release,
+/// [`Error::AppServerIsolationAvailable`] when its app-server accepts `--ignore-user-config`, and
+/// an error when codex cannot be run or writes no bundle.
 pub fn export(pinned: &str) -> Result<Vec<u8>, Error> {
     let version = run(&["--version"])?.stdout;
     let installed = version.split_whitespace().last().unwrap_or_default();
     if installed != pinned {
-        return Err(Error::CodexVersion {
+        return Err(Error::CodexVersionMismatch {
             installed: installed.to_owned(),
             pinned: pinned.to_owned(),
         });
@@ -37,32 +37,39 @@ pub fn export(pinned: &str) -> Result<Vec<u8>, Error> {
     let help = run(&["app-server", "--help"])?;
     if help.stdout.contains("--ignore-user-config") || help.stderr.contains("--ignore-user-config")
     {
-        return Err(Error::IgnoreUserConfig {
+        return Err(Error::AppServerIsolationAvailable {
             version: installed.to_owned(),
         });
     }
 
-    let out = tempfile::tempdir().map_err(|source| Error::Spawn {
+    let export_directory = tempfile::tempdir().map_err(|source| Error::Spawn {
         command: "a temporary directory".to_owned(),
         source,
     })?;
-    let out_dir = out.path().to_string_lossy().into_owned();
-    run(&["app-server", "generate-json-schema", "--out", &out_dir])?;
-    let bundle = out.path().join("codex_app_server_protocol.schemas.json");
-    std::fs::read(&bundle).map_err(|source| Error::Read {
-        path: bundle,
+    let export_directory_arg = export_directory.path().to_string_lossy().into_owned();
+    run(&[
+        "app-server",
+        "generate-json-schema",
+        "--out",
+        &export_directory_arg,
+    ])?;
+    let bundle_path = export_directory
+        .path()
+        .join("codex_app_server_protocol.schemas.json");
+    std::fs::read(&bundle_path).map_err(|source| Error::Read {
+        path: bundle_path,
         source,
     })
 }
 
 /// What a successful codex command wrote.
-struct Said {
+struct CommandOutput {
     stdout: String,
     stderr: String,
 }
 
 /// Run codex with `args`.
-fn run(args: &[&str]) -> Result<Said, Error> {
+fn run(args: &[&str]) -> Result<CommandOutput, Error> {
     let command = format!("{CODEX} {}", args.join(" "));
     let output = Command::new(CODEX)
         .args(args)
@@ -77,7 +84,7 @@ fn run(args: &[&str]) -> Result<Said, Error> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    Ok(Said {
+    Ok(CommandOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })

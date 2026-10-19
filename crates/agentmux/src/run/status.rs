@@ -70,7 +70,10 @@ pub struct RunStatus {
     ///
     /// A CLI often explains a refusal only there: a resume that finds no saved conversation says so
     /// on stderr and hands the stream nothing but a bare error.
-    /// This is a snapshot, so reading a file that may still grow moves nothing already published.
+    /// A failure its exit record settled already quotes the stderr tail that record froze, so the
+    /// stderr is quoted here only when no exit record settled the failure, and never twice.
+    /// This is a snapshot kept outside the append-only transcript, so reading a file that may
+    /// still grow moves nothing already published.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegate_stderr: Option<String>,
     /// Event types the parser met but does not model.
@@ -100,7 +103,8 @@ pub struct RunStatus {
     pub broke_continuity: bool,
     /// Whether codex sent app-server messages the generated protocol could not read, which
     /// running the consultation over `codex exec` gets round.
-    pub undecoded_messages: bool,
+    #[serde(rename = "undecoded_messages")]
+    pub has_undecoded_app_server_messages: bool,
     /// Where the rendered transcript is written.
     pub transcript_path: PathBuf,
     /// Where the delegate's raw event stream for the newest turn is written.

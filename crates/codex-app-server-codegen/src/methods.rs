@@ -1,4 +1,4 @@
-//! Every method of the protocol, as codex's bundle lists it: [`Method`].
+//! Every method of the protocol, as codex's bundle lists it: [`MethodBinding`].
 //!
 //! The bundle's four message unions (`ClientRequest`, `ClientNotification`, `ServerRequest`,
 //! `ServerNotification`) name each method and the schema of its `params`, and every method they
@@ -12,11 +12,11 @@ use serde_json::Value;
 
 use crate::{Error, NAMESPACES};
 
-use crate::surface::{Carries, Entry, Surface};
+use crate::surface::{Entry, EntryParams, Surface};
 
 /// Who sends a message, and whether it is answered: one of the bundle's message unions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Direction {
+pub enum MessageKind {
     /// A request the client sends.
     ClientRequest,
     /// A notification the client sends.
@@ -27,8 +27,8 @@ pub enum Direction {
     ServerNotification,
 }
 
-impl Direction {
-    /// Every direction, in the order the generated module lists them.
+impl MessageKind {
+    /// Every message kind, in the order the generated module lists them.
     pub const ALL: [Self; 4] = [
         Self::ClientRequest,
         Self::ClientNotification,
@@ -36,10 +36,10 @@ impl Direction {
         Self::ServerNotification,
     ];
 
-    /// The bundle's union of every message in this direction, which is also the name of the
+    /// The bundle's union of every message of this kind, which is also the name of the
     /// protocol crate's trait for it.
     #[must_use]
-    pub fn union(self) -> &'static str {
+    pub fn union_name(self) -> &'static str {
         match self {
             Self::ClientRequest => "ClientRequest",
             Self::ClientNotification => "ClientNotification",
@@ -50,7 +50,7 @@ impl Direction {
 
     /// Whether agentmux sends its messages, which makes it the one that reads the answers.
     #[must_use]
-    pub fn is_sent(self) -> bool {
+    pub fn is_client_message(self) -> bool {
         matches!(self, Self::ClientRequest | Self::ClientNotification)
     }
 
@@ -60,7 +60,7 @@ impl Direction {
         matches!(self, Self::ClientRequest | Self::ServerRequest)
     }
 
-    /// The [`Surface`]'s entries for this direction.
+    /// The [`Surface`]'s entries for this message kind.
     #[must_use]
     pub fn entries(self, surface: &Surface) -> &[Entry] {
         match self {
@@ -74,7 +74,7 @@ impl Direction {
 
 /// What a message's `params` carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Params {
+pub enum ParamsSpec {
     /// Nothing: the member is absent or `null`.
     None,
     /// Always this schema.
@@ -83,7 +83,7 @@ pub enum Params {
     Optional(String),
 }
 
-impl Params {
+impl ParamsSpec {
     /// The schema it carries, if any.
     #[must_use]
     pub fn schema(&self) -> Option<&str> {
@@ -96,100 +96,106 @@ impl Params {
 
 /// One method, bound to its name and, when agentmux uses it, to its payload types.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Method {
-    /// Who sends it.
-    pub direction: Direction,
+pub struct MethodBinding {
+    /// Who sends it, and whether it is answered.
+    pub kind: MessageKind,
     /// Its name on the wire.
-    pub wire: String,
-    /// The Rust type that stands for it, unique across every direction.
-    pub name: String,
+    pub wire_name: String,
+    /// The Rust type that stands for it, unique across every message kind.
+    pub rust_type_name: String,
     /// Its payload types, for a method of the [`Surface`].
-    pub typed: Option<Typed>,
+    pub payload_schemas: Option<PayloadSchemas>,
 }
 
 /// The payload types of a method of the [`Surface`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Typed {
+pub struct PayloadSchemas {
     /// What its `params` carry.
-    pub params: Params,
+    pub params: ParamsSpec,
     /// The schema of its `result`, for a request.
     pub response: Option<String>,
 }
 
-/// Every method the bundle lists, ordered by direction and then by wire name.
+/// Every method the bundle lists, ordered by message kind and then by wire name.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Binding`] for a [`Surface`] entry the bundle does not bear out, or two
 /// methods that would share a type name; and [`Error::Bundle`] for a missing union or a branch
 /// that names no single method.
-pub fn read(bundle: &Value, surface: &Surface) -> Result<Vec<Method>, Error> {
+pub fn read(bundle: &Value, surface: &Surface) -> Result<Vec<MethodBinding>, Error> {
     let mut methods = Vec::new();
-    let mut names = BTreeSet::new();
-    for direction in Direction::ALL {
-        let union = direction.union();
+    let mut rust_type_names = BTreeSet::new();
+    for kind in MessageKind::ALL {
+        let union_name = kind.union_name();
         let mut listed = BTreeMap::new();
-        for branch in branches(bundle, union)? {
-            let wire = branch_method(branch).ok_or_else(|| {
-                Error::Bundle(format!("a branch of `{union}` names no single method"))
+        for branch in branches(bundle, union_name)? {
+            let wire_name = branch_method(branch).ok_or_else(|| {
+                Error::Bundle(format!("a branch of `{union_name}` names no single method"))
             })?;
-            if listed.insert(wire.to_owned(), params(branch)).is_some() {
-                return Err(Error::Bundle(format!("`{union}` lists `{wire}` twice")));
+            if listed
+                .insert(wire_name.to_owned(), parse_params_spec(branch))
+                .is_some()
+            {
+                return Err(Error::Bundle(format!(
+                    "`{union_name}` lists `{wire_name}` twice"
+                )));
             }
         }
-        let mut typed = typed(direction, direction.entries(surface), &listed, bundle)?;
-        for wire in listed.into_keys() {
-            let name = type_name(&wire).map_err(|reason| Error::Binding {
-                method: wire.clone(),
+        let mut payload_schemas =
+            validate_surface_bindings(kind, kind.entries(surface), &listed, bundle)?;
+        for wire_name in listed.into_keys() {
+            let rust_type_name = type_name(&wire_name).map_err(|reason| Error::Binding {
+                method: wire_name.clone(),
                 reason,
             })?;
-            if !names.insert(name.clone()) {
+            if !rust_type_names.insert(rust_type_name.clone()) {
                 return Err(Error::Binding {
-                    method: wire,
-                    reason: format!("another method is also named `{name}`"),
+                    method: wire_name,
+                    reason: format!("another method is also named `{rust_type_name}`"),
                 });
             }
-            methods.push(Method {
-                typed: typed.remove(wire.as_str()),
-                direction,
-                wire,
-                name,
+            methods.push(MethodBinding {
+                payload_schemas: payload_schemas.remove(wire_name.as_str()),
+                kind,
+                wire_name,
+                rust_type_name,
             });
         }
     }
     Ok(methods)
 }
 
-/// The payload types of each [`Surface`] entry of one direction, by method, once the bundle bears
-/// the entry out.
+/// The payload types of each [`Surface`] entry of one message kind, by method, once the bundle
+/// bears the entry out.
 ///
-/// An entry is borne out when the direction's union lists its method with exactly its params, no
+/// An entry is borne out when the message kind's union lists its method with exactly its params, no
 /// other method of the union carries those params, and a request's response is a schema codex
 /// defines while a notification has none.
 /// The uniqueness is what lets the oracle, which knows codex's methods by their payloads and not
 /// by their wire names, vouch for the method.
-fn typed(
-    direction: Direction,
+fn validate_surface_bindings(
+    kind: MessageKind,
     entries: &[Entry],
-    listed: &BTreeMap<String, Result<Params, String>>,
+    listed: &BTreeMap<String, Result<ParamsSpec, String>>,
     bundle: &Value,
-) -> Result<BTreeMap<&'static str, Typed>, Error> {
-    let union = direction.union();
-    let mut typed = BTreeMap::new();
+) -> Result<BTreeMap<&'static str, PayloadSchemas>, Error> {
+    let union_name = kind.union_name();
+    let mut payload_schemas = BTreeMap::new();
     for entry in entries {
         let refuse = |reason: String| Error::Binding {
             method: entry.method.to_owned(),
             reason,
         };
         let expected = match entry.params {
-            Carries::Nothing => Params::None,
-            Carries::Required(schema) => Params::Required(schema.to_owned()),
-            Carries::Optional(schema) => Params::Optional(schema.to_owned()),
+            EntryParams::Nothing => ParamsSpec::None,
+            EntryParams::Required(schema) => ParamsSpec::Required(schema.to_owned()),
+            EntryParams::Optional(schema) => ParamsSpec::Optional(schema.to_owned()),
         };
         match listed.get(entry.method) {
             None => {
                 return Err(refuse(format!(
-                    "the surface table lists it, but codex's `{union}` does not"
+                    "the surface table lists it, but codex's `{union_name}` does not"
                 )));
             }
             Some(Err(reason)) => return Err(refuse(reason.clone())),
@@ -201,7 +207,7 @@ fn typed(
             }
             Some(Ok(_)) => {}
         }
-        if expected != Params::None
+        if expected != ParamsSpec::None
             && let Some((other, _)) = listed.iter().find(|(other, params)| {
                 other.as_str() != entry.method && params.as_ref() == Ok(&expected)
             })
@@ -210,7 +216,7 @@ fn typed(
                 "`{other}` carries the same params, so the oracle cannot tell the two apart"
             )));
         }
-        let response = match (direction.is_request(), entry.response) {
+        let response = match (kind.is_request(), entry.response) {
             (true, Some(response)) if defines(bundle, response) => Some(response.to_owned()),
             (true, Some(response)) => {
                 return Err(refuse(format!(
@@ -231,15 +237,18 @@ fn typed(
             }
             (false, None) => None,
         };
-        let entry_typed = Typed {
+        let entry_schemas = PayloadSchemas {
             params: expected,
             response,
         };
-        if typed.insert(entry.method, entry_typed).is_some() {
+        if payload_schemas
+            .insert(entry.method, entry_schemas)
+            .is_some()
+        {
             return Err(refuse("the surface table lists it twice".to_owned()));
         }
     }
-    Ok(typed)
+    Ok(payload_schemas)
 }
 
 /// Whether one of the bundle's [`NAMESPACES`] defines a schema called `name`.
@@ -258,20 +267,20 @@ fn defines(bundle: &Value, name: &str) -> bool {
 /// A schema carried both ways, such as one a request sends and a notification reads back, is
 /// [`progeny::Direction::Both`].
 #[must_use]
-pub fn roots(methods: &[Method]) -> Vec<progeny::SchemaRoot> {
+pub fn roots(methods: &[MethodBinding]) -> Vec<progeny::SchemaRoot> {
     let mut roots = BTreeMap::new();
     for method in methods {
-        let Some(typed) = &method.typed else {
+        let Some(payload_schemas) = &method.payload_schemas else {
             continue;
         };
-        let (params, response) = if method.direction.is_sent() {
+        let (params_direction, response_direction) = if method.kind.is_client_message() {
             (progeny::Direction::Sent, progeny::Direction::Received)
         } else {
             (progeny::Direction::Received, progeny::Direction::Sent)
         };
         let carried = [
-            (typed.params.schema(), params),
-            (typed.response.as_deref(), response),
+            (payload_schemas.params.schema(), params_direction),
+            (payload_schemas.response.as_deref(), response_direction),
         ];
         for (schema, direction) in carried {
             let Some(schema) = schema else {
@@ -324,13 +333,13 @@ fn branch_method(branch: &Value) -> Option<&str> {
 /// - `{"anyOf": [{"$ref": …}, {"type": "null"}]}`, not required: that schema, or nothing.
 ///
 /// Any other shape is refused rather than bound to something looser.
-fn params(branch: &Value) -> Result<Params, String> {
+fn parse_params_spec(branch: &Value) -> Result<ParamsSpec, String> {
     let required = branch
         .get("required")
         .and_then(Value::as_array)
         .is_some_and(|required| required.iter().any(|member| member == "params"));
     let Some(schema) = branch.pointer("/properties/params") else {
-        return Ok(Params::None);
+        return Ok(ParamsSpec::None);
     };
     let null = serde_json::json!({"type": "null"});
     let reference = |schema: &Value| {
@@ -350,10 +359,10 @@ fn params(branch: &Value) -> Result<Params, String> {
         .filter(|_| schema.as_object().is_some_and(|members| members.len() == 1))
         .map(Vec::as_slice);
     match (required, reference(schema), alternatives) {
-        (true, Some(name), _) => Ok(Params::Required(name)),
-        (false, None, _) if *schema == null => Ok(Params::None),
+        (true, Some(name), _) => Ok(ParamsSpec::Required(name)),
+        (false, None, _) if *schema == null => Ok(ParamsSpec::None),
         (false, None, Some([some, none])) if *none == null => reference(some)
-            .map(Params::Optional)
+            .map(ParamsSpec::Optional)
             .ok_or_else(|| format!("its optional params are not one schema: {schema}")),
         _ => Err(format!(
             "its params are {} `{schema}`, a shape this generator does not bind",
@@ -392,8 +401,8 @@ mod tests {
     use googletest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::{Direction, Method, Params, Typed, read, roots, type_name};
-    use crate::surface::{Carries, Entry, Surface};
+    use super::{MessageKind, MethodBinding, ParamsSpec, PayloadSchemas, read, roots, type_name};
+    use crate::surface::{Entry, EntryParams, Surface};
 
     fn bundle(client_requests: &[Value], server_notifications: &[Value]) -> Value {
         json!({"definitions": {
@@ -409,12 +418,12 @@ mod tests {
         }})
     }
 
-    fn branch(method: &str, params: Option<Value>, required: bool) -> Value {
+    fn branch(method: &str, params: Option<Value>, params_required: bool) -> Value {
         let mut properties = json!({"id": {}, "method": {"enum": [method]}});
         let mut members = vec!["id", "method"];
         if let Some(params) = params {
             properties["params"] = params;
-            if required {
+            if params_required {
                 members.push("params");
             }
         }
@@ -425,10 +434,10 @@ mod tests {
         json!({"$ref": format!("#/definitions/v2/{name}")})
     }
 
-    fn request(method: &'static str, params: &'static str, response: &'static str) -> Entry {
+    fn request_entry(method: &'static str, params: &'static str, response: &'static str) -> Entry {
         Entry {
             method,
-            params: Carries::Required(params),
+            params: EntryParams::Required(params),
             response: Some(response),
         }
     }
@@ -467,10 +476,10 @@ mod tests {
         );
         let surface = surface(
             vec![
-                request("turn/start", "TurnStartParams", "TurnStartResponse"),
+                request_entry("turn/start", "TurnStartParams", "TurnStartResponse"),
                 Entry {
-                    params: Carries::Optional("GetAccountRateLimitsParams"),
-                    ..request(
+                    params: EntryParams::Optional("GetAccountRateLimitsParams"),
+                    ..request_entry(
                         "account/rateLimits/read",
                         "",
                         "GetAccountRateLimitsResponse",
@@ -479,7 +488,7 @@ mod tests {
             ],
             vec![Entry {
                 method: "turn/started",
-                params: Carries::Required("TurnStartedNotification"),
+                params: EntryParams::Required("TurnStartedNotification"),
                 response: None,
             }],
         );
@@ -488,33 +497,33 @@ mod tests {
         assert_that!(
             methods,
             elements_are![
-                matches_pattern!(Method {
-                    direction: eq(&Direction::ClientRequest),
-                    name: eq("AccountLogout"),
-                    typed: none(),
+                matches_pattern!(MethodBinding {
+                    kind: eq(&MessageKind::ClientRequest),
+                    rust_type_name: eq("AccountLogout"),
+                    payload_schemas: none(),
                     ..
                 }),
-                matches_pattern!(Method {
-                    name: eq("AccountRateLimitsRead"),
-                    typed: some(eq(&Typed {
-                        params: Params::Optional("GetAccountRateLimitsParams".to_owned()),
+                matches_pattern!(MethodBinding {
+                    rust_type_name: eq("AccountRateLimitsRead"),
+                    payload_schemas: some(eq(&PayloadSchemas {
+                        params: ParamsSpec::Optional("GetAccountRateLimitsParams".to_owned()),
                         response: Some("GetAccountRateLimitsResponse".to_owned()),
                     })),
                     ..
                 }),
-                matches_pattern!(Method {
-                    name: eq("TurnStart"),
-                    typed: some(eq(&Typed {
-                        params: Params::Required("TurnStartParams".to_owned()),
+                matches_pattern!(MethodBinding {
+                    rust_type_name: eq("TurnStart"),
+                    payload_schemas: some(eq(&PayloadSchemas {
+                        params: ParamsSpec::Required("TurnStartParams".to_owned()),
                         response: Some("TurnStartResponse".to_owned()),
                     })),
                     ..
                 }),
-                matches_pattern!(Method {
-                    direction: eq(&Direction::ServerNotification),
-                    name: eq("TurnStarted"),
-                    typed: some(eq(&Typed {
-                        params: Params::Required("TurnStartedNotification".to_owned()),
+                matches_pattern!(MethodBinding {
+                    kind: eq(&MessageKind::ServerNotification),
+                    rust_type_name: eq("TurnStarted"),
+                    payload_schemas: some(eq(&PayloadSchemas {
+                        params: ParamsSpec::Required("TurnStartedNotification".to_owned()),
                         response: None,
                     })),
                     ..
@@ -563,8 +572,8 @@ mod tests {
         }
 
         let turn_start = || branch("turn/start", Some(reference("TurnStartParams")), true);
-        let entry = || request("turn/start", "TurnStartParams", "TurnStartResponse");
-        let started = || {
+        let entry = || request_entry("turn/start", "TurnStartParams", "TurnStartResponse");
+        let turn_started_branch = || {
             branch(
                 "turn/started",
                 Some(reference("TurnStartedNotification")),
@@ -575,7 +584,7 @@ mod tests {
             Case {
                 requests: vec![turn_start()],
                 notifications: vec![],
-                request_entries: vec![request(
+                request_entries: vec![request_entry(
                     "turn/begin",
                     "TurnStartParams",
                     "TurnStartResponse",
@@ -586,7 +595,7 @@ mod tests {
             Case {
                 requests: vec![turn_start()],
                 notifications: vec![],
-                request_entries: vec![request(
+                request_entries: vec![request_entry(
                     "turn/start",
                     "TurnBeginParams",
                     "TurnStartResponse",
@@ -614,7 +623,7 @@ mod tests {
             Case {
                 requests: vec![turn_start()],
                 notifications: vec![],
-                request_entries: vec![request(
+                request_entries: vec![request_entry(
                     "turn/start",
                     "TurnStartParams",
                     "TurnBeginResponse",
@@ -634,11 +643,11 @@ mod tests {
             },
             Case {
                 requests: vec![],
-                notifications: vec![started()],
+                notifications: vec![turn_started_branch()],
                 request_entries: vec![],
                 notification_entries: vec![Entry {
                     method: "turn/started",
-                    params: Carries::Required("TurnStartedNotification"),
+                    params: EntryParams::Required("TurnStartedNotification"),
                     response: Some("TurnStartResponse"),
                 }],
                 reason: "gives it a response",

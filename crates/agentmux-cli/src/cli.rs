@@ -124,7 +124,8 @@ pub enum CodexLaunchArg {
 #[derive(Debug, Args)]
 pub struct CodexAppServerArgs {
     /// The plan the run store wrote into the turn's directory.
-    pub plan: PathBuf,
+    #[arg(value_name = "PLAN")]
+    pub plan_path: PathBuf,
 }
 
 /// How the server is served.

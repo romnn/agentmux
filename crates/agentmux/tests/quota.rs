@@ -25,7 +25,7 @@ struct ScriptedProbe {
 
 impl QuotaProbe for ScriptedProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
-        if request.target == ProbeTarget::Credential {
+        if request.target == ProbeTarget::NoSubscriptionWindow {
             return Observation::Unavailable {
                 reason: "custom endpoint".to_owned(),
             };
@@ -164,7 +164,7 @@ fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
     let alias = AccountAlias::parse("ci").or_fail()?;
     assert_that!(
         ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &env),
-        ok(eq(&ProbeTarget::Credential))
+        ok(eq(&ProbeTarget::NoSubscriptionWindow))
     );
     let reported = probe_vendor(Vendor::Claude, &config, &env, &probe);
     assert_that!(
@@ -195,13 +195,17 @@ fn a_claude_account_routed_to_a_cloud_backend_reports_no_window() -> Result<()> 
 
         let alias = AccountAlias::parse("cloud").or_fail()?;
         let target = ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &host_env());
-        assert_that!(target, ok(eq(&ProbeTarget::Credential)), "{switch}");
+        assert_that!(
+            target,
+            ok(eq(&ProbeTarget::NoSubscriptionWindow)),
+            "{switch}"
+        );
     }
 
     // Such a target is answered before anything is read or spawned.
     let observation = SystemProbe.probe(&ProbeRequest {
         vendor: Vendor::Claude,
-        target: ProbeTarget::Credential,
+        target: ProbeTarget::NoSubscriptionWindow,
         host_env: &host_env(),
     });
     assert_that!(
@@ -432,12 +436,12 @@ fn a_codex_chatgpt_login_outranks_a_key_in_the_environment() -> Result<()> {
 /// A Codex account whose stored login *is* the key is still billed per token.
 ///
 /// The rule reads what the vendor wrote down rather than assuming a precedence in either
-/// direction, so `apikey` must still answer `Credential`.
+/// direction, so `apikey` must still answer `NoSubscriptionWindow`.
 #[gtest]
 fn a_codex_apikey_login_still_reports_no_window() -> Result<()> {
     let target = codex_target_with(Some(r#"{"auth_mode":"apikey"}"#), None)?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 
@@ -452,7 +456,7 @@ fn a_codex_endpoint_outranks_even_a_stored_login() -> Result<()> {
         Some("http://localhost:11434/v1"),
     )?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 
@@ -464,7 +468,7 @@ fn a_codex_endpoint_outranks_even_a_stored_login() -> Result<()> {
 fn a_codex_key_with_no_stored_login_reports_no_window() -> Result<()> {
     let target = codex_target_with(None, None)?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 

@@ -271,12 +271,12 @@ impl Outcome {
 
     /// Where the turn stands, without what the outcome carries.
     #[must_use]
-    pub fn state(&self) -> State {
+    pub fn state(&self) -> TurnState {
         match self {
-            Self::Running => State::Running,
-            Self::Completed { .. } => State::Completed,
-            Self::Failed { .. } => State::Failed,
-            Self::Cancelled => State::Cancelled,
+            Self::Running => TurnState::Running,
+            Self::Completed { .. } => TurnState::Completed,
+            Self::Failed { .. } => TurnState::Failed,
+            Self::Cancelled => TurnState::Cancelled,
         }
     }
 }
@@ -287,7 +287,7 @@ impl Outcome {
 /// caller to branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
 #[strum(serialize_all = "snake_case")]
-pub enum State {
+pub enum TurnState {
     /// See [`Outcome::Running`].
     Running,
     /// See [`Outcome::Completed`].
@@ -375,8 +375,12 @@ pub struct Turn {
     pub unrecognised: UnrecognisedEvents,
     /// Whether codex sent app-server messages the generated protocol could not read, which
     /// running the consultation over `codex exec` gets round.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub undecoded_messages: bool,
+    #[serde(
+        rename = "undecoded_messages",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub has_undecoded_app_server_messages: bool,
     /// What the vendor reported about the account's usage window, when it reported anything.
     ///
     /// Set whenever the stream carries the information, not only on a rate-limited failure: a run
@@ -446,7 +450,7 @@ impl Turn {
             messages: Vec::new(),
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
-            undecoded_messages: false,
+            has_undecoded_app_server_messages: false,
             rate_limit: None,
             resolved_model: None,
             broke_continuity: false,
@@ -765,14 +769,14 @@ pub fn render_turn(turn: &Turn) -> String {
     out
 }
 
-fn render_messages(out: &mut String, messages: &[Message]) {
+fn render_messages(rendered_turn: &mut String, messages: &[Message]) {
     let mut reopened = false;
     for message in messages {
         match message.source {
             MessageSource::HookInjection => {
                 reopened = true;
                 let _ = indoc::writedoc!(
-                    out,
+                    rendered_turn,
                     "
 
                     > [!WARNING]
@@ -786,7 +790,7 @@ fn render_messages(out: &mut String, messages: &[Message]) {
             }
             MessageSource::HookContext => {
                 let _ = indoc::writedoc!(
-                    out,
+                    rendered_turn,
                     "
 
                     > [!NOTE]
@@ -800,7 +804,7 @@ fn render_messages(out: &mut String, messages: &[Message]) {
             }
             MessageSource::Steer => {
                 let _ = indoc::writedoc!(
-                    out,
+                    rendered_turn,
                     "
 
                     ### user (steer)
@@ -812,7 +816,7 @@ fn render_messages(out: &mut String, messages: &[Message]) {
             }
             MessageSource::Synthetic => {
                 let _ = indoc::writedoc!(
-                    out,
+                    rendered_turn,
                     "
 
                     > [!NOTE]
@@ -829,7 +833,7 @@ fn render_messages(out: &mut String, messages: &[Message]) {
                     (Role::System, _) => "system",
                 };
                 let _ = indoc::writedoc!(
-                    out,
+                    rendered_turn,
                     "
 
                     ### {label}

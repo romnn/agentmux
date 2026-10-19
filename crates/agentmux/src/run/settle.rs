@@ -23,7 +23,9 @@
 //! terminal event ends the fold at that line; a child observed gone is recorded together with
 //! how much capture existed and what its stderr said, and the fold reads neither past that
 //! length nor from the live stderr again; and a cancellation records the capture length once
-//! the child has gone, so nothing that could be written afterwards is read.
+//! the child was asked and then made to stop, so nothing that could be written afterwards is read.
+//! A cancellation record freezes the capture without proving the child left, which is why
+//! removing a run still asks about a cancelled turn's child.
 //! Whatever record settles a turn, the turn is rendered from exactly the capture length that
 //! record froze, whichever caller wrote it.
 
@@ -62,29 +64,29 @@ pub(super) struct FoldedTurn {
     /// record since the fold.
     pub(super) settled_by: Option<SettledBy>,
     /// How the turn's delegate was launched.
-    pub(super) mode: LaunchMode,
+    pub(super) launch_mode: LaunchMode,
     /// Whether the turn's capture says the turn itself began.
     pub(super) turn_started: bool,
     /// Where its usage window is still to be read from, when its stream carried none.
-    pub(super) rollout: Option<RolloutSearch>,
+    pub(super) pending_rate_limit_lookup: Option<RateLimitLookup>,
 }
 
 /// A finished Codex turn whose usage window is still to be read from its session rollout.
 ///
-/// Searched for outside the run's lock, by [`RunStore::read_rollouts`]: the search walks the
-/// vendor's whole session tree, and the transcript does not depend on what it finds.
+/// Searched for outside the run's lock, by [`RunStore::resolve_rate_limit_lookups`]: the search
+/// walks the vendor's whole session tree, and the transcript does not depend on what it finds.
 #[derive(Debug)]
-pub(super) struct RolloutSearch {
+pub(super) struct RateLimitLookup {
     /// The turn's index.
-    index: u32,
+    turn_index: u32,
     /// The turn's directory, which caches the answer.
-    dir: TurnDir,
+    turn_dir: TurnDir,
     /// The `CODEX_HOME` the launch recorded, when it recorded one.
     codex_home: Option<std::path::PathBuf>,
     /// The thread whose rollout to read.
-    thread: SessionRef,
+    thread_id: SessionRef,
     /// Whether the turn's delegate had gone before the search, so its rollout was final.
-    departed: bool,
+    delegate_has_exited: bool,
 }
 
 /// What one observation of a child that had gone established.
@@ -144,7 +146,7 @@ impl LockedRun<'_> {
         {
             return Ok(());
         }
-        if let Err(err) = crate::once::write_whole(&dir.recovered(), text.as_bytes()) {
+        if let Err(err) = crate::atomic_file::write_whole(&dir.recovered(), text.as_bytes()) {
             tracing::warn!(
                 ?err,
                 path = %dir.recovered().display(),
@@ -197,19 +199,24 @@ fn note_continuity(asked_for: Option<&SessionRef>, opened: Option<&SessionRef>, 
 /// With none exhausted it is the one closest to closing, which is what the next question has to
 /// expect.
 /// A window that names no reopening time cannot answer either question, and is passed over.
-fn binding_window(snapshot: &RateLimitSnapshot) -> Option<&RateLimitWindow> {
+fn select_rate_limit_window(snapshot: &RateLimitSnapshot) -> Option<&RateLimitWindow> {
     [&snapshot.primary, &snapshot.secondary]
         .into_iter()
         .flatten()
         .filter(|window| window.resets_at.is_some())
-        .max_by(|a, b| {
-            a.exhausted().cmp(&b.exhausted()).then_with(|| {
-                if a.exhausted() {
-                    a.resets_at.cmp(&b.resets_at)
-                } else {
-                    a.used_percent.total_cmp(&b.used_percent)
-                }
-            })
+        .max_by(|left_window, right_window| {
+            left_window
+                .exhausted()
+                .cmp(&right_window.exhausted())
+                .then_with(|| {
+                    if left_window.exhausted() {
+                        left_window.resets_at.cmp(&right_window.resets_at)
+                    } else {
+                        left_window
+                            .used_percent
+                            .total_cmp(&right_window.used_percent)
+                    }
+                })
         })
 }
 
@@ -222,7 +229,7 @@ pub(super) fn last_write(dir: &TurnDir) -> Option<SystemTime> {
 }
 
 impl RunStore {
-    /// Read every usage window the fold left to a rollout search, and remember each answer.
+    /// Read every usage window the fold left to a rate-limit lookup, and remember each answer.
     ///
     /// The absence of one is remembered too, once the delegate has gone.
     /// Its rollout does not gain rate limits after that, so a fruitless search repeated on every
@@ -232,12 +239,15 @@ impl RunStore {
     /// The first answer remembered is the one every caller adopts: a follow-up resuming the same
     /// thread appends to the same rollout, so two searches can disagree, and overwriting would let
     /// a later miss erase an earlier hit.
-    pub(super) fn read_rollouts(&self, meta: &Meta, state: &mut RunState) {
-        for search in std::mem::take(&mut state.rollouts) {
-            let found =
-                self.codex_rate_limit(meta, search.codex_home.as_deref(), search.thread.as_str());
-            let found = if found.is_some() || search.departed {
-                write_json_once(&search.dir.rate_limit(), &found).unwrap_or_else(|err| {
+    pub(super) fn resolve_rate_limit_lookups(&self, meta: &Meta, state: &mut RunState) {
+        for lookup in std::mem::take(&mut state.pending_rate_limit_lookups) {
+            let found = self.codex_rate_limit(
+                meta,
+                lookup.codex_home.as_deref(),
+                lookup.thread_id.as_str(),
+            );
+            let found = if found.is_some() || lookup.delegate_has_exited {
+                write_json_once(&lookup.turn_dir.rate_limit(), &found).unwrap_or_else(|err| {
                     tracing::debug!(?err, "not remembering a turn's usage window");
                     found
                 })
@@ -248,7 +258,7 @@ impl RunStore {
                 .transcript
                 .turns
                 .iter_mut()
-                .find(|turn| turn.index == search.index)
+                .find(|turn| turn.index == lookup.turn_index)
             {
                 turn.rate_limit = found;
             }
@@ -275,7 +285,7 @@ impl RunStore {
 
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
         let snapshot = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
-        let resets_at = binding_window(&snapshot)?
+        let resets_at = select_rate_limit_window(&snapshot)?
             .resets_at
             .and_then(chrono::DateTime::from_timestamp_secs)?;
         Some(RateLimit {
@@ -302,19 +312,19 @@ impl LockedRun<'_> {
         let mut session = None;
         let mut newest = None;
         let mut last_activity: Option<SystemTime> = None;
-        let mut rollouts = Vec::new();
+        let mut pending_rate_limit_lookups = Vec::new();
 
         let all_files = self.store.turn_files(&self.run_id)?;
         for files in &all_files {
             let folded = self.fold_turn(meta, files)?;
-            rollouts.extend(folded.rollout);
+            pending_rate_limit_lookups.extend(folded.pending_rate_limit_lookup);
             newest = Some(NewestTurn {
                 index: files.index,
                 settled_by: folded.settled_by,
-                mode: folded.mode,
+                launch_mode: folded.launch_mode,
                 turn_started: folded.turn_started,
                 // Asked of the newest turn alone, below: it costs a process lookup.
-                departed: false,
+                delegate_has_exited: false,
             });
             if folded.session.is_some() {
                 session = folded.session;
@@ -325,7 +335,7 @@ impl LockedRun<'_> {
             transcript.turns.push(folded.turn);
         }
         if let (Some(newest), Some(files)) = (newest.as_mut(), all_files.last()) {
-            newest.departed = self.store.departed(files);
+            newest.delegate_has_exited = self.store.delegate_has_exited(files);
         }
 
         Ok(RunState {
@@ -333,7 +343,7 @@ impl LockedRun<'_> {
             session,
             newest,
             last_activity,
-            rollouts,
+            pending_rate_limit_lookups,
         })
     }
 
@@ -342,7 +352,7 @@ impl LockedRun<'_> {
     /// A run's outcome is its newest turn's, and a turn folds from its own files alone, so the
     /// callers that only need to know whether a consultation is over — the poll loop, `list`,
     /// the sweep — do not re-read every settled turn's capture to find out.
-    pub(super) fn newest_turn(&self, meta: &Meta) -> Result<Option<Turn>, RunError> {
+    pub(super) fn fold_newest_turn(&self, meta: &Meta) -> Result<Option<Turn>, RunError> {
         let turns = self.store.turn_files(&self.run_id)?;
         let Some(newest) = turns.last() else {
             return Ok(None);
@@ -359,25 +369,26 @@ impl LockedRun<'_> {
     /// Only once the turn is over: a running turn's rollout is still being written, and the
     /// search is too expensive to repeat on every fold.
     /// A remembered answer is read here; a search is left to the caller, after the lock.
-    fn remembered_window(
+    fn cached_rate_limit_or_lookup(
         &self,
         files: &TurnFiles,
         turn: &mut Turn,
-        thread: Option<&SessionRef>,
+        thread_id: Option<&SessionRef>,
         codex_home: Option<&Path>,
-    ) -> Option<RolloutSearch> {
-        let thread = thread.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
+    ) -> Option<RateLimitLookup> {
+        let thread_id =
+            thread_id.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
         match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
             Ok(Some(remembered)) => {
                 turn.rate_limit = remembered;
                 None
             }
-            Ok(None) | Err(_) => Some(RolloutSearch {
-                index: files.index,
-                dir: files.dir.clone(),
+            Ok(None) | Err(_) => Some(RateLimitLookup {
+                turn_index: files.index,
+                turn_dir: files.dir.clone(),
                 codex_home: codex_home.map(Path::to_path_buf),
-                thread: thread.clone(),
-                departed: self.store.departed(files),
+                thread_id: thread_id.clone(),
+                delegate_has_exited: self.store.delegate_has_exited(files),
             }),
         }
     }
@@ -473,9 +484,12 @@ impl LockedRun<'_> {
         let settled_by = match &record {
             Some(record) => {
                 turn.outcome = RunStore::outcome_of(dir, record, vendor);
-                Some(SettledBy::Record)
+                Some(SettledBy::ExitRecord)
             }
-            None => turn.outcome.is_terminal().then_some(SettledBy::Stream),
+            None => turn
+                .outcome
+                .is_terminal()
+                .then_some(SettledBy::TerminalEvent),
         };
 
         // What the launch recorded before the spawn: which session it asked to resume, and
@@ -483,15 +497,15 @@ impl LockedRun<'_> {
         let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
         turn.unsaved_session_store = invocation.unsaved_session_store;
         turn.billing = invocation.billing;
-        let mode = invocation.mode;
+        let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),
             turn_session.as_ref(),
             &mut turn,
         );
 
-        let rollout = if vendor == Vendor::Codex {
-            self.remembered_window(
+        let pending_rate_limit_lookup = if vendor == Vendor::Codex {
+            self.cached_rate_limit_or_lookup(
                 files,
                 &mut turn,
                 turn_session.as_ref(),
@@ -508,9 +522,9 @@ impl LockedRun<'_> {
             session: turn_session,
             last_activity: last_write(dir),
             settled_by,
-            mode,
+            launch_mode,
             turn_started,
-            rollout,
+            pending_rate_limit_lookup,
         })
     }
 }
@@ -616,7 +630,7 @@ mod tests {
     use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
     use googletest::prelude::*;
 
-    use super::binding_window;
+    use super::select_rate_limit_window;
 
     fn window(used_percent: f64, resets_at: Option<i64>) -> RateLimitWindow {
         RateLimitWindow {
@@ -626,7 +640,7 @@ mod tests {
         }
     }
 
-    fn reopening(
+    fn selected_reset_timestamp(
         primary: Option<RateLimitWindow>,
         secondary: Option<RateLimitWindow>,
     ) -> Option<i64> {
@@ -635,7 +649,7 @@ mod tests {
             primary,
             secondary,
         };
-        binding_window(&snapshot).and_then(|window| window.resets_at)
+        select_rate_limit_window(&snapshot).and_then(|window| window.resets_at)
     }
 
     /// The window a refusal is reported against is the exhausted one, however full the other is,
@@ -645,18 +659,18 @@ mod tests {
         // A five-hour window nearly full and a weekly one used up: waiting for the five-hour
         // window to reopen would only be refused again.
         assert_that!(
-            reopening(Some(window(90.0, Some(10))), Some(window(100.0, Some(500)))),
+            selected_reset_timestamp(Some(window(90.0, Some(10))), Some(window(100.0, Some(500)))),
             some(eq(500))
         );
         assert_that!(
-            reopening(
+            selected_reset_timestamp(
                 Some(window(100.0, Some(10))),
                 Some(window(100.0, Some(500)))
             ),
             some(eq(500))
         );
         assert_that!(
-            reopening(Some(window(100.0, Some(10))), Some(window(40.0, Some(500)))),
+            selected_reset_timestamp(Some(window(100.0, Some(10))), Some(window(40.0, Some(500)))),
             some(eq(10))
         );
     }
@@ -666,13 +680,13 @@ mod tests {
     #[gtest]
     fn otherwise_the_fullest_window_with_a_reopening_time_binds() {
         assert_that!(
-            reopening(Some(window(20.0, Some(10))), Some(window(60.0, Some(500)))),
+            selected_reset_timestamp(Some(window(20.0, Some(10))), Some(window(60.0, Some(500)))),
             some(eq(500))
         );
         assert_that!(
-            reopening(Some(window(20.0, Some(10))), Some(window(100.0, None))),
+            selected_reset_timestamp(Some(window(20.0, Some(10))), Some(window(100.0, None))),
             some(eq(10))
         );
-        assert_that!(reopening(None, None), none());
+        assert_that!(selected_reset_timestamp(None, None), none());
     }
 }

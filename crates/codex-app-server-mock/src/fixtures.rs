@@ -16,13 +16,13 @@ use codex_app_server_protocol::types::{
 };
 
 /// The thread a fake server opens, unless a test names another.
-pub const THREAD: &str = "th-fake";
+pub const THREAD_ID: &str = "th-fake";
 
 /// The turn a fake server starts, unless a test names another.
-pub const TURN: &str = "tu-1";
+pub const TURN_ID: &str = "tu-1";
 
 /// The model a fake server reports.
-pub const MODEL: &str = "gpt-6-astra";
+pub const MODEL_ID: &str = "gpt-6-astra";
 
 /// What `initialize` answers.
 #[must_use]
@@ -90,7 +90,7 @@ pub fn thread_start_response(id: &str) -> ThreadStartResponse {
         cwd: "/work/project".to_owned(),
         disabled_plugin_ids: None,
         instruction_sources: None,
-        model: MODEL.to_owned(),
+        model: MODEL_ID.to_owned(),
         model_provider: "openai".to_owned(),
         reasoning_effort: None,
         sandbox: read_only(),
@@ -110,7 +110,7 @@ pub fn thread_resume_response(id: &str) -> ThreadResumeResponse {
         disabled_plugin_ids: None,
         instruction_sources: None,
         items_backwards_cursor: None,
-        model: MODEL.to_owned(),
+        model: MODEL_ID.to_owned(),
         model_provider: "openai".to_owned(),
         reasoning_effort: None,
         sandbox: read_only(),
@@ -146,9 +146,9 @@ pub fn turn_start_response(id: &str) -> TurnStartResponse {
 
 /// `turn/started` for turn `turn` of thread `thread`.
 #[must_use]
-pub fn turn_started(thread: &str, turn_id: &str) -> TurnStartedNotification {
+pub fn turn_started(thread_id: &str, turn_id: &str) -> TurnStartedNotification {
     TurnStartedNotification {
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn: turn(turn_id, TurnStatus::InProgress, Vec::new()),
     }
 }
@@ -156,13 +156,13 @@ pub fn turn_started(thread: &str, turn_id: &str) -> TurnStartedNotification {
 /// `turn/completed` for turn `turn` of thread `thread`, ended in `status` holding `items`.
 #[must_use]
 pub fn turn_completed(
-    thread: &str,
+    thread_id: &str,
     turn_id: &str,
     status: TurnStatus,
     items: Vec<ThreadItem>,
 ) -> TurnCompletedNotification {
     TurnCompletedNotification {
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn: turn(turn_id, status, items),
     }
 }
@@ -183,9 +183,9 @@ pub fn turn_interrupt_response() -> TurnInterruptResponse {
 
 /// `turn/interrupt`'s parameters, as a client sends them.
 #[must_use]
-pub fn turn_interrupt_params(thread: &str, turn_id: &str) -> TurnInterruptParams {
+pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> TurnInterruptParams {
     TurnInterruptParams {
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
     }
 }
@@ -243,18 +243,22 @@ pub fn command(id: &str, command: &str, output: &str, exit_code: i32) -> ThreadI
 
 /// `item/completed` for `item`, in turn `turn` of thread `thread`.
 #[must_use]
-pub fn item_completed(thread: &str, turn_id: &str, item: ThreadItem) -> ItemCompletedNotification {
+pub fn item_completed(
+    thread_id: &str,
+    turn_id: &str,
+    item: ThreadItem,
+) -> ItemCompletedNotification {
     ItemCompletedNotification {
         completed_at_ms: 1,
         item,
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
     }
 }
 
 /// Token counts, as `thread/tokenUsage/updated` reports each figure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Tokens {
+pub struct TokenCounts {
     /// Input tokens.
     pub input: i64,
     /// Input tokens served from the cache.
@@ -265,7 +269,7 @@ pub struct Tokens {
     pub reasoning_output: i64,
 }
 
-impl Tokens {
+impl TokenCounts {
     fn breakdown(self) -> TokenUsageBreakdown {
         TokenUsageBreakdown {
             cache_write_input_tokens: None,
@@ -281,13 +285,13 @@ impl Tokens {
 /// `thread/tokenUsage/updated` for turn `turn` of thread `thread`.
 #[must_use]
 pub fn token_usage(
-    thread: &str,
+    thread_id: &str,
     turn_id: &str,
-    last: Tokens,
-    total: Tokens,
+    last: TokenCounts,
+    total: TokenCounts,
 ) -> ThreadTokenUsageUpdatedNotification {
     ThreadTokenUsageUpdatedNotification {
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         token_usage: ThreadTokenUsage {
             last: last.breakdown(),
             model_context_window: None,
@@ -299,16 +303,16 @@ pub fn token_usage(
 
 /// A `warning` about thread `thread`.
 #[must_use]
-pub fn warning(thread: &str, message: &str) -> WarningNotification {
+pub fn warning(thread_id: &str, message: &str) -> WarningNotification {
     WarningNotification {
         message: message.to_owned(),
-        thread_id: Some(thread.to_owned()),
+        thread_id: Some(thread_id.to_owned()),
     }
 }
 
 /// An `error` in turn `turn` of thread `thread`.
 #[must_use]
-pub fn error(thread: &str, turn_id: &str, will_retry: bool, message: &str) -> ErrorNotification {
+pub fn error(thread_id: &str, turn_id: &str, will_retry: bool, message: &str) -> ErrorNotification {
     ErrorNotification {
         error: TurnError {
             additional_details: None,
@@ -316,7 +320,7 @@ pub fn error(thread: &str, turn_id: &str, will_retry: bool, message: &str) -> Er
             message: message.to_owned(),
             misalignment: None,
         },
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
         will_retry,
     }
@@ -324,10 +328,10 @@ pub fn error(thread: &str, turn_id: &str, will_retry: bool, message: &str) -> Er
 
 /// `item/commandExecution/requestApproval` for item `item` of turn `turn` in thread `thread`.
 #[must_use]
-pub fn command_approval(
-    thread: &str,
+pub fn command_approval_params(
+    thread_id: &str,
     turn_id: &str,
-    item: &str,
+    item_id: &str,
 ) -> CommandExecutionRequestApprovalParams {
     CommandExecutionRequestApprovalParams {
         approval_id: None,
@@ -335,14 +339,14 @@ pub fn command_approval(
         command_actions: None,
         cwd: None,
         environment_id: None,
-        item_id: item.to_owned(),
+        item_id: item_id.to_owned(),
         kind: None,
         network_approval_context: None,
         proposed_execpolicy_amendment: None,
         proposed_network_policy_amendments: None,
         reason: None,
         started_at_ms: 1,
-        thread_id: thread.to_owned(),
+        thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
     }
 }

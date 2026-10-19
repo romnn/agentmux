@@ -48,7 +48,7 @@ pub struct StartRequest {
     ///
     /// For a codex whose app-server protocol no longer matches this agentmux; such a turn cannot
     /// be steered.
-    pub codex_exec: bool,
+    pub force_codex_exec: bool,
 }
 
 /// What the machine's configuration decided about a requested delegate.
@@ -69,13 +69,16 @@ impl RunStore {
     /// The environment marker every delegate carries is passed on by Claude Code and by both
     /// CLIs' shells, but Codex starts its MCP servers with an environment of its own choosing
     /// that does not include it.
-    /// The process tree is the other witness: if any ancestor of this process is a delegate this
-    /// store launched and that delegate is still running, this process is inside it, however
-    /// many shells or shims sit in between.
+    /// Measured, that environment holds only `HOME`, `LANG`, `LC_ALL`, `LOGNAME`, `PATH`, `PWD`,
+    /// `SHELL`, `TERM`, `TMPDIR` and `USER`, in a fresh process group.
+    /// The process tree is the other witness: if any ancestor of this process, within the bounded
+    /// walk [`crate::launch::ancestors`] makes, is a delegate this store launched whose turn has
+    /// no exit record and that is still running, this process is inside it, however many shells
+    /// or shims sit in between.
     ///
-    /// Decided once per process.
+    /// Decided once per store.
     /// The marker comes from the captured environment, and an ancestor cannot become a delegate
-    /// after the fact, so the answer cannot change while the process lives.
+    /// after the fact, so the answer cannot change while the store lives.
     ///
     /// # Errors
     ///
@@ -149,7 +152,7 @@ impl RunStore {
             delegate,
             rewritten_from,
         } = Self::pin_defaults(&request.delegate, &config);
-        let billing = delegate.billing(request.billing, &self.host_env, &config)?;
+        let billing = delegate.resolve_billing(request.billing, &self.host_env, &config)?;
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
             env: request.env.clone(),
@@ -159,7 +162,7 @@ impl RunStore {
             billing: Some(billing),
             // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
             // whichever store continues the consultation.
-            codex_exec: request.codex_exec || self.codex_driver.is_none(),
+            force_codex_exec: request.force_codex_exec || self.codex_driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -319,8 +322,11 @@ impl RunStore {
                 store: store.to_path_buf(),
             });
         }
-        if state.newest.is_some_and(|newest| !newest.departed) {
-            return Err(NotResumable::StillSaving {
+        if state
+            .newest
+            .is_some_and(|newest| !newest.delegate_has_exited)
+        {
+            return Err(NotResumable::AwaitingDelegateExit {
                 run_id: run_id.clone(),
             });
         }
@@ -403,7 +409,7 @@ impl RunStore {
     ///
     /// Decided per turn, from the delegate and this store: the environment, the refusals and the
     /// billing already in `invocation` are the same either way, and only what is run differs.
-    pub(super) fn choose_launch(
+    pub(super) fn prepare_launch_mode(
         &self,
         turn: &TurnDir,
         meta: &Meta,
@@ -414,22 +420,22 @@ impl RunStore {
         let (Some(driver), Some(settings), false) = (
             &self.codex_driver,
             meta.delegate.app_server_settings(config),
-            meta.codex_exec,
+            meta.force_codex_exec,
         ) else {
-            return Ok(LaunchMode::Exec);
+            return Ok(LaunchMode::DirectCli);
         };
-        let plan_path = turn.app_server_plan();
+        let plan_path = turn.app_server_plan_path();
         write_json(
             &plan_path,
-            &crate::appserver::Plan {
+            &crate::appserver::DriverPlan {
                 settings,
                 cwd: meta.cwd.clone(),
-                resume: resume.cloned(),
+                resume_thread_id: resume.cloned(),
                 billing: invocation.billing(),
                 turn_dir: turn.root.clone(),
             },
         )?;
-        invocation.drive_through(driver, crate::appserver::SUBCOMMAND, &plan_path);
+        invocation.set_driver_command(driver, crate::appserver::SUBCOMMAND, &plan_path);
         Ok(LaunchMode::AppServer)
     }
 
@@ -458,11 +464,11 @@ impl RunStore {
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
-        invocation.name_state_dir(Self::STATE_DIR_ENV, &self.root);
+        invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
 
         // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
-        let mode = self.choose_launch(turn, meta, resume, config, &mut invocation)?;
+        let launch_mode = self.prepare_launch_mode(turn, meta, resume, config, &mut invocation)?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
@@ -498,7 +504,7 @@ impl RunStore {
                 cwd: meta.cwd.clone(),
                 resumed_from: resume.cloned(),
                 unsaved_session_store,
-                mode,
+                launch_mode,
                 billing: Some(invocation.billing()),
                 config_dir,
                 cli_version,
@@ -516,7 +522,7 @@ impl RunStore {
             args = ?invocation.args(),
             cwd = %meta.cwd.display(),
             resumed = resume.is_some(),
-            ?mode,
+            mode = ?launch_mode,
             billing = %invocation.billing(),
             "launching delegate",
         );

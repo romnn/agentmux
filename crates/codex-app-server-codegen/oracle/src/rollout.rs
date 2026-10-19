@@ -9,11 +9,11 @@
 //! names on the wire and that every line the mirror does not read still reads as something.
 
 use codex_protocol::protocol as codex;
-use mirror::rollout as ours;
+use mirror::rollout as mirror_rollout;
 
 /// codex's snapshot of one bucket, as the mirror reads it.
 #[must_use]
-pub fn snapshot(snapshot: codex::RateLimitSnapshot) -> ours::RateLimitSnapshot {
+pub fn mirror_snapshot(snapshot: codex::RateLimitSnapshot) -> mirror_rollout::RateLimitSnapshot {
     let codex::RateLimitSnapshot {
         limit_id,
         limit_name: _,
@@ -26,20 +26,20 @@ pub fn snapshot(snapshot: codex::RateLimitSnapshot) -> ours::RateLimitSnapshot {
         plan_type: _,
         rate_limit_reached_type: _,
     } = snapshot;
-    ours::RateLimitSnapshot {
+    mirror_rollout::RateLimitSnapshot {
         limit_id,
-        primary: primary.map(window),
-        secondary: secondary.map(window),
+        primary: primary.map(mirror_window),
+        secondary: secondary.map(mirror_window),
     }
 }
 
-fn window(window: codex::RateLimitWindow) -> ours::RateLimitWindow {
+fn mirror_window(window: codex::RateLimitWindow) -> mirror_rollout::RateLimitWindow {
     let codex::RateLimitWindow {
         used_percent,
         window_minutes,
         resets_at,
     } = window;
-    ours::RateLimitWindow {
+    mirror_rollout::RateLimitWindow {
         used_percent,
         window_minutes,
         resets_at,
@@ -51,14 +51,14 @@ mod tests {
     use codex_history::{RolloutItem, RolloutLine};
     use codex_protocol::protocol as codex;
     use googletest::prelude::*;
-    use mirror::rollout as ours;
+    use mirror::rollout as mirror_rollout;
 
     /// Read one of codex's lines as the mirror.
     ///
     /// Through a `Value`, because codex's graph turns on serde_json's `arbitrary_precision`, under
     /// which a number a tagged enum buffers reaches an `f64` as a map; agentmux builds without it
     /// and reads the line directly.
-    fn read(line: &RolloutLine) -> Result<ours::RolloutItem> {
+    fn decode_mirror_item(line: &RolloutLine) -> Result<mirror_rollout::RolloutItem> {
         let written = serde_json::to_string(line).or_fail()?;
         let value = serde_json::from_str::<serde_json::Value>(&written).or_fail()?;
         serde_json::from_value(value).or_fail()
@@ -72,7 +72,7 @@ mod tests {
         }
     }
 
-    fn token_count(rate_limits: Option<codex::RateLimitSnapshot>) -> RolloutLine {
+    fn token_count_line(rate_limits: Option<codex::RateLimitSnapshot>) -> RolloutLine {
         line(RolloutItem::EventMsg(codex::EventMsg::TokenCount(
             codex::TokenCountEvent {
                 info: None,
@@ -129,18 +129,20 @@ mod tests {
     /// value it converts to.
     #[gtest]
     fn the_mirror_reads_the_usage_windows_codex_writes() -> Result<()> {
-        let mut samples = vec![(token_count(None), None)];
+        let mut samples = vec![(token_count_line(None), None)];
         for snapshot in snapshots() {
-            let mirrored = super::snapshot(snapshot.clone());
-            samples.push((token_count(Some(snapshot)), Some(mirrored)));
+            let mirrored = super::mirror_snapshot(snapshot.clone());
+            samples.push((token_count_line(Some(snapshot)), Some(mirrored)));
         }
         for (sample, expected) in samples {
             expect_that!(
-                read(&sample)?,
-                eq(&ours::RolloutItem::EventMsg {
-                    payload: ours::EventMsg::TokenCount(ours::TokenCountEvent {
-                        rate_limits: expected
-                    })
+                decode_mirror_item(&sample)?,
+                eq(&mirror_rollout::RolloutItem::EventMsg {
+                    payload: mirror_rollout::EventMsg::TokenCount(
+                        mirror_rollout::TokenCountEvent {
+                            rate_limits: expected
+                        }
+                    )
                 })
             );
         }
@@ -163,12 +165,15 @@ mod tests {
         let metadata = line(RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true });
 
         expect_that!(
-            read(&message)?,
-            eq(&ours::RolloutItem::EventMsg {
-                payload: ours::EventMsg::Other
+            decode_mirror_item(&message)?,
+            eq(&mirror_rollout::RolloutItem::EventMsg {
+                payload: mirror_rollout::EventMsg::Other
             })
         );
-        expect_that!(read(&metadata)?, eq(&ours::RolloutItem::Other));
+        expect_that!(
+            decode_mirror_item(&metadata)?,
+            eq(&mirror_rollout::RolloutItem::Other)
+        );
         Ok(())
     }
 }

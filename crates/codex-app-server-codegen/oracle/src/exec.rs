@@ -12,50 +12,52 @@
 
 use codex_exec as codex;
 use codex_protocol::models::WebSearchAction;
-use mirror::exec as ours;
+use mirror::exec as mirror_exec;
 
 /// One event.
 #[must_use]
-pub fn event(event: codex::ThreadEvent) -> ours::ThreadEvent {
+pub fn mirror_event(event: codex::ThreadEvent) -> mirror_exec::ThreadEvent {
     match event {
         codex::ThreadEvent::ThreadStarted(codex::ThreadStartedEvent { thread_id }) => {
-            ours::ThreadEvent::ThreadStarted(ours::ThreadStartedEvent {
+            mirror_exec::ThreadEvent::ThreadStarted(mirror_exec::ThreadStartedEvent {
                 thread_id: Some(thread_id),
             })
         }
         codex::ThreadEvent::TurnStarted(codex::TurnStartedEvent {}) => {
-            ours::ThreadEvent::TurnStarted(ours::TurnStartedEvent {})
+            mirror_exec::ThreadEvent::TurnStarted(mirror_exec::TurnStartedEvent {})
         }
         codex::ThreadEvent::TurnCompleted(codex::TurnCompletedEvent { usage }) => {
-            ours::ThreadEvent::TurnCompleted(ours::TurnCompletedEvent {
-                usage: Some(self::usage(usage)),
+            mirror_exec::ThreadEvent::TurnCompleted(mirror_exec::TurnCompletedEvent {
+                usage: Some(self::mirror_usage(usage)),
             })
         }
         codex::ThreadEvent::TurnFailed(codex::TurnFailedEvent { error }) => {
-            ours::ThreadEvent::TurnFailed(ours::TurnFailedEvent {
-                error: Some(self::error(error)),
+            mirror_exec::ThreadEvent::TurnFailed(mirror_exec::TurnFailedEvent {
+                error: Some(self::mirror_error(error)),
             })
         }
         codex::ThreadEvent::ItemStarted(codex::ItemStartedEvent { item }) => {
-            ours::ThreadEvent::ItemStarted(ours::ItemStartedEvent {
-                item: self::item(item),
+            mirror_exec::ThreadEvent::ItemStarted(mirror_exec::ItemStartedEvent {
+                item: self::mirror_item(item),
             })
         }
         codex::ThreadEvent::ItemUpdated(codex::ItemUpdatedEvent { item }) => {
-            ours::ThreadEvent::ItemUpdated(ours::ItemUpdatedEvent {
-                item: self::item(item),
+            mirror_exec::ThreadEvent::ItemUpdated(mirror_exec::ItemUpdatedEvent {
+                item: self::mirror_item(item),
             })
         }
         codex::ThreadEvent::ItemCompleted(codex::ItemCompletedEvent { item }) => {
-            ours::ThreadEvent::ItemCompleted(ours::ItemCompletedEvent {
-                item: self::item(item),
+            mirror_exec::ThreadEvent::ItemCompleted(mirror_exec::ItemCompletedEvent {
+                item: self::mirror_item(item),
             })
         }
-        codex::ThreadEvent::Error(error) => ours::ThreadEvent::Error(self::error(error)),
+        codex::ThreadEvent::Error(error) => {
+            mirror_exec::ThreadEvent::Error(self::mirror_error(error))
+        }
     }
 }
 
-fn usage(usage: codex::Usage) -> ours::Usage {
+fn mirror_usage(usage: codex::Usage) -> mirror_exec::Usage {
     let codex::Usage {
         input_tokens,
         cached_input_tokens,
@@ -63,7 +65,7 @@ fn usage(usage: codex::Usage) -> ours::Usage {
         output_tokens,
         reasoning_output_tokens,
     } = usage;
-    ours::Usage {
+    mirror_exec::Usage {
         input_tokens: Some(input_tokens),
         cached_input_tokens: Some(cached_input_tokens),
         cache_write_input_tokens: Some(cache_write_input_tokens),
@@ -72,14 +74,14 @@ fn usage(usage: codex::Usage) -> ours::Usage {
     }
 }
 
-fn error(error: codex::ThreadErrorEvent) -> ours::ThreadErrorEvent {
+fn mirror_error(error: codex::ThreadErrorEvent) -> mirror_exec::ThreadErrorEvent {
     let codex::ThreadErrorEvent { message } = error;
-    ours::ThreadErrorEvent {
+    mirror_exec::ThreadErrorEvent {
         message: Some(message),
     }
 }
 
-fn item(item: codex::ExecThreadItem) -> ours::ThreadItem {
+fn mirror_item(item: codex::ExecThreadItem) -> mirror_exec::ThreadItem {
     let codex::ExecThreadItem { id, details } = item;
     // codex writes a web search's own id after the item's, under the same key, and a reader of
     // the line keeps the later one.
@@ -87,70 +89,82 @@ fn item(item: codex::ExecThreadItem) -> ours::ThreadItem {
         codex::ThreadItemDetails::WebSearch(search) => search.id.clone(),
         _ => id,
     };
-    ours::ThreadItem {
+    mirror_exec::ThreadItem {
         id: Some(id),
-        details: self::details(details),
+        details: self::mirror_item_details(details),
     }
 }
 
-fn details(details: codex::ThreadItemDetails) -> ours::ThreadItemDetails {
-    use codex::ThreadItemDetails as Codex;
-    use ours::ThreadItemDetails as Ours;
+fn mirror_item_details(details: codex::ThreadItemDetails) -> mirror_exec::ThreadItemDetails {
+    use codex::ThreadItemDetails as CodexItemDetails;
+    use mirror_exec::ThreadItemDetails as MirrorItemDetails;
     match details {
-        Codex::AgentMessage(codex::AgentMessageItem { text }) => {
-            Ours::AgentMessage(ours::AgentMessageItem { text: Some(text) })
+        CodexItemDetails::AgentMessage(codex::AgentMessageItem { text }) => {
+            MirrorItemDetails::AgentMessage(mirror_exec::AgentMessageItem { text: Some(text) })
         }
-        Codex::Reasoning(codex::ReasoningItem { text }) => {
-            Ours::Reasoning(ours::ReasoningItem { text })
+        CodexItemDetails::Reasoning(codex::ReasoningItem { text }) => {
+            MirrorItemDetails::Reasoning(mirror_exec::ReasoningItem { text })
         }
-        Codex::CommandExecution(codex::CommandExecutionItem {
+        CodexItemDetails::CommandExecution(codex::CommandExecutionItem {
             command,
             aggregated_output,
             exit_code,
             status,
-        }) => Ours::CommandExecution(ours::CommandExecutionItem {
+        }) => MirrorItemDetails::CommandExecution(mirror_exec::CommandExecutionItem {
             command,
             aggregated_output,
             exit_code,
             status: match status {
                 codex::CommandExecutionStatus::InProgress => {
-                    ours::CommandExecutionStatus::InProgress
+                    mirror_exec::CommandExecutionStatus::InProgress
                 }
-                codex::CommandExecutionStatus::Completed => ours::CommandExecutionStatus::Completed,
-                codex::CommandExecutionStatus::Failed => ours::CommandExecutionStatus::Failed,
-                codex::CommandExecutionStatus::Declined => ours::CommandExecutionStatus::Declined,
+                codex::CommandExecutionStatus::Completed => {
+                    mirror_exec::CommandExecutionStatus::Completed
+                }
+                codex::CommandExecutionStatus::Failed => {
+                    mirror_exec::CommandExecutionStatus::Failed
+                }
+                codex::CommandExecutionStatus::Declined => {
+                    mirror_exec::CommandExecutionStatus::Declined
+                }
             },
         }),
-        Codex::FileChange(codex::FileChangeItem { changes, status }) => {
-            Ours::FileChange(ours::FileChangeItem {
+        CodexItemDetails::FileChange(codex::FileChangeItem { changes, status }) => {
+            MirrorItemDetails::FileChange(mirror_exec::FileChangeItem {
                 changes: changes
                     .into_iter()
                     .map(
-                        |codex::FileUpdateChange { path, kind }| ours::FileUpdateChange {
+                        |codex::FileUpdateChange { path, kind }| mirror_exec::FileUpdateChange {
                             path,
                             kind: match kind {
-                                codex::PatchChangeKind::Add => ours::PatchChangeKind::Add,
-                                codex::PatchChangeKind::Delete => ours::PatchChangeKind::Delete,
-                                codex::PatchChangeKind::Update => ours::PatchChangeKind::Update,
+                                codex::PatchChangeKind::Add => mirror_exec::PatchChangeKind::Add,
+                                codex::PatchChangeKind::Delete => {
+                                    mirror_exec::PatchChangeKind::Delete
+                                }
+                                codex::PatchChangeKind::Update => {
+                                    mirror_exec::PatchChangeKind::Update
+                                }
                             },
                         },
                     )
                     .collect(),
                 status: match status {
-                    codex::PatchApplyStatus::InProgress => ours::PatchApplyStatus::InProgress,
-                    codex::PatchApplyStatus::Completed => ours::PatchApplyStatus::Completed,
-                    codex::PatchApplyStatus::Failed => ours::PatchApplyStatus::Failed,
+                    codex::PatchApplyStatus::InProgress => {
+                        mirror_exec::PatchApplyStatus::InProgress
+                    }
+                    codex::PatchApplyStatus::Completed => mirror_exec::PatchApplyStatus::Completed,
+                    codex::PatchApplyStatus::Failed => mirror_exec::PatchApplyStatus::Failed,
                 },
             })
         }
-        Codex::McpToolCall(codex::McpToolCallItem {
+        CodexItemDetails::McpToolCall(codex::McpToolCallItem {
             server,
             tool,
             arguments,
             result,
             error,
             status,
-        }) => Ours::McpToolCall(ours::McpToolCallItem {
+        }) => MirrorItemDetails::McpToolCall(mirror_exec::McpToolCallItem {
             server,
             tool,
             arguments,
@@ -159,34 +173,34 @@ fn details(details: codex::ThreadItemDetails) -> ours::ThreadItemDetails {
                      content,
                      meta,
                      structured_content,
-                 }| ours::McpToolCallItemResult {
+                 }| mirror_exec::McpToolCallItemResult {
                     content,
                     meta,
                     structured_content,
                 },
             ),
             error: error.map(|codex::McpToolCallItemError { message }| {
-                ours::McpToolCallItemError { message }
+                mirror_exec::McpToolCallItemError { message }
             }),
             status: match status {
-                codex::McpToolCallStatus::InProgress => ours::McpToolCallStatus::InProgress,
-                codex::McpToolCallStatus::Completed => ours::McpToolCallStatus::Completed,
-                codex::McpToolCallStatus::Failed => ours::McpToolCallStatus::Failed,
+                codex::McpToolCallStatus::InProgress => mirror_exec::McpToolCallStatus::InProgress,
+                codex::McpToolCallStatus::Completed => mirror_exec::McpToolCallStatus::Completed,
+                codex::McpToolCallStatus::Failed => mirror_exec::McpToolCallStatus::Failed,
             },
         }),
-        Codex::CollabToolCall(codex::CollabToolCallItem {
+        CodexItemDetails::CollabToolCall(codex::CollabToolCallItem {
             tool,
             sender_thread_id,
             receiver_thread_ids,
             prompt,
             agents_states,
             status,
-        }) => Ours::CollabToolCall(ours::CollabToolCallItem {
+        }) => MirrorItemDetails::CollabToolCall(mirror_exec::CollabToolCallItem {
             tool: match tool {
-                codex::CollabTool::SpawnAgent => ours::CollabTool::SpawnAgent,
-                codex::CollabTool::SendInput => ours::CollabTool::SendInput,
-                codex::CollabTool::Wait => ours::CollabTool::Wait,
-                codex::CollabTool::CloseAgent => ours::CollabTool::CloseAgent,
+                codex::CollabTool::SpawnAgent => mirror_exec::CollabTool::SpawnAgent,
+                codex::CollabTool::SendInput => mirror_exec::CollabTool::SendInput,
+                codex::CollabTool::Wait => mirror_exec::CollabTool::Wait,
+                codex::CollabTool::CloseAgent => mirror_exec::CollabTool::CloseAgent,
             },
             sender_thread_id,
             receiver_thread_ids,
@@ -196,55 +210,78 @@ fn details(details: codex::ThreadItemDetails) -> ours::ThreadItemDetails {
                 .map(|(thread, codex::CollabAgentState { status, message })| {
                     let status = match status {
                         codex::CollabAgentStatus::PendingInit => {
-                            ours::CollabAgentStatus::PendingInit
+                            mirror_exec::CollabAgentStatus::PendingInit
                         }
-                        codex::CollabAgentStatus::Running => ours::CollabAgentStatus::Running,
+                        codex::CollabAgentStatus::Running => {
+                            mirror_exec::CollabAgentStatus::Running
+                        }
                         codex::CollabAgentStatus::Interrupted => {
-                            ours::CollabAgentStatus::Interrupted
+                            mirror_exec::CollabAgentStatus::Interrupted
                         }
-                        codex::CollabAgentStatus::Completed => ours::CollabAgentStatus::Completed,
-                        codex::CollabAgentStatus::Errored => ours::CollabAgentStatus::Errored,
-                        codex::CollabAgentStatus::Shutdown => ours::CollabAgentStatus::Shutdown,
-                        codex::CollabAgentStatus::NotFound => ours::CollabAgentStatus::NotFound,
+                        codex::CollabAgentStatus::Completed => {
+                            mirror_exec::CollabAgentStatus::Completed
+                        }
+                        codex::CollabAgentStatus::Errored => {
+                            mirror_exec::CollabAgentStatus::Errored
+                        }
+                        codex::CollabAgentStatus::Shutdown => {
+                            mirror_exec::CollabAgentStatus::Shutdown
+                        }
+                        codex::CollabAgentStatus::NotFound => {
+                            mirror_exec::CollabAgentStatus::NotFound
+                        }
                     };
-                    (thread, ours::CollabAgentState { status, message })
+                    (thread, mirror_exec::CollabAgentState { status, message })
                 })
                 .collect(),
             status: match status {
-                codex::CollabToolCallStatus::InProgress => ours::CollabToolCallStatus::InProgress,
-                codex::CollabToolCallStatus::Completed => ours::CollabToolCallStatus::Completed,
-                codex::CollabToolCallStatus::Failed => ours::CollabToolCallStatus::Failed,
+                codex::CollabToolCallStatus::InProgress => {
+                    mirror_exec::CollabToolCallStatus::InProgress
+                }
+                codex::CollabToolCallStatus::Completed => {
+                    mirror_exec::CollabToolCallStatus::Completed
+                }
+                codex::CollabToolCallStatus::Failed => mirror_exec::CollabToolCallStatus::Failed,
             },
         }),
-        // The search's own id shares the item's key on the wire; see `item`.
-        Codex::WebSearch(codex::WebSearchItem {
+        // The search's own id shares the item's key on the wire; see `mirror_item`.
+        CodexItemDetails::WebSearch(codex::WebSearchItem {
             id: _,
             query,
             action,
             results,
-        }) => Ours::WebSearch(ours::WebSearchItem {
+        }) => MirrorItemDetails::WebSearch(mirror_exec::WebSearchItem {
             query,
             action: match action {
                 WebSearchAction::Search { query, queries } => {
-                    ours::WebSearchAction::Search { query, queries }
+                    mirror_exec::WebSearchAction::Search { query, queries }
                 }
-                WebSearchAction::OpenPage { url } => ours::WebSearchAction::OpenPage { url },
+                WebSearchAction::OpenPage { url } => mirror_exec::WebSearchAction::OpenPage { url },
                 WebSearchAction::FindInPage { url, pattern } => {
-                    ours::WebSearchAction::FindInPage { url, pattern }
+                    mirror_exec::WebSearchAction::FindInPage { url, pattern }
                 }
-                WebSearchAction::Other => ours::WebSearchAction::Other,
+                WebSearchAction::Other => mirror_exec::WebSearchAction::Other,
             },
             results,
         }),
-        Codex::TodoList(codex::TodoListItem { items }) => Ours::TodoList(ours::TodoListItem {
-            items: items
-                .into_iter()
-                .map(|codex::TodoItem { text, completed }| ours::TodoItem { text, completed })
-                .collect(),
-        }),
-        Codex::Error(codex::ErrorItem { message }) => Ours::Error(ours::ErrorItem {
-            message: Some(message),
-        }),
+        CodexItemDetails::TodoList(codex::TodoListItem { items }) => {
+            MirrorItemDetails::TodoList(mirror_exec::TodoListItem {
+                items: items
+                    .into_iter()
+                    .map(
+                        |codex::TodoItem { text, completed }| mirror_exec::TodoItem {
+                            text,
+                            completed,
+                        },
+                    )
+                    .collect(),
+            })
+        }
+        CodexItemDetails::Error(codex::ErrorItem { message }) => {
+            MirrorItemDetails::Error(mirror_exec::ErrorItem {
+                message: Some(message),
+            })
+        }
     }
 }
 
@@ -260,39 +297,37 @@ mod tests {
     /// One of codex's values for every event, every item and every value of every enum, each with
     /// its optional fields both set and unset somewhere.
     fn samples() -> Vec<codex::ThreadEvent> {
-        use codex::ThreadItemDetails as D;
-
         let item = |details| codex::ExecThreadItem {
             id: "item_1".to_owned(),
             details,
         };
         let command = |status, exit_code| {
-            D::CommandExecution(codex::CommandExecutionItem {
+            codex::ThreadItemDetails::CommandExecution(codex::CommandExecutionItem {
                 command: "ls".to_owned(),
                 aggregated_output: "out".to_owned(),
                 exit_code,
                 status,
             })
         };
-        let mcp = |status, answered: bool| {
-            D::McpToolCall(codex::McpToolCallItem {
+        let mcp_tool_call = |status, has_result: bool| {
+            codex::ThreadItemDetails::McpToolCall(codex::McpToolCallItem {
                 server: "files".to_owned(),
                 tool: "read".to_owned(),
                 arguments: json!({"path": "a"}),
-                result: answered.then(|| codex::McpToolCallItemResult {
+                result: has_result.then(|| codex::McpToolCallItemResult {
                     content: vec![json!({"type": "text", "text": "x"})],
                     meta: (status == codex::McpToolCallStatus::Completed).then(|| json!({"k": 1})),
                     structured_content: (status == codex::McpToolCallStatus::InProgress)
                         .then(|| json!({"rows": 1})),
                 }),
-                error: (!answered).then(|| codex::McpToolCallItemError {
+                error: (!has_result).then(|| codex::McpToolCallItemError {
                     message: "no".to_owned(),
                 }),
                 status,
             })
         };
-        let collab = |tool, status, agent| {
-            D::CollabToolCall(codex::CollabToolCallItem {
+        let collaboration_tool_call = |tool, status, agent_status| {
+            codex::ThreadItemDetails::CollabToolCall(codex::CollabToolCallItem {
                 tool,
                 sender_thread_id: "t0".to_owned(),
                 receiver_thread_ids: vec!["t1".to_owned()],
@@ -300,7 +335,7 @@ mod tests {
                 agents_states: HashMap::from([(
                     "t1".to_owned(),
                     codex::CollabAgentState {
-                        status: agent,
+                        status: agent_status,
                         message: None,
                     },
                 )]),
@@ -308,7 +343,7 @@ mod tests {
             })
         };
         let search = |action| {
-            D::WebSearch(codex::WebSearchItem {
+            codex::ThreadItemDetails::WebSearch(codex::WebSearchItem {
                 id: "ws_1".to_owned(),
                 query: "rust".to_owned(),
                 action,
@@ -317,17 +352,17 @@ mod tests {
         };
 
         let details = vec![
-            D::AgentMessage(codex::AgentMessageItem {
+            codex::ThreadItemDetails::AgentMessage(codex::AgentMessageItem {
                 text: "hi".to_owned(),
             }),
-            D::Reasoning(codex::ReasoningItem {
+            codex::ThreadItemDetails::Reasoning(codex::ReasoningItem {
                 text: "thinking".to_owned(),
             }),
             command(codex::CommandExecutionStatus::InProgress, None),
             command(codex::CommandExecutionStatus::Completed, Some(0)),
             command(codex::CommandExecutionStatus::Failed, Some(1)),
             command(codex::CommandExecutionStatus::Declined, None),
-            D::FileChange(codex::FileChangeItem {
+            codex::ThreadItemDetails::FileChange(codex::FileChangeItem {
                 changes: vec![
                     codex::FileUpdateChange {
                         path: "a".to_owned(),
@@ -344,48 +379,48 @@ mod tests {
                 ],
                 status: codex::PatchApplyStatus::InProgress,
             }),
-            D::FileChange(codex::FileChangeItem {
+            codex::ThreadItemDetails::FileChange(codex::FileChangeItem {
                 changes: Vec::new(),
                 status: codex::PatchApplyStatus::Completed,
             }),
-            D::FileChange(codex::FileChangeItem {
+            codex::ThreadItemDetails::FileChange(codex::FileChangeItem {
                 changes: Vec::new(),
                 status: codex::PatchApplyStatus::Failed,
             }),
-            mcp(codex::McpToolCallStatus::InProgress, true),
-            mcp(codex::McpToolCallStatus::Completed, true),
-            mcp(codex::McpToolCallStatus::Failed, false),
-            collab(
+            mcp_tool_call(codex::McpToolCallStatus::InProgress, true),
+            mcp_tool_call(codex::McpToolCallStatus::Completed, true),
+            mcp_tool_call(codex::McpToolCallStatus::Failed, false),
+            collaboration_tool_call(
                 codex::CollabTool::SpawnAgent,
                 codex::CollabToolCallStatus::InProgress,
                 codex::CollabAgentStatus::PendingInit,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::SendInput,
                 codex::CollabToolCallStatus::Completed,
                 codex::CollabAgentStatus::Running,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::Wait,
                 codex::CollabToolCallStatus::Failed,
                 codex::CollabAgentStatus::Interrupted,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::CloseAgent,
                 codex::CollabToolCallStatus::Completed,
                 codex::CollabAgentStatus::Completed,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::Wait,
                 codex::CollabToolCallStatus::Completed,
                 codex::CollabAgentStatus::Errored,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::Wait,
                 codex::CollabToolCallStatus::Completed,
                 codex::CollabAgentStatus::Shutdown,
             ),
-            collab(
+            collaboration_tool_call(
                 codex::CollabTool::Wait,
                 codex::CollabToolCallStatus::Completed,
                 codex::CollabAgentStatus::NotFound,
@@ -400,13 +435,13 @@ mod tests {
                 pattern: Some("p".to_owned()),
             }),
             search(WebSearchAction::Other),
-            D::TodoList(codex::TodoListItem {
+            codex::ThreadItemDetails::TodoList(codex::TodoListItem {
                 items: vec![codex::TodoItem {
                     text: "do".to_owned(),
                     completed: false,
                 }],
             }),
-            D::Error(codex::ErrorItem {
+            codex::ThreadItemDetails::Error(codex::ErrorItem {
                 message: "careful".to_owned(),
             }),
         ];
@@ -456,7 +491,7 @@ mod tests {
     fn the_mirror_writes_and_reads_what_codex_writes() -> Result<()> {
         for sample in samples() {
             let written = serde_json::to_value(&sample).or_fail()?;
-            let mirrored = super::event(sample);
+            let mirrored = super::mirror_event(sample);
             expect_that!(serde_json::to_value(&mirrored).or_fail()?, eq(&written));
             expect_that!(
                 serde_json::from_value::<mirror::exec::ThreadEvent>(written).or_fail()?,

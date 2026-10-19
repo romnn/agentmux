@@ -105,7 +105,7 @@ impl RunStore {
             if !expired(&run_id, &meta) {
                 continue;
             }
-            let finished = match run.newest_turn(&meta) {
+            let finished = match run.fold_newest_turn(&meta) {
                 Ok(turn) => turn.is_none_or(|turn| turn.outcome.is_terminal()),
                 Err(_) => continue,
             };
@@ -134,7 +134,7 @@ impl RunStore {
         let run = self.lock(run_id)?;
         let meta = self.meta(run_id)?;
         if run
-            .newest_turn(&meta)?
+            .fold_newest_turn(&meta)?
             .is_some_and(|turn| !turn.outcome.is_terminal())
             || self.a_child_is_alive(run_id)?
         {

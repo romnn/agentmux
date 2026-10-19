@@ -1,4 +1,4 @@
-//! The part of codex's protocol agentmux uses: [`surface!`], the one table of it.
+//! The part of codex's protocol agentmux uses: `surface!`, the one table of it.
 //!
 //! Every method codex lists is bound by name, so a method codex adds or drops changes the
 //! generated `Any*` enums and fails to build where they are matched.
@@ -84,7 +84,7 @@ macro_rules! surface {
 
 /// What one entry says a method's `params` carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Carries {
+pub enum EntryParams {
     /// Nothing.
     Nothing,
     /// Always this schema.
@@ -99,7 +99,7 @@ pub struct Entry {
     /// The method on the wire.
     pub method: &'static str,
     /// What its params carry.
-    pub params: Carries,
+    pub params: EntryParams,
     /// The schema of the `result` that answers it, for a request.
     pub response: Option<&'static str>,
 }
@@ -118,15 +118,15 @@ pub struct Surface {
 }
 
 /// What an entry's params carry, from its `(Params)` or `(Params?)`, or nothing.
-macro_rules! carries {
+macro_rules! entry_params {
     () => {
-        Carries::Nothing
+        EntryParams::Nothing
     };
     ($params:ident) => {
-        Carries::Required(stringify!($params))
+        EntryParams::Required(stringify!($params))
     };
     ($params:ident ?) => {
-        Carries::Optional(stringify!($params))
+        EntryParams::Optional(stringify!($params))
     };
 }
 
@@ -156,7 +156,7 @@ macro_rules! entries {
                 $section: vec![$(
                     Entry {
                         method: $method,
-                        params: carries!($($params $($optional)?)?),
+                        params: entry_params!($($params $($optional)?)?),
                         response: response!($($response)?),
                     },
                 )*],
@@ -166,7 +166,7 @@ macro_rules! entries {
 }
 
 impl Surface {
-    /// The table [`surface!`] states.
+    /// The table `surface!` states.
     #[must_use]
     pub fn table() -> Self {
         surface!(entries)
@@ -177,7 +177,7 @@ impl Surface {
 mod tests {
     use googletest::prelude::*;
 
-    use super::{Carries, Entry, Surface};
+    use super::{Entry, EntryParams, Surface};
 
     /// An entry reads with its method, its params, and a request's response; `?` marks optional
     /// params, and a method without params carries nothing.
@@ -188,7 +188,7 @@ mod tests {
             table.client_requests,
             contains(eq(&Entry {
                 method: "turn/start",
-                params: Carries::Required("TurnStartParams"),
+                params: EntryParams::Required("TurnStartParams"),
                 response: Some("TurnStartResponse"),
             }))
         );
@@ -196,7 +196,7 @@ mod tests {
             table.client_requests,
             contains(eq(&Entry {
                 method: "account/rateLimits/read",
-                params: Carries::Optional("GetAccountRateLimitsParams"),
+                params: EntryParams::Optional("GetAccountRateLimitsParams"),
                 response: Some("GetAccountRateLimitsResponse"),
             }))
         );
@@ -204,7 +204,7 @@ mod tests {
             table.client_notifications,
             elements_are![eq(&Entry {
                 method: "initialized",
-                params: Carries::Nothing,
+                params: EntryParams::Nothing,
                 response: None,
             })]
         );
@@ -212,7 +212,7 @@ mod tests {
             table.server_notifications,
             contains(eq(&Entry {
                 method: "turn/completed",
-                params: Carries::Required("TurnCompletedNotification"),
+                params: EntryParams::Required("TurnCompletedNotification"),
                 response: None,
             }))
         );

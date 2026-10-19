@@ -275,7 +275,7 @@ impl AgentMux {
                 retention: params.question.retention(),
                 env: params.question.environment(),
                 billing: params.delegate.billing,
-                codex_exec: params.delegate.codex_exec,
+                force_codex_exec: params.delegate.force_codex_exec,
             })
             .map_err(|error| run_error(&error))?;
 
@@ -308,7 +308,7 @@ impl AgentMux {
                 retention: params.question.retention(),
                 env: params.question.environment(),
                 billing: params.delegate.billing,
-                codex_exec: params.delegate.codex_exec,
+                force_codex_exec: params.delegate.force_codex_exec,
             })
             .map_err(|error| run_error(&error))?;
         Ok(text(render::status(&status)))
@@ -445,7 +445,7 @@ impl AgentMux {
             .steer(&run_id(&params.run_id)?, &params.message)
             .await
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::steered(&status)))
+        Ok(text(render::steer_confirmation(&status)))
     }
 
     #[tool(
@@ -772,8 +772,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use agentmux::appserver::Plan;
-    use agentmux::appserver::mailbox::{Mailbox, Reply};
+    use agentmux::appserver::DriverPlan;
+    use agentmux::appserver::mailbox::{Mailbox, SteerReply};
     use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId};
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
@@ -784,30 +784,34 @@ mod tests {
     use super::{AgentMux, SteerParams};
 
     /// A steerable consultation behind an MCP server, and the thread playing its driver.
-    struct Steering {
+    struct SteerTestContext {
         server: AgentMux,
         run_id: String,
-        driver: std::thread::JoinHandle<std::io::Result<Option<String>>>,
-        _dir: tempfile::TempDir,
+        driver_thread: std::thread::JoinHandle<std::io::Result<Option<String>>>,
+        #[expect(
+            dead_code,
+            reason = "holds the store's temporary directory until the test ends; never read"
+        )]
+        state_directory: tempfile::TempDir,
     }
 
     /// A server over a store whose one Codex turn is running, driven over the app-server, with
     /// a thread playing the driver: it answers the first steer with `reply`, and hands back the
     /// text it claimed.
-    fn steering(reply: Reply) -> Result<Steering> {
-        let dir = tempfile::tempdir().or_fail()?;
+    fn start_steerable_run(reply: SteerReply) -> Result<SteerTestContext> {
+        let state_directory = tempfile::tempdir().or_fail()?;
         let launcher = Arc::new(ScriptedLauncher::new([Script::running(indoc::indoc! {r#"
             {"type":"thread.started","thread_id":"th"}
             {"type":"turn.started"}
         "#})]));
-        let env = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+        let host_env = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect();
-        let store = RunStore::open(dir.path(), launcher.clone(), env)
+        let store = RunStore::open(state_directory.path(), launcher.clone(), host_env)
             .or_fail()?
             .with_codex_app_server("/opt/agentmux");
-        let started = store.start(&StartRequest {
+        let run_status = store.start(&StartRequest {
             delegate: Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
@@ -816,36 +820,36 @@ mod tests {
                 isolation: Some(Isolation::Inherit),
             },
             question: "q".to_owned(),
-            cwd: dir.path().to_path_buf(),
+            cwd: state_directory.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })?;
         // The mailbox the driver was pointed at, from the plan it was launched with.
         let launch = launcher.launches().into_iter().next().or_fail()?;
-        let plan = Plan::read(Path::new(launch.args.get(1).or_fail()?)).or_fail()?;
-        let mailbox = Mailbox::new(plan.mailbox());
-        let driver = std::thread::spawn(move || {
+        let plan = DriverPlan::read(Path::new(launch.args.get(1).or_fail()?)).or_fail()?;
+        let mailbox = Mailbox::new(plan.mailbox_dir());
+        let driver_thread = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if let Some(claim) = mailbox.claim_all().into_iter().next() {
-                    mailbox.answer(&claim, &reply)?;
+                    mailbox.write_reply(&claim, &reply)?;
                     return Ok(Some(claim.text));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None)
         });
-        Ok(Steering {
+        Ok(SteerTestContext {
             server: AgentMux::new(Arc::new(store)),
-            run_id: started.run_id.to_string(),
-            driver,
-            _dir: dir,
+            run_id: run_status.run_id.to_string(),
+            driver_thread,
+            state_directory,
         })
     }
 
-    fn params(run_id: &str, message: &str) -> Parameters<SteerParams> {
+    fn steer_params(run_id: &str, message: &str) -> Parameters<SteerParams> {
         Parameters(SteerParams {
             run_id: run_id.to_owned(),
             message: message.to_owned(),
@@ -857,17 +861,20 @@ mod tests {
     #[gtest]
     #[tokio::test]
     async fn the_steer_tool_delivers_the_whole_message() -> Result<()> {
-        let s = steering(Reply::Accepted)?;
+        let context = start_steerable_run(SteerReply::Accepted)?;
         let message = indoc::indoc! {"
             Narrow it to «auth»,
             and leave the tests alone."};
 
-        let answered = s.server.steer(params(&s.run_id, message)).await;
+        let steer_result = context
+            .server
+            .steer(steer_params(&context.run_id, message))
+            .await;
 
-        let claimed = s.driver.join().ok().or_fail()?.or_fail()?;
-        assert_that!(claimed, some(eq(message)));
-        let text = format!("{:?}", answered.or_fail()?.content);
-        assert_that!(text, contains_substring("### user (steer)"));
+        let claimed_message = context.driver_thread.join().ok().or_fail()?.or_fail()?;
+        assert_that!(claimed_message, some(eq(message)));
+        let response_debug = format!("{:?}", steer_result.or_fail()?.content);
+        assert_that!(response_debug, contains_substring("### user (steer)"));
         Ok(())
     }
 
@@ -876,22 +883,24 @@ mod tests {
     #[gtest]
     #[tokio::test]
     async fn the_steer_tool_reports_a_refusal_as_invalid_parameters() -> Result<()> {
-        let s = steering(Reply::Rejected {
+        let context = start_steerable_run(SteerReply::Rejected {
             reason: "no active turn".to_owned(),
         })?;
-        let server = &s.server;
+        let server = &context.server;
 
-        let refused = server.steer(params(&s.run_id, "too late")).await;
-        let refused = refused.err().or_fail()?;
-        assert_that!(refused.code, eq(ErrorCode::INVALID_PARAMS));
+        let steer_result = server
+            .steer(steer_params(&context.run_id, "too late"))
+            .await;
+        let rejection_error = steer_result.err().or_fail()?;
+        assert_that!(rejection_error.code, eq(ErrorCode::INVALID_PARAMS));
         assert_that!(
-            refused.message.as_ref(),
+            rejection_error.message.as_ref(),
             contains_substring("no active turn")
         );
 
-        let malformed = server.steer(params("not-an-id", "x")).await;
+        let invalid_id_result = server.steer(steer_params("not-an-id", "x")).await;
         assert_that!(
-            malformed.err().map(|err| err.code),
+            invalid_id_result.err().map(|err| err.code),
             some(eq(ErrorCode::INVALID_PARAMS))
         );
         Ok(())

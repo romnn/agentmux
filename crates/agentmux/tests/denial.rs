@@ -20,7 +20,7 @@ use googletest::prelude::*;
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
 
@@ -51,7 +51,7 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         retention: Retention::Ttl,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     }
 }
 

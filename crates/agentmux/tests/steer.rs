@@ -10,22 +10,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::appserver::mailbox::{Mailbox, Reply};
-use agentmux::appserver::{Plan, STOP_BUDGET};
+use agentmux::appserver::mailbox::{Mailbox, SteerReply};
+use agentmux::appserver::{DriverPlan, STOP_BUDGET};
 use agentmux::delegate::{
     AccountChoice, Billing, CodexSandbox, Delegate, Effort, Isolation, ModelId,
 };
 use agentmux::launch::Launcher as _;
-use agentmux::run::{Idle, Retention, RunError, RunId, RunStore, StartRequest, SteerRefused};
+use agentmux::run::{
+    NotRunningReason, Retention, RunError, RunId, RunStore, StartRequest, SteerError,
+};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
-use agentmux::transcript::State;
+use agentmux::transcript::TurnState;
 use googletest::prelude::*;
 
 /// Where a test pretends the agentmux executable lives.
-const DRIVER: &str = "/opt/agentmux/bin/agentmux";
+const DRIVER_PATH: &str = "/opt/agentmux/bin/agentmux";
 
 /// A running Codex turn, as a driven turn's capture begins.
-const RUNNING: &str = indoc::indoc! {r#"
+const RUNNING_CAPTURE: &str = indoc::indoc! {r#"
     {"type":"thread.started","thread_id":"th-fake"}
     {"type":"turn.started"}
 "#};
@@ -33,7 +35,7 @@ const RUNNING: &str = indoc::indoc! {r#"
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
 
@@ -62,13 +64,13 @@ struct Harness {
     dir: tempfile::TempDir,
 }
 
-/// A store that drives inheriting Codex turns through [`DRIVER`].
+/// A store that drives inheriting Codex turns through [`DRIVER_PATH`].
 fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
     let dir = tempfile::tempdir().or_fail()?;
     let launcher = Arc::new(ScriptedLauncher::new(scripts));
     let store = RunStore::open(dir.path(), launcher.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER);
+        .with_codex_app_server(DRIVER_PATH);
     Ok(Harness {
         store: Arc::new(store),
         launcher,
@@ -86,15 +88,15 @@ impl Harness {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         }
     }
 
     /// The plan the `index`th launch's driver was pointed at, read from the launch itself.
-    fn plan(&self, index: usize) -> Result<Plan> {
+    fn plan(&self, index: usize) -> Result<DriverPlan> {
         let launch = self.launcher.launches().into_iter().nth(index).or_fail()?;
         let path = launch.args.get(1).or_fail()?;
-        Plan::read(Path::new(path)).or_fail()
+        DriverPlan::read(Path::new(path)).or_fail()
     }
 
     /// The transcript as every reader sees it, from the top.
@@ -125,13 +127,16 @@ fn until_submitted(mailbox: &Path) -> bool {
 }
 
 /// Play the driver's half of a turn's mailbox: answer the first message with `reply`.
-fn answer_first(mailbox: PathBuf, reply: Reply) -> std::thread::JoinHandle<Option<String>> {
+fn spawn_steer_responder(
+    mailbox: PathBuf,
+    reply: SteerReply,
+) -> std::thread::JoinHandle<Option<String>> {
     let mailbox = Mailbox::new(mailbox);
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if let Some(claim) = mailbox.claim_all().into_iter().next() {
-                let _ = mailbox.answer(&claim, &reply);
+                let _ = mailbox.write_reply(&claim, &reply);
                 return Some(claim.text);
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -150,38 +155,41 @@ fn an_inheriting_codex_turn_is_launched_through_the_driver() -> Result<()> {
         {"type":"item.completed","item":{"id":"i","type":"agent_message","text":"OK"}}
         {"type":"turn.completed"}
     "#};
-    let h = harness([Script::completed(first), Script::running(RUNNING)])?;
+    let harness = harness([Script::completed(first), Script::running(RUNNING_CAPTURE)])?;
 
-    let request = h.request(codex(Isolation::Inherit)?);
-    let started = h.store.start(&request)?;
-    let launch = h.launcher.launches().into_iter().next().or_fail()?;
+    let request = harness.request(codex(Isolation::Inherit)?);
+    let started = harness.store.start(&request)?;
+    let launch = harness.launcher.launches().into_iter().next().or_fail()?;
 
     // The delegate is the driver, pointed at a plan.
-    assert_that!(launch.program, eq(DRIVER));
+    assert_that!(launch.program, eq(DRIVER_PATH));
     assert_that!(
         launch.args,
         elements_are![eq("codex-app-server"), anything()]
     );
     // The plan keeps the delegate's model, effort and sandbox, and the turn's own files.
-    let plan = h.plan(0)?;
+    let plan = harness.plan(0)?;
     assert_that!(plan.settings.model.as_str(), eq("gpt-6-astra"));
     assert_that!(
         plan.settings.args,
         contains(eq("model_reasoning_effort=\"high\""))
     );
     assert_that!(plan.settings.sandbox, eq(CodexSandbox::WorkspaceWrite));
-    assert_that!(plan.resume, none());
+    assert_that!(plan.resume_thread_id, none());
     assert_that!(plan.billing, eq(Billing::Subscription));
     assert_that!(plan.cwd, eq(&request.cwd));
     // The status reports the pricing the turn runs on.
     assert_that!(started.billing, some(eq(Billing::Subscription)));
 
     // A follow-up is driven too, and resumes the thread the first turn announced.
-    let followed = h
+    let followed = harness
         .store
         .follow_up(&started.run_id, "And the session code?")?;
     assert_that!(
-        h.plan(1)?.resume.map(|s| s.to_string()),
+        harness
+            .plan(1)?
+            .resume_thread_id
+            .map(|session| session.to_string()),
         some(eq("th-fake"))
     );
     // The running follow-up is the one place `steer` would be offered.
@@ -207,16 +215,16 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
         retention: Retention::Ttl,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     })?;
     exec_only
         .wait_until_terminal(&started.run_id, Duration::from_secs(5))
         .await?;
 
-    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING)]));
+    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
     let driving = RunStore::open(dir.path(), later.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER);
+        .with_codex_app_server(DRIVER_PATH);
     driving.follow_up(&started.run_id, "And the session code?")?;
 
     assert_that!(
@@ -234,22 +242,23 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_consultation_that_asks_for_exec_runs_over_exec_throughout() -> Result<()> {
-    let h = harness([
+    let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
-        Script::running(RUNNING),
+        Script::running(RUNNING_CAPTURE),
     ])?;
-    let mut request = h.request(codex(Isolation::Inherit)?);
-    request.codex_exec = true;
+    let mut request = harness.request(codex(Isolation::Inherit)?);
+    request.force_codex_exec = true;
 
-    let started = h.store.start(&request)?;
-    h.store
+    let started = harness.store.start(&request)?;
+    harness
+        .store
         .wait_until_terminal(&started.run_id, Duration::from_secs(5))
         .await?;
-    let followed = h
+    let followed = harness
         .store
         .follow_up(&started.run_id, "And the session code?")?;
 
-    let programs: Vec<String> = h
+    let programs: Vec<String> = harness
         .launcher
         .launches()
         .into_iter()
@@ -264,12 +273,14 @@ async fn a_consultation_that_asks_for_exec_runs_over_exec_throughout() -> Result
 #[gtest]
 #[tokio::test]
 async fn a_steer_is_delivered_through_the_turns_mailbox() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
     assert_that!(started.steerable, eq(true));
 
-    let driver = answer_first(h.plan(0)?.mailbox(), Reply::Accepted);
-    let steered = h
+    let driver = spawn_steer_responder(harness.plan(0)?.mailbox_dir(), SteerReply::Accepted);
+    let steered = harness
         .store
         .steer(&started.run_id, "Only look at the auth module.")
         .await;
@@ -286,22 +297,27 @@ async fn a_steer_is_delivered_through_the_turns_mailbox() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_refused_steer_says_why() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let driver = answer_first(
-        h.plan(0)?.mailbox(),
-        Reply::Rejected {
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    let driver = spawn_steer_responder(
+        harness.plan(0)?.mailbox_dir(),
+        SteerReply::Rejected {
             reason: "no active turn".to_owned(),
         },
     );
 
-    let refused = h.store.steer(&started.run_id, "REFUSED-SENTINEL").await;
+    let refused = harness
+        .store
+        .steer(&started.run_id, "REFUSED-SENTINEL")
+        .await;
     let _ = driver.join();
 
     assert_that!(
         refused,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
-            SteerRefused::Rejected {
+            SteerError::Rejected {
                 detail: eq("no active turn"),
                 ..
             }
@@ -309,7 +325,7 @@ async fn a_refused_steer_says_why() -> Result<()> {
     );
     // A refused message is in no reader's view of the consultation.
     assert_that!(
-        h.transcript(&started.run_id)?,
+        harness.transcript(&started.run_id)?,
         not(contains_substring("REFUSED-SENTINEL"))
     );
     Ok(())
@@ -320,22 +336,24 @@ async fn a_refused_steer_says_why() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_steer_the_driver_could_not_confirm_says_so() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let driver = answer_first(
-        h.plan(0)?.mailbox(),
-        Reply::Unconfirmed {
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    let driver = spawn_steer_responder(
+        harness.plan(0)?.mailbox_dir(),
+        SteerReply::Unconfirmed {
             reason: "the turn ended before codex answered it".to_owned(),
         },
     );
 
-    let unknown = h.store.steer(&started.run_id, "did it land?").await;
+    let unknown = harness.store.steer(&started.run_id, "did it land?").await;
     let _ = driver.join();
 
     assert_that!(
         unknown,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
-            SteerRefused::Unconfirmed {
+            SteerError::Unconfirmed {
                 why: contains_substring("before codex answered"),
                 ..
             }
@@ -356,15 +374,17 @@ async fn a_claimed_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
         (true, "left without answering"),
         (false, "did not confirm it within"),
     ] {
-        let h = harness([Script::running(RUNNING)])?;
-        let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-        let mailbox = Mailbox::new(h.plan(0)?.mailbox());
-        let launcher = Arc::clone(&h.launcher);
+        let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+        let started = harness
+            .store
+            .start(&harness.request(codex(Isolation::Inherit)?))?;
+        let mailbox = Mailbox::new(harness.plan(0)?.mailbox_dir());
+        let launcher = Arc::clone(&harness.launcher);
         let driver = tokio::spawn(async move {
             for _ in 0..1000 {
                 if !mailbox.claim_all().is_empty() {
                     if driver_leaves {
-                        launcher.kill(launcher.launched(0));
+                        launcher.kill(launcher.launch_handle(0));
                     }
                     return true;
                 }
@@ -372,20 +392,23 @@ async fn a_claimed_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
             }
             false
         });
-        let steered = h.store.steer(&started.run_id, "UNANSWERED-SENTINEL").await;
+        let steered = harness
+            .store
+            .steer(&started.run_id, "UNANSWERED-SENTINEL")
+            .await;
 
         assert_that!(driver.await.or_fail()?, eq(true));
         assert_that!(
             steered,
             err(matches_pattern!(RunError::Steer(matches_pattern!(
-                SteerRefused::Unconfirmed {
+                SteerError::Unconfirmed {
                     why: contains_substring(why),
                     ..
                 }
             ))))
         );
         assert_that!(
-            h.transcript(&started.run_id)?,
+            harness.transcript(&started.run_id)?,
             not(contains_substring("UNANSWERED-SENTINEL"))
         );
     }
@@ -396,22 +419,24 @@ async fn a_claimed_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_turn_being_cancelled_takes_no_steer() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    std::fs::write(h.plan(0)?.cancel_marker(), "").or_fail()?;
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    std::fs::write(harness.plan(0)?.cancel_marker_path(), "").or_fail()?;
 
-    assert_that!(h.store.status(&started.run_id)?.steerable, eq(false));
+    assert_that!(harness.store.status(&started.run_id)?.steerable, eq(false));
     assert_that!(
-        h.store.steer(&started.run_id, "x").await,
+        harness.store.steer(&started.run_id, "x").await,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
-            SteerRefused::NotRunning {
-                state: eq(&Idle::Cancelling),
+            SteerError::NotRunning {
+                state: eq(&NotRunningReason::Cancelling),
                 ..
             }
         ))))
     );
     assert_that!(
-        std::fs::read_dir(h.plan(0)?.mailbox())
+        std::fs::read_dir(harness.plan(0)?.mailbox_dir())
             .map(Iterator::count)
             .unwrap_or(0),
         eq(0)
@@ -434,22 +459,24 @@ async fn a_turn_not_yet_running_takes_no_steer() -> Result<()> {
             "#},
         ),
     ] {
-        let h = harness([Script::running(capture)])?;
-        let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
+        let harness = harness([Script::running(capture)])?;
+        let started = harness
+            .store
+            .start(&harness.request(codex(Isolation::Inherit)?))?;
 
         assert_that!(started.steerable, eq(false), "{case}");
         assert_that!(
-            h.store.steer(&started.run_id, "x").await,
+            harness.store.steer(&started.run_id, "x").await,
             err(all![
                 matches_pattern!(RunError::Steer(matches_pattern!(
-                    SteerRefused::Starting { .. }
+                    SteerError::Starting { .. }
                 ))),
                 displays_as(contains_substring("again in a few seconds"))
             ]),
             "{case}"
         );
         assert_that!(
-            std::fs::read_dir(h.plan(0)?.mailbox())
+            std::fs::read_dir(harness.plan(0)?.mailbox_dir())
                 .map(Iterator::count)
                 .unwrap_or(0),
             eq(0),
@@ -464,27 +491,32 @@ async fn a_turn_not_yet_running_takes_no_steer() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_steer_the_turn_outlives_is_withdrawn_unsent() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let mailbox = h.plan(0)?.mailbox();
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    let mailbox = harness.plan(0)?.mailbox_dir();
 
     // The turn's child goes away while the message waits, unclaimed, in the mailbox.
-    let launcher = Arc::clone(&h.launcher);
+    let launcher = Arc::clone(&harness.launcher);
     let stopper = std::thread::spawn({
         let mailbox = mailbox.clone();
         move || {
             if until_submitted(&mailbox) {
-                launcher.terminate(launcher.launched(0));
+                launcher.terminate(launcher.launch_handle(0));
             }
         }
     });
-    let withdrawn = h.store.steer(&started.run_id, "WITHDRAWN-SENTINEL").await;
+    let withdrawn = harness
+        .store
+        .steer(&started.run_id, "WITHDRAWN-SENTINEL")
+        .await;
     let _ = stopper.join();
 
     assert_that!(
         withdrawn,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
-            SteerRefused::Withdrawn {
+            SteerError::Withdrawn {
                 why: contains_substring("ended"),
                 ..
             }
@@ -493,7 +525,7 @@ async fn a_steer_the_turn_outlives_is_withdrawn_unsent() -> Result<()> {
     // Withdrawn means the driver can never claim it afterwards, and nobody reads it.
     assert_that!(Mailbox::new(mailbox).claim_all(), is_empty());
     assert_that!(
-        h.transcript(&started.run_id)?,
+        harness.transcript(&started.run_id)?,
         not(contains_substring("WITHDRAWN-SENTINEL"))
     );
     Ok(())
@@ -503,39 +535,47 @@ async fn a_steer_the_turn_outlives_is_withdrawn_unsent() -> Result<()> {
 #[gtest]
 #[tokio::test]
 async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
-    let h = harness([
-        Script::running(RUNNING),
+    let harness = harness([
+        Script::running(RUNNING_CAPTURE),
         Script::running(String::new()),
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
 
     // Isolated Codex runs over `exec`, because the app-server cannot skip the account's
     // configuration.
-    let isolated = h.store.start(&h.request(codex(Isolation::Isolated)?))?;
+    let isolated = harness
+        .store
+        .start(&harness.request(codex(Isolation::Isolated)?))?;
     assert_that!(
-        h.launcher.launches().first().map(|l| l.args.clone()),
+        harness
+            .launcher
+            .launches()
+            .first()
+            .map(|launch| launch.args.clone()),
         some(contains(eq("exec")))
     );
     assert_that!(isolated.steerable, eq(false));
     assert_that!(
-        h.store.steer(&isolated.run_id, "x").await,
+        harness.store.steer(&isolated.run_id, "x").await,
         err(displays_as(contains_substring("inherit_settings: true")))
     );
 
     // Claude reads its question once.
-    let claude = h.store.start(&h.request(claude()?))?;
+    let claude = harness.store.start(&harness.request(claude()?))?;
     assert_that!(
-        h.store.steer(&claude.run_id, "x").await,
+        harness.store.steer(&claude.run_id, "x").await,
         err(displays_as(contains_substring("claude --print")))
     );
 
     // A finished consultation points at the follow-up instead.
-    let finished = h.store.start(&h.request(codex(Isolation::Isolated)?))?;
+    let finished = harness
+        .store
+        .start(&harness.request(codex(Isolation::Isolated)?))?;
     assert_that!(
-        h.store.steer(&finished.run_id, "x").await,
+        harness.store.steer(&finished.run_id, "x").await,
         err(matches_pattern!(RunError::Steer(matches_pattern!(
-            SteerRefused::NotRunning {
-                state: eq(&Idle::Ended(State::Completed)),
+            SteerError::NotRunning {
+                state: eq(&NotRunningReason::Ended(TurnState::Completed)),
                 ..
             }
         ))))
@@ -543,10 +583,11 @@ async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
 
     // And an empty message says nothing to steer with.
     assert_that!(
-        h.store
+        harness
+            .store
             .steer(&isolated.run_id, indoc::indoc! {"  \n"})
             .await,
-        err(matches_pattern!(RunError::Steer(eq(&SteerRefused::Empty))))
+        err(matches_pattern!(RunError::Steer(eq(&SteerError::Empty))))
     );
     Ok(())
 }
@@ -557,7 +598,7 @@ async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
 #[tokio::test]
 async fn a_store_without_a_driver_launches_codex_over_exec() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let launcher = Arc::new(ScriptedLauncher::new([Script::running(RUNNING)]));
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
     let store = RunStore::open(dir.path(), launcher.clone(), env()).or_fail()?;
 
     let started = store.start(&StartRequest {
@@ -567,10 +608,13 @@ async fn a_store_without_a_driver_launches_codex_over_exec() -> Result<()> {
         retention: Retention::Ttl,
         env: BTreeMap::new(),
         billing: None,
-        codex_exec: false,
+        force_codex_exec: false,
     })?;
     assert_that!(
-        launcher.launches().first().map(|l| l.program.clone()),
+        launcher
+            .launches()
+            .first()
+            .map(|launch| launch.program.clone()),
         some(eq("codex"))
     );
     assert_that!(
@@ -589,25 +633,27 @@ async fn a_store_without_a_driver_launches_codex_over_exec() -> Result<()> {
 #[gtest]
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_driver_is_given_its_whole_stop_budget_before_any_signal() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
-    let marker = h.plan(0)?.cancel_marker();
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    let marker = harness.plan(0)?.cancel_marker_path();
 
-    let launcher = Arc::clone(&h.launcher);
+    let launcher = Arc::clone(&harness.launcher);
     let driver = tokio::spawn(async move {
         while !marker.exists() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         tokio::time::sleep(STOP_BUDGET).await;
         // Leaving is all the store can observe of a driver that interrupted its turn.
-        launcher.kill(launcher.launched(0));
+        launcher.kill(launcher.launch_handle(0));
     });
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     driver.await.or_fail()?;
 
-    assert_that!(cancelled.outcome.state(), eq(State::Cancelled));
+    assert_that!(cancelled.outcome.state(), eq(TurnState::Cancelled));
     // The store sends a termination before anything harsher, and never had to.
-    assert_that!(h.launcher.terminated(), is_empty());
+    assert_that!(harness.launcher.terminated(), is_empty());
     Ok(())
 }
 
@@ -616,19 +662,21 @@ async fn a_cancelled_driver_is_given_its_whole_stop_budget_before_any_signal() -
 #[gtest]
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_driver_that_never_leaves_is_signalled() -> Result<()> {
-    let h = harness([Script::running(RUNNING)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
+    let harness = harness([Script::running(RUNNING_CAPTURE)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
 
-    let asked = tokio::time::Instant::now();
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancel_started_at = tokio::time::Instant::now();
+    let cancelled = harness.store.cancel(&started.run_id).await?;
 
-    assert_that!(asked.elapsed() > STOP_BUDGET, eq(true));
-    assert_that!(h.plan(0)?.cancel_marker().exists(), eq(true));
+    assert_that!(cancel_started_at.elapsed() > STOP_BUDGET, eq(true));
+    assert_that!(harness.plan(0)?.cancel_marker_path().exists(), eq(true));
     assert_that!(
-        h.launcher.terminated(),
-        elements_are![eq(&h.launcher.launched(0).pid)]
+        harness.launcher.terminated(),
+        elements_are![eq(&harness.launcher.launch_handle(0).pid)]
     );
-    assert_that!(cancelled.outcome.state(), eq(State::Cancelled));
+    assert_that!(cancelled.outcome.state(), eq(TurnState::Cancelled));
     Ok(())
 }
 
@@ -644,21 +692,23 @@ async fn a_cancel_after_a_completed_turn_waits_for_driver_cleanup() -> Result<()
         {"type":"thread.started","thread_id":"th-fake"}
         {"type":"turn.completed"}
     "#};
-    let h = harness([Script::running(ended)])?;
-    let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
+    let harness = harness([Script::running(ended)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
     assert_that!(started.outcome.is_terminal(), eq(true));
 
-    let launcher = Arc::clone(&h.launcher);
+    let launcher = Arc::clone(&harness.launcher);
     let driver = tokio::spawn(async move {
         tokio::time::sleep(STOP_BUDGET).await;
-        launcher.kill(launcher.launched(0));
+        launcher.kill(launcher.launch_handle(0));
     });
-    let asked = tokio::time::Instant::now();
-    let cancelled = h.store.cancel(&started.run_id).await?;
+    let cancel_started_at = tokio::time::Instant::now();
+    let cancelled = harness.store.cancel(&started.run_id).await?;
     driver.await.or_fail()?;
 
-    assert_that!(asked.elapsed() >= STOP_BUDGET, eq(true));
-    assert_that!(h.launcher.terminated(), is_empty());
-    assert_that!(cancelled.outcome.state(), eq(State::Completed));
+    assert_that!(cancel_started_at.elapsed() >= STOP_BUDGET, eq(true));
+    assert_that!(harness.launcher.terminated(), is_empty());
+    assert_that!(cancelled.outcome.state(), eq(TurnState::Completed));
     Ok(())
 }

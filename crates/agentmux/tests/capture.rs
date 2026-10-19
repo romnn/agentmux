@@ -32,7 +32,7 @@ fn a_blocking_stop_hook_does_not_replace_the_report() {
     let report = turn
         .messages
         .iter()
-        .find(|m| m.text.trim() == "THE_REPORT_BODY")
+        .find(|message| message.text.trim() == "THE_REPORT_BODY")
         .expect("the report must survive the fold");
     assert_that!(report.role, eq(Role::Assistant));
     assert_that!(report.source, eq(MessageSource::Delegate));
@@ -40,19 +40,23 @@ fn a_blocking_stop_hook_does_not_replace_the_report() {
     let injections: Vec<_> = turn
         .messages
         .iter()
-        .filter(|m| m.source == MessageSource::HookInjection)
+        .filter(|message| message.source == MessageSource::HookInjection)
         .collect();
     assert_that!(injections, not(is_empty()));
     assert_that!(
-        injections.first().map(|m| m.text.as_str()),
+        injections.first().map(|message| message.text.as_str()),
         some(starts_with("Stop hook feedback:"))
     );
     assert_that!(turn.was_reopened_by_hook(), eq(true));
 
     // The hook's continuation is the last thing the delegate said, and it is not the answer.
-    let last = turn.messages.iter().rev().find(|m| m.is_report_content());
+    let last = turn
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.is_report_content());
     assert_that!(
-        last.map(|m| m.text.as_str()),
+        last.map(|message| message.text.as_str()),
         some(not(eq("THE_REPORT_BODY")))
     );
 
@@ -150,8 +154,8 @@ fn a_failed_turn_keeps_what_it_collected() {
     let kept: Vec<&str> = turn
         .messages
         .iter()
-        .filter(|m| m.is_report_content())
-        .map(|m| m.text.as_str())
+        .filter(|message| message.is_report_content())
+        .map(|message| message.text.as_str())
         .collect();
     assert_that!(kept, elements_are![eq(&"two hours of analysis")]);
 }
@@ -173,7 +177,7 @@ fn three_codex_failure_events_fold_into_one_outcome() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.is_report_content())
+            .filter(|message| message.is_report_content())
             .count(),
         eq(0)
     );
@@ -196,15 +200,15 @@ fn a_codex_item_error_is_a_warning_not_a_failure() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.is_report_content())
-            .map(|m| m.text.clone())
+            .filter(|message| message.is_report_content())
+            .map(|message| message.text.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("BANANAPHONE")]
     );
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.source == MessageSource::Synthetic)
+            .filter(|message| message.source == MessageSource::Synthetic)
             .count(),
         eq(1)
     );
@@ -237,8 +241,8 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
         assert_that!(
             turn.messages
                 .iter()
-                .filter(|m| m.is_report_content())
-                .map(|m| m.text.clone())
+                .filter(|message| message.is_report_content())
+                .map(|message| message.text.clone())
                 .collect::<Vec<_>>(),
             elements_are![eq("FIXTURE_OK")],
             "vendor {vendor}"
@@ -273,7 +277,7 @@ fn a_rate_limited_run_is_classified_from_the_status_code() {
     assert_that!(
         turn.messages
             .iter()
-            .any(|m| m.text.contains("Switch to another model")),
+            .any(|message| message.text.contains("Switch to another model")),
         eq(true)
     );
 }
@@ -381,7 +385,7 @@ fn a_reopened_turn_is_detected_without_the_vendors_wording() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.source == MessageSource::HookInjection)
+            .filter(|message| message.source == MessageSource::HookInjection)
             .count(),
         eq(1)
     );
@@ -401,7 +405,7 @@ fn tool_results_are_not_mistaken_for_a_reopening() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.is_report_content())
+            .filter(|message| message.is_report_content())
             .count(),
         gt(0)
     );
@@ -468,8 +472,8 @@ fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.is_report_content())
-            .map(|m| m.text.clone())
+            .filter(|message| message.is_report_content())
+            .map(|message| message.text.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("FLAMINGO")]
     );
@@ -531,9 +535,13 @@ fn a_codex_top_level_error_is_a_note_and_the_turn_goes_on() {
 
     // The turn completed, the answer is kept, and the retry is said once, before it.
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
-    let said: Vec<&str> = turn.messages.iter().map(|m| m.text.as_str()).collect();
+    let message_texts: Vec<&str> = turn
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
     assert_that!(
-        said,
+        message_texts,
         elements_are![
             contains_substring("stream disconnected before completion"),
             eq(&"the answer")
@@ -641,7 +649,7 @@ fn context_injected_mid_turn_is_not_a_reopening() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.source == MessageSource::HookContext)
+            .filter(|message| message.source == MessageSource::HookContext)
             .count(),
         eq(1)
     );
@@ -742,8 +750,8 @@ fn task_lifecycle_and_progress_events_are_named_and_silent() {
     assert_that!(
         turn.messages
             .iter()
-            .filter(|m| m.is_report_content())
-            .map(|m| m.text.clone())
+            .filter(|message| message.is_report_content())
+            .map(|message| message.text.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("ANSWER")]
     );
@@ -762,7 +770,10 @@ fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
     "#};
     let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", keyed);
     assert_that!(
-        turn.messages.iter().map(|m| m.source).collect::<Vec<_>>(),
+        turn.messages
+            .iter()
+            .map(|message| message.source)
+            .collect::<Vec<_>>(),
         elements_are![eq(&MessageSource::Synthetic)]
     );
     assert_that!(

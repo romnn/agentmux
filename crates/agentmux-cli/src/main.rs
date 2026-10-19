@@ -35,7 +35,7 @@ fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<Sta
         retention: question.retention(),
         env: question.environment()?,
         billing: delegate.billing,
-        codex_exec: false,
+        force_codex_exec: false,
     })
 }
 
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     // The driver is a delegate, not a front end: it opens no store and serves nobody, and its
     // exit status is what the store reads when the turn's stream says nothing.
     if let Command::CodexAppServer(args) = &cli.command {
-        std::process::exit(agentmux::appserver::drive(&args.plan));
+        std::process::exit(agentmux::appserver::drive(&args.plan_path));
     }
 
     let host_env = agentmux::host_env();
@@ -70,8 +70,9 @@ async fn main() -> Result<()> {
     // This executable is the driver, so a turn it starts is run by the same build that will read
     // it back.
     if cli.codex_launch == CodexLaunchArg::AppServer {
-        let driver = std::env::current_exe().wrap_err("locating the agentmux executable")?;
-        store = store.with_codex_app_server(driver);
+        let driver_executable =
+            std::env::current_exe().wrap_err("locating the agentmux executable")?;
+        store = store.with_codex_app_server(driver_executable);
     }
 
     match cli.command {

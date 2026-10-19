@@ -35,7 +35,7 @@ pub enum Warning<'a> {
     /// An earlier turn failed, although the newest did not.
     EarlierFailure {
         /// The turn, counting from zero.
-        turn: u32,
+        turn_index: u32,
         /// What kind of failure.
         kind: FailureKind,
     },
@@ -56,10 +56,10 @@ pub enum Warning<'a> {
         /// Which, with counts.
         summary: String,
         /// Where the raw stream is.
-        events: &'a Path,
+        events_path: &'a Path,
         /// Whether codex sent app-server messages the generated protocol could not read, which
         /// running the consultation over `codex exec` gets round.
-        another_protocol: bool,
+        has_undecoded_app_server_messages: bool,
     },
     /// A Claude delegate also reads the instruction files at or above its working directory,
     /// which isolation does not stop.
@@ -81,8 +81,8 @@ impl RunStatus {
                 stderr: self.delegate_stderr.as_deref(),
             });
         }
-        if let Some((turn, kind)) = self.earlier_failure {
-            warnings.push(Warning::EarlierFailure { turn, kind });
+        if let Some((turn_index, kind)) = self.earlier_failure {
+            warnings.push(Warning::EarlierFailure { turn_index, kind });
         }
         if let Some(store) = &self.unsaved_session_store {
             warnings.push(Warning::SessionNotSaved { store });
@@ -97,8 +97,8 @@ impl RunStatus {
             warnings.push(Warning::Unrecognised {
                 total: self.unrecognised.total(),
                 summary,
-                events: &self.events_path,
-                another_protocol: self.undecoded_messages,
+                events_path: &self.events_path,
+                has_undecoded_app_server_messages: self.has_undecoded_app_server_messages,
             });
         }
         // Measured: `--setting-sources ""` stops hooks and settings but does not stop the Claude
@@ -189,15 +189,19 @@ pub fn rate_limit_line(limit: &RateLimit) -> String {
     }
 }
 
-/// The line that introduces the other accounts, for a consultation that ran as `ran_as`.
+/// The line that introduces the other accounts, for a consultation that ran as
+/// `consultation_account`.
 ///
 /// A consultation on the CLI's own login is not told the listed aliases are *other* accounts:
 /// one of them may name that very login, and agentmux cannot tell.
 /// With no other account at all there is nothing to switch to, and the lead-in says what the
 /// figures are instead of inviting a switch to the account that just failed.
 #[must_use]
-pub fn quota_lead_in(ran_as: Option<&AccountAlias>, others_exist: bool) -> &'static str {
-    match (others_exist, ran_as) {
+pub fn quota_lead_in(
+    consultation_account: Option<&AccountAlias>,
+    others_exist: bool,
+) -> &'static str {
+    match (others_exist, consultation_account) {
         (false, _) => "this account's usage:",
         (true, Some(_)) => "other accounts on this machine (pass one as `account`):",
         (true, None) => {
@@ -214,26 +218,33 @@ pub fn quota_lead_in(ran_as: Option<&AccountAlias>, others_exist: bool) -> &'sta
 /// or introduce the list differently.
 #[must_use]
 pub fn quota_block(status: &RunStatus) -> Vec<String> {
-    let ran_as = status.delegate.account().alias();
-    let ordered = ordered_quota(&status.quota, status.delegate.vendor(), ran_as);
+    let consultation_account = status.delegate.account().alias();
+    let ordered = ordered_quota(
+        &status.quota,
+        status.delegate.vendor(),
+        consultation_account,
+    );
     if ordered.is_empty() {
         return Vec::new();
     }
-    let others_exist = ordered.iter().any(|entry| !entry.ran);
-    let mut lines = vec![quota_lead_in(ran_as, others_exist).to_owned()];
+    let others_exist = ordered.iter().any(|entry| !entry.is_consultation_account);
+    let mut lines = vec![quota_lead_in(consultation_account, others_exist).to_owned()];
     for entry in ordered {
-        lines.extend(quota_report_labelled(entry.quota, entry.ran));
+        lines.extend(quota_report_labelled(
+            entry.quota,
+            entry.is_consultation_account,
+        ));
     }
     lines
 }
 
 /// One account's figures, and whether the consultation ran on it.
 #[derive(Debug, Clone, Copy)]
-pub struct OrderedQuota<'a> {
+pub struct QuotaReportEntry<'a> {
     /// The account's figures.
     pub quota: &'a AccountQuota,
     /// Whether this is the account the consultation ran on.
-    pub ran: bool,
+    pub is_consultation_account: bool,
 }
 
 /// This vendor's quota entries, in the order a reader should meet them, with the one that ran
@@ -246,30 +257,36 @@ pub struct OrderedQuota<'a> {
 pub fn ordered_quota<'a>(
     quota: &'a [AccountQuota],
     vendor: Vendor,
-    ran_as: Option<&AccountAlias>,
-) -> Vec<OrderedQuota<'a>> {
+    consultation_account: Option<&AccountAlias>,
+) -> Vec<QuotaReportEntry<'a>> {
     // Only this vendor's accounts: the lead-in offers each as an `account` value, and an alias
     // from the other vendor's table resolves to nothing but a paid round trip.
-    let (failed, others): (Vec<_>, Vec<_>) = quota
+    let (consultation_accounts, others): (Vec<_>, Vec<_>) = quota
         .iter()
         .filter(|entry| entry.vendor == vendor)
-        .partition(|entry| entry.account.as_ref() == ran_as);
+        .partition(|entry| entry.account.as_ref() == consultation_account);
     others
         .into_iter()
-        .map(|quota| OrderedQuota { quota, ran: false })
+        .map(|quota| QuotaReportEntry {
+            quota,
+            is_consultation_account: false,
+        })
         .chain(
-            failed
+            consultation_accounts
                 .into_iter()
-                .map(|quota| OrderedQuota { quota, ran: true }),
+                .map(|quota| QuotaReportEntry {
+                    quota,
+                    is_consultation_account: true,
+                }),
         )
         .collect()
 }
 
 /// One account's quota, with the account the consultation ran on flagged.
 #[must_use]
-pub fn quota_report_labelled(entry: &AccountQuota, ran: bool) -> Vec<String> {
+pub fn quota_report_labelled(entry: &AccountQuota, is_consultation_account: bool) -> Vec<String> {
     let mut lines = quota_report(entry);
-    if ran && let Some(first) = lines.first_mut() {
+    if is_consultation_account && let Some(first) = lines.first_mut() {
         first.push_str(" — this consultation");
     }
     lines

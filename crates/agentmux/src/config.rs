@@ -453,7 +453,7 @@ impl Account {
     /// The first field that names a key, a token or an endpoint, which only an account on API
     /// pricing may use.
     #[must_use]
-    pub fn api_credential_field(&self) -> Option<&'static str> {
+    pub fn api_only_field(&self) -> Option<&'static str> {
         [
             ("api_key", self.api_key.is_some()),
             ("api_key_env", self.api_key_env.is_some()),
@@ -540,17 +540,25 @@ pub struct Config {
     /// Model identifiers to substitute, by vendor, then by the identifier a caller asks for.
     ///
     /// Read through [`Config::rewritten_model`].
-    #[serde(default, deserialize_with = "by_vendor::deserialize")]
-    pub models: BTreeMap<Vendor, BTreeMap<ModelId, ModelId>>,
+    #[serde(
+        rename = "models",
+        default,
+        deserialize_with = "by_vendor::deserialize"
+    )]
+    pub model_rewrites: BTreeMap<Vendor, BTreeMap<ModelId, ModelId>>,
     /// Reasoning efforts to use when a caller names none, by vendor, then by the model that runs.
     ///
     /// Read through [`Config::default_effort`].
-    /// Keyed by the identifier that is launched, after any rewrite in [`Self::models`]: it is
-    /// the one identifier every consultation of that model shares, whatever name it asked by.
+    /// Keyed by the identifier that is launched, after any rewrite in [`Self::model_rewrites`]: it
+    /// is the one identifier every consultation of that model shares, whatever name it asked by.
     /// Both sides are opaque identifiers, as the rewrites are, so a vendor's new effort
     /// vocabulary is a line in this file and never an agentmux release.
-    #[serde(default, deserialize_with = "by_vendor::deserialize")]
-    pub efforts: BTreeMap<Vendor, BTreeMap<ModelId, Effort>>,
+    #[serde(
+        rename = "efforts",
+        default,
+        deserialize_with = "by_vendor::deserialize"
+    )]
+    pub effort_defaults: BTreeMap<Vendor, BTreeMap<ModelId, Effort>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -795,8 +803,8 @@ impl Config {
             let project = Self::read(&path)?;
             if !project.accounts.is_empty()
                 || !project.launch.is_empty()
-                || !project.models.is_empty()
-                || !project.efforts.is_empty()
+                || !project.model_rewrites.is_empty()
+                || !project.effort_defaults.is_empty()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
@@ -932,7 +940,7 @@ impl Config {
                 }
             }
         }
-        for rewrites in self.models.values() {
+        for rewrites in self.model_rewrites.values() {
             for (from, to) in rewrites {
                 // A rule naming another rule's key reads as a chain, and one substitution is all
                 // there is; refused here rather than resolved, because either answer would be a
@@ -949,13 +957,13 @@ impl Config {
                 }
             }
         }
-        for (vendor, efforts) in &self.efforts {
+        for (vendor, efforts) in &self.effort_defaults {
             for model in efforts.keys() {
                 // Looked up by the model that runs, so a key the file rewrites away can never be
                 // met; refused rather than left in, because a rule that does nothing reads as one
                 // that does.
                 if let Some(to) = self
-                    .models
+                    .model_rewrites
                     .get(vendor)
                     .and_then(|rewrites| rewrites.get(model))
                     .filter(|to| *to != model)
@@ -991,7 +999,7 @@ impl Config {
     #[must_use]
     pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<ModelId, ModelId> {
         static NONE: BTreeMap<ModelId, ModelId> = BTreeMap::new();
-        self.models.get(&vendor).unwrap_or(&NONE)
+        self.model_rewrites.get(&vendor).unwrap_or(&NONE)
     }
 
     /// What to run when a caller asks for `model`, when this machine rewrites it.
@@ -1021,7 +1029,7 @@ impl Config {
     #[must_use]
     pub fn effort_defaults(&self, vendor: Vendor) -> &BTreeMap<ModelId, Effort> {
         static NONE: BTreeMap<ModelId, Effort> = BTreeMap::new();
-        self.efforts.get(&vendor).unwrap_or(&NONE)
+        self.effort_defaults.get(&vendor).unwrap_or(&NONE)
     }
 
     /// The reasoning effort to run `model` at when the caller named none, if this machine says.
@@ -1056,7 +1064,7 @@ impl Config {
 
     /// Every alias defined for one vendor, for an error message or a tool description.
     #[must_use]
-    pub fn alias_names(&self, vendor: Vendor) -> Vec<AccountAlias> {
+    pub fn account_aliases(&self, vendor: Vendor) -> Vec<AccountAlias> {
         self.accounts(vendor).keys().cloned().collect()
     }
 }

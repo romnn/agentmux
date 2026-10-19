@@ -56,7 +56,7 @@ pub enum CaptureEvent {
     /// Something `codex app-server` said that the generated types could not read, kept with
     /// what it said.
     #[serde(rename = "agentmux.undecoded")]
-    Undecoded(Undecoded),
+    Undecoded(UndecodedServerOutput),
     /// An event as `codex exec --json` writes it.
     #[serde(untagged)]
     Exec(Box<ThreadEvent>),
@@ -71,7 +71,7 @@ impl From<ThreadEvent> for CaptureEvent {
 /// What the server said that could not be read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Undecoded {
+pub enum UndecodedServerOutput {
     /// A message whose payload did not match the generated types, or whose method the pinned
     /// schema never had.
     Message {
@@ -93,48 +93,49 @@ pub enum Undecoded {
 
 /// Enough of a line to name it in the drift count: its `type`, and its item's.
 #[derive(Debug, Deserialize)]
-struct Named {
+struct EventTypeProbe {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
-    item: Option<NamedItem>,
+    item: Option<ItemTypeProbe>,
 }
 
 #[derive(Debug, Deserialize)]
-struct NamedItem {
+struct ItemTypeProbe {
     #[serde(rename = "type")]
     kind: String,
 }
 
 /// What the drift count calls a line it cannot read: its `type`.
-fn unparsable(line: &Value) -> String {
-    match Named::deserialize(line) {
-        Ok(Named { kind, .. }) => format!("{kind}.<unparsable>"),
+fn unparsable_drift_label(line: &Value) -> String {
+    match EventTypeProbe::deserialize(line) {
+        Ok(EventTypeProbe { kind, .. }) => format!("{kind}.<unparsable>"),
         Err(_) => MALFORMED_LINE.to_owned(),
     }
 }
 
 /// What the drift count calls a line: its `type`, and its item's when it carries one.
-fn name(line: &Value) -> String {
-    match Named::deserialize(line) {
-        Ok(Named {
+fn drift_label(line: &Value) -> String {
+    match EventTypeProbe::deserialize(line) {
+        Ok(EventTypeProbe {
             kind,
             item: Some(item),
         }) => format!("{kind}.{}", item.kind),
-        Ok(Named { kind, item: None }) => kind,
+        Ok(EventTypeProbe { kind, item: None }) => kind,
         Err(_) => MALFORMED_LINE.to_owned(),
     }
 }
 
 impl From<&exec::Usage> for Usage {
     fn from(usage: &exec::Usage) -> Self {
-        let count = |tokens: Option<i64>| tokens.and_then(|tokens| u64::try_from(tokens).ok());
+        let to_unsigned_token_count =
+            |tokens: Option<i64>| tokens.and_then(|tokens| u64::try_from(tokens).ok());
         Self {
-            input_tokens: count(usage.input_tokens),
-            cached_input_tokens: count(usage.cached_input_tokens),
-            cache_write_input_tokens: count(usage.cache_write_input_tokens),
-            output_tokens: count(usage.output_tokens),
-            reasoning_output_tokens: count(usage.reasoning_output_tokens),
+            input_tokens: to_unsigned_token_count(usage.input_tokens),
+            cached_input_tokens: to_unsigned_token_count(usage.cached_input_tokens),
+            cache_write_input_tokens: to_unsigned_token_count(usage.cache_write_input_tokens),
+            output_tokens: to_unsigned_token_count(usage.output_tokens),
+            reasoning_output_tokens: to_unsigned_token_count(usage.reasoning_output_tokens),
         }
     }
 }
@@ -161,13 +162,13 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             }
             // Drift the driver recorded, counted as such.
             Ok(CaptureEvent::Undecoded(_)) => {
-                turn.unrecognised.record(name(&value));
-                turn.undecoded_messages = true;
+                turn.unrecognised.record(drift_label(&value));
+                turn.has_undecoded_app_server_messages = true;
                 continue;
             }
             // An event this parser names, in a shape it does not.
             Err(_) => {
-                turn.unrecognised.record(unparsable(&value));
+                turn.unrecognised.record(unparsable_drift_label(&value));
                 continue;
             }
         };
@@ -191,7 +192,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     }
                     // A reply with no `text` is not an empty reply; it means the payload field
                     // was renamed, and defaulting it away would drop the report.
-                    None => turn.unrecognised.record(format!("{}.text", name(&value))),
+                    None => turn.unrecognised.record(drift_label(&value) + ".text"),
                     Some(_) => {}
                 },
                 // Advisory, not terminal.
@@ -205,7 +206,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 // Counted rather than skipped: if a release renamed `agent_message`, this count
                 // would be all that stands between a silently empty report and a caller who
                 // notices.
-                ThreadItemDetails::Unknown => turn.unrecognised.record(name(&value)),
+                ThreadItemDetails::Unknown => turn.unrecognised.record(drift_label(&value)),
                 // The delegate narrating its own work: kept in the capture and, like all
                 // narration, not rendered.
                 ThreadItemDetails::Reasoning(_)
@@ -252,7 +253,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 };
                 break;
             }
-            ThreadEvent::Unknown => turn.unrecognised.record(name(&value)),
+            ThreadEvent::Unknown => turn.unrecognised.record(drift_label(&value)),
         }
     }
 

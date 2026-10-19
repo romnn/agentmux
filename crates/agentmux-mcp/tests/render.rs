@@ -54,7 +54,7 @@ fn consult_with(
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -70,7 +70,7 @@ fn consult_with(
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -157,7 +157,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -180,7 +180,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -229,7 +229,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -253,7 +253,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -432,7 +432,7 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -512,7 +512,7 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
             retention: Retention::Ttl,
             env: BTreeMap::new(),
             billing: None,
-            codex_exec: false,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -529,23 +529,23 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
 /// consultation without the app-server protocol, and other drift does not.
 #[gtest]
 fn protocol_drift_points_at_codex_exec() -> Result<()> {
-    let undecoded = indoc::indoc! {r#"
+    let protocol_drift_capture = indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"th"}
         {"type":"agentmux.undecoded","method":"item/completed","reason":"missing field","payload":{}}
         {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
     "#};
-    let (_store, status, _dir) = consult(undecoded)?;
+    let (_store, status, _dir) = consult(protocol_drift_capture)?;
     assert_that!(
         agentmux_mcp::render::warnings(&status),
         contains_substring("`codex_exec: true`")
     );
 
-    let other = indoc::indoc! {r#"
+    let unknown_event_capture = indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"th"}
         {"type":"some.future.event"}
         {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
     "#};
-    let (_store, status, _dir) = consult(other)?;
+    let (_store, status, _dir) = consult(unknown_event_capture)?;
     assert_that!(
         agentmux_mcp::render::warnings(&status),
         all![

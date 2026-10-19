@@ -7,13 +7,13 @@
 //! only `codex-app-server-codegen refresh --check` can answer, because it needs that codex and its
 //! source.
 
-use codex_app_server_codegen::{Inputs, Layout, generate};
+use codex_app_server_codegen::{GeneratorPaths, Inputs, generate};
 use googletest::prelude::*;
 
 /// Every generated file in `codex-app-server-protocol` matches what generation produces now.
 #[gtest]
 fn the_checked_in_protocol_is_what_the_vendored_schema_generates() -> Result<()> {
-    let layout = Layout::of_this_checkout();
+    let layout = GeneratorPaths::of_this_checkout();
     let files = generate(&Inputs::read(&layout).or_fail()?, &layout).or_fail()?;
 
     // Compared whole rather than with a diff: the schema module is twenty thousand lines, and the

@@ -16,28 +16,28 @@ const BUNDLE: &str =
     include_str!("../../codex-app-server-codegen/schema/codex_app_server_protocol.schemas.json");
 
 /// The bundle's four message unions and its two answer envelopes, compiled once.
-struct Messages {
+struct MessageValidators {
     client_request: jsonschema::Validator,
     client_notification: jsonschema::Validator,
     server_request: jsonschema::Validator,
     server_notification: jsonschema::Validator,
-    result: jsonschema::Validator,
-    error: jsonschema::Validator,
+    success_response: jsonschema::Validator,
+    error_response: jsonschema::Validator,
 }
 
-static MESSAGES: LazyLock<Result<Messages, String>> = LazyLock::new(|| {
-    Ok(Messages {
-        client_request: validator("ClientRequest")?,
-        client_notification: validator("ClientNotification")?,
-        server_request: validator("ServerRequest")?,
-        server_notification: validator("ServerNotification")?,
-        result: validator("JSONRPCResponse")?,
-        error: validator("JSONRPCError")?,
+static MESSAGE_VALIDATORS: LazyLock<Result<MessageValidators, String>> = LazyLock::new(|| {
+    Ok(MessageValidators {
+        client_request: compile_definition_validator("ClientRequest")?,
+        client_notification: compile_definition_validator("ClientNotification")?,
+        server_request: compile_definition_validator("ServerRequest")?,
+        server_notification: compile_definition_validator("ServerNotification")?,
+        success_response: compile_definition_validator("JSONRPCResponse")?,
+        error_response: compile_definition_validator("JSONRPCError")?,
     })
 });
 
 /// A validator for the bundle's definition `name`, a top-level one or a v2 one.
-fn validator(name: &str) -> Result<jsonschema::Validator, String> {
+fn compile_definition_validator(name: &str) -> Result<jsonschema::Validator, String> {
     let bundle: Value =
         serde_json::from_str(BUNDLE).map_err(|err| format!("the bundle is not JSON: {err}"))?;
     let definitions = bundle.get("definitions").cloned().unwrap_or(Value::Null);
@@ -70,7 +70,7 @@ pub enum Side {
 ///
 /// Returns every way the message breaks the schema, one per line, each with where it is.
 pub fn check(sender: Side, message: &Value) -> Result<(), String> {
-    let messages = MESSAGES.as_ref().map_err(Clone::clone)?;
+    let messages = MESSAGE_VALIDATORS.as_ref().map_err(Clone::clone)?;
     let Some(members) = message.as_object() else {
         return Err(format!("{message} is not a JSON object"));
     };
@@ -80,8 +80,12 @@ pub fn check(sender: Side, message: &Value) -> Result<(), String> {
     {
         return Err("a message's `method` is not a string".to_owned());
     }
-    let has = |member| members.get(member).is_some_and(|value| !value.is_null());
-    let schema = match (sender, has("id"), has("method")) {
+    let has_non_null_member = |member| members.get(member).is_some_and(|value| !value.is_null());
+    let validator = match (
+        sender,
+        has_non_null_member("id"),
+        has_non_null_member("method"),
+    ) {
         (Side::Client, true, true) => &messages.client_request,
         (Side::Client, false, true) => &messages.client_notification,
         (Side::Server, true, true) => &messages.server_request,
@@ -91,12 +95,12 @@ pub fn check(sender: Side, message: &Value) -> Result<(), String> {
             members.contains_key("error"),
         ) {
             (true, true) => return Err("an answer carries both a result and an error".to_owned()),
-            (false, true) => &messages.error,
-            _ => &messages.result,
+            (false, true) => &messages.error_response,
+            _ => &messages.success_response,
         },
         (_, false, false) => return Err("a message names neither a method nor an id".to_owned()),
     };
-    violations(schema, message)
+    validate_instance(validator, message)
 }
 
 /// Check a payload against the bundle's definition `name`, such as `ThreadStartResponse`.
@@ -106,12 +110,12 @@ pub fn check(sender: Side, message: &Value) -> Result<(), String> {
 /// Returns every way the payload breaks the schema, one per line, or why the definition could
 /// not be compiled.
 pub fn check_definition(name: &str, payload: &Value) -> Result<(), String> {
-    violations(&validator(name)?, payload)
+    validate_instance(&compile_definition_validator(name)?, payload)
 }
 
 /// Every way `instance` breaks `schema`, one per line, each with where it is.
-fn violations(schema: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
-    let errors: Vec<String> = schema
+fn validate_instance(validator: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
+    let errors: Vec<String> = validator
         .iter_errors(instance)
         .map(|err| format!("{err} at `{}`", err.instance_path()))
         .collect();

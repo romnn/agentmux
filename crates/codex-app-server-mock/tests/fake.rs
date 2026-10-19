@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use codex_app_server_mock::fixtures::{THREAD, TURN};
+use codex_app_server_mock::fixtures::{THREAD_ID, TURN_ID};
 use codex_app_server_mock::scenario::{CONFIG_FILE, Config, Scenario};
 use codex_app_server_mock::{Peer, PeerError};
 use codex_app_server_protocol::envelope::{Message, RequestId, RpcError};
-use codex_app_server_protocol::methods as m;
+use codex_app_server_protocol::methods;
 use codex_app_server_protocol::types::{
     InitializeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams, TurnSteerParams,
 };
@@ -19,20 +19,20 @@ use googletest::prelude::*;
 use serde_json::{Value, json};
 
 /// The fake, started as `codex app-server` with `scenario`, and the client's end of it.
-struct Fake {
+struct MockServerProcess {
     child: Child,
     client: Peer,
     _home: tempfile::TempDir,
-    commands: PathBuf,
+    command_pids_path: PathBuf,
 }
 
-impl Fake {
+impl MockServerProcess {
     /// The pids of the commands the fake started, once `count` of them have recorded themselves,
     /// which they do only once they run as their scenario says.
-    fn recorded(&self, count: usize) -> Result<Vec<u32>> {
+    fn wait_for_command_pids(&self, count: usize) -> Result<Vec<u32>> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let pids = recorded(&self.commands);
+            let pids = read_command_pids(&self.command_pids_path);
             if pids.len() >= count {
                 return Ok(pids);
             }
@@ -44,7 +44,7 @@ impl Fake {
     }
 
     /// The fake's exit status, waiting at most ten seconds for it.
-    fn exit_status(&mut self) -> Result<std::process::ExitStatus> {
+    fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self.child.try_wait().or_fail()? {
@@ -58,9 +58,9 @@ impl Fake {
     }
 }
 
-/// The pids recorded in `commands` so far.
-fn recorded(commands: &Path) -> Vec<u32> {
-    std::fs::read_to_string(commands)
+/// The pids recorded in `command_pids_path` so far.
+fn read_command_pids(command_pids_path: &Path) -> Vec<u32> {
+    std::fs::read_to_string(command_pids_path)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.trim().parse().ok())
@@ -68,11 +68,11 @@ fn recorded(commands: &Path) -> Vec<u32> {
 }
 
 /// Stops the fake and every command it recorded, however the test ended.
-impl Drop for Fake {
+impl Drop for MockServerProcess {
     fn drop(&mut self) {
         self.child.kill().ok();
         self.child.wait().ok();
-        let pids: Vec<sysinfo::Pid> = recorded(&self.commands)
+        let pids: Vec<sysinfo::Pid> = read_command_pids(&self.command_pids_path)
             .into_iter()
             .map(sysinfo::Pid::from_u32)
             .collect();
@@ -86,14 +86,14 @@ impl Drop for Fake {
     }
 }
 
-fn fake(scenario: impl FnOnce(&Path) -> Scenario) -> Result<Fake> {
+fn spawn_mock_server(scenario: impl FnOnce(&Path) -> Scenario) -> Result<MockServerProcess> {
     let home = tempfile::tempdir().or_fail()?;
-    let commands = home.path().join("commands.txt");
+    let command_pids_path = home.path().join("commands.txt");
     let config = Config {
         scenario: scenario(home.path()),
-        log: None,
-        environment: None,
-        commands: commands.clone(),
+        client_messages_path: None,
+        environment_dump_path: None,
+        command_pids_path: command_pids_path.clone(),
     };
     std::fs::write(
         home.path().join(CONFIG_FILE),
@@ -110,52 +110,56 @@ fn fake(scenario: impl FnOnce(&Path) -> Scenario) -> Result<Fake> {
     let stdin = child.stdin.take().or_fail()?;
     let stdout = child.stdout.take().or_fail()?;
     let client = Peer::new(BufReader::new(stdout), stdin).with_timeout(Duration::from_secs(10));
-    Ok(Fake {
+    Ok(MockServerProcess {
         child,
         client,
         _home: home,
-        commands,
+        command_pids_path,
     })
 }
 
 /// Send request `params` under `id` and take the next message, which must answer it.
-fn ask<M: codex_app_server_protocol::ClientRequest + codex_app_server_protocol::Typed>(
+fn send_request_and_expect_response<
+    M: codex_app_server_protocol::ClientRequest + codex_app_server_protocol::TypedParams,
+>(
     client: &mut Peer,
     id: i64,
     params: &M::Params,
 ) -> std::result::Result<std::result::Result<Value, RpcError>, PeerError> {
     client.send(&Message::request::<M>(RequestId::Integer(id), params)?)?;
-    client.expect_raw_answer(&RequestId::Integer(id))
+    client.expect_raw_response(&RequestId::Integer(id))
 }
 
 /// The handshake and the thread, as a client opens them, then the turn.
-fn open_and_start(client: &mut Peer) -> Result<()> {
+fn initialize_and_start_turn(client: &mut Peer) -> Result<()> {
     let initialize: InitializeParams = serde_json::from_value(json!({
         "clientInfo": {"name": "test", "version": "0"},
     }))
     .or_fail()?;
-    ask::<m::Initialize>(client, 1, &initialize)
+    send_request_and_expect_response::<methods::Initialize>(client, 1, &initialize)
         .or_fail()?
         .or_fail()?;
     client
-        .send(&Message::notification::<m::Initialized>(&()).or_fail()?)
+        .send(&Message::notification::<methods::Initialized>(&()).or_fail()?)
         .or_fail()?;
     let thread: ThreadStartParams = serde_json::from_value(json!({})).or_fail()?;
-    ask::<m::ThreadStart>(client, 2, &thread)
+    send_request_and_expect_response::<methods::ThreadStart>(client, 2, &thread)
         .or_fail()?
         .or_fail()?;
     let turn: TurnStartParams = serde_json::from_value(json!({
-        "threadId": THREAD,
+        "threadId": THREAD_ID,
         "input": [{"type": "text", "text": "q"}],
     }))
     .or_fail()?;
-    ask::<m::TurnStart>(client, 3, &turn).or_fail()?.or_fail()?;
+    send_request_and_expect_response::<methods::TurnStart>(client, 3, &turn)
+        .or_fail()?
+        .or_fail()?;
     Ok(())
 }
 
-fn steer(turn: &str) -> Result<TurnSteerParams> {
+fn steer_params(turn: &str) -> Result<TurnSteerParams> {
     serde_json::from_value(json!({
-        "threadId": THREAD,
+        "threadId": THREAD_ID,
         "expectedTurnId": turn,
         "input": [{"type": "text", "text": "only auth"}],
     }))
@@ -163,8 +167,8 @@ fn steer(turn: &str) -> Result<TurnSteerParams> {
 }
 
 /// The next notification's method.
-fn notified(client: &mut Peer) -> Result<String> {
-    match client.recv().or_fail()? {
+fn expect_notification_method(client: &mut Peer) -> Result<String> {
+    match client.receive_message().or_fail()? {
         Message::Notification { method, .. } => Ok(method),
         other => fail!("not a notification: {}", other.to_line()).map(|()| String::new()),
     }
@@ -174,28 +178,54 @@ fn notified(client: &mut Peer) -> Result<String> {
 /// refused, as codex refuses a steer for a turn that is not running.
 #[gtest]
 fn a_steerable_turn_takes_one_steer_and_refuses_the_rest() -> Result<()> {
-    let mut fake = fake(|_| Scenario::Steerable)?;
-    open_and_start(&mut fake.client)?;
-    assert_that!(notified(&mut fake.client)?, eq("turn/started"));
+    let mut fake = spawn_mock_server(|_| Scenario::Steerable)?;
+    initialize_and_start_turn(&mut fake.client)?;
+    assert_that!(
+        expect_notification_method(&mut fake.client)?,
+        eq("turn/started")
+    );
     // The turn's command, which dropping the fake stops.
-    assert_that!(fake.recorded(1)?.len(), eq(1));
+    assert_that!(fake.wait_for_command_pids(1)?.len(), eq(1));
 
-    let wrong = ask::<m::TurnSteer>(&mut fake.client, 4, &steer("tu-other")?).or_fail()?;
-    assert_that!(wrong, err(anything()));
+    let wrong_turn_response = send_request_and_expect_response::<methods::TurnSteer>(
+        &mut fake.client,
+        4,
+        &steer_params("tu-other")?,
+    )
+    .or_fail()?;
+    assert_that!(wrong_turn_response, err(anything()));
 
-    let steered = ask::<m::TurnSteer>(&mut fake.client, 5, &steer(TURN)?).or_fail()?;
-    assert_that!(steered, ok(anything()));
-    assert_that!(notified(&mut fake.client)?, eq("item/completed"));
-    assert_that!(notified(&mut fake.client)?, eq("turn/completed"));
+    let steer_response = send_request_and_expect_response::<methods::TurnSteer>(
+        &mut fake.client,
+        5,
+        &steer_params(TURN_ID)?,
+    )
+    .or_fail()?;
+    assert_that!(steer_response, ok(anything()));
+    assert_that!(
+        expect_notification_method(&mut fake.client)?,
+        eq("item/completed")
+    );
+    assert_that!(
+        expect_notification_method(&mut fake.client)?,
+        eq("turn/completed")
+    );
 
-    let late = ask::<m::TurnSteer>(&mut fake.client, 6, &steer(TURN)?).or_fail()?;
-    assert_that!(late, err(anything()));
+    let late_steer_response = send_request_and_expect_response::<methods::TurnSteer>(
+        &mut fake.client,
+        6,
+        &steer_params(TURN_ID)?,
+    )
+    .or_fail()?;
+    assert_that!(late_steer_response, err(anything()));
     let interrupt = TurnInterruptParams {
-        thread_id: THREAD.to_owned(),
-        turn_id: TURN.to_owned(),
+        thread_id: THREAD_ID.to_owned(),
+        turn_id: TURN_ID.to_owned(),
     };
-    let late = ask::<m::TurnInterrupt>(&mut fake.client, 7, &interrupt).or_fail()?;
-    assert_that!(late, err(anything()));
+    let late_interrupt_response =
+        send_request_and_expect_response::<methods::TurnInterrupt>(&mut fake.client, 7, &interrupt)
+            .or_fail()?;
+    assert_that!(late_interrupt_response, err(anything()));
     Ok(())
 }
 
@@ -203,41 +233,41 @@ fn a_steerable_turn_takes_one_steer_and_refuses_the_rest() -> Result<()> {
 /// recorded the command it started — in a session of its own, where the platform has sessions.
 #[gtest]
 fn a_crashing_server_exits_with_a_failure() -> Result<()> {
-    let mut fake = fake(|home| {
-        let release = home.join("release");
-        std::fs::write(&release, "").ok();
-        Scenario::Dying {
-            death: codex_app_server_mock::scenario::Death::Crash,
-            release,
+    let mut fake = spawn_mock_server(|home| {
+        let exit_trigger_path = home.join("release");
+        std::fs::write(&exit_trigger_path, "").ok();
+        Scenario::ServerExit {
+            exit_mode: codex_app_server_mock::scenario::ServerExitMode::Crash,
+            exit_trigger_path,
         }
     })?;
     let initialize: InitializeParams = serde_json::from_value(json!({
         "clientInfo": {"name": "test", "version": "0"},
     }))
     .or_fail()?;
-    ask::<m::Initialize>(&mut fake.client, 1, &initialize)
+    send_request_and_expect_response::<methods::Initialize>(&mut fake.client, 1, &initialize)
         .or_fail()?
         .or_fail()?;
     fake.client
-        .send(&Message::notification::<m::Initialized>(&()).or_fail()?)
+        .send(&Message::notification::<methods::Initialized>(&()).or_fail()?)
         .or_fail()?;
     let thread: ThreadStartParams = serde_json::from_value(json!({})).or_fail()?;
-    ask::<m::ThreadStart>(&mut fake.client, 2, &thread)
+    send_request_and_expect_response::<methods::ThreadStart>(&mut fake.client, 2, &thread)
         .or_fail()?
         .or_fail()?;
     let turn: TurnStartParams = serde_json::from_value(json!({
-        "threadId": THREAD,
+        "threadId": THREAD_ID,
         "input": [{"type": "text", "text": "q"}],
     }))
     .or_fail()?;
     fake.client
-        .send(&Message::request::<m::TurnStart>(RequestId::Integer(3), &turn).or_fail()?)
+        .send(&Message::request::<methods::TurnStart>(RequestId::Integer(3), &turn).or_fail()?)
         .or_fail()?;
 
-    let status = fake.exit_status()?;
+    let status = fake.wait_for_exit()?;
     assert_that!(status.code(), some(eq(1)));
     // The command recorded itself only once it was set up; dropping the fake stops it.
-    let recorded = fake.recorded(1)?;
+    let recorded = fake.wait_for_command_pids(1)?;
     assert_that!(recorded.len(), eq(1));
     // On Unix, set up means leading a session of its own.
     #[cfg(unix)]

@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Answered, Notification, Request, Typed};
+use crate::{Notification, Request, TypedParams, TypedResponse};
 
 /// JSON-RPC's code for a method the receiver does not offer.
 pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -106,11 +106,16 @@ impl Message {
         let message: Value = serde_json::from_str(line).map_err(EnvelopeError::NotJson)?;
         let id = match message.get("id") {
             None | Some(Value::Null) => None,
-            Some(id) => Some(RequestId::deserialize(id).map_err(|_| EnvelopeError::Id)?),
+            Some(id) => Some(RequestId::deserialize(id).map_err(|_| EnvelopeError::InvalidId)?),
         };
         let method = match message.get("method") {
             None => None,
-            Some(method) => Some(method.as_str().ok_or(EnvelopeError::Method)?.to_owned()),
+            Some(method) => Some(
+                method
+                    .as_str()
+                    .ok_or(EnvelopeError::InvalidMethod)?
+                    .to_owned(),
+            ),
         };
         let params = || message.get("params").cloned().unwrap_or(Value::Null);
         match (id, method) {
@@ -131,7 +136,7 @@ impl Message {
                         data: error.get("data").cloned(),
                     }),
                     (Some(result), None) => Ok(result.clone()),
-                    _ => return Err(EnvelopeError::Answer),
+                    _ => return Err(EnvelopeError::InvalidResponse),
                 };
                 Ok(Self::Response { id, outcome })
             }
@@ -139,7 +144,7 @@ impl Message {
                 method,
                 params: params(),
             }),
-            (None, None) => Err(EnvelopeError::Neither),
+            (None, None) => Err(EnvelopeError::MissingIdAndMethod),
         }
     }
 
@@ -148,7 +153,7 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the parameters cannot be encoded as JSON.
-    pub fn request<M: Request + Typed>(
+    pub fn request<M: Request + TypedParams>(
         id: RequestId,
         params: &M::Params,
     ) -> Result<Self, EncodeError> {
@@ -164,7 +169,9 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the parameters cannot be encoded as JSON.
-    pub fn notification<M: Notification + Typed>(params: &M::Params) -> Result<Self, EncodeError> {
+    pub fn notification<M: Notification + TypedParams>(
+        params: &M::Params,
+    ) -> Result<Self, EncodeError> {
         Ok(Self::Notification {
             method: M::METHOD.to_owned(),
             params: encode(M::METHOD, params)?,
@@ -176,7 +183,10 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`EncodeError`] when the result cannot be encoded as JSON.
-    pub fn result<M: Answered>(id: RequestId, response: &M::Response) -> Result<Self, EncodeError> {
+    pub fn success_response<M: TypedResponse>(
+        id: RequestId,
+        response: &M::Response,
+    ) -> Result<Self, EncodeError> {
         Ok(Self::Response {
             id,
             outcome: Ok(encode(M::METHOD, response)?),
@@ -185,7 +195,7 @@ impl Message {
 
     /// The error answer to request `id`.
     #[must_use]
-    pub fn error(id: RequestId, code: i64, message: &str) -> Self {
+    pub fn error_response(id: RequestId, code: i64, message: &str) -> Self {
         Self::Response {
             id,
             outcome: Err(RpcError {
@@ -256,16 +266,16 @@ pub enum EnvelopeError {
     NotJson(#[source] serde_json::Error),
     /// Its id is neither an integer nor a string.
     #[error("its id is neither an integer nor a string")]
-    Id,
+    InvalidId,
     /// Its method is not a string.
     #[error("its method is not a string")]
-    Method,
+    InvalidMethod,
     /// It answers a request without exactly one of a `result` and an `error` object.
     #[error("it answers a request without exactly one of a result and an error object")]
-    Answer,
+    InvalidResponse,
     /// It has neither an id nor a method.
     #[error("it has neither an id nor a method")]
-    Neither,
+    MissingIdAndMethod,
 }
 
 /// A payload that could not be encoded as JSON.
@@ -318,7 +328,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{Message, RequestId, RpcError};
-    use crate::{Answered, methods, types};
+    use crate::{TypedResponse, methods, types};
 
     /// Responses, notifications and requests are told apart by `id` and `method`, with or
     /// without the `jsonrpc` member codex leaves out.
@@ -459,7 +469,7 @@ mod tests {
     /// what did not match.
     #[gtest]
     fn an_undecodable_payload_names_its_type_and_why() {
-        let decoded = methods::TurnStart::response(
+        let decoded = methods::TurnStart::decode_response(
             &json!({"turn": {"id": "tu", "items": "none", "status": "completed"}}),
         );
         assert_that!(
