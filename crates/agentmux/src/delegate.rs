@@ -18,11 +18,11 @@
 //! names the valid set — reaches the caller verbatim.
 //!
 //! One identifier may still be exchanged for another before it is launched, when the machine's
-//! configuration says so — see [`crate::config::Config::rewritten_model`].
+//! configuration says so — see [`crate::config::ModelRules::resolve`].
 //! That is a substitution the operator wrote down in a file, not a roster this crate keeps: the
 //! set of models agentmux knows about is still empty.
 //! The same file may name a reasoning effort for a model, used only when the caller named none —
-//! see [`crate::config::Config::default_effort`] — and when neither did, no effort is passed and
+//! see [`crate::config::ModelRules::resolve`] — and when neither did, no effort is passed and
 //! the CLI's own default runs.
 
 use std::collections::BTreeMap;

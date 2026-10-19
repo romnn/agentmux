@@ -14,22 +14,23 @@ isolation, or open the request environment.
 ## Decision
 
 **Only a machine file may define anything.** Accounts, `[launch]`, model rewrites
-([0012](0012-model-rewrites.md)), default efforts ([0013](0013-default-efforts.md)) and the
-`retention` window come from a machine file alone. The window governs one store shared by every
-project, so a checkout that set it would decide when other projects' consultations are deleted. A
-project `agentmux.toml` is found by walking up from the delegate's working directory to the root of
-its repository (the nearest `.git`); outside a repository, discovery runs only within the home
-directory and excludes home itself. A project file may only select an account with
-`[defaults.<vendor>]`: nonempty understood account definitions, launch settings, model rewrites,
-effort defaults and a retention are refused (`ConfigError::ProjectFileOversteps`), and unknown keys
-follow [0015](0015-unknown-config-keys-reported.md).
+([0012](0012-model-rewrites.md)), default efforts ([0013](0013-default-efforts.md)), blocked models
+([0024](0024-blocked-models.md)) and the `retention` window come from a machine file alone. The
+window governs one store shared by every project, so a checkout that set it would decide when other
+projects' consultations are deleted. A project `agentmux.toml` is found by walking up from the
+delegate's working directory to the root of its repository (the nearest `.git`); outside a
+repository, discovery runs only within the home directory and excludes home itself. A project file
+may only select an account with `[defaults.<vendor>]`: nonempty understood account definitions,
+launch settings, model rewrites, effort defaults, blocked models and a retention are refused
+(`ConfigError::ProjectFileOversteps`), and unknown keys follow
+[0015](0015-unknown-config-keys-reported.md).
 
 Machine files live under the home directory only: `XDG_CONFIG_HOME` and `APPDATA` count only when
 they point there, and `AGENTMUX_CONFIG` (which must be absolute) is the one deliberate escape hatch.
 A container that points the config base at a workspace therefore cannot promote a checkout to a
 machine file. On Unix, both roles require a regular file owned by the current user and not writable
-by group or others (`refuse_if_untrusted` in `crates/agentmux/src/config.rs`); other platforms do
-not currently enforce equivalent ownership or permission checks.
+by group or others (`refuse_if_untrusted` in `crates/agentmux/src/config/mod.rs`); other platforms
+do not currently enforce equivalent ownership or permission checks.
 
 **A project file's selection switches nothing on.** An account a project file chose runs isolated,
 never on API pricing, and without its own `request_env`, whatever the machine file configures for

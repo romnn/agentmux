@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use crate::delegate::{DelegateError, Vendor};
+use crate::config::BlockedModel;
+use crate::delegate::{DelegateError, ModelId, Vendor};
 use crate::launch::LaunchError;
 use crate::transcript::{TurnState, describe_unsaved_session_store};
 
@@ -47,6 +48,25 @@ pub enum RunError {
     VendorDenied {
         /// The vendor that was asked for.
         vendor: Vendor,
+    },
+    /// The machine's configuration blocks the model a new consultation would launch.
+    ///
+    /// Refused rather than exchanged for the recommendation: which model answers decides what the
+    /// caller pays and what it is told, so the caller makes that choice knowingly and asks again.
+    #[error(
+        "{vendor} model \"{model}\" is blocked by this machine's agentmux configuration; \
+         {blocked}. No delegate was launched."
+    )]
+    ModelBlocked {
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The model that would have been launched, after the machine's rewrite.
+        ///
+        /// It is the one the caller asked for, because a file that rewrites another name onto a
+        /// blocked model is refused when it is read.
+        model: ModelId,
+        /// What the configuration says instead: the recommendation, and why.
+        blocked: BlockedModel,
     },
     /// A child could not be launched.
     #[error(transparent)]

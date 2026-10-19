@@ -84,6 +84,7 @@ use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, page_of};
 
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
+pub use quota::QuotaReport;
 pub use records::{LaunchMode, Meta};
 pub use retention::Retention;
 pub use spawn::StartRequest;

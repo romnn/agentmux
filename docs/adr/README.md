@@ -33,6 +33,8 @@ a record names to show where the decision is enforced must be renamed there too.
   opt-in.
 - [0022](0022-delegate-env-from-allowlist.md): A delegate's environment is built from empty by
   allowlist.
+- [0024](0024-blocked-models.md): A blocked model is refused at `start`, naming what to ask for
+  instead.
 
 ## Quota observations
 

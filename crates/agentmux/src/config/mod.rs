@@ -13,8 +13,9 @@
 //!
 //! A **machine** file defines accounts: paths, credentials, endpoints, environment.
 //! It also holds the model rewrites — the machine's answer to "when something asks for *this*
-//! model, run *that* one" — and the reasoning effort to use for a model when a caller names none,
-//! which are the other things a caller cannot know from where it sits.
+//! model, run *that* one" — the reasoning effort to use for a model when a caller names none,
+//! and the models it refuses to launch together with what to ask for instead, which are the
+//! other things a caller cannot know from where it sits.
 //! And it says how long a consultation is kept, because every consultation on the machine shares
 //! one store.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
@@ -37,6 +38,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
+
+mod model_rules;
+
+pub use model_rules::{BlockedModel, ModelRules, RefusedModel, ResolvedModel};
 
 /// Environment variable holding an explicit path to the configuration file.
 pub const CONFIG_PATH_ENV: &str = "AGENTMUX_CONFIG";
@@ -90,14 +95,14 @@ pub enum ConfigError {
         reason: &'static str,
     },
     /// A project file tried to define an account, a launch environment, a model rewrite, a
-    /// default effort or the retention window, rather than select an account.
+    /// default effort, a blocked model or the retention window, rather than select an account.
     #[error(
-        "{path} defines accounts, model rewrites, default efforts, a retention or a [launch] \
-         environment, and a project agentmux.toml may only select an account with \
+        "{path} defines accounts, model rewrites, default efforts, blocked models, a retention or \
+         a [launch] environment, and a project agentmux.toml may only select an account with \
          [defaults.<vendor>]. Move the definitions to your machine configuration: a file that \
          travels with a repository must not be able to name a credential, an endpoint, an \
-         environment variable, which model answers your questions and how hard it thinks, or \
-         when every consultation on this machine is deleted."
+         environment variable, which model answers your questions and how hard it thinks, which \
+         models you may ask for, or when every consultation on this machine is deleted."
     )]
     ProjectFileOversteps {
         /// The offending file.
@@ -105,13 +110,15 @@ pub enum ConfigError {
     },
     /// A model rewrite names a model the same file rewrites again.
     #[error(
-        "the agentmux config at {path} rewrites the model {from:?} to {to:?}, which it rewrites \
-         again. A rewrite is one substitution, never a chain, so this rule does not do what it \
-         reads as: name the identifier you want run on both lines."
+        "the agentmux config at {path} rewrites the {vendor} model \"{from}\" to \"{to}\", which it \
+         rewrites again. A rewrite is one substitution, never a chain, so this rule does not do \
+         what it reads as: name the identifier you want run on both lines."
     )]
     ChainedRewrite {
         /// The file.
         path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
         /// The identifier a caller would ask for.
         from: ModelId,
         /// What it is rewritten to, which is itself rewritten.
@@ -119,17 +126,68 @@ pub enum ConfigError {
     },
     /// A default effort is keyed by a model the same file rewrites to another.
     #[error(
-        "the agentmux config at {path} sets a default effort for the model {model:?}, but \
-         rewrites that model to {to:?}, and a default effort is looked up by the model that runs. \
-         This rule would never apply: key it by {to:?}."
+        "the agentmux config at {path} sets a default effort for the {vendor} model \"{model}\", \
+         but rewrites that model to \"{to}\", and a default effort is looked up by the model that \
+         runs. This rule would never apply: key it by \"{to}\"."
     )]
     EffortForRewrittenModel {
         /// The file.
         path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
         /// The model the effort is keyed by.
         model: ModelId,
         /// What the same file rewrites it to.
         to: ModelId,
+    },
+    /// A model rewrite launches a model the same file blocks.
+    #[error(
+        "the agentmux config at {path} rewrites the {vendor} model \"{from}\" to \"{to}\", which it \
+         blocks, so every request for \"{from}\" would be refused. Rewrite it to a model you allow, \
+         or remove the block."
+    )]
+    RewriteToBlockedModel {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The identifier a caller would ask for.
+        from: ModelId,
+        /// What it is rewritten to, which is blocked.
+        to: ModelId,
+    },
+    /// A blocked model is keyed by an identifier the same file rewrites to another.
+    #[error(
+        "the agentmux config at {path} blocks the {vendor} model \"{model}\" and also rewrites it \
+         to \"{to}\", and a block is checked against the model that runs, so this block would \
+         never apply. Remove the rewrite to refuse \"{model}\", or remove the block to keep sending \
+         it to \"{to}\"."
+    )]
+    BlockForRewrittenModel {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The model the block is keyed by.
+        model: ModelId,
+        /// What the same file rewrites it to.
+        to: ModelId,
+    },
+    /// A blocked model recommends one the same file blocks too.
+    #[error(
+        "the agentmux config at {path} blocks the {vendor} model \"{model}\" and recommends \
+         \"{recommended}\", which it blocks as well, so the refusal would send a caller to another \
+         refusal. Recommend a model this file does not block."
+    )]
+    BlockedRecommendation {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The blocked model.
+        model: ModelId,
+        /// What its entry recommends instead, which is blocked too.
+        recommended: ModelId,
     },
     /// A configuration file another user could have written was found.
     #[error(
@@ -593,7 +651,7 @@ pub struct Config {
     pub defaults: BTreeMap<Vendor, Defaults>,
     /// Model identifiers to substitute, by vendor, then by the identifier a caller asks for.
     ///
-    /// Read through [`Config::rewritten_model`].
+    /// Read through [`Config::model_rules`].
     #[serde(
         rename = "models",
         default,
@@ -602,7 +660,7 @@ pub struct Config {
     pub model_rewrites: BTreeMap<Vendor, BTreeMap<ModelId, ModelId>>,
     /// Reasoning efforts to use when a caller names none, by vendor, then by the model that runs.
     ///
-    /// Read through [`Config::default_effort`].
+    /// Read through [`Config::model_rules`].
     /// Keyed by the identifier that is launched, after any rewrite in [`Self::model_rewrites`]: it
     /// is the one identifier every consultation of that model shares, whatever name it asked by.
     /// Both sides are opaque identifiers, as the rewrites are, so a vendor's new effort
@@ -613,6 +671,15 @@ pub struct Config {
         deserialize_with = "by_vendor::deserialize"
     )]
     pub effort_defaults: BTreeMap<Vendor, BTreeMap<ModelId, Effort>>,
+    /// Models a new consultation may not launch, by vendor, then by the model that would run.
+    ///
+    /// Read through [`Config::model_rules`].
+    /// Keyed by the identifier that is launched, after any rewrite in [`Self::model_rewrites`], so
+    /// an old spelling the file rewrites to an allowed model still works.
+    /// A block refuses and names its recommendation; it never launches the recommendation in the
+    /// caller's place, because which model answers is the caller's choice to make knowingly.
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub blocked: BTreeMap<Vendor, BTreeMap<ModelId, BlockedModel>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -824,18 +891,49 @@ impl Config {
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
     /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account, a
-    /// model rewrite, a default effort or a retention rather than naming an account,
-    /// [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten, and
+    /// model rewrite, a default effort, a blocked model or a retention rather than naming an
+    /// account, [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten,
     /// [`ConfigError::EffortForRewrittenModel`] for a default effort keyed by a model the same
-    /// file rewrites away.
+    /// file rewrites away, and [`ConfigError::RewriteToBlockedModel`],
+    /// [`ConfigError::BlockForRewrittenModel`] or [`ConfigError::BlockedRecommendation`] for a
+    /// block the same file's rewrites contradict.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
+        Self::load_machine(host_env)?.with_project(host_env, start)
+    }
+
+    /// Load the machine file alone, for a reader that needs nothing a project file could say.
+    ///
+    /// The retention sweep is one: it acts on the store every project shares, so a broken project
+    /// file in whichever directory it runs from must not stop it.
+    /// Whatever describes the machine as a whole, such as its model rules, is another.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Config::load`] documents for the machine file.
+    pub fn load_machine(host_env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let config = Self::read_machine(host_env)?;
+        warn_unknown(&config.unknown);
+        Ok(config)
+    }
+
+    /// Add the choice of the project file found by walking up from `start`, when there is one, to
+    /// this machine configuration.
+    ///
+    /// [`Config::load`] is this over [`Config::load_machine`]; a reader that keeps the machine
+    /// configuration for when the project file is broken calls the two apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Config::load`] documents for a project file.
+    pub fn with_project(
+        mut self,
+        host_env: &BTreeMap<String, String>,
+        start: &Path,
+    ) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
-
-        let mut config = Self::read_machine(host_env)?;
-
         // The machine file keeps its role even when the walk passes over it, which happens when
         // an explicit path points inside the checkout.
-        let machine_file = config
+        let machine_file = self
             .source
             .as_deref()
             .and_then(|path| path.canonicalize().ok());
@@ -848,41 +946,27 @@ impl Config {
                 || !project.launch.is_empty()
                 || !project.model_rewrites.is_empty()
                 || !project.effort_defaults.is_empty()
+                || !project.blocked.is_empty()
                 || project.retention.is_some()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
+            warn_unknown(&project.unknown);
             // Extended, not replaced: a repository pinning its Codex account must not silently
             // drop a machine-wide Claude default, which would spend a different subscription.
             // A project entry that merely restates the machine's own default changes nothing,
             // and is not counted as the project's choice.
             for (vendor, chosen) in project.defaults {
-                if config.defaults.get(&vendor) != Some(&chosen) {
-                    config.project_defaults.insert(vendor);
+                if self.defaults.get(&vendor) != Some(&chosen) {
+                    self.project_defaults.insert(vendor);
                 }
-                config.defaults.insert(vendor, chosen);
+                self.defaults.insert(vendor, chosen);
             }
-            config.project_source = Some(path);
-            config.unknown.extend(project.unknown);
+            self.project_source = Some(path);
+            self.unknown.extend(project.unknown);
             break;
         }
-
-        config.warn_unknown();
-        Ok(config)
-    }
-
-    /// Load the machine file alone, for a reader that needs nothing a project file could say.
-    ///
-    /// The retention sweep is one: it acts on the store every project shares, so a broken project
-    /// file in whichever directory it runs from must not stop it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors [`Config::load`] documents for the machine file.
-    pub fn load_machine(host_env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
-        let config = Self::read_machine(host_env)?;
-        config.warn_unknown();
-        Ok(config)
+        Ok(self)
     }
 
     /// Read the machine file: the explicit one, or the first found at [`Self::machine_paths`].
@@ -908,15 +992,6 @@ impl Config {
             }
         }
         Ok(Self::default())
-    }
-
-    fn warn_unknown(&self) {
-        for unknown in &self.unknown {
-            // Warned at every load rather than once: this is a file the operator can fix, and the
-            // reader who needs to see it is whoever is looking at a delegation that behaved
-            // unexpectedly, not whoever started the process.
-            tracing::warn!(%unknown, "this agentmux does not read that key, and is ignoring it");
-        }
     }
 
     /// Read and parse one file.
@@ -1027,41 +1102,8 @@ impl Config {
                 }
             }
         }
-        for rewrites in self.model_rewrites.values() {
-            for (from, to) in rewrites {
-                // A rule naming another rule's key reads as a chain, and one substitution is all
-                // there is; refused here rather than resolved, because either answer would be a
-                // guess at which of the two lines the operator meant.
-                // A rule that maps a name to itself changes nothing, so a rule pointing at it
-                // does not chain.
-                let is_rewritten = |name: &ModelId| rewrites.get(name).is_some_and(|to| to != name);
-                if is_rewritten(from) && is_rewritten(to) {
-                    return Err(ConfigError::ChainedRewrite {
-                        path: path.to_path_buf(),
-                        from: from.clone(),
-                        to: to.clone(),
-                    });
-                }
-            }
-        }
-        for (vendor, efforts) in &self.effort_defaults {
-            for model in efforts.keys() {
-                // Looked up by the model that runs, so a key the file rewrites away can never be
-                // met; refused rather than left in, because a rule that does nothing reads as one
-                // that does.
-                if let Some(to) = self
-                    .model_rewrites
-                    .get(vendor)
-                    .and_then(|rewrites| rewrites.get(model))
-                    .filter(|to| *to != model)
-                {
-                    return Err(ConfigError::EffortForRewrittenModel {
-                        path: path.to_path_buf(),
-                        model: model.clone(),
-                        to: to.clone(),
-                    });
-                }
-            }
+        for vendor in Vendor::ALL {
+            self.model_rules(vendor).validate(path)?;
         }
         self.launch.validate(path)
     }
@@ -1079,16 +1121,6 @@ impl Config {
         self.accounts.get(&vendor)?.get(alias)
     }
 
-    /// The model rewrites defined for one vendor, which may be none.
-    ///
-    /// For a reader listing what the machine offers; [`Self::rewritten_model`] is what a launch
-    /// asks.
-    #[must_use]
-    pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<ModelId, ModelId> {
-        static NONE: BTreeMap<ModelId, ModelId> = BTreeMap::new();
-        self.model_rewrites.get(&vendor).unwrap_or(&NONE)
-    }
-
     /// How long a consultation without `keep` survives after its delegate last wrote anything:
     /// the machine file's `retention`, or [`DEFAULT_RETENTION`].
     #[must_use]
@@ -1096,45 +1128,18 @@ impl Config {
         self.retention.unwrap_or(DEFAULT_RETENTION)
     }
 
-    /// What to run when a caller asks for `model`, when this machine rewrites it.
+    /// This machine's model rules for one vendor: its rewrites, default efforts and blocks.
     ///
-    /// The rewrite is how an operator says once, in one file, that "fable-5" means whichever
-    /// point release they actually want today.
-    /// agentmux keeps no roster of models and this does not become one: an identifier the file
-    /// says nothing about is not touched, so a model released this morning reaches the delegate
-    /// CLI unchanged and without an agentmux release.
-    ///
-    /// The match is exact, because the delegate CLI's own match is, and one substitution is
-    /// applied: the result is never looked up again.
-    /// A rule naming the same identifier on both sides asks for nothing and answers `None`.
-    /// A file whose rules would chain is refused when it is read, so what is written on one line
-    /// is what runs.
+    /// What a launch resolves through and what every report lists, so the two cannot disagree
+    /// about what counts as a rewrite.
     #[must_use]
-    pub fn rewritten_model(&self, vendor: Vendor, model: &ModelId) -> Option<&ModelId> {
-        self.model_rewrites(vendor)
-            .get(model)
-            .filter(|rewritten| *rewritten != model)
-    }
-
-    /// The default efforts defined for one vendor, by model, which may be none.
-    ///
-    /// For a reader listing what the machine offers; [`Self::default_effort`] is what a launch
-    /// asks.
-    #[must_use]
-    pub fn effort_defaults(&self, vendor: Vendor) -> &BTreeMap<ModelId, Effort> {
-        static NONE: BTreeMap<ModelId, Effort> = BTreeMap::new();
-        self.effort_defaults.get(&vendor).unwrap_or(&NONE)
-    }
-
-    /// The reasoning effort to run `model` at when the caller named none, if this machine says.
-    ///
-    /// `model` is the identifier that runs — after [`Self::rewritten_model`] — because that is the
-    /// one every consultation of the model shares.
-    /// A fallback only: an effort the caller names is never overridden, and a model the file says
-    /// nothing about runs at the CLI's own default, with no effort passed at all.
-    #[must_use]
-    pub fn default_effort(&self, vendor: Vendor, model: &ModelId) -> Option<&Effort> {
-        self.effort_defaults(vendor).get(model)
+    pub fn model_rules(&self, vendor: Vendor) -> ModelRules<'_> {
+        ModelRules {
+            vendor,
+            rewrites: self.model_rewrites.get(&vendor),
+            efforts: self.effort_defaults.get(&vendor),
+            blocked: self.blocked.get(&vendor),
+        }
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.
@@ -1160,6 +1165,16 @@ impl Config {
     #[must_use]
     pub fn account_aliases(&self, vendor: Vendor) -> Vec<AccountAlias> {
         self.accounts(vendor).keys().cloned().collect()
+    }
+}
+
+/// Say each key this build does not read out loud.
+fn warn_unknown(unknown: &[UnknownKey]) {
+    for unknown in unknown {
+        // Warned at every load rather than once: this is a file the operator can fix, and the
+        // reader who needs to see it is whoever is looking at a delegation that behaved
+        // unexpectedly, not whoever started the process.
+        tracing::warn!(%unknown, "this agentmux does not read that key, and is ignoring it");
     }
 }
 

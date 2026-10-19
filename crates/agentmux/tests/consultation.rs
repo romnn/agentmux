@@ -2221,3 +2221,185 @@ fn a_session_store_agentmux_can_write_raises_nothing_and_keeps_nothing() -> Resu
     assert_that!(std::fs::read_dir(&projects)?.count(), eq(0));
     Ok(())
 }
+
+/// A store whose machine file says `config`, with the directories it lives in kept alive.
+struct ConfiguredStore {
+    store: RunStore,
+    launcher: Arc<ScriptedLauncher>,
+    config: PathBuf,
+    home: tempfile::TempDir,
+    #[expect(
+        dead_code,
+        reason = "holds the store's temporary directory until the test ends; never read"
+    )]
+    state_directory: tempfile::TempDir,
+}
+
+fn configured_store(
+    config: &str,
+    scripts: impl IntoIterator<Item = Script>,
+) -> Result<ConfiguredStore> {
+    let home = tempfile::tempdir().or_fail()?;
+    let config_path = home.path().join("agentmux.toml");
+    agentmux::testing::write_config_file(&config_path, config).or_fail()?;
+    let mut host = env();
+    host.insert(
+        "HOME".to_owned(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    let state_directory = tempfile::tempdir().or_fail()?;
+    let launcher = Arc::new(ScriptedLauncher::new(scripts));
+    let store = RunStore::open(
+        state_directory.path(),
+        Arc::<ScriptedLauncher>::clone(&launcher),
+        host,
+    )
+    .or_fail()?;
+    Ok(ConfiguredStore {
+        store,
+        launcher,
+        config: config_path,
+        home,
+        state_directory,
+    })
+}
+
+/// A Codex consultation of `model`, reading the configured home.
+fn codex_request(model: &str, cwd: &Path) -> Result<StartRequest> {
+    Ok(StartRequest {
+        delegate: Delegate::Codex {
+            model: ModelId::parse(model).or_fail()?,
+            effort: Some(Effort::parse("high").or_fail()?),
+            sandbox: CodexSandbox::ReadOnly,
+            account: AccountChoice::Default,
+            isolation: None,
+        },
+        question: "q".to_owned(),
+        cwd: cwd.to_path_buf(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+    })
+}
+
+/// A new consultation whose launched model is blocked is refused with the recommendation, and
+/// nothing is launched or recorded.
+///
+/// The recommendation is named but never launched in the caller's place: which model answers is
+/// the caller's choice, made knowingly.
+#[gtest]
+fn a_blocked_model_is_refused_before_anything_is_launched() -> Result<()> {
+    let configured = configured_store(
+        indoc::indoc! {r#"
+            [blocked.codex]
+            "gpt-5.6-sol" = { use = "sol", reason = "gpt-6.1-sol is much cheaper" }
+        "#},
+        [Script::completed(fixtures::CODEX_HAPPY)],
+    )?;
+
+    let refused = configured
+        .store
+        .start(&codex_request("gpt-5.6-sol", configured.home.path())?);
+
+    assert_that!(
+        refused.as_ref().map(|_| ()),
+        err(matches_pattern!(RunError::ModelBlocked {
+            model: eq(&ModelId::parse("gpt-5.6-sol").or_fail()?),
+            blocked: eq(&agentmux::config::BlockedModel {
+                recommended: ModelId::parse("sol").or_fail()?,
+                reason: Some("gpt-6.1-sol is much cheaper".to_owned()),
+            }),
+            ..
+        }))
+    );
+    assert_that!(
+        refused.err().map(|err| err.to_string()),
+        some(eq(
+            "codex model \"gpt-5.6-sol\" is blocked by this machine's agentmux configuration; use \
+             model \"sol\" instead (gpt-6.1-sol is much cheaper). No delegate was launched."
+        ))
+    );
+    // No child, and no half-made consultation for `list` to report.
+    assert_that!(configured.launcher.launches(), is_empty());
+    assert_that!(configured.store.list(20).or_fail()?, is_empty());
+    Ok(())
+}
+
+/// The block is checked on the launched model, so an old spelling the file rewrites to an allowed
+/// model still works, and the record names what ran.
+#[gtest]
+fn an_old_spelling_rewritten_to_an_allowed_model_is_not_blocked() -> Result<()> {
+    let configured = configured_store(
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-5.6" = "gpt-6.1-sol"
+
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+        "#},
+        [Script::completed(fixtures::CODEX_HAPPY)],
+    )?;
+
+    let started = configured
+        .store
+        .start(&codex_request("gpt-5.6", configured.home.path())?)?;
+
+    assert_that!(started.delegate.model().as_str(), eq("gpt-6.1-sol"));
+    let launch = configured
+        .launcher
+        .launches()
+        .into_iter()
+        .next()
+        .or_fail()?;
+    assert_that!(launch.has_flag_with("--model", "gpt-6.1-sol"), eq(true));
+    Ok(())
+}
+
+/// A follow-up of a consultation whose model was blocked after it started is allowed.
+///
+/// The consultation keeps the model it pinned at `start`, and a block added later must not strand
+/// a review that is already paid for; only a new consultation is checked.
+#[gtest]
+fn a_follow_up_continues_a_consultation_whose_model_was_blocked_later() -> Result<()> {
+    let configured = configured_store(
+        indoc::indoc! {r#"
+            [models.codex]
+            "sol" = "gpt-6.1-sol"
+        "#},
+        [
+            Script::completed(fixtures::CODEX_HAPPY),
+            Script::completed(fixtures::CODEX_HAPPY),
+        ],
+    )?;
+    let started = configured
+        .store
+        .start(&codex_request("gpt-5.6-sol", configured.home.path())?)?;
+
+    // Blocked between the two questions.
+    std::fs::write(
+        &configured.config,
+        indoc::indoc! {r#"
+            [models.codex]
+            "sol" = "gpt-6.1-sol"
+
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+        "#},
+    )
+    .or_fail()?;
+    configured.store.follow_up(&started.run_id, "and now?")?;
+
+    let launches = configured.launcher.launches();
+    let second = launches.get(1).or_fail()?;
+    assert_that!(second.has_flag_with("--model", "gpt-5.6-sol"), eq(true));
+    // A new consultation of the same model is refused under the same file.
+    assert_that!(
+        configured
+            .store
+            .start(&codex_request("gpt-5.6-sol", configured.home.path())?)
+            .map(|_| ()),
+        err(matches_pattern!(RunError::ModelBlocked { .. }))
+    );
+    Ok(())
+}

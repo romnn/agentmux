@@ -252,8 +252,8 @@ pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print the account aliases this machine defines, the model rewrites it applies and the efforts
-/// it falls back to.
+/// Print the account aliases this machine defines, the model rewrites it applies, the efforts it
+/// falls back to and the models it blocks.
 ///
 /// The point of the command is discovery: an alias is a name someone has to know, and the error
 /// for guessing wrong is only visible after a consultation has been attempted.
@@ -367,17 +367,7 @@ pub fn accounts(
         }
         // Printed where the accounts are, because it answers the same kind of question: what this
         // machine does with a name a caller hands it.
-        let mut heading = "models";
-        for (from, to) in config.model_rewrites(vendor) {
-            println!("  {heading:<14} {from} -> {to}");
-            heading = "";
-        }
-        // Keyed by the model that runs, which the `->` above may have chosen.
-        let mut heading = "efforts";
-        for (model, effort) in config.effort_defaults(vendor) {
-            println!("  {heading:<14} {model} defaults to {effort}");
-            heading = "";
-        }
+        print_model_rules(config.model_rules(vendor));
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             println!("  (none configured — omit --account to use the CLI's own default)");
@@ -392,6 +382,37 @@ pub fn accounts(
         }
     }
     Ok(())
+}
+
+/// Print what this machine does with the model names a caller hands it for one vendor: the
+/// rewrites, the default efforts and the blocked models.
+fn print_model_rules(rules: agentmux::config::ModelRules<'_>) {
+    print_rows(
+        "models",
+        rules.aliases().map(|(from, to)| format!("{from} -> {to}")),
+    );
+    // Keyed by the model that runs, which the `->` above may have chosen.
+    print_rows(
+        "efforts",
+        rules
+            .efforts()
+            .map(|(model, effort)| format!("{model} defaults to {effort}")),
+    );
+    // Also keyed by the model that runs, and refused at `start`.
+    print_rows(
+        "blocked",
+        rules
+            .blocked()
+            .map(|(model, block)| format!("{model}: {block}")),
+    );
+}
+
+/// Print `rows` in the account column layout, naming `heading` on the first row only.
+fn print_rows(heading: &str, rows: impl Iterator<Item = String>) {
+    for (index, row) in rows.enumerate() {
+        let heading = if index == 0 { heading } else { "" };
+        println!("  {heading:<14} {row}");
+    }
 }
 
 /// How one account authenticates, as a list of `field=value` facts.
@@ -449,12 +470,19 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
 /// # Errors
 ///
 /// Returns an error only when the JSON form cannot be serialised.
-pub fn quota(reported: &[agentmux::quota::AccountQuota], json: bool) -> Result<()> {
+pub fn quota(reported: &agentmux::run::QuotaReport, json: bool) -> Result<()> {
+    if let Some(error) = &reported.project_error {
+        // On stderr, so the JSON on stdout keeps its shape.
+        eprintln!(
+            "warning: the project agentmux.toml could not be read, so these are the machine \
+             file's accounts alone: {error}"
+        );
+    }
     if json {
-        println!("{}", serde_json::to_string_pretty(reported)?);
+        println!("{}", serde_json::to_string_pretty(&reported.accounts)?);
         return Ok(());
     }
-    for entry in reported {
+    for entry in &reported.accounts {
         for line in report::quota_report(entry) {
             println!("{line}");
         }

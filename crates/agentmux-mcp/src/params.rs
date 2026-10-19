@@ -65,13 +65,18 @@ pub struct DelegateParams {
     #[schemars(schema_with = "vendor_schema")]
     pub delegate: Vendor,
 
-    /// Model identifier, passed to the delegate CLI verbatim and never checked against a list —
-    /// a model released tomorrow works today.
-    /// Use the vendor's full identifier, for example `claude-opus-5` or `claude-fable-5-1` for
-    /// `claude`, `gpt-6-astra` or `gpt-5.6-sol` for `codex`.
-    /// If the identifier is wrong the vendor's own error comes back and names what it accepts.
-    /// This machine's configuration may rewrite one identifier to another; when it does, the
-    /// result says so and names both.
+    /// Model identifier.
+    /// agentmux keeps no built-in model roster, so a model released tomorrow works today; this
+    /// machine's rewrites and blocks apply before launch, and the identifier that runs is passed
+    /// to the delegate CLI verbatim.
+    /// Prefer a family alias this machine's `agentmux.toml` defines, which the server
+    /// instructions and `quota` list, and otherwise the vendor's own identifier; `opus` and `sol`
+    /// show an alias's shape, not a list of them.
+    /// When the vendor CLI refuses an identifier, its own error comes back, usually naming what it
+    /// accepts: look a current identifier up there rather than copying one from an example, which
+    /// goes stale with the next release.
+    /// A rewritten model is named beside the one asked for in the result, and a blocked one is
+    /// refused naming the model to ask for instead.
     pub model: String,
 
     /// Reasoning effort, passed verbatim: usually `high` or `xhigh`.
