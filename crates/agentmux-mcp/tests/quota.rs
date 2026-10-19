@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId, Vendor};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId, Vendor};
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
@@ -20,7 +20,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -34,13 +34,15 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Review the diff.".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -62,7 +64,7 @@ fn an_unavailable_account_never_reads_as_spare_capacity() {
         },
     };
 
-    let rendered = agentmux_mcp::render::quota_report(&entry).join("\n");
+    let rendered = agentmux::report::quota_report(&entry).join("\n");
 
     assert_that!(rendered, contains_substring("unavailable"));
     assert_that!(rendered, contains_substring("not idle"));
@@ -91,7 +93,7 @@ fn nothing_rendered_recommends_an_account() {
         },
     };
 
-    let rendered = agentmux_mcp::render::quota_report(&entry)
+    let rendered = agentmux::report::quota_report(&entry)
         .join("\n")
         .to_lowercase();
 
@@ -207,7 +209,8 @@ fn a_reopened_window_is_retried_rather_than_routed_elsewhere() -> Result<()> {
     Ok(())
 }
 
-/// A window reopening within one `start`'s wait is waited for, not routed around.
+/// A window reopening within the longest wait one call can block for is waited for, not routed
+/// around.
 #[gtest]
 fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
     let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
@@ -226,7 +229,7 @@ fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
 
     let warnings = agentmux_mcp::render::warnings(&status);
 
-    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, contains_substring("wait that long"));
     assert_that!(warnings, not(contains_substring("Retry with a different")));
     Ok(())
 }
@@ -303,8 +306,8 @@ fn a_refresh_that_did_not_happen_is_named_rather_than_implied() {
         reason: "`claude --print /usage` exited with exit status: 1".to_owned(),
     });
 
-    let timed_out = agentmux_mcp::render::quota_report(&timed_out).join("\n");
-    let failed = agentmux_mcp::render::quota_report(&failed).join("\n");
+    let timed_out = agentmux::report::quota_report(&timed_out).join("\n");
+    let failed = agentmux::report::quota_report(&failed).join("\n");
 
     // Both say the figures predate the attempt, so neither can be mistaken for a fresh reading.
     assert_that!(timed_out, contains_substring("timed out"));
@@ -316,8 +319,8 @@ fn a_refresh_that_did_not_happen_is_named_rather_than_implied() {
 /// The ordinary outcomes are named too, so silence never has to be interpreted.
 #[gtest]
 fn a_refresh_that_happened_says_so() {
-    let refreshed = agentmux_mcp::render::quota_report(&cached_with(Refresh::Succeeded)).join("\n");
-    let skipped = agentmux_mcp::render::quota_report(&cached_with(Refresh::Skipped)).join("\n");
+    let refreshed = agentmux::report::quota_report(&cached_with(Refresh::Succeeded)).join("\n");
+    let skipped = agentmux::report::quota_report(&cached_with(Refresh::Skipped)).join("\n");
 
     assert_that!(refreshed, contains_substring("just refreshed"));
     assert_that!(

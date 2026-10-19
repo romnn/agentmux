@@ -4,6 +4,14 @@ members = [
 	"crates/agentmux",
 	"crates/agentmux-mcp",
 	"crates/agentmux-cli",
+	"crates/codex-app-server-protocol",
+	"crates/codex-app-server-mock",
+	"crates/codex-app-server-codegen",
+]
+# The oracle builds codex's own crates, several hundred packages with native dependencies, which
+# only `task codegen:app-server:oracle` should pay for.
+exclude = [
+	"crates/codex-app-server-codegen/oracle",
 ]
 default-members = [
 	"crates/agentmux-cli",
@@ -79,8 +87,13 @@ tracing-subscriber = { version = "0", features = ["env-filter"] }
 
 # serde
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` is what the tests' `jsonschema` turns on, so it is on everywhere: a feature
+# unified into test builds alone would test a float parser the release never links.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.9"
+# Lists an enum's variants, so a front end offers every value the core accepts without a copy of
+# the enum to keep in step.
+strum = { version = "0.27", features = ["derive"] }
 # `schemars` derives the JSON Schema for every MCP tool's input; `rmcp`'s `schemars`
 # feature must stay on the same major.
 schemars = "1"
@@ -123,7 +136,17 @@ nix = "0.31.3"
 # own. A delegate outlives the agentmux that started it, so a pid on disk needs a start time
 # beside it before it can be trusted not to have been recycled.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# A kill-on-close job object holds everything a driven Codex turn starts on Windows, where a
+# process's recorded parent cannot be trusted once that parent has exited.
+win32job = "2.0.3"
 
 # testing
+# Builds the fake `codex` a test puts on a driver's `PATH`, which is a target `cargo test` builds
+# only when the test run selects it.
+escargot = "0.5"
+# Holds the test server's messages, and the driver's, to codex's own JSON Schema rather than to
+# the types generated from it.
+# Without remote references, because the schema is vendored.
+jsonschema = { version = "0.58", default-features = false }
 googletest = "0"
 tempfile = "3"

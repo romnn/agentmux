@@ -1,8 +1,10 @@
 //! Folds a delegate's raw event stream into a [`Turn`].
 //!
-//! Parsing happens here and only here.
-//! No `serde_json::Value` leaves this module, so everything downstream is vendor-neutral and
-//! cannot be called with the wrong vendor's shape.
+//! Every capture is parsed here, and only here.
+//! What a fold returns is vendor-neutral, so nothing downstream can be called with the wrong
+//! vendor's shape.
+//! The Codex capture model, [`codex::CaptureEvent`], is also what the app-server driver writes,
+//! and it keeps whatever the server said that could not be decoded verbatim, as evidence.
 //!
 //! # Why every fold counts what it does not recognise
 //!
@@ -18,8 +20,6 @@
 pub mod claude;
 pub mod codex;
 
-use serde::Deserialize;
-
 use crate::delegate::{SessionRef, Vendor};
 use crate::transcript::Turn;
 
@@ -33,6 +33,11 @@ pub struct Fold {
     /// Without this a follow-up is impossible, so it is recovered on every fold rather than
     /// remembered from the launch.
     pub session: Option<SessionRef>,
+    /// Whether the stream said the turn itself began, which only Codex's `turn.started` says.
+    ///
+    /// Over the app-server it is written by the driver once it follows the turn, which is when
+    /// it delivers a steer.
+    pub turn_started: bool,
 }
 
 /// Counted under [`Turn::unrecognised`] when a line is not JSON at all.
@@ -67,20 +72,6 @@ pub(crate) fn complete_lines(events: &str) -> impl Iterator<Item = &str> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-}
-
-/// Just enough of a line to know which typed shape to parse it as.
-#[derive(Debug, Deserialize)]
-pub(crate) struct TypeProbe {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-}
-
-/// Read the top-level `type` of a JSONL line.
-pub(crate) fn probe(line: &str) -> Option<String> {
-    serde_json::from_str::<TypeProbe>(line)
-        .ok()
-        .map(|probe| probe.kind)
 }
 
 /// Classify a vendor's error text into a [`crate::transcript::FailureKind`].

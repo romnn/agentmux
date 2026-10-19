@@ -22,6 +22,7 @@ agentmux = { path = "../agentmux" }
 
 rmcp.workspace = true
 schemars.workspace = true
+strum.workspace = true
 
 chrono.workspace = true
 indoc.workspace = true
@@ -34,3 +35,4 @@ tracing.workspace = true
 [dev-dependencies]
 googletest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

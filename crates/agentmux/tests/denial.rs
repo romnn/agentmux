@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId, Vendor};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId, Vendor};
 use agentmux::run::{Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use googletest::prelude::*;
@@ -20,7 +20,7 @@ use googletest::prelude::*;
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
 
@@ -28,7 +28,7 @@ fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     })
 }
@@ -38,7 +38,7 @@ fn codex() -> Result<Delegate> {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
         sandbox: CodexSandbox::ReadOnly,
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     })
 }
@@ -50,6 +50,8 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         cwd: PathBuf::from("/work/project"),
         retention: Retention::Ttl,
         env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
     }
 }
 

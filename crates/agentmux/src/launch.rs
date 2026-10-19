@@ -42,7 +42,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::Invocation;
+use crate::delegate::{Billing, Invocation, scrub_billing_env};
 
 /// A child process could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -109,7 +109,8 @@ pub struct Launched {
     ///
     /// The pid alone does not identify a process across an agentmux restart: it is recycled, and
     /// a recycled pid that happens to lead a process group of its own passes every other test.
-    /// A process found under this pid is the child only if it also started at this time.
+    /// A process found under this pid is the child only if it also started at this time, and
+    /// without a start time on record, it is never taken to be the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
 }
@@ -212,7 +213,18 @@ pub trait Launcher: Send + Sync {
     /// [`Launcher::liveness`] report it alive forever.
     /// Asking again reports the same status again.
     fn reap(&self, launched: Launched) -> Option<ExitStatus>;
+
+    /// What the CLI an invocation runs says its version is, as it prints it, or `None` when it
+    /// cannot say.
+    ///
+    /// Asked with the environment and working directory the delegate gets, so it names the
+    /// program the turn runs, and bounded by [`VERSION_TIMEOUT`], because it is asked before every
+    /// launch and a launch must not wait on it.
+    fn version(&self, invocation: &Invocation, cwd: &Path) -> Option<String>;
 }
+
+/// How long a CLI is given to say its version.
+pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What one non-blocking wait on a retained handle said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +341,64 @@ fn open_append(path: &Path) -> Result<File, LaunchError> {
 }
 
 impl Launcher for ProcessLauncher {
+    fn version(&self, invocation: &Invocation, cwd: &Path) -> Option<String> {
+        use std::io::{Read as _, Seek as _};
+        use std::process::Stdio;
+
+        /// The most of what the CLI prints that is read, which a version fits many times over.
+        const MAX_VERSION_OUTPUT_BYTES: u64 = 4096;
+
+        let mut env = invocation.env().clone();
+        if invocation.billing() == Billing::Subscription {
+            scrub_billing_env(&mut env);
+        }
+        // Into a file rather than a pipe: a descendant that inherited a pipe can hold it open
+        // after the CLI itself has exited, and reading it would then outlast the deadline, where
+        // a file is read for what it holds.
+        let mut version_output_file = tempfile::tempfile().ok()?;
+        let spawn = |program: &str| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .current_dir(cwd)
+                .env_clear()
+                .envs(&env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(version_output_file.try_clone()?))
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let program = invocation.program();
+        let spawned = spawn(program);
+        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
+        // bare name.
+        #[cfg(windows)]
+        let spawned = spawned.or_else(|_| spawn(&format!("{program}.cmd")));
+        let mut child = spawned.ok()?;
+
+        let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(Some(_) | None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        version_output_file.rewind().ok()?;
+        let mut bytes = Vec::new();
+        version_output_file
+            .take(MAX_VERSION_OUTPUT_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(String::from_utf8_lossy(&bytes).trim().to_owned())
+            .filter(|version| !version.is_empty())
+    }
+
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {
         self.collect_finished();
         if !spec.cwd.is_dir() {
@@ -340,6 +410,13 @@ impl Launcher for ProcessLauncher {
         let stdout = open_append(spec.events)?;
         let stderr = open_append(spec.stderr)?;
 
+        // The guarantee is kept here, where the child is made, rather than trusted to every layer
+        // that built the environment: a subscription delegate is never handed a key.
+        let mut env = spec.invocation.env().clone();
+        if spec.invocation.billing() == Billing::Subscription {
+            scrub_billing_env(&mut env);
+        }
+
         let spawn = |program: &str| -> Result<Child, LaunchError> {
             let clone = |file: &File, path: &Path| {
                 file.try_clone().map_err(|source| LaunchError::Io {
@@ -349,7 +426,7 @@ impl Launcher for ProcessLauncher {
             };
             let mut command = std::process::Command::new(program);
             command
-                .args(&spec.invocation.args)
+                .args(spec.invocation.args())
                 .current_dir(spec.cwd)
                 .stdin(clone(&stdin, spec.question)?)
                 .stdout(clone(&stdout, spec.events)?)
@@ -358,7 +435,7 @@ impl Launcher for ProcessLauncher {
             // Never a denylist: the host that launched agentmux is itself an agent session, and
             // its environment carries that session's identity.
             command.env_clear();
-            for (key, value) in &spec.invocation.env {
+            for (key, value) in &env {
                 command.env(key, value);
             }
             #[cfg(unix)]
@@ -369,7 +446,7 @@ impl Launcher for ProcessLauncher {
             })
         };
 
-        let program = spec.invocation.program;
+        let program = spec.invocation.program();
         let child = match spawn(program) {
             Ok(child) => child,
             // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find
@@ -524,43 +601,13 @@ mod identity {
         }
         // The recorded start time is the identity; a pid handed to a different process since is
         // not this child, however much else it has in common.
+        // Without one, a process holding the pid may or may not be the child, and nothing here
+        // can tell: it is not called alive, so it is never signalled, nor gone, so its run is
+        // never deleted under it.
         match launched.started {
             Some(started) if started == process.start_time() => Liveness::Alive,
             Some(_) => Liveness::Gone,
-            None => platform::same_group(launched),
-        }
-    }
-
-    #[cfg(unix)]
-    mod platform {
-        use nix::unistd::Pid;
-
-        use super::{Launched, Liveness};
-
-        /// With no start time on record, the process group is the next best witness: the child
-        /// leads its own, and a recycled pid that does too is the residual hazard.
-        pub(super) fn same_group(launched: Launched) -> Liveness {
-            let Ok(pid) = i32::try_from(launched.pid) else {
-                return Liveness::Unknown;
-            };
-            match nix::unistd::getpgid(Some(Pid::from_raw(pid))) {
-                Ok(group) => match launched.process_group {
-                    Some(expected) if i32::try_from(expected) != Ok(group.as_raw()) => {
-                        Liveness::Gone
-                    }
-                    _ => Liveness::Alive,
-                },
-                Err(_) => Liveness::Gone,
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    mod platform {
-        use super::{Launched, Liveness};
-
-        pub(super) fn same_group(_launched: Launched) -> Liveness {
-            Liveness::Alive
+            None => Liveness::Unknown,
         }
     }
 }

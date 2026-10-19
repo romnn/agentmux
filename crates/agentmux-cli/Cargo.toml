@@ -19,16 +19,25 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-agentmux = { path = "../agentmux" }
+agentmux = { path = "../agentmux", features = ["clap"] }
 agentmux-mcp = { path = "../agentmux-mcp" }
 
 clap.workspace = true
 color-eyre.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # `io-std` is the stdio transport the MCP server runs on.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-std", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+codex-app-server-mock = { path = "../codex-app-server-mock" }
+escargot.workspace = true
+googletest.workspace = true
+# What the tests' fake codex left running, read the way the driver itself reads it.
+sysinfo.workspace = true
+tempfile.workspace = true
 
 # Only the musl builds swap the allocator; see the workspace manifest.
 [target.'cfg(target_env = "musl")'.dependencies]

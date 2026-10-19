@@ -12,15 +12,18 @@
 //!
 //! - [`delegate`] — the closed set of delegates, and the exact argument vector each one needs.
 //! - [`stream`] — folds each vendor's event stream into a transcript.
-//!   Nothing else parses JSON.
+//!   Nothing else parses a capture.
 //! - [`transcript`] — the vendor-neutral record of what a delegate said.
 //! - [`launch`] — turns a prepared invocation into a detached child writing to files.
+//! - [`appserver`] — the driver that runs a Codex turn over `codex app-server`, so the turn can
+//!   be steered while it runs.
 //! - [`run`] — run directories, ids, lifecycle, retention and resume state.
 //! - [`testing`] — a scripted launcher and the recorded vendor fixtures, so the whole pipeline
 //!   runs with no credentials and no network.
 //!
 //! The dependency direction is one way: `transcript` and `delegate` import nothing heavy;
-//! `stream` imports `transcript`; `run` imports `launch`, `stream` and `delegate`.
+//! `stream` imports `transcript`; `appserver` imports `stream` and `delegate`; `run` imports
+//! `launch`, `stream`, `appserver` and `delegate`.
 //! Nothing here knows about MCP, which is what makes the whole pipeline testable without a client.
 //!
 //! # Example
@@ -29,7 +32,7 @@
 //! # // Uses `no_run` because the example spawns a real delegate CLI and writes a run directory.
 //! use std::sync::Arc;
 //!
-//! use agentmux::delegate::{Delegate, Effort, ModelId};
+//! use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId};
 //! use agentmux::launch::ProcessLauncher;
 //! use agentmux::run::{Retention, RunStore, StartRequest};
 //!
@@ -45,13 +48,15 @@
 //!     delegate: Delegate::Claude {
 //!         model: ModelId::parse("claude-opus-5")?,
 //!         effort: Some(Effort::parse("xhigh")?),
-//!         account: None,
+//!         account: AccountChoice::Default,
 //!         isolation: None,
 //!     },
 //!     question: "Review the merge-base diff for correctness bugs.".to_owned(),
 //!     cwd: std::env::current_dir()?,
 //!     retention: Retention::Ttl,
 //!     env: Default::default(),
+//!     billing: None,
+//!     force_codex_exec: false,
 //! })?;
 //!
 //! println!("consultation {} started", status.run_id);
@@ -59,10 +64,13 @@
 //! # }
 //! ```
 
+pub mod appserver;
+mod atomic_file;
 pub mod config;
 pub mod delegate;
 pub mod launch;
 pub mod quota;
+pub mod report;
 pub mod run;
 pub mod stream;
 pub mod testing;

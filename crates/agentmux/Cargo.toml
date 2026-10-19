@@ -17,12 +17,23 @@ keywords = ["agent", "llm", "mcp", "review"]
 [lints]
 workspace = true
 
+[features]
+# Command-line parsing for the enums a caller chooses from, so the CLI parses the core's own
+# types rather than copies of them.
+clap = ["dep:clap"]
+
 [dependencies]
+codex-app-server-protocol = { path = "../codex-app-server-protocol" }
 chrono = { workspace = true, features = ["serde"] }
+clap = { workspace = true, optional = true }
 directories.workspace = true
+indoc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+strum.workspace = true
 sysinfo.workspace = true
+# Captures what a CLI prints for `--version` without a pipe its descendants could hold open.
+tempfile.workspace = true
 thiserror.workspace = true
 # Only the timer, for the bounded wait in `run`.
 # The binary pulls in the full runtime.
@@ -35,10 +46,13 @@ uuid = { workspace = true, features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["process", "signal", "user"] }
 
+[target.'cfg(windows)'.dependencies]
+win32job.workspace = true
+
 [dev-dependencies]
 chrono = { workspace = true, features = ["serde"] }
-# The async tests need a runtime; the library itself needs only the timer.
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+codex-app-server-mock = { path = "../codex-app-server-mock" }
+# The async tests need a runtime, and a clock they can stop; the library itself needs only the
+# timer.
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 googletest.workspace = true
-indoc.workspace = true
-tempfile.workspace = true

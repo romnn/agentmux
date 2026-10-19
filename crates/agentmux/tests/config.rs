@@ -20,7 +20,7 @@ fn env(home: &Path) -> BTreeMap<String, String> {
 /// Write a machine file defining one Claude account.
 fn write_machine(dir: &Path, alias: &str) -> Result<()> {
     std::fs::create_dir_all(dir).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         dir.join("agentmux.toml"),
         format!("[accounts.claude.{alias}]\nconfig_dir = \"/tmp\"\n"),
     )
@@ -31,7 +31,7 @@ fn write_machine(dir: &Path, alias: &str) -> Result<()> {
 /// Write a project file selecting an account.
 fn write_project(dir: &Path, alias: &str) -> Result<()> {
     std::fs::create_dir_all(dir).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         dir.join("agentmux.toml"),
         format!("[defaults.claude]\naccount = \"{alias}\"\n"),
     )
@@ -62,7 +62,7 @@ fn the_closest_project_file_chooses_the_account() -> Result<()> {
     );
     // The machine file still supplied the account itself.
     assert_that!(
-        config.alias_names(agentmux::delegate::Vendor::Claude),
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
         elements_are![eq("clientx")]
     );
     Ok(())
@@ -97,7 +97,7 @@ fn a_project_file_that_defines_an_account_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/cloned");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         indoc::indoc! {r#"
             [accounts.claude.personal]
@@ -125,7 +125,7 @@ fn a_project_file_that_sets_launch_environment_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/cloned");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         indoc::indoc! {r#"
             [launch]
@@ -219,7 +219,7 @@ fn no_config_anywhere_is_not_an_error() -> Result<()> {
 #[gtest]
 fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [accounts.claude.personal]
@@ -235,9 +235,48 @@ fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
         config
             .unknown
             .iter()
-            .map(|u| u.key.clone())
+            .map(|unknown_key| unknown_key.key.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("accounts.claude.personal.configdir")]
+    );
+    Ok(())
+}
+
+/// A vendor this build does not know is reported like any other key, and the rest of the file
+/// takes effect.
+///
+/// One file is synced across machines that will not all be running the same agentmux.
+#[gtest]
+fn an_unknown_vendor_is_reported_and_the_file_still_loads() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.claude.personal]
+            config_dir = "/tmp"
+
+            [accounts.gemini.personal]
+            config_dir = "/tmp"
+
+            [defaults.gemini]
+            account = "personal"
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|unknown_key| unknown_key.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("accounts.gemini"), eq("defaults.gemini")]
+    );
+    assert_that!(
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
+        elements_are![eq("personal")]
     );
     Ok(())
 }
@@ -251,7 +290,7 @@ fn a_misspelled_key_is_reported_and_the_file_still_loads() -> Result<()> {
 #[gtest]
 fn a_key_from_a_newer_agentmux_is_reported_and_ignored() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [defaults.claude]
@@ -283,12 +322,15 @@ fn a_key_from_a_newer_agentmux_is_reported_and_ignored() -> Result<()> {
         config
             .unknown
             .iter()
-            .map(|u| u.key.clone())
+            .map(|unknown_key| unknown_key.key.clone())
             .collect::<Vec<_>>(),
         elements_are![eq("some_table_from_the_future")]
     );
     assert_that!(
-        config.unknown.first().map(|u| u.file.clone()),
+        config
+            .unknown
+            .first()
+            .map(|unknown_key| unknown_key.file.clone()),
         some(eq(&home.path().join("agentmux.toml")))
     );
     Ok(())
@@ -404,7 +446,7 @@ fn discovery_never_reads_the_ambient_environment() -> Result<()> {
 #[gtest]
 fn a_project_default_does_not_discard_the_other_vendors() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [defaults.claude]
@@ -418,7 +460,7 @@ fn a_project_default_does_not_discard_the_other_vendors() -> Result<()> {
 
     let repo = home.path().join("work/client");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         indoc::indoc! {r#"
             [defaults.codex]
@@ -543,12 +585,14 @@ fn a_checkout_outside_home_is_walked_up_to_its_repository_root() -> Result<()> {
 /// third way to switch isolation off, from a file the operator never wrote.
 #[gtest]
 fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
-    use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Vendor};
+    use agentmux::delegate::{
+        AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, Vendor,
+    };
 
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/client");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [accounts.claude.personal]
@@ -567,7 +611,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     let chosen_by_the_checkout = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: None,
+        account: AccountChoice::Default,
         isolation: None,
     };
     assert_that!(
@@ -575,14 +619,22 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
         eq(Isolation::Isolated)
     );
 
-    // Named by the caller, the account's own preference stands.
+    // Named by the caller, it is still the checkout's choice: a follow-up names the default it
+    // resolved, and the checkout's instructions could name it too.
     let named = Delegate::Claude {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
-        account: Some(AccountAlias::parse("personal").or_fail()?),
+        account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
     };
-    assert_that!(named.resolved_isolation(&config), eq(Isolation::Inherit));
+    assert_that!(named.resolved_isolation(&config), eq(Isolation::Isolated));
+
+    // Only the caller asking for it outright switches it on.
+    let inheriting_delegate = named.with_isolation(Isolation::Inherit);
+    assert_that!(
+        inheriting_delegate.resolved_isolation(&config),
+        eq(Isolation::Inherit)
+    );
     Ok(())
 }
 
@@ -592,7 +644,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
 #[gtest]
 fn an_unusable_alias_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [accounts.claude."work account"]
@@ -601,12 +653,16 @@ fn an_unusable_alias_is_refused_at_load() -> Result<()> {
     )
     .or_fail()?;
 
+    // The file is read straight into aliases, so the parser refuses it and says where.
     let error = Config::load(&env(home.path()), home.path()).expect_err("a space is not a name");
     assert_that!(
         error,
-        matches_pattern!(agentmux::config::ConfigError::InvalidName { .. })
+        matches_pattern!(agentmux::config::ConfigError::Malformed {
+            message: contains_substring("account"),
+            offset: some(anything()),
+            ..
+        })
     );
-    assert_that!(error.to_string(), contains_substring("work account"));
     Ok(())
 }
 
@@ -614,7 +670,7 @@ fn an_unusable_alias_is_refused_at_load() -> Result<()> {
 #[gtest]
 fn an_environment_name_with_an_equals_sign_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [launch]
@@ -649,7 +705,7 @@ fn an_explicit_machine_file_inside_the_checkout_keeps_its_role() -> Result<()> {
     let config = Config::load(&host, &repo).or_fail()?;
 
     assert_that!(
-        config.alias_names(agentmux::delegate::Vendor::Claude),
+        config.account_aliases(agentmux::delegate::Vendor::Claude),
         elements_are![eq("clientx")]
     );
     assert_that!(config.project_source, none());
@@ -681,7 +737,7 @@ fn a_directory_named_like_the_config_file_is_skipped() -> Result<()> {
 #[gtest]
 fn launch_environment_values_are_redacted_when_shown() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [launch]
@@ -773,7 +829,7 @@ fn a_config_base_outside_home_is_ignored() -> Result<()> {
 #[gtest]
 fn a_malformed_file_is_reported_without_its_contents() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         "[accounts.claude.work]\napi_key = \"sk-ant-live-secret\n",
     )
@@ -782,7 +838,7 @@ fn a_malformed_file_is_reported_without_its_contents() -> Result<()> {
     let unterminated = Config::load(&env(home.path()), home.path()).expect_err("malformed");
 
     // A value of the wrong kind is repeated by the parser's own message, quotes and all.
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         "[accounts.claude.work]\ninherit_settings = \"sk-ant-live-secret\"\n",
     )
@@ -810,7 +866,7 @@ fn a_malformed_file_is_reported_without_its_contents() -> Result<()> {
 #[gtest]
 fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         "[defaults.claude]\naccount = \"work account\"\n",
     )
@@ -818,12 +874,10 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
 
     assert_that!(
         Config::load(&env(home.path()), home.path()).map(|_| ()),
-        err(matches_pattern!(
-            agentmux::config::ConfigError::InvalidName {
-                what: eq(&"the default account"),
-                ..
-            }
-        ))
+        err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+            message: contains_substring("account"),
+            ..
+        }))
     );
     Ok(())
 }
@@ -837,10 +891,10 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
 /// business of knowing which models exist.
 #[gtest]
 fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
-    use agentmux::delegate::Vendor;
+    use agentmux::delegate::{ModelId, Vendor};
 
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -857,24 +911,30 @@ fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "fable-5"),
+        config.rewritten_model(Vendor::Claude, &ModelId::parse("fable-5").or_fail()?),
         some(eq("claude-fable-5-1"))
     );
     // Released this morning, named by nobody's configuration, launched exactly as asked.
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "claude-opus-6"),
+        config.rewritten_model(Vendor::Claude, &ModelId::parse("claude-opus-6").or_fail()?),
         none()
     );
     // The rewritten identifier is not itself a name to be rewritten again, and a rule mapping it
     // to itself is neither a rewrite nor the second link of a chain.
     assert_that!(
-        config.rewritten_model(Vendor::Claude, "claude-fable-5-1"),
+        config.rewritten_model(
+            Vendor::Claude,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         none()
     );
     // One vendor's rules are not the other's: the same name means different things to each CLI.
-    assert_that!(config.rewritten_model(Vendor::Codex, "fable-5"), none());
     assert_that!(
-        config.rewritten_model(Vendor::Codex, "gpt-6"),
+        config.rewritten_model(Vendor::Codex, &ModelId::parse("fable-5").or_fail()?),
+        none()
+    );
+    assert_that!(
+        config.rewritten_model(Vendor::Codex, &ModelId::parse("gpt-6").or_fail()?),
         some(eq("gpt-6-astra"))
     );
     Ok(())
@@ -890,7 +950,7 @@ fn a_project_file_that_rewrites_a_model_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/cloned");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -916,7 +976,7 @@ fn a_project_file_that_rewrites_a_model_is_refused() -> Result<()> {
 #[gtest]
 fn a_rewrite_that_chains_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -944,7 +1004,7 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
         r#""fable-5" = "--dangerously-skip-permissions""#,
         r#""fable-5" = """#,
     ] {
-        std::fs::write(
+        agentmux::testing::write_config_file(
             home.path().join("agentmux.toml"),
             indoc::formatdoc! {"
                 [models.claude]
@@ -954,12 +1014,10 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
         .or_fail()?;
         assert_that!(
             Config::load(&env(home.path()), home.path()).map(|_| ()),
-            err(matches_pattern!(
-                agentmux::config::ConfigError::InvalidName {
-                    what: eq(&"the model"),
-                    ..
-                }
-            )),
+            err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+                message: starts_with("model "),
+                ..
+            })),
             "{rule} was accepted"
         );
     }
@@ -973,10 +1031,10 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
 /// and the CLI's own is what runs.
 #[gtest]
 fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
-    use agentmux::delegate::Vendor;
+    use agentmux::delegate::{ModelId, Vendor};
 
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [efforts.claude]
@@ -991,21 +1049,27 @@ fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.default_effort(Vendor::Claude, "claude-fable-5-1"),
+        config.default_effort(
+            Vendor::Claude,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         some(eq("high"))
     );
     assert_that!(
-        config.default_effort(Vendor::Codex, "gpt-6-astra"),
+        config.default_effort(Vendor::Codex, &ModelId::parse("gpt-6-astra").or_fail()?),
         some(eq("medium"))
     );
     // Named by nobody's configuration: no effort, and the CLI decides.
     assert_that!(
-        config.default_effort(Vendor::Claude, "claude-opus-5"),
+        config.default_effort(Vendor::Claude, &ModelId::parse("claude-opus-5").or_fail()?),
         none()
     );
     // One vendor's defaults are not the other's.
     assert_that!(
-        config.default_effort(Vendor::Codex, "claude-fable-5-1"),
+        config.default_effort(
+            Vendor::Codex,
+            &ModelId::parse("claude-fable-5-1").or_fail()?
+        ),
         none()
     );
     Ok(())
@@ -1020,7 +1084,7 @@ fn a_project_file_that_names_a_default_effort_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     let repo = home.path().join("work/cloned");
     std::fs::create_dir_all(&repo).or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         repo.join("agentmux.toml"),
         indoc::indoc! {r#"
             [efforts.claude]
@@ -1045,7 +1109,7 @@ fn a_project_file_that_names_a_default_effort_is_refused() -> Result<()> {
 #[gtest]
 fn a_default_effort_keyed_by_a_rewritten_model_is_refused() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -1072,12 +1136,12 @@ fn a_default_effort_keyed_by_a_rewritten_model_is_refused() -> Result<()> {
 fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     for (rule, what) in [
-        (r#""fable 5" = "high""#, "the model"),
-        (r#""claude-fable-5-1" = "very high""#, "the effort"),
-        (r#""claude-fable-5-1" = "--verbose""#, "the effort"),
-        (r#""claude-fable-5-1" = """#, "the effort"),
+        (r#""fable 5" = "high""#, "model "),
+        (r#""claude-fable-5-1" = "very high""#, "effort "),
+        (r#""claude-fable-5-1" = "--verbose""#, "effort "),
+        (r#""claude-fable-5-1" = """#, "effort "),
     ] {
-        std::fs::write(
+        agentmux::testing::write_config_file(
             home.path().join("agentmux.toml"),
             indoc::formatdoc! {"
                 [efforts.claude]
@@ -1087,12 +1151,10 @@ fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> 
         .or_fail()?;
         assert_that!(
             Config::load(&env(home.path()), home.path()).map(|_| ()),
-            err(matches_pattern!(
-                agentmux::config::ConfigError::InvalidName {
-                    what: eq(&what),
-                    ..
-                }
-            )),
+            err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+                message: starts_with(what),
+                ..
+            })),
             "{rule} was accepted"
         );
     }

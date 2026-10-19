@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
@@ -24,7 +24,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
             sandbox: CodexSandbox::ReadOnly,
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
     )
@@ -40,7 +40,7 @@ fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tem
         Delegate::Claude {
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            account: None,
+            account: AccountChoice::Default,
             isolation: None,
         },
     )
@@ -54,7 +54,7 @@ fn consult_with(
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -69,6 +69,8 @@ fn consult_with(
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -155,7 +157,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -170,13 +172,15 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Reply with exactly: THE_REPORT_BODY".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -223,9 +227,9 @@ fn a_finished_transcript_offers_the_follow_up() -> Result<()> {
 #[gtest]
 fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let env: BTreeMap<String, String> = [("PATH", "/usr/bin")]
+    let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     let store = RunStore::open(
         dir.path(),
@@ -241,13 +245,15 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 sandbox: CodexSandbox::ReadOnly,
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "A long review.".to_owned(),
             cwd: PathBuf::from("/work/project"),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -282,7 +288,7 @@ fn no_rendered_result_names_an_answer_field() -> Result<()> {
 /// A rate limit whose window reopens soon must not send the caller to the other vendor.
 ///
 /// Switching vendor costs a whole consultation against a different model, so it is the wrong
-/// advice when the window reopens inside what a single `start` can already wait for.
+/// advice when the window reopens within the longest wait one call can block for.
 /// The reopening time is the only thing that separates this case from the next one, which is why
 /// discarding it made both cases produce the same sentence.
 #[gtest]
@@ -303,7 +309,7 @@ fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()>
     let warnings = agentmux_mcp::render::warnings(&status);
 
     assert_that!(warnings, contains_substring("five_hour"));
-    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, contains_substring("wait that long"));
     assert_that!(warnings, not(contains_substring("other vendor")));
     Ok(())
 }
@@ -387,7 +393,7 @@ fn a_model_the_vendor_expanded_is_reported_beside_the_one_requested() -> Result<
 #[gtest]
 fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
-    std::fs::write(
+    agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.claude]
@@ -418,13 +424,15 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
             delegate: Delegate::Claude {
                 model: ModelId::parse("sonnet").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: home.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -496,13 +504,15 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
             delegate: Delegate::Claude {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                account: None,
+                account: AccountChoice::Default,
                 isolation: None,
             },
             question: "q".to_owned(),
             cwd: dir.path().to_path_buf(),
             retention: Retention::Ttl,
             env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
         })
         .or_fail()?;
 
@@ -511,6 +521,37 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
     assert_that!(
         rendered,
         contains_substring("Its CLI wrote to stderr: No conversation found")
+    );
+    Ok(())
+}
+
+/// A Codex turn whose app-server sent something agentmux could not read says how to run the
+/// consultation without the app-server protocol, and other drift does not.
+#[gtest]
+fn protocol_drift_points_at_codex_exec() -> Result<()> {
+    let protocol_drift_capture = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th"}
+        {"type":"agentmux.undecoded","method":"item/completed","reason":"missing field","payload":{}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+    "#};
+    let (_store, status, _dir) = consult(protocol_drift_capture)?;
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        contains_substring("`codex_exec: true`")
+    );
+
+    let unknown_event_capture = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th"}
+        {"type":"some.future.event"}
+        {"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+    "#};
+    let (_store, status, _dir) = consult(unknown_event_capture)?;
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        all![
+            contains_substring("did not recognise"),
+            not(contains_substring("codex_exec"))
+        ]
     );
     Ok(())
 }

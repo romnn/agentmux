@@ -1,0 +1,33 @@
+[package]
+name = "codex-app-server-oracle"
+description = "Checks the generator's method table and the exec stream and rollout mirrors against codex's own Rust at the pinned release"
+version = "0.0.0"
+edition = "2024"
+license-file = "../../../LICENSE"
+publish = false
+
+# A workspace of its own: it builds codex's crate, several hundred packages with native
+# dependencies, which neither agentmux nor the generator's own tests should pay for.
+[workspace]
+
+[dependencies]
+codex-app-server-codegen = { path = ".." }
+# The pin of the whole protocol: this tag, as `Cargo.lock` resolves it, is the codex release the
+# vendored schema must come from (`codex-app-server-codegen pin`).
+codex-app-server-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
+codex-exec = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
+codex-history = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
+# agentmux's own protocol crate, whose hand-written mirrors of the exec stream and a rollout's usage
+# windows are checked here.
+mirror = { package = "codex-app-server-protocol", path = "../../codex-app-server-protocol" }
+serde_json = "1"
+
+[dev-dependencies]
+googletest = "0"
+
+# codex's crates resolve only with codex's own forks, which a dependent must repeat: copy the ones
+# this graph uses from `codex-rs/Cargo.toml` at the pinned tag whenever the tag moves.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

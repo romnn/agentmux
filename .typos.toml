@@ -1,5 +1,10 @@
 [files]
 ignore-files = true
+# Codex's own schema, and what is generated from it, whose descriptions are codex's words, not ours.
+extend-exclude = [
+  "crates/codex-app-server-codegen/schema/codex_app_server_protocol.schemas.json",
+  "crates/codex-app-server-protocol/src/generated/",
+]
 
 [default]
 extend-ignore-re = [

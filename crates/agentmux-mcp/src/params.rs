@@ -11,11 +11,12 @@
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use agentmux::delegate::{CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
+use agentmux::delegate::{Billing, CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 /// Build the schema for a string-valued choice as a flat `enum`.
 ///
@@ -27,10 +28,13 @@ use serde::Deserialize;
 /// one sentence that tells a caller to pick the vendor they are not.
 /// A flat `{"type": "string", "enum": [...]}` survives all of that.
 ///
-/// The fields carry the core crate's own enums — their `snake_case` serde names are the wire
-/// spellings — and only the *schema* is written by hand here, so the two cannot disagree about
-/// which values exist.
-fn string_choice(description: &str, values: &[&str]) -> Schema {
+/// The fields carry the core crate's own enums, and the values listed are those enums' variants
+/// as serde spells them, so the schema offers exactly what the field deserializes.
+fn string_enum_schema<T: VariantArray + Serialize>(description: &str) -> Schema {
+    let values: Vec<serde_json::Value> = T::VARIANTS
+        .iter()
+        .filter_map(|variant| serde_json::to_value(variant).ok())
+        .collect();
     json_schema!({
         "type": "string",
         "enum": values,
@@ -39,13 +43,16 @@ fn string_choice(description: &str, values: &[&str]) -> Schema {
 }
 
 fn vendor_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice("Which delegate CLI to run.", &["claude", "codex"])
+    string_enum_schema::<Vendor>("Which delegate CLI to run.")
+}
+
+fn billing_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_enum_schema::<Billing>("The pricing to run on: `subscription` or `api`.")
 }
 
 fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
-    string_choice(
+    string_enum_schema::<CodexSandbox>(
         "How much of the working directory a Codex delegate may write.",
-        &["read_only", "workspace_write"],
     )
 }
 
@@ -111,6 +118,28 @@ pub struct DelegateParams {
     #[serde(default)]
     #[schemars(schema_with = "sandbox_schema")]
     pub sandbox: Option<CodexSandbox>,
+
+    /// Whether the delegate's environment may carry an API key; omit it and the account decides.
+    ///
+    /// No key from the environment reaches a delegate unless this machine's `agentmux.toml` marks
+    /// its account `billing = "api"`, which the account list in these instructions shows.
+    /// `api` is refused for any other account, so it cannot switch API pricing on; it only makes a
+    /// consultation meant to use the account's key fail rather than run without it.
+    /// `subscription` withholds the key even from an account that allows one, and is refused for
+    /// one that authenticates only with a key.
+    /// Follow-ups keep whatever the first turn was allowed.
+    #[serde(default)]
+    #[schemars(schema_with = "billing_schema")]
+    pub billing: Option<Billing>,
+
+    /// Set to `true` to run a Codex consultation with `codex exec` rather than over
+    /// `codex app-server`; its follow-ups keep it.
+    ///
+    /// A consultation run this way cannot be steered.
+    /// Use it when an earlier Codex consultation failed with a protocol error, which means the
+    /// installed codex no longer speaks the app-server protocol this agentmux was built for.
+    #[serde(rename = "codex_exec", default)]
+    pub force_codex_exec: bool,
 }
 
 impl DelegateParams {

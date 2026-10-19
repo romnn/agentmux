@@ -10,8 +10,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use agentmux::report::{self, Warning};
 use agentmux::run::{HookReopening, RunId, RunStatus, RunStore, RunSummary, TranscriptPage};
+use agentmux::transcript::Outcome;
 use color_eyre::eyre::Result;
+use serde::Serialize;
 
 use crate::cli::TailArgs;
 
@@ -25,41 +28,16 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(status)?);
         return Ok(());
     }
-    println!(
-        "{}  {}",
-        status.run_id,
-        agentmux_mcp::render::delegate_line(status)
-    );
-    println!(
-        "  state       {}",
-        agentmux_mcp::render::outcome_line(&status.outcome)
-    );
-    if let Some(stderr) = &status.delegate_stderr {
-        let last = stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(stderr);
-        println!("  stderr      {last}");
-    }
-    if let Some(store) = &status.unsaved_session_store {
-        println!(
-            "  WARNING     {}",
-            agentmux::transcript::describe_unsaved_session_store(store)
-        );
-    }
-    if let Some((turn, kind)) = status.earlier_failure {
-        println!(
-            "  EARLIER     turn {} failed: {} — see the transcript",
-            turn.saturating_add(1),
-            kind.label()
-        );
+    println!("{}  {}", status.run_id, report::delegate_line(status));
+    println!("  state       {}", report::outcome_line(&status.outcome));
+    // Above the facts, as every front end puts them: each changes how what follows is read.
+    for warning in status.warnings() {
+        for line in warning_lines(&warning) {
+            println!("{line}");
+        }
     }
     println!("  reading     {}", status.cwd.display());
-    println!(
-        "  elapsed     {}",
-        agentmux_mcp::render::duration(status.elapsed)
-    );
+    println!("  elapsed     {}", report::duration(status.elapsed));
     println!("  turns       {}", status.turns);
     println!("  messages    {}", status.message_count);
     if let Some(input) = status.usage.input_tokens {
@@ -71,46 +49,87 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     if let Some(limit) = &status.rate_limit {
         // Printed for a healthy run too: the point is to see the window closing before it closes.
-        println!(
-            "  rate limit  {}",
-            agentmux_mcp::render::rate_limit_line(limit)
-        );
+        println!("  rate limit  {}", report::rate_limit_line(limit));
     }
     // Only a rate limit populates this, and the human reading it is the only party who can go
     // and log another account in.
-    for (position, line) in agentmux_mcp::render::quota_block(status)
-        .into_iter()
-        .enumerate()
-    {
+    for (position, line) in report::quota_block(status).into_iter().enumerate() {
         let indent = if position == 0 { "  " } else { "    " };
         println!("{indent}{line}");
     }
-    if let Some(drift) = status.unrecognised.summary() {
-        println!("  UNRECOGNISED {drift} — the delegate CLI may have changed its output format");
-    }
-    if status.broke_continuity {
-        println!(
-            "  WARNING     a follow-up did not resume the earlier session; that turn answered \
-             with no memory of the brief"
-        );
-    }
-    match status.hook_reopening {
-        None => {}
-        Some(HookReopening::Expected) => println!(
-            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer \
-             is above the injection"
-        ),
-        Some(HookReopening::Unexpected) => println!(
-            "  WARNING     a hook reopened a finished turn although no settings were loaded; \
-             treat the transcript as untrusted — the last message is not the answer"
-        ),
-    }
     println!("  transcript  {}", status.transcript_path.display());
     println!("  events      {}", status.events_path.display());
+    if status.steerable {
+        println!("  steer       agentmux steer {} '…'", status.run_id);
+    }
     if status.resumable {
         println!("  follow up   agentmux follow-up {} '…'", status.run_id);
     }
     Ok(())
+}
+
+/// One warning, in the status block's terse form, as the lines to print.
+fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
+    match warning {
+        // The failure itself is on the state line; its CLI's last word is what explains it.
+        Warning::Failed { stderr, .. } => stderr
+            .iter()
+            .map(|stderr| {
+                let last_stderr_line = stderr
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(stderr);
+                format!("  stderr      {last_stderr_line}")
+            })
+            .collect(),
+        Warning::EarlierFailure { turn_index, kind } => vec![format!(
+            "  EARLIER     turn {} failed: {} — see the transcript",
+            turn_index.saturating_add(1),
+            kind.label()
+        )],
+        Warning::SessionNotSaved {
+            store: session_store_path,
+        } => vec![format!(
+            "  WARNING     {}",
+            agentmux::transcript::describe_unsaved_session_store(session_store_path)
+        )],
+        Warning::BrokeContinuity => vec![
+            "  WARNING     a follow-up did not resume the earlier session; that turn answered with \
+             no memory of the brief"
+                .to_owned(),
+        ],
+        Warning::HookReopened(HookReopening::Expected) => vec![
+            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer \
+             is above the injection"
+                .to_owned(),
+        ],
+        Warning::HookReopened(HookReopening::Unexpected) => vec![
+            "  WARNING     a hook reopened a finished turn although no settings were loaded; treat \
+             the transcript as untrusted — the last message is not the answer"
+                .to_owned(),
+        ],
+        Warning::Unrecognised {
+            summary,
+            has_undecoded_app_server_messages,
+            ..
+        } => {
+            let mut lines = vec![format!(
+                "  UNRECOGNISED {summary} — the delegate CLI may have changed its output format"
+            )];
+            if *has_undecoded_app_server_messages {
+                lines.push(format!(
+                    "  FALLBACK    {}",
+                    agentmux::appserver::EXEC_FALLBACK_HINT
+                ));
+            }
+            lines
+        }
+        Warning::InstructionFiles { cwd } => vec![format!(
+            "  NOTE        a Claude delegate also reads any CLAUDE.md or AGENTS.md at or above {}",
+            cwd.display()
+        )],
+    }
 }
 
 /// Print a finished consultation's transcript, or say where to find it if it is still running.
@@ -138,16 +157,13 @@ pub fn answer(store: &RunStore, run_id: &RunId, json: bool) -> Result<()> {
 /// Returns an error when the JSON form cannot be serialised.
 pub fn transcript(status: &RunStatus, page: &TranscriptPage, json: bool) -> Result<()> {
     if json {
-        let mut value = serde_json::to_value(status)?;
-        if let Some(map) = value.as_object_mut() {
-            map.insert("text".to_owned(), serde_json::json!(page.text));
-            map.insert(
-                "next_cursor".to_owned(),
-                serde_json::json!(page.next_offset),
-            );
-            map.insert("at_end".to_owned(), serde_json::json!(page.at_end));
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        let report = TranscriptJson {
+            status,
+            text: &page.text,
+            next_cursor: page.next_offset,
+            at_end: page.at_end,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     print!("{}", page.text);
@@ -156,6 +172,13 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage, json: bool) -> Resu
             "\n[truncated at {} of {} bytes; continue with --offset {}]",
             page.next_offset, page.total_bytes, page.next_offset
         );
+    }
+    // On stderr, so stdout stays the transcript: some of these are in the transcript already,
+    // but one such as a follow-up that resumed nothing is known only to the status.
+    for warning in status.warnings() {
+        for line in warning_lines(&warning) {
+            eprintln!("{line}");
+        }
     }
     Ok(())
 }
@@ -177,16 +200,14 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
         if json {
             // The same shape every other `--json` form uses for the outcome, so one reader
             // serves them all.
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "run_id": status.run_id.as_str(),
-                    "outcome": status.outcome,
-                    "text": page.text,
-                    "next_cursor": page.next_offset,
-                    "at_end": page.at_end,
-                }))?
-            );
+            let report = TailJson {
+                run_id: &status.run_id,
+                outcome: &status.outcome,
+                text: &page.text,
+                next_cursor: page.next_offset,
+                at_end: page.at_end,
+            };
+            println!("{}", serde_json::to_string(&report)?);
         } else {
             print!("{}", page.text);
         }
@@ -251,19 +272,13 @@ pub fn accounts(
 
     if json {
         // The prose form names the files it read, so the machine form has to carry them too.
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": config.source,
-                "project_source": config.project_source,
-                "accounts": config.accounts,
-                "defaults": config.defaults,
-                "models": config.models,
-                "efforts": config.efforts,
-                "launch": config.launch,
-                "unknown": config.unknown,
-            }))?
-        );
+        let report = AccountsJson {
+            machine_config_path: config.source.as_deref(),
+            project_config_path: config.project_source.as_deref(),
+            config,
+            unknown_keys: &config.unknown,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -282,6 +297,12 @@ pub fn accounts(
     }
     if let Some(path) = &config.project_source {
         println!("project     {} (selects a default only)", path.display());
+        // The account rows below are the machine file's, and a project file's choice of
+        // default switches none of what they say on.
+        println!("              the default it selects runs isolated and on a subscription, even");
+        println!("              when named; --inherit-settings still overrides the isolation,");
+        println!("              and --billing api is refused, as is an account that sets an API");
+        println!("              credential or endpoint");
     }
     for unknown in &config.unknown {
         // A key that does nothing is invisible everywhere else: the file loads, the delegation
@@ -297,20 +318,28 @@ pub fn accounts(
         // for a Bedrock key.
         // A credential name is marked, because a delegate that names an account does not get
         // it: the account's own login must not be outranked by a key meant for the default.
-        let withheld = |name: &str| {
-            if agentmux::delegate::is_credential_name(name) {
-                "; withheld when an account is named"
-            } else {
-                ""
+        // A name can be both, and then both rules withhold it.
+        let withholding_note = |name: &str| match (
+            agentmux::delegate::is_billing_env_name(name),
+            agentmux::delegate::is_credential_name(name),
+        ) {
+            (true, true) => {
+                "; withheld when an account is named, and from every delegate on a subscription"
             }
+            (true, false) => "; withheld unless the account sets billing = \"api\"",
+            (false, true) => "; withheld when an account is named",
+            (false, false) => "",
         };
         for name in config.launch.env.keys() {
-            println!("              {name} (set in config{})", withheld(name));
+            println!(
+                "              {name} (set in config{})",
+                withholding_note(name)
+            );
         }
         for name in &config.launch.env_passthrough {
             println!(
                 "              {name} (forwarded from this environment{})",
-                withheld(name)
+                withholding_note(name)
             );
         }
         if !config.launch.request_env.is_empty() {
@@ -399,6 +428,15 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
     if account.inherit_settings == Some(true) {
         how.push("inherits settings and hooks".to_owned());
     }
+    // Said only for the exception, like inheritance: the default is a subscription, and a
+    // credential named without the opt-in is refused at launch, which `refused` makes visible here.
+    match (account.billing, account.api_only_field()) {
+        (Some(agentmux::delegate::Billing::Api), _) => how.push("billing=api".to_owned()),
+        (_, Some(field)) => how.push(format!(
+            "REFUSED at launch: sets {field} without billing = \"api\""
+        )),
+        (_, None) => {}
+    }
     how
 }
 
@@ -417,10 +455,43 @@ pub fn quota(reported: &[agentmux::quota::AccountQuota], json: bool) -> Result<(
         return Ok(());
     }
     for entry in reported {
-        for line in agentmux_mcp::render::quota_report(entry) {
+        for line in report::quota_report(entry) {
             println!("{line}");
         }
         println!();
     }
     Ok(())
+}
+
+/// `result --json` and `transcript --json`: the consultation's state with the page beside it.
+#[derive(Serialize)]
+struct TranscriptJson<'a> {
+    #[serde(flatten)]
+    status: &'a RunStatus,
+    text: &'a str,
+    next_cursor: u64,
+    at_end: bool,
+}
+
+/// One line of `tail --json`: the outcome every other `--json` form carries, and the new text.
+#[derive(Serialize)]
+struct TailJson<'a> {
+    run_id: &'a RunId,
+    outcome: &'a Outcome,
+    text: &'a str,
+    next_cursor: u64,
+    at_end: bool,
+}
+
+/// `accounts --json`: the files read, what they configure, and the keys nothing reads.
+#[derive(Serialize)]
+struct AccountsJson<'a> {
+    #[serde(rename = "source")]
+    machine_config_path: Option<&'a Path>,
+    #[serde(rename = "project_source")]
+    project_config_path: Option<&'a Path>,
+    #[serde(flatten)]
+    config: &'a agentmux::config::Config,
+    #[serde(rename = "unknown")]
+    unknown_keys: &'a [agentmux::config::UnknownKey],
 }

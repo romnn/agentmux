@@ -1,4 +1,4 @@
-//! The MCP surface: nine tools over one run store, spoken over stdio.
+//! The MCP surface: ten tools over one run store, spoken over stdio.
 //!
 //! Changes when the tool API changes.
 //!

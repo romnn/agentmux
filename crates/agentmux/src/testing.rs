@@ -6,9 +6,10 @@
 //! happens between a spawn and a stream, and none of it is testable against a real CLI in CI.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::delegate::Invocation;
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 
 /// Take a lock, recovering from a poisoned one rather than panicking.
@@ -36,6 +37,15 @@ pub struct Script {
     /// Both model a real child flushing the tail of its stream as it exits, which is what makes
     /// the gap between reading the capture file and observing the process a race worth testing.
     pub flush_on_departure: Option<String>,
+    /// Whether the child outlives every request to stop, as one stuck in an uninterruptible
+    /// wait does.
+    pub survives_stop: bool,
+    /// Whether the launcher cannot tell the running child from another process holding its pid,
+    /// as an agentmux restarted without a recorded start time cannot.
+    ///
+    /// Such a child reports [`Liveness::Unknown`] until it is
+    /// [marked gone](ScriptedLauncher::mark_process_gone).
+    pub unidentifiable: bool,
 }
 
 impl Script {
@@ -84,6 +94,26 @@ impl Script {
         }
     }
 
+    /// A child that emits `events` and keeps running however it is asked to stop.
+    #[must_use]
+    pub fn survives_stop(events: impl Into<String>) -> Self {
+        Self {
+            events: events.into(),
+            survives_stop: true,
+            ..Self::default()
+        }
+    }
+
+    /// A child that emits `events` and keeps running, which the launcher cannot identify.
+    #[must_use]
+    pub fn unidentifiable(events: impl Into<String>) -> Self {
+        Self {
+            events: events.into(),
+            unidentifiable: true,
+            ..Self::default()
+        }
+    }
+
     /// A child that emits `events`, keeps running, and flushes `tail` as it dies once it has been
     /// asked to stop.
     ///
@@ -97,6 +127,28 @@ impl Script {
             ..Self::default()
         }
     }
+}
+
+/// Write a configuration file that only its owner can write, whatever the umask.
+///
+/// `Config::load` refuses a file other users could write, and a shell with `umask 002` would
+/// otherwise make every file a test writes one of those.
+///
+/// # Errors
+///
+/// Whatever writing the file or setting its permissions fails with.
+pub fn write_config_file(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// What a scripted launcher was actually asked to run.
@@ -133,25 +185,37 @@ impl RecordedLaunch {
 }
 
 /// A launcher that plays back canned event streams instead of starting processes.
-#[derive(Debug, Default)]
+///
+/// Each launcher hands out pids from a range of its own, so two launchers serving one store, as
+/// two agentmux processes would, never name each other's children; a pid a launcher did not hand
+/// out is a process it cannot see, which it reports gone, as the real launcher reports a process
+/// that is not there.
+#[derive(Debug)]
 pub struct ScriptedLauncher {
+    /// The first pid this launcher hands out.
+    first_pid: u32,
     scripts: Mutex<VecDeque<Script>>,
     launches: Mutex<Vec<RecordedLaunch>>,
     terminated: Mutex<Vec<u32>>,
     killed: Mutex<Vec<u32>>,
     flushed: Mutex<BTreeSet<u32>>,
+    gone_pids: Mutex<BTreeSet<u32>>,
 }
 
 impl ScriptedLauncher {
     /// A launcher that will play `scripts` in order, one per launch.
     #[must_use]
     pub fn new(scripts: impl IntoIterator<Item = Script>) -> Self {
+        let launcher_index = NEXT_LAUNCHER_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
+            first_pid: FAKE_PID_BASE
+                .saturating_add(launcher_index.saturating_mul(PIDS_PER_LAUNCHER)),
             scripts: Mutex::new(scripts.into_iter().collect()),
             launches: Mutex::new(Vec::new()),
             terminated: Mutex::new(Vec::new()),
             killed: Mutex::new(Vec::new()),
             flushed: Mutex::new(BTreeSet::new()),
+            gone_pids: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -159,6 +223,26 @@ impl ScriptedLauncher {
     #[must_use]
     pub fn launches(&self) -> Vec<RecordedLaunch> {
         lock(&self.launches).clone()
+    }
+
+    /// The handle this launcher returns for its `index`th launch, counting from zero, so a test
+    /// can stop that child as a real one would stop.
+    #[must_use]
+    pub fn launch_handle(&self, index: usize) -> Launched {
+        Launched {
+            pid: self
+                .first_pid
+                .saturating_add(u32::try_from(index).unwrap_or(u32::MAX)),
+            process_group: None,
+            started: None,
+        }
+    }
+
+    /// Which of this launcher's launches `pid` is, or `None` for a pid it never handed out.
+    fn launch_index_for_pid(&self, pid: u32) -> Option<usize> {
+        pid.checked_sub(self.first_pid)
+            .filter(|offset| *offset < PIDS_PER_LAUNCHER)
+            .and_then(|offset| usize::try_from(offset).ok())
     }
 
     /// The pids the launcher was asked to terminate.
@@ -171,6 +255,12 @@ impl ScriptedLauncher {
     #[must_use]
     pub fn killed(&self) -> Vec<u32> {
         lock(&self.killed).clone()
+    }
+
+    /// Take a child out of the process table without being asked, as one agentmux cannot signal
+    /// leaves when it is done.
+    pub fn mark_process_gone(&self, launched: Launched) {
+        lock(&self.gone_pids).insert(launched.pid);
     }
 
     /// Whether a scripted child has been asked to stop.
@@ -205,10 +295,27 @@ impl ScriptedLauncher {
     }
 }
 
+impl Default for ScriptedLauncher {
+    fn default() -> Self {
+        Self::new([])
+    }
+}
+
 /// Pids above `i32::MAX` so a stray reap can never name a real process.
 const FAKE_PID_BASE: u32 = 4_000_000_000;
 
+/// How many pids each launcher's range holds, which is more launches than any test makes.
+const PIDS_PER_LAUNCHER: u32 = 1024;
+
+/// How many launchers this process has made, which places the next one's pid range.
+static NEXT_LAUNCHER_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl Launcher for ScriptedLauncher {
+    /// A scripted delegate is no CLI, and names itself after the program it stands in for.
+    fn version(&self, invocation: &Invocation, _cwd: &Path) -> Option<String> {
+        Some(format!("{} (scripted)", invocation.program()))
+    }
+
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {
         let mut launches = lock(&self.launches);
         let index = launches.len();
@@ -224,28 +331,31 @@ impl Launcher for ScriptedLauncher {
         })?;
 
         launches.push(RecordedLaunch {
-            program: spec.invocation.program.to_owned(),
-            args: spec.invocation.args.clone(),
-            env: spec.invocation.env.clone(),
+            program: spec.invocation.program().to_owned(),
+            args: spec.invocation.args().to_vec(),
+            env: spec.invocation.env().clone(),
             cwd: spec.cwd.to_owned(),
             events: spec.events.to_owned(),
             question: std::fs::read_to_string(spec.question).unwrap_or_default(),
         });
 
-        Ok(Launched {
-            pid: FAKE_PID_BASE.saturating_add(u32::try_from(index).unwrap_or(0)),
-            process_group: None,
-            started: None,
-        })
+        Ok(self.launch_handle(index))
     }
 
     fn liveness(&self, launched: Launched) -> Liveness {
-        let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
+        let Some(index) = self.launch_index_for_pid(launched.pid) else {
+            return Liveness::Gone;
+        };
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
 
-        if script.exit.is_some() || self.stopped(launched.pid) {
+        if script.exit.is_some()
+            || (self.stopped(launched.pid) && !script.survives_stop)
+            || lock(&self.gone_pids).contains(&launched.pid)
+        {
             Liveness::Gone
+        } else if script.unidentifiable {
+            Liveness::Unknown
         } else {
             Liveness::Alive
         }
@@ -266,12 +376,12 @@ impl Launcher for ScriptedLauncher {
     }
 
     fn reap(&self, launched: Launched) -> Option<ExitStatus> {
-        let index = usize::try_from(launched.pid.saturating_sub(FAKE_PID_BASE)).unwrap_or(0);
+        let index = self.launch_index_for_pid(launched.pid)?;
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
         script.exit.or_else(|| {
             // A stopped child reports the signal that stopped it, as a real one would.
-            self.stopped(launched.pid).then_some(ExitStatus {
+            (self.stopped(launched.pid) && !script.survives_stop).then_some(ExitStatus {
                 code: None,
                 signal: Some(15),
             })

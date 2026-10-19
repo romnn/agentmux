@@ -2,16 +2,18 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same nine verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! The same ten verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
+//! One more, `codex-app-server`, is hidden: it is the driver the run store launches for a Codex
+//! turn it runs over `codex app-server`.
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{CodexSandbox, Delegate, Isolation, Vendor};
+use agentmux::delegate::{Billing, CodexSandbox, Delegate, Isolation, Vendor};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -28,6 +30,22 @@ pub struct Cli {
     /// Print machine-readable JSON instead of prose.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// How a Codex turn that can be steered is launched.
+    ///
+    /// `app-server` drives a Codex consultation that inherits its account's settings over
+    /// `codex app-server`, which is what lets `steer` reach its running turn; an isolated one runs
+    /// over `codex exec` either way.
+    /// `exec` launches every Codex turn with `codex exec`, for a codex CLI whose app-server
+    /// cannot run these turns; no Codex turn can then be steered.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "AGENTMUX_CODEX_LAUNCH",
+        default_value_t = CodexLaunchArg::AppServer
+    )]
+    pub codex_launch: CodexLaunchArg,
 
     #[command(subcommand)]
     pub command: Command,
@@ -60,6 +78,13 @@ pub enum Command {
     #[command(name = "follow-up", alias = "followup")]
     FollowUp(FollowUpArgs),
 
+    /// Add an instruction to a consultation's running turn, which the delegate sees before its
+    /// next model call.
+    ///
+    /// Only a turn launched over `codex app-server` takes one; `status` says whether the running
+    /// turn is steerable.
+    Steer(SteerArgs),
+
     /// Stop a running consultation, keeping everything collected so far.
     Cancel(RunArgs),
 
@@ -78,6 +103,29 @@ pub enum Command {
 
     /// Serve the tools over stdio, for an MCP host to launch.
     Mcp(McpArgs),
+
+    /// Drive one Codex turn over `codex app-server`.
+    ///
+    /// Launched by the run store as a consultation's delegate, never by hand.
+    #[command(name = "codex-app-server", hide = true)]
+    CodexAppServer(CodexAppServerArgs),
+}
+
+/// How a Codex turn that can be steered is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CodexLaunchArg {
+    /// Over `codex app-server`, driven by this executable, so the turn can be steered.
+    AppServer,
+    /// With `codex exec`, which reads its question once.
+    Exec,
+}
+
+/// The plan a driven Codex turn runs under.
+#[derive(Debug, Args)]
+pub struct CodexAppServerArgs {
+    /// The plan the run store wrote into the turn's directory.
+    #[arg(value_name = "PLAN")]
+    pub plan_path: PathBuf,
 }
 
 /// How the server is served.
@@ -93,7 +141,7 @@ pub struct McpArgs {
     /// agentmux is worth paying for across the vendor line, not along it.
     /// Denying both leaves nothing to consult and is refused.
     #[arg(long = "deny", value_enum, value_name = "VENDOR")]
-    pub deny: Vec<VendorArg>,
+    pub deny: Vec<Vendor>,
 }
 
 /// Which delegate to consult, and on what terms.
@@ -101,7 +149,7 @@ pub struct McpArgs {
 pub struct DelegateArgs {
     /// Which CLI to consult: `claude` reaches Anthropic models, `codex` reaches GPT models.
     #[arg(long, value_enum)]
-    pub delegate: VendorArg,
+    pub delegate: Vendor,
 
     /// Model identifier, passed to the delegate CLI verbatim, for example `claude-opus-5` or
     /// `gpt-6-astra`.
@@ -145,31 +193,17 @@ pub struct DelegateArgs {
     /// How much of the filesystem the delegate may write, for `--delegate codex`.
     /// Defaults to `read-only`.
     #[arg(long, value_enum)]
-    pub sandbox: Option<SandboxArg>,
-}
+    pub sandbox: Option<CodexSandbox>,
 
-/// Which CLI to consult.
-///
-/// A copy of [`Vendor`] that clap can list in `--help`; the core enum stays free of clap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum VendorArg {
-    /// Anthropic's `claude`.
+    /// Whether the delegate's environment may carry an API key; omitted, the account decides.
     ///
-    /// Aliased to `claude-code` because the CLI and the harness that runs it are spelled
-    /// differently, and `--deny` is written while thinking of the harness.
-    #[value(alias = "claude-code")]
-    Claude,
-    /// The `codex` CLI from `OpenAI`.
-    Codex,
-}
-
-impl From<VendorArg> for Vendor {
-    fn from(vendor: VendorArg) -> Self {
-        match vendor {
-            VendorArg::Claude => Self::Claude,
-            VendorArg::Codex => Self::Codex,
-        }
-    }
+    /// No key from the environment reaches a delegate unless `agentmux.toml` marks its account
+    /// `billing = "api"`, which `agentmux accounts` shows.
+    /// `api` is refused for any other account: it insists on the permission, it cannot grant it.
+    /// `subscription` withholds the key even from an account that allows one.
+    /// Follow-ups keep whatever the first turn was allowed.
+    #[arg(long, value_enum)]
+    pub billing: Option<Billing>,
 }
 
 /// Which vendor's accounts to ask about.
@@ -178,25 +212,7 @@ pub struct QuotaArgs {
     /// Ask only this vendor.
     /// Both are asked when omitted.
     #[arg(long, value_enum)]
-    pub delegate: Option<VendorArg>,
-}
-
-/// How much of the filesystem a Codex delegate may write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SandboxArg {
-    /// Read the working directory, write nothing.
-    ReadOnly,
-    /// Also write inside the working directory.
-    WorkspaceWrite,
-}
-
-impl From<SandboxArg> for CodexSandbox {
-    fn from(sandbox: SandboxArg) -> Self {
-        match sandbox {
-            SandboxArg::ReadOnly => Self::ReadOnly,
-            SandboxArg::WorkspaceWrite => Self::WorkspaceWrite,
-        }
-    }
+    pub delegate: Option<Vendor>,
 }
 
 impl DelegateArgs {
@@ -220,12 +236,12 @@ impl DelegateArgs {
     /// vendor-specific option was set for the wrong vendor.
     pub fn build(&self) -> Result<Delegate> {
         Delegate::from_parts(
-            self.delegate.into(),
+            self.delegate,
             &self.model,
             self.effort.as_deref(),
             self.account.as_deref(),
             self.isolation(),
-            self.sandbox.map(CodexSandbox::from),
+            self.sandbox,
         )
         .wrap_err("invalid delegate arguments")
     }
@@ -270,26 +286,7 @@ impl QuestionArgs {
     /// Returns an error when the file cannot be read, stdin cannot be read, or the question is
     /// empty — a delegate given an empty brief burns money to say nothing.
     pub fn text(&self) -> Result<String> {
-        let text = match (&self.question, &self.file) {
-            (Some(text), _) => text.clone(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .wrap_err_with(|| format!("reading the question from {}", path.display()))?,
-            (None, None) => {
-                use std::io::Read as _;
-                let mut buffer = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buffer)
-                    .wrap_err("reading the question from stdin")?;
-                buffer
-            }
-        };
-        if text.trim().is_empty() {
-            bail!(
-                "the question is empty. Pass it as an argument, with --file, or on stdin. The \
-                 delegate starts with no context, so the question has to be self-contained."
-            );
-        }
-        Ok(text)
+        supplied_text(self.question.as_deref(), self.file.as_deref())
     }
 
     /// The directory the delegate reads from, made absolute.
@@ -348,6 +345,30 @@ impl QuestionArgs {
             Retention::Ttl
         }
     }
+}
+
+/// The text given as an argument, else read from `file`, else from stdin, refused when empty.
+fn supplied_text(text: Option<&str>, file: Option<&Path>) -> Result<String> {
+    let text = match (text, file) {
+        (Some(text), _) => text.to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("reading the question from {}", path.display()))?,
+        (None, None) => {
+            use std::io::Read as _;
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .wrap_err("reading the question from stdin")?;
+            buffer
+        }
+    };
+    if text.trim().is_empty() {
+        bail!(
+            "the question is empty. Pass it as an argument, with --file, or on stdin. The \
+             delegate starts with no context, so the question has to be self-contained."
+        );
+    }
+    Ok(text)
 }
 
 /// Arguments for `agentmux ask`: who to consult, what to ask, and how long to wait.
@@ -449,14 +470,33 @@ impl FollowUpArgs {
     ///
     /// Returns an error when the file or stdin cannot be read, or the question is empty.
     pub fn text(&self) -> Result<String> {
-        QuestionArgs {
-            env: Vec::new(),
-            question: self.question.clone(),
-            file: self.file.clone(),
-            cwd: None,
-            keep: false,
-        }
-        .text()
+        supplied_text(self.question.as_deref(), self.file.as_deref())
+    }
+}
+
+/// Arguments for `agentmux steer`: which consultation, and what to tell its running turn.
+#[derive(Debug, Args)]
+pub struct SteerArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// The instruction.
+    /// Omit it to read from stdin.
+    pub message: Option<String>,
+
+    /// Read the instruction from a file instead.
+    #[arg(long, short = 'f', conflicts_with = "message")]
+    pub file: Option<PathBuf>,
+}
+
+impl SteerArgs {
+    /// Read the instruction from wherever it was supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file or stdin cannot be read, or the instruction is empty.
+    pub fn text(&self) -> Result<String> {
+        supplied_text(self.message.as_deref(), self.file.as_deref())
     }
 }
 

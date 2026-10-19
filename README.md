@@ -87,14 +87,14 @@ natively, in-process, and under its own supervision, which is cheaper and better
 anything `agentmux` can start for it. So under Claude Code the tools offer `codex` and nothing else,
 and under Codex they offer `claude`.
 
-A denied vendor is left out of the `delegate` choices `ask` and `start` advertise, so a calling model
-does not spend a call discovering it; one that names it anyway is refused before any process starts,
-and so is a `follow_up` that would resume it. `quota` still reports both vendors — reading what an
-account has left launches nothing. `--deny claude-code` is accepted as another spelling of
-`--deny claude`, and denying both vendors is refused rather than served, since it would leave nothing
-to consult. The flag is a server flag only: `agentmux ask` in a terminal still reaches either vendor.
-Leave it off when the server is how you reach a second account of your own vendor — it refuses the
-vendor as a whole, not one account.
+A denied vendor is left out of the `delegate` choices `ask` and `start` advertise, so a calling
+model does not spend a call discovering it; one that names it anyway is refused before any process
+starts, and so is a `follow_up` that would resume it. `quota` still reports both vendors — denial
+restricts consultations, not usage probes, which may start a CLI but never ask a model.
+`--deny claude-code` is accepted as another spelling of `--deny claude`, and denying both vendors is
+refused rather than served, since it would leave nothing to consult. The flag is a server flag only:
+`agentmux ask` in a terminal still reaches either vendor. Leave it off when the server is how you
+reach a second account of your own vendor — it refuses the vendor as a whole, not one account.
 
 ### Tools
 
@@ -112,13 +112,14 @@ disk. The inline text is a bounded convenience; the file is the record.
 | `tail`      | The transcript written since a cursor, plus the next cursor — call it on a loop     |
 | `result`    | The complete transcript, paged, optionally after blocking for the consultation      |
 | `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
+| `steer`     | Add an instruction to a turn that is still running, read before its next model call |
 | `cancel`    | Stop a running consultation, keeping everything collected so far; returns once it has  |
 | `list`      | Recent consultations with their ids, so an id can be recovered                       |
 | `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
 
 ### Use from the command line
 
-The same nine verbs are available directly, as a unified CLI over both vendors:
+The same ten verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.
@@ -129,6 +130,12 @@ agentmux ask --delegate codex --model gpt-6-astra --effort high \
 agentmux start --delegate claude --model claude-opus-5 --effort xhigh --keep \
   --file review/brief.md
 agentmux tail <run-id> --follow
+
+# A correction while the turn is still running, from another terminal. Only a Codex turn that
+# inherits its account's settings runs over `codex app-server`, which is what can take one.
+agentmux start --delegate codex --model gpt-6-astra --effort high --inherit-settings \
+  'Review the diff against main for correctness bugs. Cite file:line.'
+agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
 # One more question, in the delegate's own session.
 agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
@@ -172,18 +179,22 @@ description = "Personal Max subscription"
 inherit_settings = true
 
 # A key kept out of the file, read from the environment at launch.
+# A key is billed per token, so the account must say it may be: see "Billing safety".
 [accounts.claude.ci]
 api_key_env = "CI_ANTHROPIC_KEY"
+billing = "api"
 
 # A gateway that authenticates with a bearer token rather than a key (Claude only).
 [accounts.claude.gateway]
 base_url = "https://llm-gateway.example.com"
 auth_token_env = "GATEWAY_TOKEN"
+billing = "api"
 
 # A locally served OpenAI-compatible endpoint.
 [accounts.codex.local]
 base_url = "http://localhost:11434/v1"
 api_key = "ollama"
+billing = "api"
 ```
 
 Aliases are opaque, exactly like model identifiers: agentmux keeps no roster, and naming one that
@@ -214,21 +225,23 @@ an account:
 account = "clientx"
 ```
 
-A project file that tries to define an account, a `[launch]` table or a `[models]` rewrite is
-refused by name. It has to be, because such a file arrives with a `git clone`: were it able to
-name a `base_url` and an `api_key_env`, cloning a repository and asking for one second opinion
-would send your key to whoever wrote it. For the same reason a project file may choose *which* of
-your accounts pays but nothing more: an account it selects runs isolated unless the call says
-otherwise, and does not bring its own `request_env` with it. Either file is read only when you own
-it and nobody else can write it, and a file that cannot be parsed is reported by position, never by
-quoting the line.
+A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite or an
+`[efforts]` default is refused by name. It has to be, because such a file arrives with a
+`git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a repository and asking
+for one second opinion would send your key to whoever wrote it. For the same reason a project file
+may choose *which* of your accounts pays but nothing more: an account it selects runs isolated
+unless the call says otherwise, and does not bring its own `request_env` with it. On Unix either
+file is read only when you own it and nobody else can write it (other platforms check only that it
+is a regular file), and a file that cannot be parsed is reported by position, never by quoting the
+line.
 
 **A key agentmux does not know is a warning, not a failure.** One machine file is read by every
 agentmux on the machine, including the MCP servers that have been running since before you added
 the key; refusing the file would take those servers out entirely over a table they have no use for.
 So an unknown key is ignored, named on stderr and listed by `agentmux accounts` as `ignored`, and
 the rest of the file takes effect. The same warning is what a misspelling gets — `configdir` for
-`config_dir` leaves that account on the CLI's own login — so read the `ignored` lines: the two need
+`config_dir` can leave that account on the CLI's own login, and an account left with nothing
+understood is refused — so read the `ignored` lines: the two need
 opposite fixes, and only one of them is fixed by upgrading.
 
 ### Model rewrites
@@ -343,6 +356,66 @@ stays there. On Windows, where the operating system reads environment names with
 case, agentmux spells every name in upper case on the way in, so `path` and `PATH` are one name
 everywhere it looks.
 
+### Billing safety
+
+A delegate runs on the subscription its CLI is logged in with, unless the machine file says
+otherwise for the account it runs on. A key or endpoint override found in the environment can move
+a CLI onto per-token API billing — which one wins over a stored login depends on the vendor and the
+login — so without this a key the launching shell happened to export could quietly turn a
+consultation into a paid one.
+
+**`billing = "subscription"` is the default**, and needs no configuration:
+
+- Every API-key and billing-override variable is removed from the delegate's environment at the
+  launch itself, whichever layer put it there: the host, `[launch]`, an account's `env`, or a
+  call's `env`. That is any name ending in `_API_KEY` or `_API_KEY_FILE`, any `ANTHROPIC_`,
+  `CLAUDE_`, `OPENAI_`, `AZURE_OPENAI_` or `CODEX_` name that names a URL (`_BASE_URL`,
+  `_URL_OVERRIDE` and the like) or ends in `_ISSUER` or `_AUTH_TOKEN`, and
+  `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `CLAUDE_CODE_USE_FOUNDRY`, `AWS_BEARER_TOKEN_BEDROCK` and `CODEX_ACCESS_TOKEN`, in any case.
+  A subscription token such as `CLAUDE_CODE_OAUTH_TOKEN` is not among them.
+- A call whose `env` names one of those is refused, even when `request_env` lists it.
+- An account that sets `api_key`, `api_key_env`, `auth_token`, `auth_token_env` or `base_url` is
+  refused at launch, naming the field; `agentmux accounts` marks it in advance.
+- The quota probes run with the same base environment a delegate starts from and the account's
+  configuration directory, always scrubbed of those names, and without the `[launch]` or account
+  layers.
+
+**`billing = "api"`** on an account in the machine file lifts exactly those restrictions for that
+account, as in the [examples above](#accounts): it permits API pricing, and agentmux cannot
+tell whether the CLI then uses the account's key or a login. Every report on such a consultation
+says so:
+`billing=api` beside the delegate in the header every tool and `agentmux status` print and in
+`list`, `"billing": "api"` in `--json`, and a line under the question in the transcript. The key is
+still the account's own; a key the host exported is withheld, as it is for any account that was
+named.
+
+A call may pin the pricing it expects, with `billing` on `start` and `ask` (`--billing` on the
+command line), as it pins a model. `api` is refused unless the account opted in, so it cannot
+switch API pricing on; it only makes a consultation that is meant to use the account's key fail
+rather than run under the subscription rule. `subscription` keeps even an account that allows API
+pricing on its login, and is refused for one that authenticates only with a key. Whatever the
+first turn was allowed is pinned for the consultation's follow-ups, however the files change in
+between.
+
+A project `agentmux.toml` may select an account that opts in, but the opt-in does not come with it:
+the consultation runs under the subscription rule, and an account that names a key is refused.
+That file arrives with a clone, so it may say which account runs, never that a key reaches it.
+
+The rule is about the environment, because that is where a key a project needs for its own
+backend ends up by accident. What a CLI's own configuration says is left alone: a provider or an
+endpoint in `~/.codex/config.toml`, a Codex login made with `codex login --with-api-key`, or a key
+in the `settings.json` an inheriting Claude delegate loads is a choice the user made for that CLI.
+A Claude delegate names the key source it used when its turn starts, so a turn that did not run
+on the subscription says so in the transcript.
+
+**Upgrading from 0.0.8**, which passed keys through: an account that names a key or an endpoint
+(`api_key`, `api_key_env`, `auth_token`, `auth_token_env`, `base_url`) needs `billing = "api"`
+added to its table in the machine file, or its launches are refused naming the field, and
+`agentmux accounts` marks it until then. A key exported in the shell that starts `agentmux`
+reaches no delegate any more; to keep using it, give it to an account with `api_key_env` and
+`billing = "api"`. Nothing else in the file changes.
+
 ### Isolation, and opting out of it
 
 By default a delegate loads **no** user, project or local settings, no hooks and no MCP servers.
@@ -384,7 +457,9 @@ guarded by the variable alone.
 
 The child environment is built as an **allowlist from empty**, never by filtering a denylist. It
 gets `PATH`, `HOME`, locale, proxy and CA settings, and the credential variables its own vendor
-reads — and nothing else. None of the launching agent's session identity reaches it.
+reads, less the API keys [Billing safety](#billing-safety) removes — and nothing else. None of the
+launching agent's session identity reaches it
+([ADR 0022](docs/adr/0022-delegate-env-from-allowlist.md)).
 
 A Claude delegate runs with `--setting-sources ""`, so no user, project or local settings load and
 no hook can reopen its finished turn, and with `--strict-mcp-config` and an empty MCP config so it
@@ -400,17 +475,74 @@ One thing does still reach a Claude delegate: `--setting-sources ""` does **not*
 `CLAUDE.md` discovery, so a project's own instruction file is part of the delegate's prompt.
 `agentmux` says so in the result rather than hiding it.
 
+### Steering a running turn
+
+`steer` adds an instruction to the turn that is running now. The delegate reads it before its next
+model call, and the transcript shows it where it arrived, under `### user (steer)`. It is for the
+correction you notice ten minutes into a review; a new question, once the turn has ended, is a
+`follow_up`.
+
+```bash
+agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
+```
+
+`status` says `steerable: yes` while a turn can take one. Today that is a **Codex delegate that
+inherits its account's settings**, because only `codex app-server` accepts input for a running
+turn and only an inheriting delegate can run over it:
+
+- `codex exec`, which reads its prompt once, is what an isolated Codex delegate needs: the
+  app-server has no equivalent of `--ignore-user-config` (codex-cli 0.159.3), and a private
+  `CODEX_HOME` holding only the login cannot stand in for it — a keyring login is filed under the
+  directory's path, a copied login's token refresh would log your own codex out, and sessions
+  would land where your codex cannot find them. So isolation is never traded for steering
+  silently: start the consultation with `inherit_settings: true` (`--inherit-settings`) if it
+  should be steerable. The codex release whose app-server takes the flag lifts this.
+- A Claude delegate runs as `claude --print`, which reads its question once and offers no channel
+  into a turn that has started.
+
+`steerable: yes` appears once the turn is running; for the first seconds, while the delegate opens
+its thread, a steer is refused with a request to send it again shortly.
+
+Everything else is refused with the reason, and a refused message is never in the transcript: a
+consultation that is not running or is being cancelled, a delegate launched another way, a message
+the server rejected, and one the turn ended before picking up (it is withdrawn unsent). A message
+that was sent but never answered — the turn or the server ended first, or no answer came within
+30 seconds — is reported as unconfirmed rather than refused, because codex may have taken it; read
+the transcript before sending it again.
+
+**How an inheriting Codex turn runs.** `agentmux` itself, run as a detached child exactly where
+`codex exec` would be, starts `codex app-server`, runs the one turn with `approvalPolicy: never`,
+writes what the server reports in the event format `codex exec --json` writes, and exits. So
+`status`, `tail`, `result` and the files on disk read the same in either mode, and the turn survives
+a restart of the `agentmux` that started it. An approval request the server sends anyway is
+declined and noted in the transcript. A `follow_up` starts a new turn that resumes the same thread,
+and `cancel` asks the server to interrupt the turn before it signals anything. When a turn ends, the
+commands it left running are stopped too, within a time budget and on a best-effort basis; on
+macOS, a command started by a crashed server's command after the driver's last once-a-second check
+is out of reach.
+[ADR 0018](docs/adr/0018-codex-app-server-driver.md) explains why it is built this way, and
+`crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
+
+`--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
+with `codex exec` instead, for a CLI whose app-server cannot run them; nothing is steerable then.
+`codex_exec: true` on `start` or `ask` does the same for one consultation, and its follow-ups keep
+it. When a driven turn fails, or codex sends something agentmux cannot read, the status says so and
+points at these switches: that is what a codex whose app-server protocol has moved looks like.
+A running turn keeps the mode it started in.
+
 ### Stopping, and what survives a restart
 
 `cancel` marks the turn as cancelling, asks the delegate to stop, waits a few seconds, makes it
-stop if it did not, and records the cancellation once the process has actually gone. The footer
-it writes is the last thing the transcript will ever say, so it cannot be written while the child
-is still able to say more; whatever the child wrote before going is kept, and a delegate that had
-already finished its turn when the signal landed is reported as having finished. A `status` or
-`tail` that happens to see the child go first records the same cancellation, and a child that
-somehow survives both signals is stopped again by the next `cancel`. `prune` refuses a running
-consultation — or a finished one whose process is still there — for the same reason: deleting
-its record would leave the child running, billing, and unreachable.
+stop if it did not, waits a few seconds more, and then records the cancellation. A turn run over
+`codex app-server` is first interrupted through the protocol and given up to about twenty seconds to
+close and clear up after itself. The record freezes the transcript at what the child had written by
+then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
+that had already finished its turn when the signal landed is reported as having finished. A
+`status` or `tail` that happens to see the child go first records the same cancellation. The record
+does not prove the child left: one that somehow survives both signals is stopped again by the next
+`cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose process
+is still there — because deleting its record would leave the child running, billing, and
+unreachable.
 
 A delegate that exits without a closing event is recorded once, with its exit status and the tail
 of its stderr, and the transcript is rendered from that record from then on — never from files a
@@ -419,7 +551,9 @@ tool subprocess the delegate started may still be writing to.
 A delegate outlives the `agentmux` that started it. While that process lives it holds the child's
 handle; afterwards the pid on disk is trusted only together with the process start time recorded
 beside it, so a recycled pid is never mistaken for a delegate. On Windows a restarted `agentmux`
-can stop a delegate but only ever reaches the direct child, not the tool subprocesses it started.
+can stop a delegate but its signal reaches only the delegate process: a turn run over
+`codex app-server` holds its descendants in a job that ends with the driver, while a directly
+launched CLI's tool subprocesses are not contained.
 
 ### License
 

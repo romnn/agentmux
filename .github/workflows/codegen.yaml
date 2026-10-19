@@ -1,0 +1,104 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
+name: codegen
+# Only a change to the generator, its vendored inputs, the protocol crate it generates and the
+# oracle checks, or the workspace lockfile that pins progeny can make the protocol crate drift, so
+# nothing else runs this.
+on:
+  push:
+    paths: &inputs
+      - crates/codex-app-server-codegen/**
+      - crates/codex-app-server-protocol/**
+      - Cargo.toml
+      - Cargo.lock
+      - taskfile.yaml
+      - .github/workflows/codegen.yaml
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    paths: *inputs
+
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_AUTO_INSTALL: "0"
+
+jobs:
+  # The checked-in protocol crate is what the vendored schema generates; needs no codex.
+  generated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check the protocol crate is what the vendored schema generates
+        run: task codegen:app-server:check
+
+  # The vendored schema is what the pinned codex exports, and its app-server still cannot be
+  # isolated.
+  upstream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Read the pin
+        id: pin
+        run: |
+          pin="$(cargo run --quiet -p codex-app-server-codegen -- pin)"
+          echo "codex=$pin" >>"$GITHUB_OUTPUT"
+      # Installed once per pin and then restored.
+      - name: Restore the pinned codex
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/agentmux/codex-${{ steps.pin.outputs.codex }}
+          key: codegen-${{ runner.os }}-codex-${{ steps.pin.outputs.codex }}
+      - name: Install the pinned codex
+        env:
+          CODEX_VERSION: ${{ steps.pin.outputs.codex }}
+        run: |
+          prefix="$HOME/.cache/agentmux/codex-$CODEX_VERSION"
+          if [ ! -x "$prefix/bin/codex" ]; then
+            npm install --global --prefix "$prefix" "@openai/codex@$CODEX_VERSION"
+          fi
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+      - name: Check the vendored schema is what the pinned codex exports
+        run: task codegen:app-server:upstream
+
+  # The answers table and the exec mirror are what codex's own crates declare at the pinned tag.
+  oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/codex-app-server-codegen/oracle
+          cache-on-failure: true
+      - name: Check the answers table and the exec mirror against codex's own crates
+        run: task codegen:app-server:oracle

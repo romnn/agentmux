@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agentmux::config::{Account, Config, Defaults};
-use agentmux::delegate::{AccountAlias, Vendor};
+use agentmux::delegate::{AccountAlias, Billing, Vendor};
 use agentmux::quota::{
     AccountQuota, Observation, Origin, ProbeRequest, ProbeTarget, QuotaProbe, SystemProbe,
     probe_vendor,
@@ -25,7 +25,7 @@ struct ScriptedProbe {
 
 impl QuotaProbe for ScriptedProbe {
     fn probe(&self, request: &ProbeRequest<'_>) -> Observation {
-        if request.target == ProbeTarget::Credential {
+        if request.target == ProbeTarget::NoSubscriptionWindow {
             return Observation::Unavailable {
                 reason: "custom endpoint".to_owned(),
             };
@@ -43,22 +43,22 @@ fn host_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn config_with(vendor: &str, accounts: &[(&str, Account)]) -> Config {
+fn config_with(vendor: Vendor, accounts: &[(&str, Account)]) -> Result<Config> {
     let mut config = Config::default();
-    let table = config.accounts.entry(vendor.to_owned()).or_default();
+    let table = config.accounts.entry(vendor).or_default();
     for (alias, account) in accounts {
-        table.insert((*alias).to_owned(), account.clone());
+        table.insert(AccountAlias::parse(alias).or_fail()?, account.clone());
     }
-    config
+    Ok(config)
 }
 
 /// Every configured account is asked, and each answer is labelled with the account it came from.
 ///
 /// A caller choosing where to send work needs the mapping; a bare list of percentages is unusable.
 #[gtest]
-fn every_configured_account_is_reported_by_name() {
+fn every_configured_account_is_reported_by_name() -> Result<()> {
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[
             (
                 "work",
@@ -75,7 +75,7 @@ fn every_configured_account_is_reported_by_name() {
                 },
             ),
         ],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
@@ -87,6 +87,7 @@ fn every_configured_account_is_reported_by_name() {
         .filter_map(|entry| entry.account.as_ref().map(ToString::to_string))
         .collect();
     assert_that!(names, unordered_elements_are![eq("work"), eq("personal")]);
+    Ok(())
 }
 
 /// A machine with no configuration still gets an answer, for the CLI's own default account.
@@ -107,17 +108,18 @@ fn a_machine_without_configuration_still_reports_its_default_account() {
 /// Probing it would otherwise answer with the *default* account's figures under this account's
 /// name, which is worse than no answer.
 #[gtest]
-fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
+fn an_endpoint_account_reports_no_window_rather_than_someone_elses() -> Result<()> {
     let config = config_with(
-        "codex",
+        Vendor::Codex,
         &[(
             "local",
             Account {
                 base_url: Some("http://localhost:11434/v1".to_owned()),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"rateLimitsByLimitId": {}}),
     };
@@ -128,6 +130,7 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
         reported[0].observation,
         matches_pattern!(Observation::Unavailable { .. })
     );
+    Ok(())
 }
 
 /// An account that names a profile directory but authenticates with a key has no window either.
@@ -137,28 +140,114 @@ fn an_endpoint_account_reports_no_window_rather_than_someone_elses() {
 /// spending them.
 /// Codex does not, which is why this is a Claude account and not a shared rule.
 #[gtest]
-fn a_profile_that_also_supplies_a_key_reports_no_window() {
+fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
+    // A profile that exists and a key that is set, so nothing but the key decides.
+    let profile = tempfile::tempdir().or_fail()?;
+    let mut env = host_env();
+    env.insert("CI_ANTHROPIC_KEY".to_owned(), "sk-ci".to_owned());
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[(
             "ci",
             Account {
-                config_dir: Some(PathBuf::from("/home/dev/.claude-ci")),
+                config_dir: Some(profile.path().to_path_buf()),
                 api_key_env: Some("CI_ANTHROPIC_KEY".to_owned()),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
 
-    let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &probe);
-
+    let alias = AccountAlias::parse("ci").or_fail()?;
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &env),
+        ok(eq(&ProbeTarget::NoSubscriptionWindow))
+    );
+    let reported = probe_vendor(Vendor::Claude, &config, &env, &probe);
     assert_that!(
         reported[0].observation,
-        matches_pattern!(Observation::Unavailable { .. })
+        matches_pattern!(Observation::Unavailable {
+            reason: eq("custom endpoint")
+        })
     );
+    Ok(())
+}
+
+/// A Claude account whose environment switches it to a cloud backend has no subscription window,
+/// and says so rather than reporting the plain profile's figures under its name.
+///
+/// The switch is all that marks it: no key, no endpoint, and no profile directory of its own, so
+/// a probe that read the window would read the CLI's default login.
+#[gtest]
+fn a_claude_account_routed_to_a_cloud_backend_reports_no_window() -> Result<()> {
+    for switch in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        let config = config_with(
+            Vendor::Claude,
+            &[("cloud", cloud_account(switch, Billing::Api))],
+        )?;
+
+        let alias = AccountAlias::parse("cloud").or_fail()?;
+        let target = ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &host_env());
+        assert_that!(
+            target,
+            ok(eq(&ProbeTarget::NoSubscriptionWindow)),
+            "{switch}"
+        );
+    }
+
+    // Such a target is answered before anything is read or spawned.
+    let observation = SystemProbe.probe(&ProbeRequest {
+        vendor: Vendor::Claude,
+        target: ProbeTarget::NoSubscriptionWindow,
+        host_env: &host_env(),
+    });
+    assert_that!(
+        observation,
+        matches_pattern!(Observation::Unavailable {
+            reason: contains_substring("routing environment")
+        })
+    );
+    Ok(())
+}
+
+/// A subscription account never carries a backend switch, which is withheld from it like a key,
+/// so the switch does not take its window away.
+#[gtest]
+fn a_withheld_backend_switch_leaves_a_subscription_account_on_its_window() -> Result<()> {
+    let config = config_with(
+        Vendor::Claude,
+        &[(
+            "work",
+            cloud_account("CLAUDE_CODE_USE_BEDROCK", Billing::Subscription),
+        )],
+    )?;
+
+    let alias = AccountAlias::parse("work").or_fail()?;
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &host_env()),
+        ok(eq(&ProbeTarget::Window { config_dir: None }))
+    );
+    Ok(())
+}
+
+/// A Claude account that sets `switch` in its environment, on `billing`.
+fn cloud_account(switch: &str, billing: Billing) -> Account {
+    let mut account = Account {
+        billing: Some(billing),
+        ..Account::default()
+    };
+    account
+        .launch
+        .env
+        .insert(switch.to_owned(), agentmux::config::Secret::new("1"));
+    account
 }
 
 /// With no account named, the probe reads exactly the login a delegate without an account runs
@@ -190,15 +279,18 @@ fn the_default_target_reads_the_login_a_delegate_would_run_as() {
     );
 }
 
-/// A key the host exports, or the machine's launch layer forwards, is what a no-account delegate
-/// authenticates with — so the probe must not report the subscription window it would not spend.
+/// A key the host exports, or the machine's launch layer forwards, never reaches a no-account
+/// delegate, so the identity it spends is still the subscription window the probe reads.
+///
+/// The probe classifies the environment the delegate would actually get, and a delegate whose
+/// account did not opt into API pricing gets no key.
 #[gtest]
-fn a_forwarded_key_makes_the_default_identity_a_credential() {
+fn a_forwarded_key_leaves_the_default_identity_on_its_window() {
     let mut env = host_env();
     env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-host".to_owned());
     assert_that!(
         ProbeTarget::of(Vendor::Claude, None, &Config::default(), &env),
-        ok(eq(&ProbeTarget::Credential))
+        ok(matches_pattern!(ProbeTarget::Window { .. }))
     );
 
     let mut config = Config::default();
@@ -208,7 +300,7 @@ fn a_forwarded_key_makes_the_default_identity_a_credential() {
     );
     assert_that!(
         ProbeTarget::of(Vendor::Codex, None, &config, &host_env()),
-        ok(eq(&ProbeTarget::Credential))
+        ok(matches_pattern!(ProbeTarget::Window { .. }))
     );
 }
 
@@ -250,19 +342,24 @@ fn a_codex_rollout_yields_the_window_the_stream_omitted() -> Result<()> {
         indoc::indoc! {r#"
             {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":11.0,"window_minutes":10080,"resets_at":1789303382}}}}
             {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1789303382}}}}
+            {"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}
+            {"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
+            {"type":"turn_context","payload":{"cwd":"/work"}}
         "#},
     )
     .or_fail()?;
 
-    let limits = agentmux::quota::codex_rollout_rate_limits(home.path(), thread)
-        .expect("the rollout carries rate limits");
+    let Some(limits) = agentmux::quota::codex_rollout_rate_limits(home.path(), thread) else {
+        return fail!("the rollout carries rate limits");
+    };
 
-    // The last record wins: each is a snapshot and the newest is where the turn ended.
+    // The last record that carries a snapshot wins: each is a snapshot and the newest is where
+    // the turn ended; a count without one and every other line are passed over.
     assert_that!(
-        limits["primary"]["used_percent"].as_f64(),
+        limits.primary.map(|window| window.used_percent),
         some(approx_eq(53.0))
     );
-    assert_that!(limits["limit_id"].as_str(), some(eq("codex")));
+    assert_that!(limits.limit_id, some(eq("codex")));
     Ok(())
 }
 
@@ -288,7 +385,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let missing = dir.path().join("never-created");
     let config = config_with(
-        "claude",
+        Vendor::Claude,
         &[(
             "gone",
             Account {
@@ -296,7 +393,7 @@ fn probing_a_missing_config_dir_creates_nothing() -> Result<()> {
                 ..Account::default()
             },
         )],
-    );
+    )?;
 
     let reported = probe_vendor(Vendor::Claude, &config, &host_env(), &SystemProbe);
 
@@ -339,12 +436,12 @@ fn a_codex_chatgpt_login_outranks_a_key_in_the_environment() -> Result<()> {
 /// A Codex account whose stored login *is* the key is still billed per token.
 ///
 /// The rule reads what the vendor wrote down rather than assuming a precedence in either
-/// direction, so `apikey` must still answer `Credential`.
+/// direction, so `apikey` must still answer `NoSubscriptionWindow`.
 #[gtest]
 fn a_codex_apikey_login_still_reports_no_window() -> Result<()> {
     let target = codex_target_with(Some(r#"{"auth_mode":"apikey"}"#), None)?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 
@@ -359,7 +456,7 @@ fn a_codex_endpoint_outranks_even_a_stored_login() -> Result<()> {
         Some("http://localhost:11434/v1"),
     )?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 
@@ -371,7 +468,7 @@ fn a_codex_endpoint_outranks_even_a_stored_login() -> Result<()> {
 fn a_codex_key_with_no_stored_login_reports_no_window() -> Result<()> {
     let target = codex_target_with(None, None)?;
 
-    assert_that!(target, eq(&ProbeTarget::Credential));
+    assert_that!(target, eq(&ProbeTarget::NoSubscriptionWindow));
     Ok(())
 }
 
@@ -385,17 +482,18 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
         std::fs::write(home.path().join("auth.json"), auth_json).or_fail()?;
     }
     let config = config_with(
-        "codex",
+        Vendor::Codex,
         &[(
             "personal",
             Account {
                 config_dir: Some(home.path().to_path_buf()),
                 api_key_env: Some("OPENAI_API_KEY".to_owned()),
                 base_url: base_url.map(str::to_owned),
+                billing: Some(Billing::Api),
                 ..Account::default()
             },
         )],
-    );
+    )?;
     let mut env = host_env();
     env.insert(
         "OPENAI_API_KEY".to_owned(),
@@ -413,8 +511,8 @@ fn codex_target_with(auth_json: Option<&str>, base_url: Option<&str>) -> Result<
 /// Reporting only the named accounts hides the identity actually paying behind a list of the ones
 /// that are not, which is the same mistake as reading a failed probe as spare capacity.
 #[gtest]
-fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
-    let config = config_with("claude", &[("work", Account::default())]);
+fn the_cli_login_is_probed_when_no_configured_account_is_the_default() -> Result<()> {
+    let config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     let probe = ScriptedProbe {
         payload: serde_json::json!({"utilization": {"limits": []}}),
     };
@@ -431,6 +529,7 @@ fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
             .count(),
         eq(1)
     );
+    Ok(())
 }
 
 /// A configured default leaves the CLI's own login out, because nothing would spend it.
@@ -439,12 +538,12 @@ fn the_cli_login_is_probed_when_no_configured_account_is_the_default() {
 /// holds that role every consultation resolves to a named account, and listing the login as well
 /// would offer a window no work is drawn against.
 #[gtest]
-fn a_configured_default_leaves_the_cli_login_out() {
-    let mut config = config_with("claude", &[("work", Account::default())]);
+fn a_configured_default_leaves_the_cli_login_out() -> Result<()> {
+    let mut config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         Defaults {
-            account: Some("work".to_owned()),
+            account: Some(AccountAlias::parse("work").or_fail()?),
         },
     );
     let probe = ScriptedProbe {
@@ -458,6 +557,7 @@ fn a_configured_default_leaves_the_cli_login_out() {
         reported[0].account.as_ref().map(ToString::to_string),
         some(eq("work"))
     );
+    Ok(())
 }
 
 /// A default naming an account the file does not define is reported as the launch would refuse it.
@@ -466,11 +566,11 @@ fn a_configured_default_leaves_the_cli_login_out() {
 /// carries the launch's own refusal rather than standing in for a login nothing would spend.
 #[gtest]
 fn a_default_naming_an_undefined_account_carries_the_launch_refusal() -> Result<()> {
-    let mut config = config_with("claude", &[("work", Account::default())]);
+    let mut config = config_with(Vendor::Claude, &[("work", Account::default())])?;
     config.defaults.insert(
-        "claude".to_owned(),
+        Vendor::Claude,
         Defaults {
-            account: Some("missing".to_owned()),
+            account: Some(AccountAlias::parse("missing").or_fail()?),
         },
     );
     let probe = ScriptedProbe {
@@ -551,6 +651,30 @@ fn a_refresh_that_left_the_cache_alone_reports_how_it_ended() -> Result<()> {
     Ok(())
 }
 
+/// A refresh whose process exited cleanly but left the cache as it was is not a refresh: the
+/// figures are as old as they were, and saying "just refreshed" would vouch for them.
+#[cfg(unix)]
+#[gtest]
+fn a_clean_exit_that_left_the_cache_alone_is_no_refresh() -> Result<()> {
+    let observation = probe_claude_with_fake_cli(indoc::indoc! {"
+        #!/bin/sh
+        exit 0
+    "})?;
+
+    let Observation::Reported {
+        origin: Origin::Cache { refresh, .. },
+        ..
+    } = observation
+    else {
+        return fail!("the stale cache must still be reported");
+    };
+    let Refresh::Failed { reason } = refresh else {
+        return fail!("a refresh that did not advance the figures must be a failure");
+    };
+    assert_that!(reason, contains_substring("did not advance"));
+    Ok(())
+}
+
 /// Drive the real Claude probe against a fake `claude` on `PATH`, with a stale cache in place.
 ///
 /// The cache carries a timestamp old enough to force a refresh, and the script decides what that
@@ -582,4 +706,74 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
         },
         host_env: &env,
     }))
+}
+
+/// A probe's child is given no key and no billing override, whatever the host exported, and
+/// keeps what it needs to reach the vendor.
+///
+/// Observed by the child itself: each vendor's fake CLI writes its environment and exits, which
+/// the probe then reports as a failed refresh or an unanswered request.
+#[cfg(unix)]
+#[gtest]
+fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for vendor in [Vendor::Claude, Vendor::Codex] {
+        let root = tempfile::tempdir().or_fail()?;
+        let config_dir = root.path().join("config");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&config_dir).or_fail()?;
+        std::fs::create_dir_all(&bin).or_fail()?;
+        // Stale, so the Claude probe refreshes it by running its CLI.
+        std::fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"cachedUsageUtilization":{"fetchedAtMs":1000,"utilization":{"limits":[]}}}"#,
+        )
+        .or_fail()?;
+        let dump = root.path().join("env.txt");
+        let program = bin.join(vendor.program());
+        std::fs::write(
+            &program,
+            indoc::formatdoc!(
+                "
+                    #!/bin/sh
+                    env > '{}'
+                    exit 1
+                ",
+                dump.display()
+            ),
+        )
+        .or_fail()?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+
+        let mut env = host_env();
+        for (key, value) in [
+            ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+            ("HTTPS_PROXY", "http://proxy.example:3128".to_owned()),
+            ("OPENAI_API_KEY", "sk-SENTINEL-1".to_owned()),
+            ("CODEX_API_KEY", "sk-SENTINEL-2".to_owned()),
+            ("ANTHROPIC_API_KEY", "sk-SENTINEL-3".to_owned()),
+            ("ANTHROPIC_AUTH_TOKEN", "SENTINEL-4".to_owned()),
+            ("OPENAI_BASE_URL", "https://SENTINEL-5.example".to_owned()),
+            ("CLAUDE_CODE_USE_BEDROCK", "SENTINEL-6".to_owned()),
+        ] {
+            env.insert(key.to_owned(), value);
+        }
+        let _ = SystemProbe.probe(&ProbeRequest {
+            vendor,
+            target: ProbeTarget::Window {
+                config_dir: Some(config_dir),
+            },
+            host_env: &env,
+        });
+
+        let seen = std::fs::read_to_string(&dump).or_fail()?;
+        expect_that!(seen, not(contains_substring("SENTINEL")), "{vendor:?}");
+        expect_that!(
+            seen,
+            contains_substring("HTTPS_PROXY=http://proxy.example:3128"),
+            "{vendor:?}"
+        );
+    }
+    Ok(())
 }

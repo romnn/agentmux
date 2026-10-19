@@ -1,0 +1,33 @@
+[package]
+name = "codex-app-server-codegen"
+description = "Generates the codex-app-server-protocol crate from the JSON Schema the codex CLI publishes"
+license-file = "../../LICENSE"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "codex-app-server-codegen"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+indoc.workspace = true
+# Pinned to a commit, and so by the workspace lockfile: the generated sources carry it in their
+# header, and moving it is a deliberate regeneration.
+progeny = { git = "https://github.com/romnn/progeny", rev = "9be5911d02bf244fd50a448f82b4666d2afe6e3f" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+googletest.workspace = true
