@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use codex_app_server_protocol::rollout::{EventMsg, RateLimitSnapshot, RolloutItem};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config, home_dir};
@@ -440,11 +441,7 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     // A weekly window moves with every other session on the account, so figures from hours ago
     // answer a question nobody asked.
     let before = read_cached_usage(&path);
-    let refresh = if is_stale(before.as_ref()) {
-        refresh_claude_cache(request)
-    } else {
-        Refresh::Skipped
-    };
+    let refreshed = is_stale(before.as_ref()).then(|| refresh_claude_cache(request));
 
     let Some(cached) = read_cached_usage(&path) else {
         return Observation::Unavailable {
@@ -461,9 +458,23 @@ fn probe_claude(request: &ProbeRequest<'_>) -> Observation {
     // dressed as a careful one.
     let fetched = fetched_at_ms(Some(&cached));
     let advanced = fetched > fetched_at_ms(before.as_ref());
-    let refresh = match refresh {
-        Refresh::TimedOut | Refresh::Failed { .. } if advanced => Refresh::Succeeded,
-        outcome => outcome,
+    let refresh = match refreshed {
+        None => Refresh::Skipped,
+        Some(_) if advanced => Refresh::Succeeded,
+        Some(RefreshEnd::TimedOut) => Refresh::TimedOut,
+        Some(RefreshEnd::Exited(status)) if status.success() => Refresh::Failed {
+            reason: format!(
+                "`{} --print /usage` exited cleanly, but the cached figures did not advance",
+                Vendor::Claude.program()
+            ),
+        },
+        Some(RefreshEnd::Exited(status)) => Refresh::Failed {
+            reason: format!(
+                "`{} --print /usage` exited with {status}",
+                Vendor::Claude.program()
+            ),
+        },
+        Some(RefreshEnd::Unrun(reason)) => Refresh::Failed { reason },
     };
 
     Observation::Reported {
@@ -504,6 +515,16 @@ fn fetched_at_ms(cached: Option<&serde_json::Value>) -> Option<i64> {
         .and_then(serde_json::Value::as_i64)
 }
 
+/// How a cache refresh's process ended, which says nothing about whether the figures advanced.
+enum RefreshEnd {
+    /// It exited with this status.
+    Exited(std::process::ExitStatus),
+    /// It was still running at the deadline and was stopped.
+    TimedOut,
+    /// It could not be started or waited on, for this reason.
+    Unrun(String),
+}
+
 /// Ask the Claude CLI to refresh its usage cache.
 ///
 /// `/usage` is answered locally: the run reports `total_cost_usd: 0` and no API duration, so this
@@ -513,7 +534,7 @@ fn fetched_at_ms(cached: Option<&serde_json::Value>) -> Option<i64> {
 ///
 /// What comes back is how the process ended.
 /// Whether the cache actually advanced is judged by `probe_claude` from the figures themselves.
-fn refresh_claude_cache(request: &ProbeRequest<'_>) -> Refresh {
+fn refresh_claude_cache(request: &ProbeRequest<'_>) -> RefreshEnd {
     use std::process::Stdio;
 
     let mut command = probe_command(request, Vendor::Claude.program());
@@ -526,12 +547,10 @@ fn refresh_claude_cache(request: &ProbeRequest<'_>) -> Refresh {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            return Refresh::Failed {
-                reason: format!(
-                    "`{} --print /usage` could not be run: {error}",
-                    Vendor::Claude.program()
-                ),
-            };
+            return RefreshEnd::Unrun(format!(
+                "`{} --print /usage` could not be run: {error}",
+                Vendor::Claude.program()
+            ));
         }
     };
     // The cached figures are read whatever happens here, so the outcome is reported rather than
@@ -540,24 +559,14 @@ fn refresh_claude_cache(request: &ProbeRequest<'_>) -> Refresh {
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Refresh::Succeeded,
-            Ok(Some(status)) => {
-                return Refresh::Failed {
-                    reason: format!(
-                        "`{} --print /usage` exited with {status}",
-                        Vendor::Claude.program()
-                    ),
-                };
-            }
+            Ok(Some(status)) => return RefreshEnd::Exited(status),
             Err(error) => {
-                return Refresh::Failed {
-                    reason: format!("the refresh could not be waited on: {error}"),
-                };
+                return RefreshEnd::Unrun(format!("the refresh could not be waited on: {error}"));
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Refresh::TimedOut;
+                return RefreshEnd::TimedOut;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -695,19 +704,21 @@ fn refusal(message: &str) -> &str {
 /// `thread_id` is the identifier the stream already yielded, and the rollout file carrying it is
 /// found by name.
 #[must_use]
-pub fn codex_rollout_rate_limits(codex_home: &Path, thread_id: &str) -> Option<serde_json::Value> {
+pub fn codex_rollout_rate_limits(codex_home: &Path, thread_id: &str) -> Option<RateLimitSnapshot> {
     let rollout = find_rollout(&codex_home.join("sessions"), thread_id)?;
     let text = std::fs::read_to_string(rollout).ok()?;
     // The last record wins: each is a snapshot, and the newest is the state the turn ended in.
     text.lines()
         .rev()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find_map(|record| {
-            record
-                .get("payload")
-                .and_then(|p| p.get("rate_limits"))
-                .filter(|limits| !limits.is_null())
-                .cloned()
+        .filter_map(|line| serde_json::from_str::<RolloutItem>(line).ok())
+        .find_map(|item| match item {
+            RolloutItem::EventMsg {
+                payload: EventMsg::TokenCount(count),
+            } => count.rate_limits,
+            RolloutItem::EventMsg {
+                payload: EventMsg::Other,
+            }
+            | RolloutItem::Other => None,
         })
 }
 

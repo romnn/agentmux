@@ -125,14 +125,16 @@ fn details(details: codex::ThreadItemDetails) -> ours::ThreadItemDetails {
             Ours::FileChange(ours::FileChangeItem {
                 changes: changes
                     .into_iter()
-                    .map(|codex::FileUpdateChange { path, kind }| ours::FileUpdateChange {
-                        path,
-                        kind: match kind {
-                            codex::PatchChangeKind::Add => ours::PatchChangeKind::Add,
-                            codex::PatchChangeKind::Delete => ours::PatchChangeKind::Delete,
-                            codex::PatchChangeKind::Update => ours::PatchChangeKind::Update,
+                    .map(
+                        |codex::FileUpdateChange { path, kind }| ours::FileUpdateChange {
+                            path,
+                            kind: match kind {
+                                codex::PatchChangeKind::Add => ours::PatchChangeKind::Add,
+                                codex::PatchChangeKind::Delete => ours::PatchChangeKind::Delete,
+                                codex::PatchChangeKind::Update => ours::PatchChangeKind::Update,
+                            },
                         },
-                    })
+                    )
                     .collect(),
                 status: match status {
                     codex::PatchApplyStatus::InProgress => ours::PatchApplyStatus::InProgress,
@@ -439,9 +441,11 @@ mod tests {
             events.push(codex::ThreadEvent::ItemUpdated(codex::ItemUpdatedEvent {
                 item: item(details.clone()),
             }));
-            events.push(codex::ThreadEvent::ItemCompleted(codex::ItemCompletedEvent {
-                item: item(details),
-            }));
+            events.push(codex::ThreadEvent::ItemCompleted(
+                codex::ItemCompletedEvent {
+                    item: item(details),
+                },
+            ));
         }
         events
     }

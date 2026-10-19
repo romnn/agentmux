@@ -30,6 +30,8 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
+
 use super::layout::TurnDir;
 use super::lock::LockedRun;
 use super::records::{
@@ -190,6 +192,29 @@ fn note_continuity(asked_for: Option<&SessionRef>, opened: Option<&SessionRef>, 
     }
 }
 
+/// The window a Codex turn's usage is reported against.
+///
+/// An exhausted window is the one a request is refused against, and when several are, the one
+/// that reopens last is the one that decides when a request can succeed again.
+/// With none exhausted it is the one closest to closing, which is what the next question has to
+/// expect.
+/// A window that names no reopening time cannot answer either question, and is passed over.
+fn binding_window(snapshot: &RateLimitSnapshot) -> Option<&RateLimitWindow> {
+    [&snapshot.primary, &snapshot.secondary]
+        .into_iter()
+        .flatten()
+        .filter(|window| window.resets_at.is_some())
+        .max_by(|a, b| {
+            a.exhausted().cmp(&b.exhausted()).then_with(|| {
+                if a.exhausted() {
+                    a.resets_at.cmp(&b.resets_at)
+                } else {
+                    a.used_percent.total_cmp(&b.used_percent)
+                }
+            })
+        })
+}
+
 /// The newest modification time among a turn's capture files.
 pub(super) fn last_write(dir: &TurnDir) -> Option<SystemTime> {
     [dir.events(), dir.stderr()]
@@ -250,19 +275,14 @@ impl RunStore {
             Vendor::Codex.config_dir(&env)?
         };
 
-        let limits = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
-        let primary = limits.get("primary")?;
-        let resets_at = primary
-            .get("resets_at")
-            .and_then(serde_json::Value::as_i64)
+        let snapshot = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
+        let resets_at = binding_window(&snapshot)?
+            .resets_at
             .and_then(chrono::DateTime::from_timestamp_secs)?;
         Some(RateLimit {
             resets_at,
-            window: limits
-                .get("limit_id")
-                .and_then(|id| id.as_str())
-                .map(ToOwned::to_owned),
+            window: snapshot.limit_id,
         })
     }
 }
@@ -325,6 +345,38 @@ impl LockedRun<'_> {
             return Ok(None);
         };
         Ok(Some(self.fold_turn(meta, newest)?.turn))
+    }
+
+    /// Read a finished Codex turn's remembered usage window, or say where to search for one.
+    ///
+    /// Codex says nothing about usage on the stream agentmux captures, but records it in the
+    /// session rollout it writes anyway.
+    /// Reading that afterwards is the only way a Codex consultation reports a usage window at
+    /// all, and it costs neither a process nor a token.
+    /// Only once the turn is over: a running turn's rollout is still being written, and the
+    /// search is too expensive to repeat on every fold.
+    /// A remembered answer is read here; a search is left to the caller, after the lock.
+    fn remembered_window(
+        &self,
+        files: &TurnFiles,
+        turn: &mut Turn,
+        thread: Option<&SessionRef>,
+        codex_home: Option<&Path>,
+    ) -> Option<RolloutSearch> {
+        let thread = thread.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
+        match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
+            Ok(Some(remembered)) => {
+                turn.rate_limit = remembered;
+                None
+            }
+            Ok(None) | Err(_) => Some(RolloutSearch {
+                index: files.index,
+                dir: files.dir.clone(),
+                codex_home: codex_home.map(Path::to_path_buf),
+                thread: thread.clone(),
+                departed: self.store.departed(files),
+            }),
+        }
     }
 
     /// Fold one turn from its own files, settling it if its child has gone, and keeping a reply
@@ -435,32 +487,16 @@ impl LockedRun<'_> {
             &mut turn,
         );
 
-        // Codex says nothing about usage on the stream agentmux captures, but records it in the
-        // session rollout it writes anyway.
-        // Reading that afterwards is the only way a Codex consultation reports a usage window at
-        // all, and it costs neither a process nor a token.
-        // Only once the turn is over: a running turn's rollout is still being written, and the
-        // search is too expensive to repeat on every fold.
-        // A remembered answer is read here; a search is left to the caller, after the lock.
-        let mut rollout = None;
-        if vendor == Vendor::Codex
-            && turn.rate_limit.is_none()
-            && turn.outcome.is_terminal()
-            && let Some(thread) = turn_session.as_ref()
-        {
-            match read_json::<Option<RateLimit>>(&dir.rate_limit()) {
-                Ok(Some(remembered)) => turn.rate_limit = remembered,
-                Ok(None) | Err(_) => {
-                    rollout = Some(RolloutSearch {
-                        index: files.index,
-                        dir: dir.clone(),
-                        codex_home: invocation.config_dir.clone(),
-                        thread: thread.clone(),
-                        departed: self.store.departed(files),
-                    });
-                }
-            }
-        }
+        let rollout = if vendor == Vendor::Codex {
+            self.remembered_window(
+                files,
+                &mut turn,
+                turn_session.as_ref(),
+                invocation.config_dir.as_deref(),
+            )
+        } else {
+            None
+        };
 
         self.recover_from_last_message(files, &mut turn)?;
 
@@ -569,5 +605,71 @@ impl RunStore {
             classified => classified,
         };
         Outcome::Failed { kind, detail }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
+    use googletest::prelude::*;
+
+    use super::binding_window;
+
+    fn window(used_percent: f64, resets_at: Option<i64>) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            resets_at,
+        }
+    }
+
+    fn reopening(
+        primary: Option<RateLimitWindow>,
+        secondary: Option<RateLimitWindow>,
+    ) -> Option<i64> {
+        let snapshot = RateLimitSnapshot {
+            limit_id: None,
+            primary,
+            secondary,
+        };
+        binding_window(&snapshot).and_then(|window| window.resets_at)
+    }
+
+    /// The window a refusal is reported against is the exhausted one, however full the other is,
+    /// and with both exhausted it is the one that reopens last.
+    #[gtest]
+    fn an_exhausted_window_binds_whichever_slot_it_is_in() {
+        // A five-hour window nearly full and a weekly one used up: waiting for the five-hour
+        // window to reopen would only be refused again.
+        assert_that!(
+            reopening(Some(window(90.0, Some(10))), Some(window(100.0, Some(500)))),
+            some(eq(500))
+        );
+        assert_that!(
+            reopening(
+                Some(window(100.0, Some(10))),
+                Some(window(100.0, Some(500)))
+            ),
+            some(eq(500))
+        );
+        assert_that!(
+            reopening(Some(window(100.0, Some(10))), Some(window(40.0, Some(500)))),
+            some(eq(10))
+        );
+    }
+
+    /// With nothing exhausted, the window closest to closing is the one to expect, and a window
+    /// with no reopening time cannot be reported.
+    #[gtest]
+    fn otherwise_the_fullest_window_with_a_reopening_time_binds() {
+        assert_that!(
+            reopening(Some(window(20.0, Some(10))), Some(window(60.0, Some(500)))),
+            some(eq(500))
+        );
+        assert_that!(
+            reopening(Some(window(20.0, Some(10))), Some(window(100.0, None))),
+            some(eq(10))
+        );
+        assert_that!(reopening(None, None), none());
     }
 }

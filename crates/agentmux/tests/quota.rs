@@ -268,19 +268,24 @@ fn a_codex_rollout_yields_the_window_the_stream_omitted() -> Result<()> {
         indoc::indoc! {r#"
             {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":11.0,"window_minutes":10080,"resets_at":1789303382}}}}
             {"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":53.0,"window_minutes":10080,"resets_at":1789303382}}}}
+            {"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}
+            {"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
+            {"type":"turn_context","payload":{"cwd":"/work"}}
         "#},
     )
     .or_fail()?;
 
-    let limits = agentmux::quota::codex_rollout_rate_limits(home.path(), thread)
-        .expect("the rollout carries rate limits");
+    let Some(limits) = agentmux::quota::codex_rollout_rate_limits(home.path(), thread) else {
+        return fail!("the rollout carries rate limits");
+    };
 
-    // The last record wins: each is a snapshot and the newest is where the turn ended.
+    // The last record that carries a snapshot wins: each is a snapshot and the newest is where
+    // the turn ended; a count without one and every other line are passed over.
     assert_that!(
-        limits["primary"]["used_percent"].as_f64(),
+        limits.primary.map(|window| window.used_percent),
         some(approx_eq(53.0))
     );
-    assert_that!(limits["limit_id"].as_str(), some(eq("codex")));
+    assert_that!(limits.limit_id, some(eq("codex")));
     Ok(())
 }
 
@@ -569,6 +574,30 @@ fn a_refresh_that_left_the_cache_alone_reports_how_it_ended() -> Result<()> {
         return fail!("a refresh that exited unhappily without writing must be a failure");
     };
     assert_that!(reason, contains_substring("exit status: 1"));
+    Ok(())
+}
+
+/// A refresh whose process exited cleanly but left the cache as it was is not a refresh: the
+/// figures are as old as they were, and saying "just refreshed" would vouch for them.
+#[cfg(unix)]
+#[gtest]
+fn a_clean_exit_that_left_the_cache_alone_is_no_refresh() -> Result<()> {
+    let observation = probe_claude_with_fake_cli(indoc::indoc! {"
+        #!/bin/sh
+        exit 0
+    "})?;
+
+    let Observation::Reported {
+        origin: Origin::Cache { refresh, .. },
+        ..
+    } = observation
+    else {
+        return fail!("the stale cache must still be reported");
+    };
+    let Refresh::Failed { reason } = refresh else {
+        return fail!("a refresh that did not advance the figures must be a failure");
+    };
+    assert_that!(reason, contains_substring("did not advance"));
     Ok(())
 }
 

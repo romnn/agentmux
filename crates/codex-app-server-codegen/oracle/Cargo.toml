@@ -1,6 +1,6 @@
 [package]
 name = "codex-app-server-oracle"
-description = "Checks the generator's method table and the exec stream mirror against codex's own Rust at the pinned release"
+description = "Checks the generator's method table and the exec stream and rollout mirrors against codex's own Rust at the pinned release"
 version = "0.0.0"
 edition = "2024"
 license-file = "../../../LICENSE"
@@ -16,8 +16,10 @@ codex-app-server-codegen = { path = ".." }
 # vendored schema must come from (`codex-app-server-codegen pin`).
 codex-app-server-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
 codex-exec = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
+codex-history = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
 codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.162.1" }
-# agentmux's own protocol crate, whose hand-written mirror of the exec stream is checked here.
+# agentmux's own protocol crate, whose hand-written mirrors of the exec stream and a rollout's usage
+# windows are checked here.
 mirror = { package = "codex-app-server-protocol", path = "../../codex-app-server-protocol" }
 serde_json = "1"
 

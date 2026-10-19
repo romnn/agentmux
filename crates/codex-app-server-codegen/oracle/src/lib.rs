@@ -1,7 +1,7 @@
-//! Checks [`codex_app_server_codegen::surface!`] and the exec stream's mirror against codex's own
-//! Rust at the pinned release.
+//! Checks [`codex_app_server_codegen::surface!`], the exec stream's mirror and a rollout's usage
+//! windows' mirror against codex's own Rust at the pinned release.
 //!
-//! The mirror's check is [`exec`]; the rest of this file is the table's.
+//! The mirrors' checks are [`exec`] and [`rollout`]; the rest of this file is the table's.
 //!
 //! Compiling this crate is the check.
 //! The table is expanded into one match per enum codex declares its methods in, and each arm
@@ -11,6 +11,7 @@
 //! which ties the variant checked here to the method the generated bindings bind.
 
 pub mod exec;
+pub mod rollout;
 
 use codex_app_server_protocol as codex;
 
