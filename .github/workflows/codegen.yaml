@@ -1,13 +1,15 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: codegen
-# Only a change to the generator, its vendored inputs, or what it generates can make the protocol
-# crate drift, so nothing else runs this.
+# Only a change to the generator, its vendored inputs, the protocol crate it generates and the
+# oracle checks, or the workspace lockfile that pins progeny can make the protocol crate drift, so
+# nothing else runs this.
 on:
   push:
     paths: &inputs
       - crates/codex-app-server-codegen/**
-      - crates/codex-app-server-protocol/src/schema.rs
-      - crates/codex-app-server-protocol/src/methods.rs
+      - crates/codex-app-server-protocol/**
+      - Cargo.toml
+      - Cargo.lock
       - taskfile.yaml
       - .github/workflows/codegen.yaml
   pull_request:
