@@ -27,6 +27,7 @@ codex-app-server-protocol = { path = "../codex-app-server-protocol" }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, optional = true }
 directories.workspace = true
+humantime.workspace = true
 indoc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

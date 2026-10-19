@@ -1,5 +1,7 @@
 //! How long a consultation is kept, and taking it away.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +15,9 @@ use super::settle;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Retention {
-    /// Swept once [`RunStore::TTL`] has passed since its delegate last wrote anything.
+    /// Swept once the machine's retention window has passed since its delegate last wrote
+    /// anything: [`Config::sweep_after`](crate::config::Config::sweep_after), a week unless the
+    /// machine file sets `retention`.
     #[default]
     Ttl,
     /// Never swept, so a follow-up can arrive at any time.
@@ -51,23 +55,27 @@ impl RunStore {
             .any(|record| !self.child_has_gone(record.launched)))
     }
 
-    /// Delete consultations past their retention.
+    /// Delete consultations whose delegate last wrote anything more than `after` ago.
+    ///
+    /// `after` is [`Config::sweep_after`](crate::config::Config::sweep_after) everywhere but in
+    /// tests.
     ///
     /// Runs once at server start.
     /// There is no timer and no daemon.
     ///
     /// A run is removed only under its lock, so a follow-up claimed between the check and the
     /// deletion cannot lose its capture files, and a run with a child still alive is never
-    /// swept, however old: a long review that outlived its TTL is exactly the one worth keeping.
+    /// swept, however old: a long review that outlived its window is exactly the one worth
+    /// keeping.
     /// A run that never got a turn — a start that failed after the directory was made — is
     /// swept like a finished one.
     ///
     /// # Errors
     ///
     /// Returns [`RunError::Io`] when the run directory cannot be listed.
-    pub fn sweep(&self) -> Result<usize, RunError> {
+    pub fn sweep(&self, after: Duration) -> Result<usize, RunError> {
         // The clock runs from the last thing the delegate wrote, not from the start: a
-        // consultation that ran for longer than the TTL is not stale the moment it ends.
+        // consultation that ran for longer than the window is not stale the moment it ends.
         // File times alone decide it, so a young run costs a few stats and no fold.
         let expired = |run_id: &RunId, meta: &Meta| {
             if meta.retention == Retention::UntilReleased {
@@ -82,7 +90,7 @@ impl RunStore {
             Utc::now()
                 .signed_duration_since(last)
                 .to_std()
-                .is_ok_and(|age| age >= Self::TTL)
+                .is_ok_and(|age| age >= after)
         };
         let mut removed = 0;
         for run_id in self.run_ids()? {

@@ -212,12 +212,12 @@ directory instead.
 
 **Two files, two jobs.** A *machine* file — `$AGENTMUX_CONFIG`, `~/.config/agentmux/agentmux.toml`,
 `~/agentmux.toml`, or the platform config directory when it lies under your home — may define
-accounts and model rewrites. `AGENTMUX_CONFIG` must be absolute and is the one way to keep the
-file anywhere else; `XDG_CONFIG_HOME` and `APPDATA` count only when they point under your home, so
-a container that points them at a workspace cannot turn a checkout into a machine file. A
-*project* file, found by walking up from the delegate's working directory to the root of its
-repository (the nearest `.git`), or to just below `$HOME` when it is in none, may only **select**
-an account:
+accounts, model rewrites, default efforts and the retention window. `AGENTMUX_CONFIG` must be
+absolute and is the one way to keep the file anywhere else; `XDG_CONFIG_HOME` and `APPDATA` count
+only when they point under your home, so a container that points them at a workspace cannot turn a
+checkout into a machine file. A *project* file, found by walking up from the delegate's working
+directory to the root of its repository (the nearest `.git`), or to just below `$HOME` when it is in
+none, may only **select** an account:
 
 ```toml
 # <repo>/agentmux.toml — safe to commit
@@ -225,11 +225,11 @@ an account:
 account = "clientx"
 ```
 
-A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite or an
-`[efforts]` default is refused by name. It has to be, because such a file arrives with a
-`git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a repository and asking
-for one second opinion would send your key to whoever wrote it. For the same reason a project file
-may choose *which* of your accounts pays but nothing more: an account it selects runs isolated
+A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite, an
+`[efforts]` default or a `retention` is refused by name. It has to be, because such a file arrives
+with a `git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a repository and
+asking for one second opinion would send your key to whoever wrote it. For the same reason a project
+file may choose *which* of your accounts pays but nothing more: an account it selects runs isolated
 unless the call says otherwise, and does not bring its own `request_env` with it. On Unix either
 file is read only when you own it and nobody else can write it (other platforms check only that it
 is a regular file), and a file that cannot be parsed is reported by position, never by quoting the
@@ -301,6 +301,24 @@ this file and never an `agentmux` release. A default keyed by a model the same f
 is refused when the file is read, because it could never apply and would read as though it did.
 Every description of a consultation names the effort that ran, and `agentmux accounts` lists the
 defaults under `efforts`.
+
+### Retention
+
+A consultation is kept until its delegate has written nothing for a week, then removed by the sweep
+that runs when an MCP server starts or by `agentmux prune`. The clock runs from the delegate's last
+write, not from the start, so a long review is not stale the moment it ends. The machine file can
+set another window, in `humantime` units (`36h`, `30d`, `1w`, `2w 3d`, `1 week`):
+
+```toml
+# ~/.config/agentmux/agentmux.toml
+retention = "30d"
+```
+
+A value that is not a duration, or is zero, fails the load. `keep: true` on `start` or `ask`
+(`--keep` on the command line) exempts one consultation from the sweep altogether, until
+`agentmux prune <run_id>` removes it. Neither a kept consultation nor one whose delegate is still
+running is ever swept. When the configuration cannot be read, a starting MCP server skips the sweep
+rather than falling back to the default window.
 
 ### Launching from a sandboxed agent
 

@@ -228,7 +228,8 @@ pub struct QuestionParams {
     pub env: Option<std::collections::BTreeMap<String, String>>,
 
     /// Keep the consultation indefinitely, so a follow-up can arrive at any time.
-    /// Without this it is deleted 24 hours after it started.
+    /// Without this it is deleted once its delegate has written nothing for a week, or for the
+    /// `retention` the machine's `agentmux.toml` sets.
     /// Set it only when you expect to ask a follow-up after that window, because nothing deletes
     /// a kept consultation automatically — a person runs `agentmux prune <run_id>`.
     #[serde(default)]

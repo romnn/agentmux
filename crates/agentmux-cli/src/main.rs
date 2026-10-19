@@ -133,11 +133,27 @@ async fn main() -> Result<()> {
                 store.remove(run_id.id())?;
                 println!("removed {}", run_id.id());
             } else {
-                println!("removed {} expired consultation(s)", store.sweep()?);
+                println!("removed {} expired consultation(s)", sweep(&store)?);
             }
             Ok(())
         }
     }
+}
+
+/// Delete the consultations past the machine's retention window.
+///
+/// Only the machine file is read, because it alone may set the window and the store is shared by
+/// every project.
+/// A machine file that does not load fails the sweep rather than falling back to the default
+/// window, which could delete what a longer configured one keeps.
+///
+/// # Errors
+///
+/// Returns an error when the machine configuration cannot be read, or the run directory cannot be
+/// listed.
+fn sweep(store: &RunStore) -> Result<usize> {
+    let config = agentmux::config::Config::load_machine(store.host_env())?;
+    Ok(store.sweep(config.sweep_after())?)
 }
 
 /// Serve the tools over stdio until the host disconnects.
@@ -175,7 +191,7 @@ async fn serve(store: RunStore, args: &McpArgs) -> Result<()> {
     }
     // The sweep runs once at server start.
     // No timer, no daemon.
-    match store.sweep() {
+    match sweep(&store) {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept expired consultations"),
         Err(error) => tracing::warn!(%error, "sweep failed; serving anyway"),

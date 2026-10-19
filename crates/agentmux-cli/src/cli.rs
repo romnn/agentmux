@@ -273,7 +273,8 @@ pub struct QuestionArgs {
 
     /// Keep the consultation indefinitely so a follow-up can arrive at any time.
     ///
-    /// Without this it is swept 24 hours after it started.
+    /// Without this it is swept once its delegate has written nothing for a week, or for the
+    /// `retention` the machine's `agentmux.toml` sets.
     #[arg(long)]
     pub keep: bool,
 }
