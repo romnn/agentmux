@@ -1330,8 +1330,8 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
 /// when the request moved it there, relative to the child's working directory, because the
 /// launch records it as the child resolves it.
 ///
-/// A request's environment is not kept, so re-deriving the directory from the account would
-/// search the account's own home, find nothing, and cache that.
+/// Re-deriving the directory from the account would ignore what the request's environment did
+/// to it, search the account's own home, find nothing, and cache that.
 #[gtest]
 fn a_rollout_is_found_where_the_requests_environment_sent_the_child() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;

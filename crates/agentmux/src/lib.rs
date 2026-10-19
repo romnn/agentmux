@@ -12,7 +12,7 @@
 //!
 //! - [`delegate`] — the closed set of delegates, and the exact argument vector each one needs.
 //! - [`stream`] — folds each vendor's event stream into a transcript.
-//!   Nothing else parses JSON.
+//!   Nothing else parses a capture.
 //! - [`transcript`] — the vendor-neutral record of what a delegate said.
 //! - [`launch`] — turns a prepared invocation into a detached child writing to files.
 //! - [`appserver`] — the driver that runs a Codex turn over `codex app-server`, so the turn can

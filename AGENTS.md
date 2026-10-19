@@ -174,8 +174,8 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `NotResumable::SessionNotSaved` rather than let the CLI fail after being paid for, and
   `describe_unsaved_session_store` is the one phrasing every reader uses. Separately,
   `RunStatus::delegate_stderr` quotes a failed newest turn's stderr when the fold says no exit
-  record settled it (`RunState::newest_settled_by_record`), so it never repeats the tail the
-  record froze. It is a snapshot, so the append-only transcript is untouched.
+  record settled it (`NewestTurn::settled_by` is not `SettledBy::Record`), so it never repeats
+  the tail the record froze. It is a snapshot, so the append-only transcript is untouched.
 - **No key from the environment reaches a delegate unless a machine file opted its account in.**
   `Billing::Subscription` is the default and needs no configuration: `delegate::scrub_billing_env`
   runs over the child's environment when the identity is resolved and again at the spawn
@@ -194,7 +194,7 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `Subscription` always — and `start` pins whatever the first turn decides in `Meta::billing`,
   which every follow-up asks for again, so a project-selected account cannot drift onto API pricing
   when the files change. The pricing surfaces as `RunStatus::billing`, `RunSummary::billing`,
-  `billing=api` in `render::delegate_line` and `list`, and a note under the question.
+  `billing=api` in `report::delegate_line` and `list`, and a note under the question.
 - **An inheriting Codex turn is driven over `codex app-server` by agentmux itself, so it can be
   steered.** The driver (`appserver::drive`) is the delegate as far as the store can tell: this
   executable run as the hidden `agentmux codex-app-server <plan>`, launched by the same launcher

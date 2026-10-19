@@ -2,7 +2,9 @@
 //! against codex's own types at the pinned release.
 //!
 //! The conversion below destructures codex's snapshot with every field named, so a field codex
-//! adds, drops or retypes is a build error here, whether or not the mirror reads it.
+//! adds or drops is a build error here, whether or not the mirror reads it.
+//! A field the mirror copies is type-checked by the copy too; one it ignores, bound as `_`, is
+//! not, so retyping that one compiles.
 //! The test writes codex's own rollout lines and reads each back as the mirror, which checks the
 //! names on the wire and that every line the mirror does not read still reads as something.
 

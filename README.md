@@ -131,7 +131,10 @@ agentmux start --delegate claude --model claude-opus-5 --effort xhigh --keep \
   --file review/brief.md
 agentmux tail <run-id> --follow
 
-# A correction while the turn is still running.
+# A correction while the turn is still running, from another terminal. Only a Codex turn that
+# inherits its account's settings runs over `codex app-server`, which is what can take one.
+agentmux start --delegate codex --model gpt-6-astra --effort high --inherit-settings \
+  'Review the diff against main for correctness bugs. Cite file:line.'
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
 # One more question, in the delegate's own session.

@@ -34,11 +34,12 @@
 //!   its own, which no signal to a process group reaches, so the driver reads the server's
 //!   process tree while it still holds the server's input open, and signals what survives by pid
 //!   and start time.
-//!   While the turn runs it also records that tree every second, so a command a crashed server
-//!   orphaned is still stopped; on Linux it adopts such orphans as well, and waits for each one
-//!   that exits so none lingers in the process table.
-//!   That is best effort: on macOS, a command a crashed server's command started after the last
-//!   record is out of reach.
+//!   On Linux it adopts what the server orphans, so a command a crashed server left behind is
+//!   still found below it, and it waits for each adopted orphan that exits so none lingers in
+//!   the process table.
+//!   Elsewhere it records that tree every second while the turn runs instead, which is best
+//!   effort: on macOS, a command a crashed server's command started after the last record is out
+//!   of reach.
 //!   On Windows the driver holds everything below it in a kill-on-close job object instead, and
 //!   reads no process tree, because a recorded parent pid proves nothing there.
 //!
@@ -74,10 +75,11 @@
 //!
 //! # Steering and cancelling go through files
 //!
-//! Whoever steers writes a request into the turn's [`mailbox`]; the driver claims it by renaming
-//! it, sends `turn/steer`, and writes a reply beside it.
-//! A caller that gives up first withdraws the request by renaming it too, and exactly one of the
-//! two renames can succeed, so a message is either claimed or withdrawn and never sent.
+//! Whoever steers writes a request into the turn's [`mailbox`]; the driver claims it by creating
+//! its one decision file, sends `turn/steer`, and writes a reply beside it.
+//! A caller that gives up first withdraws the request by creating that same decision file, and
+//! exactly one of the two can create it, so a message is either claimed or withdrawn, and a
+//! withdrawn one is never sent.
 //! A claimed message is answered with exactly what the driver knows:
 //!
 //! - accepted, once the server said so and the capture holds it as a

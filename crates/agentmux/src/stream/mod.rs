@@ -1,8 +1,10 @@
 //! Folds a delegate's raw event stream into a [`Turn`].
 //!
-//! Parsing happens here and only here.
-//! No `serde_json::Value` leaves this module, so everything downstream is vendor-neutral and
-//! cannot be called with the wrong vendor's shape.
+//! Every capture is parsed here, and only here.
+//! What a fold returns is vendor-neutral, so nothing downstream can be called with the wrong
+//! vendor's shape.
+//! The Codex capture model, [`codex::CaptureEvent`], is also what the app-server driver writes,
+//! and it keeps whatever the server said that could not be decoded verbatim, as evidence.
 //!
 //! # Why every fold counts what it does not recognise
 //!
