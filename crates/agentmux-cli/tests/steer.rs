@@ -375,6 +375,73 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     Ok(())
 }
 
+/// Record `driver` as the child of the turn in `turn`, whole, as the store does once the spawn
+/// returns: a driver whose turn's launch record does not name it starts nothing.
+fn record_launch(turn: &Path, driver: u32) -> Result<()> {
+    let record = serde_json::json!({
+        "launched": agentmux::launch::Launched {
+            pid: driver,
+            process_group: Some(driver),
+            started: None,
+        },
+        "started_at": "2026-10-19T12:00:00Z",
+    });
+    let written = turn.join("launch.json.tmp");
+    std::fs::write(&written, record.to_string()).or_fail()?;
+    std::fs::rename(&written, turn.join("launch.json")).or_fail()
+}
+
+/// A driver whose turn's launch record names another process leaves without starting codex, and
+/// says why.
+///
+/// That is the turn a follow-up took over after the caller that spawned this driver died before
+/// recording it, and whose mailbox and closing message are the new turn's.
+#[gtest]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> Result<()> {
+    use agentmux::appserver::Plan;
+    use agentmux::delegate::{AppServerSettings, Billing};
+
+    let w = world()?;
+    let turn = w.state.join("taken-over");
+    std::fs::create_dir_all(&turn).or_fail()?;
+    let plan = Plan {
+        settings: AppServerSettings {
+            program: "codex".to_owned(),
+            args: vec!["app-server".to_owned()],
+            model: ModelId::parse("gpt-6-astra").or_fail()?,
+            sandbox: CodexSandbox::ReadOnly,
+        },
+        cwd: w.project.clone(),
+        resume: None,
+        billing: Billing::Subscription,
+        turn_dir: turn.clone(),
+    };
+    let plan_path = turn.join("app-server.json");
+    std::fs::write(&plan_path, serde_json::to_string(&plan).or_fail()?).or_fail()?;
+    // The test process stands in for the driver the follow-up launched.
+    record_launch(&turn, std::process::id())?;
+
+    let mut driver = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"))
+        .args(["codex-app-server", &plan_path.to_string_lossy()])
+        .env_clear()
+        .envs(&w.host)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .or_fail()?;
+    let status = exit_of(&mut driver).await?;
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut driver.stderr.take().or_fail()?, &mut stderr).or_fail()?;
+
+    assert_that!(status.code(), some(eq(2)));
+    assert_that!(stderr, contains_substring("not as this driver"));
+    // The fake writes its environment as soon as it starts, so no file means no server.
+    assert_that!(w.environment.exists(), eq(false));
+    Ok(())
+}
+
 /// The driver scrubs the server's environment itself, so a key reaches `codex app-server` only
 /// on API pricing, whatever environment the driver was started with.
 ///
@@ -406,14 +473,16 @@ fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
         let plan_path = turn.join("app-server.json");
         std::fs::write(&plan_path, serde_json::to_string(&plan).or_fail()?).or_fail()?;
 
-        let status = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"))
+        let mut driver = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"))
             .args(["codex-app-server", &plan_path.to_string_lossy()])
             .env_clear()
             .envs(&w.host)
             .env("ANTHROPIC_AUTH_TOKEN", "tok-direct")
             .stdin(std::process::Stdio::null())
-            .status()
+            .spawn()
             .or_fail()?;
+        record_launch(&turn, driver.id())?;
+        let status = driver.wait().or_fail()?;
         assert_that!(status.success(), eq(true), "{billing}");
 
         let seen = std::fs::read_to_string(&w.environment).or_fail()?;
@@ -506,6 +575,7 @@ fn drive_fake(w: &World, dir: &Path, scenario: Scenario, releases: Vec<PathBuf>)
         .stdout(std::process::Stdio::null())
         .spawn()
         .or_fail()?;
+    record_launch(dir, child.id())?;
     Ok(Driven {
         child,
         releases,

@@ -3,10 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::appserver::mailbox::Mailbox;
+use crate::launch::Launched;
 
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
+use super::records::{LaunchRecord, read_json};
 
 /// Where one turn's files live, and what agentmux knows about its child.
 ///
@@ -34,8 +36,16 @@ impl TurnDir {
     pub(super) fn recovered(&self) -> PathBuf {
         self.root.join("recovered.md")
     }
-    pub(super) fn launch(&self) -> PathBuf {
+    pub(crate) fn launch(&self) -> PathBuf {
         self.root.join("launch.json")
+    }
+    /// The child the turn's launch record names, or `None` while the turn has no record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record is there but cannot be read or parsed.
+    pub(crate) fn launched(&self) -> Result<Option<Launched>, RunError> {
+        Ok(read_json::<LaunchRecord>(&self.launch())?.map(|record| record.launched))
     }
     pub(super) fn invocation(&self) -> PathBuf {
         self.root.join("invocation.json")

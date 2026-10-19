@@ -207,7 +207,11 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `stream::codex::CaptureEvent`, whose `exec` events are the `codex_app_server_protocol::exec`
   mirror of codex's own types.
   One driver runs one turn; a follow-up starts another that resumes the thread with
-  `thread/resume`. Reading and writing the server's pipes happen on two threads, so a server that
+  `thread/resume`. A driver starts nothing until its turn's `launch.json` names its own pid,
+  waiting up to ten seconds for the caller to write it, because a caller that died before writing
+  it leaves a claim a follow-up takes over under the same path, and once the record exists
+  `claim_turn` never does.
+  Reading and writing the server's pipes happen on two threads, so a server that
   stops reading cannot stall the driver's deadlines or a cancellation; a turn the server ends
   before answering `turn/start` is remembered, and the end is written once, after the steers in
   flight are settled. `steer` and `cancel` reach the driver through files alone, so a restarted

@@ -27,6 +27,7 @@ use super::protocol;
 use super::protocol::{ThreadId, TurnId, TurnTarget};
 use super::translate::{self, Finish, Translator};
 use crate::delegate::{Billing, scrub_billing_env};
+use crate::run::layout::TurnDir;
 use crate::stream::codex::CaptureEvent;
 
 /// How often the cancel marker, the mailbox and the server process are looked at while a turn
@@ -52,15 +53,34 @@ const SERVER_EXIT_GRACE: Duration = Duration::from_secs(5);
 /// How long what the server left running is given between the polite signal and the forceful one.
 const SWEEP_GRACE: Duration = Duration::from_secs(2);
 
+/// How long, once the forceful signal is due, what is found below the driver keeps being killed
+/// and looked for again.
+///
+/// A process forked after one read of the process table is only found by the next, and the
+/// driver's exit would not stop it: an adopted orphan is handed on to another parent, not killed.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
 /// The longest a cancelled driver takes to leave once it has seen the cancellation: the
 /// interrupt, which covers waiting for a turn being started, the server's own exit, and the sweep
-/// of whatever it left behind.
+/// of whatever it left behind, both signals included.
 ///
 /// The store's `cancel` waits longer than this before it signals the driver, so a driver that
 /// honours the cancellation is never killed in the middle of cleaning up.
 pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
     .saturating_add(SERVER_EXIT_GRACE)
-    .saturating_add(SWEEP_GRACE);
+    .saturating_add(SWEEP_GRACE)
+    .saturating_add(KILL_GRACE);
+
+/// How long a driver waits for its turn's launch record to name it before it gives the turn up.
+///
+/// The caller writes that record as soon as the spawn returns, so a driver normally finds it on
+/// its first look, and one that never comes means the caller died in between.
+/// Generous, because giving up breaks a turn that is otherwise sound, while waiting only delays a
+/// driver whose caller is already gone.
+const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the launch record is looked for while it is not there yet.
+const LAUNCH_RECORD_POLL: Duration = Duration::from_millis(20);
 
 /// How long the driver waits on the server at each point where it waits for an answer.
 ///
@@ -119,6 +139,8 @@ impl Ending {
 ///
 /// The question is read from stdin and the capture is written to stdout, which the launcher has
 /// pointed at the turn's files; a turn that breaks says why on stderr.
+/// Nothing is started until the turn's launch record names this process, which the caller writes
+/// once the spawn returns.
 /// Returns the process's exit status.
 #[must_use]
 pub fn drive(plan_path: &Path) -> i32 {
@@ -132,6 +154,13 @@ pub fn drive(plan_path: &Path) -> i32 {
             return 2;
         }
     };
+    // Confirmed once, before anything starts: once a turn's launch record exists, a
+    // follow-up never takes its directory over as an abandoned claim, so every file this
+    // driver later opens by path stays its own turn's.
+    if let Err(reason) = confirm_launch(&plan.turn(), LAUNCH_RECORD_WAIT) {
+        eprintln!("agentmux: {reason}, so codex app-server was not started");
+        return 2;
+    }
     let mut question = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut question) {
         eprintln!("agentmux: cannot read the question: {error}");
@@ -187,6 +216,39 @@ pub fn drive(plan_path: &Path) -> i32 {
         eprintln!("agentmux: {}.", super::EXEC_FALLBACK_HINT);
     }
     ending.exit_code()
+}
+
+/// Wait up to `wait` for the turn's launch record to name this process.
+///
+/// A caller that dies between spawning the driver and recording it leaves a directory that a
+/// follow-up takes over as an abandoned claim and recreates under the same path.
+/// A driver that went on regardless would claim the new turn's steers and overwrite its closing
+/// message, so it stops unless the record names it.
+/// Returns why the turn is not this driver's: the record names another process, cannot be read,
+/// or never appeared.
+fn confirm_launch(turn: &TurnDir, wait: Duration) -> Result<(), String> {
+    let driver = std::process::id();
+    let deadline = Instant::now() + wait;
+    loop {
+        match turn.launched() {
+            Ok(Some(launched)) if launched.pid == driver => return Ok(()),
+            Ok(Some(launched)) => {
+                return Err(format!(
+                    "the turn at {} was launched as process {}, not as this driver ({driver})",
+                    turn.root.display(),
+                    launched.pid
+                ));
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(LAUNCH_RECORD_POLL),
+            Ok(None) => {
+                return Err(format!(
+                    "no launch record for the turn at {} appeared within {wait:?}",
+                    turn.root.display()
+                ));
+            }
+            Err(err) => return Err(format!("cannot read the turn's launch record: {err}")),
+        }
+    }
 }
 
 /// Run one turn against a server already connected through `to_server` and `from_server`.
@@ -1014,6 +1076,8 @@ fn spawn_server(plan: &Plan) -> std::io::Result<Server> {
 /// reused meanwhile is left alone.
 /// Elsewhere an orphan neither reading saw is out of reach: one a crashed server's command
 /// started after the last record.
+/// Once the polite signal's grace is over, every read for [`KILL_GRACE`] longer kills what it
+/// finds, so a process forked during the sweep is still caught.
 fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<ProcessIdentity>) {
     let driver = std::process::id();
     let mut seen = earlier;
@@ -1037,7 +1101,8 @@ fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<ProcessIdentit
     let _ = child.kill();
     let _ = child.wait();
 
-    let deadline = Instant::now() + SWEEP_GRACE;
+    let polite_until = Instant::now() + SWEEP_GRACE;
+    let forceful_until = polite_until + KILL_GRACE;
     let mut asked: Vec<ProcessIdentity> = Vec::new();
     loop {
         let mut left = descendants(driver);
@@ -1049,15 +1114,22 @@ fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<ProcessIdentit
         if !survivors(&left, None) {
             return;
         }
-        if Instant::now() >= deadline {
-            survivors(&left, Some(sysinfo::Signal::Kill));
-            return;
-        }
         let fresh: Vec<ProcessIdentity> = left
-            .into_iter()
+            .iter()
             .filter(|process| !asked.contains(process))
+            .copied()
             .collect();
-        survivors(&fresh, Some(sysinfo::Signal::Term));
+        let now = Instant::now();
+        if now < polite_until {
+            survivors(&fresh, Some(sysinfo::Signal::Term));
+        } else {
+            // Every pass from here kills all it finds, so what was forked since the last read is
+            // killed by the next one.
+            survivors(&left, Some(sysinfo::Signal::Kill));
+            if now >= forceful_until {
+                return;
+            }
+        }
         asked.extend(fresh);
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1275,4 +1347,66 @@ fn survivors(tree: &[ProcessIdentity], signal: Option<sysinfo::Signal>) -> bool 
         }
     }
     any
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use googletest::prelude::*;
+
+    use super::confirm_launch;
+    use crate::launch::Launched;
+    use crate::run::layout::TurnDir;
+
+    /// Record `pid` as the turn's child, whole, as the store does once the spawn returns.
+    fn record_launch(turn: &TurnDir, pid: u32) -> Result<()> {
+        let record = serde_json::json!({
+            "launched": Launched {
+                pid,
+                process_group: Some(pid),
+                started: None,
+            },
+            "started_at": "2026-10-19T12:00:00Z",
+        });
+        crate::once::write_whole(&turn.launch(), record.to_string().as_bytes()).or_fail()
+    }
+
+    /// A driver goes on only when its turn's launch record names it: a record naming another
+    /// process, one that cannot be parsed, and one that never appears all stop it.
+    #[gtest]
+    fn a_driver_runs_only_the_turn_its_launch_record_names() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let turn = TurnDir {
+            root: dir.path().to_path_buf(),
+        };
+        let wait = Duration::from_millis(50);
+
+        let missing = confirm_launch(&turn, wait);
+        assert_that!(missing, err(contains_substring("no launch record")));
+
+        record_launch(&turn, std::process::id().wrapping_add(1))?;
+        let other = confirm_launch(&turn, wait);
+        assert_that!(other, err(contains_substring("not as this driver")));
+
+        std::fs::write(turn.launch(), "{").or_fail()?;
+        let unreadable = confirm_launch(&turn, wait);
+        assert_that!(unreadable, err(contains_substring("cannot read")));
+
+        record_launch(&turn, std::process::id())?;
+        assert_that!(confirm_launch(&turn, wait), ok(()));
+
+        // A record written after the driver first looks is still found.
+        std::fs::remove_file(turn.launch()).or_fail()?;
+        let recorder = std::thread::spawn({
+            let turn = turn.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                record_launch(&turn, std::process::id())
+            }
+        });
+        assert_that!(confirm_launch(&turn, Duration::from_secs(10)), ok(()));
+        recorder.join().ok().or_fail()??;
+        Ok(())
+    }
 }
