@@ -176,6 +176,76 @@ fn a_profile_that_also_supplies_a_key_reports_no_window() -> Result<()> {
     Ok(())
 }
 
+/// A Claude account whose environment switches it to a cloud backend has no subscription window,
+/// and says so rather than reporting the plain profile's figures under its name.
+///
+/// The switch is all that marks it: no key, no endpoint, and no profile directory of its own, so
+/// a probe that read the window would read the CLI's default login.
+#[gtest]
+fn a_claude_account_routed_to_a_cloud_backend_reports_no_window() -> Result<()> {
+    for switch in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        let config = config_with(
+            Vendor::Claude,
+            &[("cloud", cloud_account(switch, Billing::Api))],
+        )?;
+
+        let alias = AccountAlias::parse("cloud").or_fail()?;
+        let target = ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &host_env());
+        assert_that!(target, ok(eq(&ProbeTarget::Credential)), "{switch}");
+    }
+
+    // Such a target is answered before anything is read or spawned.
+    let observation = SystemProbe.probe(&ProbeRequest {
+        vendor: Vendor::Claude,
+        target: ProbeTarget::Credential,
+        host_env: &host_env(),
+    });
+    assert_that!(
+        observation,
+        matches_pattern!(Observation::Unavailable {
+            reason: contains_substring("routing environment")
+        })
+    );
+    Ok(())
+}
+
+/// A subscription account never carries a backend switch, which is withheld from it like a key,
+/// so the switch does not take its window away.
+#[gtest]
+fn a_withheld_backend_switch_leaves_a_subscription_account_on_its_window() -> Result<()> {
+    let config = config_with(
+        Vendor::Claude,
+        &[(
+            "work",
+            cloud_account("CLAUDE_CODE_USE_BEDROCK", Billing::Subscription),
+        )],
+    )?;
+
+    let alias = AccountAlias::parse("work").or_fail()?;
+    assert_that!(
+        ProbeTarget::of(Vendor::Claude, Some(&alias), &config, &host_env()),
+        ok(eq(&ProbeTarget::Window { config_dir: None }))
+    );
+    Ok(())
+}
+
+/// A Claude account that sets `switch` in its environment, on `billing`.
+fn cloud_account(switch: &str, billing: Billing) -> Account {
+    let mut account = Account {
+        billing: Some(billing),
+        ..Account::default()
+    };
+    account
+        .launch
+        .env
+        .insert(switch.to_owned(), agentmux::config::Secret::new("1"));
+    account
+}
+
 /// With no account named, the probe reads exactly the login a delegate without an account runs
 /// as.
 ///

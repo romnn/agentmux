@@ -29,7 +29,9 @@ use codex_app_server_protocol::rollout::{EventMsg, RateLimitSnapshot, RolloutIte
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config, home_dir};
-use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars, scrub_billing_env};
+use crate::delegate::{
+    AccountAlias, Vendor, base_env, credential_vars, is_billing_name, scrub_billing_env,
+};
 
 /// How long a single account's probe may take before it is abandoned.
 ///
@@ -144,9 +146,10 @@ pub trait QuotaProbe: Send + Sync + std::fmt::Debug {
 
 /// Which identity a probe is asking about.
 ///
-/// An account that authenticates with a key has no subscription window at all, and probing it
-/// would answer with the *default* account's figures under this account's name — a caller would
-/// then route work by another identity's remaining capacity.
+/// An account that authenticates with a key, or that its environment routes to another backend,
+/// has no subscription window at all, and probing it would answer with the *default* account's
+/// figures under this account's name — a caller would then route work by another identity's
+/// remaining capacity.
 /// So the target is decided once, from the same fields the delegate launch reads, and a key-only
 /// account is never asked.
 ///
@@ -162,8 +165,8 @@ pub enum ProbeTarget {
         /// The configuration directory the identity runs against, when it names one.
         config_dir: Option<PathBuf>,
     },
-    /// An identity that supplies a credential or an endpoint, so it is billed per token and has
-    /// no window of the vendor's to report.
+    /// An identity whose environment supplies an API credential, an endpoint, or a switch that
+    /// routes it to another backend, so no subscription window of the vendor's describes it.
     Credential,
 }
 
@@ -228,6 +231,13 @@ impl ProbeTarget {
     ) -> Result<Self, crate::delegate::DelegateError> {
         let account = crate::delegate::AccountChoice::from(alias.cloned());
         let env = crate::delegate::resolve_identity(vendor, &account, config, host_env, None)?.env;
+        // Claude keeps no stored login that outranks its environment, so any name that can move
+        // it onto API pricing or another backend, such as `CLAUDE_CODE_USE_BEDROCK`, means the
+        // plain profile's window is not this account's.
+        // A subscription identity has had every such name scrubbed already.
+        if vendor == Vendor::Claude && env.keys().any(|name| is_billing_name(name)) {
+            return Ok(Self::Credential);
+        }
         let vars = credential_vars(vendor);
         let config_dir = env.get(vars.config_dir).map(PathBuf::from);
         // An endpoint of the identity's own is not the vendor's window whatever the login says,
@@ -394,9 +404,8 @@ impl QuotaProbe for SystemProbe {
             // Reported rather than skipped: a caller comparing accounts needs to see that this one
             // exists and simply has no window, not to find it missing from the list.
             return Observation::Unavailable {
-                reason: "this account authenticates with a key rather than a logged-in profile, \
-                         so it has no subscription window to report — its usage is billed per \
-                         token"
+                reason: "subscription quota unavailable for this account's API credential or \
+                         routing environment"
                     .to_owned(),
             };
         }
