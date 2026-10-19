@@ -701,6 +701,12 @@ fn instructions(
         and refuses one passed in `env`. Pass `billing` as `api` to insist on the account's key,
         which only such an account accepts, or as `subscription` to withhold it even there;
         follow-ups keep what the first turn ran on.
+
+        Those marks are the machine file's settings. An account a checkout's own agentmux.toml
+        selects as its default, in place of the machine's, runs isolated and on subscription
+        pricing even when named explicitly: `inherit_settings: true` still overrides the
+        isolation, `billing: api` is refused, and such an account that configures an API
+        credential or endpoint is refused.
     "}
 }
 

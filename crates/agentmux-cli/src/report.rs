@@ -295,6 +295,12 @@ pub fn accounts(
     }
     if let Some(path) = &config.project_source {
         println!("project     {} (selects a default only)", path.display());
+        // The account rows below are the machine file's, and a project file's choice of
+        // default switches none of what they say on.
+        println!("              the default it selects runs isolated and on a subscription, even");
+        println!("              when named; --inherit-settings still overrides the isolation,");
+        println!("              and --billing api is refused, as is an account that sets an API");
+        println!("              credential or endpoint");
     }
     for unknown in &config.unknown {
         // A key that does nothing is invisible everywhere else: the file loads, the delegation
