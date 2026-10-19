@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use agentmux::config::{Config, expand_tilde};
 use googletest::prelude::*;
@@ -140,6 +141,123 @@ fn a_project_file_that_sets_launch_environment_is_refused() -> Result<()> {
         error.to_string(),
         contains_substring("may only select an account")
     );
+    Ok(())
+}
+
+/// A project file may not set the retention window.
+///
+/// Every consultation on the machine shares one store and one sweep, so a cloned repository that
+/// shortened the window would delete reviews other projects are still following up on.
+#[gtest]
+fn a_project_file_that_sets_the_retention_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/cloned");
+    std::fs::create_dir_all(&repo).or_fail()?;
+    agentmux::testing::write_config_file(
+        repo.join("agentmux.toml"),
+        indoc::indoc! {r#"
+            retention = "1h"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), &repo).expect_err("a project file set retention");
+
+    assert_that!(
+        error.to_string(),
+        contains_substring("may only select an account")
+    );
+    Ok(())
+}
+
+/// Without a `retention`, a consultation is kept for a week; with one, for that long.
+#[gtest]
+fn the_retention_defaults_to_a_week_and_the_machine_file_can_change_it() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+
+    let unset = Config::load(&env(home.path()), home.path()).or_fail()?;
+    assert_that!(unset.sweep_after(), eq(Duration::from_hours(7 * 24)));
+    assert_that!(unset.sweep_after(), eq(agentmux::config::DEFAULT_RETENTION));
+
+    // A misspelled sibling proves the unknown-key report still runs with a retention set: it
+    // compares the file with what the parsed configuration writes back, and stays silent if that
+    // write fails.
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            retention = "1w 8h"
+            retenton = "1d"
+        "#},
+    )
+    .or_fail()?;
+    let configured = Config::load(&env(home.path()), home.path()).or_fail()?;
+    assert_that!(
+        configured.sweep_after(),
+        eq(Duration::from_hours(7 * 24 + 8))
+    );
+    assert_that!(
+        configured
+            .unknown
+            .iter()
+            .map(|unknown| unknown.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("retenton")]
+    );
+    Ok(())
+}
+
+/// The sweep reads the machine file alone, so a broken project file where it runs cannot stop
+/// it.
+#[gtest]
+fn the_machine_file_loads_on_its_own_past_a_broken_project_file() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            retention = "30d"
+        "#},
+    )
+    .or_fail()?;
+    let repo = home.path().join("work/broken");
+    std::fs::create_dir_all(repo.join(".git")).or_fail()?;
+    agentmux::testing::write_config_file(
+        repo.join("agentmux.toml"),
+        indoc::indoc! {"
+            [defaults.claude
+        "},
+    )
+    .or_fail()?;
+
+    assert_that!(
+        Config::load(&env(home.path()), &repo).map(|_| ()),
+        err(anything())
+    );
+    let machine = Config::load_machine(&env(home.path())).or_fail()?;
+    assert_that!(machine.sweep_after(), eq(Duration::from_hours(30 * 24)));
+    Ok(())
+}
+
+/// A retention that is not a duration, or is zero, fails the load and names the file.
+#[gtest]
+fn an_invalid_retention_is_refused_at_load() -> Result<()> {
+    for written in [r#""a week""#, r#""0s""#, "7"] {
+        let home = tempfile::tempdir().or_fail()?;
+        agentmux::testing::write_config_file(
+            home.path().join("agentmux.toml"),
+            indoc::formatdoc! {"
+                retention = {written}
+            "},
+        )
+        .or_fail()?;
+
+        let loaded = Config::load(&env(home.path()), home.path());
+
+        assert_that!(
+            loaded.map(|_| ()).map_err(|error| error.to_string()),
+            err(contains_substring("agentmux.toml")),
+            "retention = {written}"
+        );
+    }
     Ok(())
 }
 
@@ -387,6 +505,7 @@ fn every_documented_config_example_parses() -> Result<()> {
                 "[launch]",
                 "[models.",
                 "[efforts.",
+                "retention =",
             ]
             .iter()
             .any(|marker| block.contains(marker))

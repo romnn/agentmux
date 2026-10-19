@@ -492,52 +492,99 @@ async fn waiting_past_the_cap_leaves_the_consultation_running() -> Result<()> {
     Ok(())
 }
 
-/// A finished `ttl` run is swept; a kept one and a running one are not.
+/// Backdates a run: its recorded creation time, and, with `captures`, its first turn's capture
+/// files, which are what the sweep's clock runs from.
+fn age_run(store: &RunStore, run_id: &RunId, days: u64, captures: bool) -> Result<()> {
+    let run = store.root().join("runs").join(run_id.as_str());
+    let path = run.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).or_fail()?).or_fail()?;
+    let created_at = chrono::Utc::now() - chrono::Duration::days(i64::try_from(days).or_fail()?);
+    meta.as_object_mut().or_fail()?.insert(
+        "created_at".to_owned(),
+        serde_json::json!(created_at.to_rfc3339()),
+    );
+    std::fs::write(&path, serde_json::to_string(&meta).or_fail()?).or_fail()?;
+    if captures {
+        let long_ago = std::time::SystemTime::now() - Duration::from_hours(days * 24);
+        for capture in ["events.jsonl", "stderr.log"] {
+            std::fs::File::options()
+                .write(true)
+                .open(run.join("turns/0000").join(capture))
+                .or_fail()?
+                .set_modified(long_ago)
+                .or_fail()?;
+        }
+    }
+    Ok(())
+}
+
+/// A finished `ttl` run is swept once its delegate has written nothing for the window.
+///
+/// A kept run, a running one, one that has answered but whose child is still there, and one whose
+/// delegate wrote recently are not, however long ago they started.
 #[gtest]
 fn the_sweep_keeps_what_must_be_kept() -> Result<()> {
     let harness = harness([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
-        Script::running("{\"type\":\"turn.started\"}\n"),
+        Script::running(indoc::indoc! {r#"
+            {"type":"turn.started"}
+        "#}),
+        Script::running(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
     ])?;
-    let expiring = harness.store.start(&request(codex()?, "old"))?;
-    let kept = harness.store.start(&StartRequest {
-        retention: Retention::UntilReleased,
-        ..request(codex()?, "kept")
-    })?;
-    let running = harness.store.start(&request(codex()?, "still going"))?;
+    let expiring = harness.store.start(&request(codex()?, "old"))?.run_id;
+    let kept = harness
+        .store
+        .start(&StartRequest {
+            retention: Retention::UntilReleased,
+            ..request(codex()?, "kept")
+        })?
+        .run_id;
+    let running = harness
+        .store
+        .start(&request(codex()?, "still going"))?
+        .run_id;
+    let answered_alive = harness.store.start(&request(codex()?, "answered"))?.run_id;
+    let recently_written = harness.store.start(&request(codex()?, "recent"))?.run_id;
+    let aged = [&expiring, &kept, &running, &answered_alive];
+    let default_window = agentmux::config::Config::default().sweep_after();
 
-    // Age all three past the TTL: the recorded creation time, and the capture files' own
-    // timestamps, because the clock runs from the last thing the delegate wrote to any of them.
-    let long_ago = std::time::SystemTime::now() - Duration::from_hours(48);
-    for id in [&expiring.run_id, &kept.run_id, &running.run_id] {
-        let run = harness.store.root().join("runs").join(id.as_str());
-        let path = run.join("meta.json");
-        let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        meta["created_at"] =
-            serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339());
-        std::fs::write(&path, serde_json::to_string(&meta)?)?;
-        for capture in ["events.jsonl", "stderr.log"] {
-            std::fs::File::options()
-                .write(true)
-                .open(run.join("turns/0000").join(capture))?
-                .set_modified(long_ago)?;
-        }
+    // Started long ago, but its delegate's files are fresh.
+    age_run(&harness.store, &recently_written, 30, false)?;
+
+    // Six days since the delegate last wrote: inside the default week.
+    for run_id in aged {
+        age_run(&harness.store, run_id, 6, true)?;
     }
+    assert_that!(harness.store.sweep(default_window)?, eq(0));
 
-    assert_that!(harness.store.sweep()?, eq(1));
+    // Eight days: past the default week, but inside a longer configured window.
+    for run_id in aged {
+        age_run(&harness.store, run_id, 8, true)?;
+    }
+    assert_that!(harness.store.sweep(Duration::from_hours(9 * 24))?, eq(0));
+
+    // Past the default week, only the finished run whose child has gone is swept.
+    assert_that!(harness.store.sweep(default_window)?, eq(1));
     assert_that!(
-        harness.store.status(&expiring.run_id).map(|_| ()),
-        err(anything())
-    );
-    assert_that!(
-        harness.store.status(&kept.run_id).map(|_| ()),
+        harness.store.status(&answered_alive).map(|_| ()),
         ok(anything())
     );
-    assert_that!(
-        harness.store.status(&running.run_id).map(|_| ()),
-        ok(anything())
-    );
+
+    // Once the answered run's child has gone, it is swept too.
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(3));
+    assert_that!(harness.store.sweep(default_window)?, eq(1));
+
+    for run_id in [&expiring, &answered_alive] {
+        assert_that!(harness.store.status(run_id).map(|_| ()), err(anything()));
+    }
+    for run_id in [&kept, &running, &recently_written] {
+        assert_that!(harness.store.status(run_id).map(|_| ()), ok(anything()));
+    }
     Ok(())
 }
 
@@ -988,7 +1035,12 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     assert_that!(refused.map(|_| ()), err(anything()));
     assert_that!(harness.launcher.launches().len(), eq(0));
     assert_that!(harness.store.list(10)?, is_empty());
-    assert_that!(harness.store.sweep()?, eq(0));
+    assert_that!(
+        harness
+            .store
+            .sweep(agentmux::config::Config::default().sweep_after())?,
+        eq(0)
+    );
     Ok(())
 }
 

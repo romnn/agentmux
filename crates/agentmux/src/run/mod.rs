@@ -114,9 +114,6 @@ impl std::fmt::Debug for RunStore {
 }
 
 impl RunStore {
-    /// How long a `ttl` consultation survives after its delegate last wrote anything.
-    pub const TTL: Duration = Duration::from_hours(24);
-
     /// Environment variable that overrides where run directories live.
     pub const STATE_DIR_ENV: &'static str = "AGENTMUX_STATE_DIR";
 

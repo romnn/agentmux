@@ -15,6 +15,8 @@
 //! It also holds the model rewrites — the machine's answer to "when something asks for *this*
 //! model, run *that* one" — and the reasoning effort to use for a model when a caller names none,
 //! which are the other things a caller cannot know from where it sits.
+//! And it says how long a consultation is kept, because every consultation on the machine shares
+//! one store.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
 //! `AGENTMUX_CONFIG` names.
 //!
@@ -30,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +43,13 @@ pub const CONFIG_PATH_ENV: &str = "AGENTMUX_CONFIG";
 
 /// The file name looked for, in both roles.
 pub const FILE_NAME: &str = "agentmux.toml";
+
+/// How long a consultation without `keep` survives after its delegate last wrote anything, when
+/// the machine file sets no `retention`.
+///
+/// A week, because a review feeds work that runs for days, and a follow-up after the window
+/// finds the consultation gone and has to pay for the review again.
+pub const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
 /// Why a configuration file could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -79,14 +89,15 @@ pub enum ConfigError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// A project file tried to define an account, a launch environment, a model rewrite or a
-    /// default effort, rather than select an account.
+    /// A project file tried to define an account, a launch environment, a model rewrite, a
+    /// default effort or the retention window, rather than select an account.
     #[error(
-        "{path} defines accounts, model rewrites, default efforts or a [launch] environment, and \
-         a project agentmux.toml may only select an account with [defaults.<vendor>]. Move the \
-         definitions to your machine configuration: a file that travels with a repository must \
-         not be able to name a credential, an endpoint, an environment variable, or which model \
-         answers your questions and how hard it thinks."
+        "{path} defines accounts, model rewrites, default efforts, a retention or a [launch] \
+         environment, and a project agentmux.toml may only select an account with \
+         [defaults.<vendor>]. Move the definitions to your machine configuration: a file that \
+         travels with a repository must not be able to name a credential, an endpoint, an \
+         environment variable, which model answers your questions and how hard it thinks, or \
+         when every consultation on this machine is deleted."
     )]
     ProjectFileOversteps {
         /// The offending file.
@@ -526,6 +537,49 @@ mod by_vendor {
     }
 }
 
+/// The `retention` duration, in the units `humantime` reads: `7d`, `1w`, `36h`, `2w 3d`,
+/// `1 week`.
+///
+/// A duration of zero is refused: it would delete every finished consultation at the next sweep,
+/// which is what `agentmux prune <run_id>` is for.
+mod retention_window {
+    use std::time::Duration;
+
+    use serde::{Deserialize as _, Deserializer, Serializer, de};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let window = humantime::parse_duration(&text).map_err(|err| {
+            de::Error::custom(format_args!(
+                "`retention` is a duration such as `7d`, `1w` or `36h` ({err})"
+            ))
+        })?;
+        if window.is_zero() {
+            return Err(de::Error::custom(
+                "a retention of zero would delete every finished consultation; give a positive \
+                 duration such as `7d`",
+            ));
+        }
+        Ok(Some(window))
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field to its serializer by reference"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        window: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match window {
+            Some(window) => serializer.collect_str(&humantime::format_duration(*window)),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
 /// The machine's agentmux configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -562,6 +616,18 @@ pub struct Config {
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
+    /// How long a consultation without `keep` survives after its delegate last wrote anything,
+    /// written as a duration such as `"7d"`, `"1w"`, `"36h"` or `"2w 3d"`.
+    ///
+    /// Read through [`Config::sweep_after`], which falls back to [`DEFAULT_RETENTION`].
+    /// Only a machine file may set it: the sweep removes every expired consultation in the store,
+    /// whichever project started it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "retention_window"
+    )]
+    pub retention: Option<Duration>,
     /// Which machine file the accounts came from, or `None` when none was found.
     ///
     /// Skipped on the wire: it records where the file was, not what it said, and round-tripping it
@@ -758,37 +824,14 @@ impl Config {
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
     /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account, a
-    /// model rewrite or a default effort rather than naming an account,
+    /// model rewrite, a default effort or a retention rather than naming an account,
     /// [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten, and
     /// [`ConfigError::EffortForRewrittenModel`] for a default effort keyed by a model the same
     /// file rewrites away.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
 
-        // An exported-but-empty variable means unset, as it does for the state directory: a shell
-        // that exports it unconditionally would otherwise make every command fail on a path of "".
-        let mut config = if let Some(explicit) = host_env
-            .get(CONFIG_PATH_ENV)
-            .filter(|value| !value.is_empty())
-        {
-            let path = PathBuf::from(explicit);
-            if !path.is_absolute() {
-                return Err(ConfigError::RelativeExplicit { path });
-            }
-            if !path.exists() {
-                return Err(ConfigError::MissingExplicit { path });
-            }
-            Self::read(&path)?
-        } else {
-            let mut found = Self::default();
-            for path in Self::machine_paths(host_env) {
-                if path.is_file() {
-                    found = Self::read(&path)?;
-                    break;
-                }
-            }
-            found
-        };
+        let mut config = Self::read_machine(host_env)?;
 
         // The machine file keeps its role even when the walk passes over it, which happens when
         // an explicit path points inside the checkout.
@@ -805,6 +848,7 @@ impl Config {
                 || !project.launch.is_empty()
                 || !project.model_rewrites.is_empty()
                 || !project.effort_defaults.is_empty()
+                || project.retention.is_some()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
@@ -823,13 +867,56 @@ impl Config {
             break;
         }
 
-        for unknown in &config.unknown {
+        config.warn_unknown();
+        Ok(config)
+    }
+
+    /// Load the machine file alone, for a reader that needs nothing a project file could say.
+    ///
+    /// The retention sweep is one: it acts on the store every project shares, so a broken project
+    /// file in whichever directory it runs from must not stop it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Config::load`] documents for the machine file.
+    pub fn load_machine(host_env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let config = Self::read_machine(host_env)?;
+        config.warn_unknown();
+        Ok(config)
+    }
+
+    /// Read the machine file: the explicit one, or the first found at [`Self::machine_paths`].
+    fn read_machine(host_env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        // An exported-but-empty variable means unset, as it does for the state directory: a shell
+        // that exports it unconditionally would otherwise make every command fail on a path of "".
+        if let Some(explicit) = host_env
+            .get(CONFIG_PATH_ENV)
+            .filter(|value| !value.is_empty())
+        {
+            let path = PathBuf::from(explicit);
+            if !path.is_absolute() {
+                return Err(ConfigError::RelativeExplicit { path });
+            }
+            if !path.exists() {
+                return Err(ConfigError::MissingExplicit { path });
+            }
+            return Self::read(&path);
+        }
+        for path in Self::machine_paths(host_env) {
+            if path.is_file() {
+                return Self::read(&path);
+            }
+        }
+        Ok(Self::default())
+    }
+
+    fn warn_unknown(&self) {
+        for unknown in &self.unknown {
             // Warned at every load rather than once: this is a file the operator can fix, and the
             // reader who needs to see it is whoever is looking at a delegation that behaved
             // unexpectedly, not whoever started the process.
             tracing::warn!(%unknown, "this agentmux does not read that key, and is ignoring it");
         }
-        Ok(config)
     }
 
     /// Read and parse one file.
@@ -1000,6 +1087,13 @@ impl Config {
     pub fn model_rewrites(&self, vendor: Vendor) -> &BTreeMap<ModelId, ModelId> {
         static NONE: BTreeMap<ModelId, ModelId> = BTreeMap::new();
         self.model_rewrites.get(&vendor).unwrap_or(&NONE)
+    }
+
+    /// How long a consultation without `keep` survives after its delegate last wrote anything:
+    /// the machine file's `retention`, or [`DEFAULT_RETENTION`].
+    #[must_use]
+    pub fn sweep_after(&self) -> Duration {
+        self.retention.unwrap_or(DEFAULT_RETENTION)
     }
 
     /// What to run when a caller asks for `model`, when this machine rewrites it.
