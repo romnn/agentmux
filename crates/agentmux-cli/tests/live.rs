@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{Retention, RunStore, StartRequest};
+use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
 use googletest::prelude::*;
 
@@ -70,15 +70,10 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         started.transcript_path.display()
     );
     // The turn takes a steer once the driver has announced it.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !store.status(&id)?.steerable {
-        assert_that!(
-            Instant::now() < deadline,
-            eq(true),
-            "the turn never started"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    until(&store, &id, "the turn never started", |status| {
+        status.steerable
+    })
+    .await?;
 
     // Steered while the command runs; it reaches the model before its next call.
     store
@@ -97,6 +92,12 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     assert_that!(reply, contains_substring("STEERED"));
 
     // A follow-up resumes the same thread; its replies are read from below its question.
+    // The driver saves the session on its way out, after the turn's last event, so a follow-up
+    // waits for it to leave.
+    until(&store, &id, "the driver never left", |status| {
+        status.resumable
+    })
+    .await?;
     store.follow_up(&id, "Reply with exactly LIVE_AGAIN and nothing else.")?;
     store
         .wait_until_terminal(&id, Duration::from_secs(300))
@@ -111,19 +112,18 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     assert_that!(replies, contains_substring("LIVE_AGAIN"));
 
     // A long turn is cancelled over the protocol once it is running, and the store records it.
+    until(&store, &id, "the driver never left", |status| {
+        status.resumable
+    })
+    .await?;
     store.follow_up(
         &id,
         "Run the shell command `sleep 120`, then reply with exactly LIVE_LATE.",
     )?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !store.status(&id)?.steerable {
-        assert_that!(
-            Instant::now() < deadline,
-            eq(true),
-            "the turn never started"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    until(&store, &id, "the turn never started", |status| {
+        status.steerable
+    })
+    .await?;
     // Time for the model to start the command, which the transcript does not show running.
     tokio::time::sleep(Duration::from_secs(10)).await;
     let asked = Instant::now();
@@ -144,5 +144,20 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         none(),
         "the app-server protocol has drifted"
     );
+    Ok(())
+}
+
+/// Poll the consultation until `ready` holds of its status, failing with `what` after a minute.
+async fn until(
+    store: &RunStore,
+    id: &RunId,
+    what: &str,
+    ready: impl Fn(&RunStatus) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready(&store.status(id)?) {
+        assert_that!(Instant::now() < deadline, eq(true), "{what}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     Ok(())
 }

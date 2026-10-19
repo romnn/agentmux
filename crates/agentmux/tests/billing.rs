@@ -53,8 +53,18 @@ fn world() -> Result<World> {
     let fake = bin.join("claude");
     std::fs::write(
         &fake,
-        format!(
-            "#!/bin/sh\nenv >> '{dump}'\necho '{LAUNCHED}' >> '{dump}'\ncat '{stream}'\nexit 0\n",
+        indoc::formatdoc!(
+            r#"
+                #!/bin/sh
+                if [ "$1" = --version ]; then
+                    echo '2.1.270 (Claude Code)'
+                    exit 0
+                fi
+                env >> '{dump}'
+                echo '{LAUNCHED}' >> '{dump}'
+                cat '{stream}'
+                exit 0
+            "#,
             dump = dump.display(),
             stream = stream.display(),
         ),
@@ -80,6 +90,11 @@ fn world() -> Result<World> {
         dump,
         store: None,
     })
+}
+
+struct Consultation {
+    status: RunStatus,
+    seen: String,
 }
 
 impl World {
@@ -118,10 +133,13 @@ impl World {
 
     /// Run one consultation in the world's own directory and return its status and the
     /// environment the fake recorded.
-    async fn consult(&mut self, account: Option<&str>) -> Result<(RunStatus, String)> {
+    async fn consult(&mut self, account: Option<&str>) -> Result<Consultation> {
         let cwd = self.root.path().to_path_buf();
         let status = self.consult_in(&cwd, account, None).await?;
-        Ok((status, self.seen(0)?))
+        Ok(Consultation {
+            status,
+            seen: self.seen(0)?,
+        })
     }
 
     /// Run one consultation in `cwd`, asking for `billing`, to its end.
@@ -163,7 +181,7 @@ impl World {
 async fn a_delegate_on_a_subscription_receives_no_key_from_the_host() -> Result<()> {
     let mut w = world()?;
 
-    let (status, seen) = w.consult(None).await?;
+    let Consultation { status, seen } = w.consult(None).await?;
 
     for (name, value) in HOST_KEYS {
         assert_that!(
@@ -192,7 +210,7 @@ async fn an_account_opted_into_api_pricing_passes_its_key_and_says_so() -> Resul
         billing = "api"
     "#})?;
 
-    let (status, seen) = w.consult(Some("ci")).await?;
+    let Consultation { status, seen } = w.consult(Some("ci")).await?;
 
     assert_that!(seen, contains_substring("ANTHROPIC_API_KEY=sk-ci-opted-in"));
     // The host's own key stays behind: the account chose the identity.
@@ -268,7 +286,7 @@ async fn no_layer_can_hand_a_subscription_delegate_a_key() -> Result<()> {
         profile = profile.display()
     ))?;
 
-    let (status, seen) = w.consult(Some("personal")).await?;
+    let Consultation { status, seen } = w.consult(Some("personal")).await?;
 
     for leaked in [
         "sk-provider-passthrough",
@@ -316,7 +334,14 @@ async fn a_follow_up_keeps_the_pricing_its_consultation_started_on() -> Result<(
     let project = w.root.path().join("project");
     std::fs::create_dir_all(project.join(".git")).or_fail()?;
     let selection = project.join("agentmux.toml");
-    std::fs::write(&selection, "[defaults.claude]\naccount = \"work\"\n").or_fail()?;
+    std::fs::write(
+        &selection,
+        indoc::indoc! {r#"
+            [defaults.claude]
+            account = "work"
+        "#},
+    )
+    .or_fail()?;
     std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o644)).or_fail()?;
 
     let started = w.consult_in(&project, None, None).await?;
@@ -331,7 +356,16 @@ async fn a_follow_up_keeps_the_pricing_its_consultation_started_on() -> Result<(
         .wait_until_terminal(&started.run_id, Duration::from_secs(20))
         .await?;
 
-    assert_that!(w.seen(1)?, not(contains_substring("sk-work-account")));
+    // Only delegate launches are recorded, so the second environment belongs to the follow-up.
+    let dump = std::fs::read_to_string(&w.dump).or_fail()?;
+    let environments: Vec<&str> = dump
+        .split(LAUNCHED)
+        .filter(|environment| !environment.trim().is_empty())
+        .collect();
+    assert_that!(environments.len(), eq(2));
+    let follow_up = environments.get(1).or_fail()?;
+    assert_that!(*follow_up, not(contains_substring("sk-work-account")));
+    assert_that!(*follow_up, contains_substring("CLAUDE_CONFIG_DIR="));
     assert_that!(
         w.store()?.status(&started.run_id)?.billing,
         some(eq(Billing::Subscription))
