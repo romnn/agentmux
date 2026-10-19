@@ -551,7 +551,7 @@ fn command_execution(command: wire::CommandExecutionThreadItem) -> Result<Detail
     Ok(Details::CommandExecution(exec::CommandExecutionItem {
         command: command.command,
         aggregated_output: command.aggregated_output.unwrap_or_default(),
-        exit_code: command.exit_code.and_then(|code| i32::try_from(code).ok()),
+        exit_code: command.exit_code,
         status: match command.status {
             wire::CommandExecutionStatus::InProgress => exec::CommandExecutionStatus::InProgress,
             wire::CommandExecutionStatus::Completed => exec::CommandExecutionStatus::Completed,

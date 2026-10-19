@@ -9398,7 +9398,7 @@ dependencies = [
 [[package]]
 name = "progeny"
 version = "0.0.3"
-source = "git+https://github.com/romnn/progeny?rev=cf06eccb8511e5e7af418dcf7cb0ce3ba6bcd102#cf06eccb8511e5e7af418dcf7cb0ce3ba6bcd102"
+source = "git+https://github.com/romnn/progeny?rev=9be5911d02bf244fd50a448f82b4666d2afe6e3f#9be5911d02bf244fd50a448f82b4666d2afe6e3f"
 dependencies = [
  "camino",
  "heck",

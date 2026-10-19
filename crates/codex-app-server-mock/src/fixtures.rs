@@ -224,7 +224,7 @@ pub fn reasoning(id: &str, summary: &[&str]) -> ThreadItem {
 
 /// A command that ran to completion.
 #[must_use]
-pub fn command(id: &str, command: &str, output: &str, exit_code: i64) -> ThreadItem {
+pub fn command(id: &str, command: &str, output: &str, exit_code: i32) -> ThreadItem {
     ThreadItem::CommandExecution(Box::new(CommandExecutionThreadItem {
         aggregated_output: Some(output.to_owned()),
         command: command.to_owned(),

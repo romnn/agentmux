@@ -350,10 +350,17 @@ pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
 /// send.
 /// Its enums and unions stay open, so a value a newer codex adds still decodes, and a payload
 /// that does not decode is recorded whole as drift by the driver.
+///
+/// Integers are as wide as their `format` says, which codex's schema writes from the Rust type
+/// behind each one, so an exit code is the `i32` codex holds it in.
 fn progeny_config() -> progeny::Config {
     progeny::Config {
         packaging: progeny::Packaging::Module,
         decoding: progeny::Decoding::Strict,
+        formats: progeny::Formats {
+            integers: progeny::IntegerWidth::ByFormat,
+            ..progeny::Formats::default()
+        },
         derives: [
             progeny::Derive::Clone,
             progeny::Derive::Debug,

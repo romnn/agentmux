@@ -22,7 +22,7 @@ clap.workspace = true
 indoc.workspace = true
 # Pinned to a commit, and so by the workspace lockfile: the generated sources carry it in their
 # header, and moving it is a deliberate regeneration.
-progeny = { git = "https://github.com/romnn/progeny", rev = "cf06eccb8511e5e7af418dcf7cb0ce3ba6bcd102" }
+progeny = { git = "https://github.com/romnn/progeny", rev = "9be5911d02bf244fd50a448f82b4666d2afe6e3f" }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
