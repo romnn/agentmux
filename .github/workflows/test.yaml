@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: test
 on:
-  push: {}
+  push:
+    branches: [main]
   workflow_call: {}
   pull_request:
     types: [opened, synchronize, reopened, edited]
@@ -13,6 +14,7 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -40,6 +42,7 @@ jobs:
 
   publish:
     name: publish (dry-run)
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

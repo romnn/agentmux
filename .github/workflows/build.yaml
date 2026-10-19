@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: build
 on:
-  push: {}
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
@@ -11,6 +12,7 @@ env:
 
 jobs:
   goreleaser:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

@@ -5,6 +5,7 @@ name: codegen
 # nothing else runs this.
 on:
   push:
+    branches: [main]
     paths: &inputs
       - crates/codex-app-server-codegen/**
       - crates/codex-app-server-protocol/**
@@ -23,6 +24,7 @@ env:
 jobs:
   # The checked-in protocol crate is what the vendored schema generates; needs no codex.
   generated:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -44,6 +46,7 @@ jobs:
   # The vendored schema is what the pinned codex exports, and its app-server still cannot be
   # isolated.
   upstream:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -84,6 +87,7 @@ jobs:
 
   # The answers table and the exec mirror are what codex's own crates declare at the pinned tag.
   oracle:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

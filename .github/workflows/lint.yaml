@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
 name: lint
 on:
-  push: {}
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
@@ -11,6 +12,7 @@ env:
 
 jobs:
   lint:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -44,6 +46,7 @@ jobs:
         run: task lint:fc
 
   spellcheck:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
