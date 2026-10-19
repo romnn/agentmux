@@ -656,7 +656,7 @@ impl Session<'_> {
         let announced = self.translator.thread_began(&thread_id);
         self.record(&[announced]).map_err(Setup::Failed)?;
 
-        let start = protocol::turn_start_params(&thread_id, question).map_err(Setup::Failed)?;
+        let start = protocol::turn_start_params(&thread_id, question);
         let started = match self.call::<m::TurnStart>(&start) {
             Ok(started) => started,
             Err(Setup::Started) => return Ok(thread_id),
@@ -768,8 +768,8 @@ impl Session<'_> {
                     thread: thread_id,
                     turn: &turn_id,
                 };
-                let sent = protocol::turn_steer_params(target, &claim.text)
-                    .and_then(|params| self.request::<m::TurnSteer>(&params));
+                let params = protocol::turn_steer_params(target, &claim.text);
+                let sent = self.request::<m::TurnSteer>(&params);
                 match sent {
                     Ok(id) => {
                         self.pending.insert(

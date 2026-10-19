@@ -26,7 +26,7 @@ use codex_app_server_mock::fixtures::{self, THREAD, TURN, Tokens};
 use codex_app_server_mock::{Peer, PeerError};
 use codex_app_server_protocol::envelope::{METHOD_NOT_FOUND, Message, RequestId};
 use codex_app_server_protocol::methods as m;
-use codex_app_server_protocol::types::TurnStatus;
+use codex_app_server_protocol::types::{TurnStatus, UserInput};
 use googletest::prelude::*;
 use serde_json::{Value, json};
 
@@ -1887,14 +1887,13 @@ fn concurrent_steers_are_each_answered_with_their_own_outcome() -> Result<()> {
             peer.start_turn(THREAD, TURN)?;
             let first = peer.expect::<m::TurnSteer>()?;
             let second = peer.expect::<m::TurnSteer>()?;
-            let text = |steer: &codex_app_server_mock::Received<m::TurnSteer>| {
-                steer
-                    .params
-                    .input
-                    .first()
-                    .and_then(|input| input.get("text"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+            let text = |steer: &codex_app_server_mock::Received<m::TurnSteer>| match steer
+                .params
+                .input
+                .first()
+            {
+                Some(UserInput::Text(input)) => Some(input.text.clone()),
+                _ => None,
             };
             let (accept, refuse) = if text(&first).as_deref() == Some("KEEP") {
                 (first, second)

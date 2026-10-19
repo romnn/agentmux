@@ -30,8 +30,9 @@
 //!   cancelled becomes nothing, so the store's own record of the cancellation decides it.
 //! - Any other notification the pinned schema names is left out, as `exec` leaves it out.
 //!
-//! A notification that does not decode, or whose method the pinned schema never had, is written
-//! as [`CaptureEvent::Undecoded`] with its payload, which the fold counts as drift: a codex whose
+//! A notification that does not decode, whose method the pinned schema never had, or that carries
+//! a type, status or kind the pinned schema does not name, is written as
+//! [`CaptureEvent::Undecoded`] with its payload, which the fold counts as drift: a codex whose
 //! protocol moved away from the generated types is loud rather than lossy, the raw capture still
 //! holds what it said, a reply is still kept, and a turn that ended is still ended.
 //!
@@ -106,7 +107,7 @@ pub(super) fn unreadable(line: &str, reason: &str) -> CaptureEvent {
 
 /// The terminal event for a turn the server ended badly.
 fn failed(message: String) -> CaptureEvent {
-    CaptureEvent::Exec(Exec::TurnFailed(exec::TurnFailedEvent {
+    CaptureEvent::from(Exec::TurnFailed(exec::TurnFailedEvent {
         error: Some(exec::ThreadErrorEvent {
             message: Some(message),
         }),
@@ -115,7 +116,7 @@ fn failed(message: String) -> CaptureEvent {
 
 /// One `exec` item, as `item.completed` carries it.
 fn completed_item(id: Option<String>, details: Details) -> CaptureEvent {
-    CaptureEvent::Exec(Exec::ItemCompleted(exec::ItemCompletedEvent {
+    CaptureEvent::from(Exec::ItemCompleted(exec::ItemCompletedEvent {
         item: exec::ThreadItem { id, details },
     }))
 }
@@ -128,18 +129,66 @@ fn with_details(summary: String, details: Option<String>) -> String {
     }
 }
 
+/// A value the generated types read but the pinned schema does not name, which a newer codex may
+/// send.
+///
+/// `exec`'s vocabulary has no word for it, so the message that carried it is written as drift with
+/// its whole payload, as one that does not decode is.
+#[derive(Debug)]
+struct Unrecognised {
+    /// What the value was meant to be, such as "item" or "command status".
+    what: &'static str,
+    /// A string value as codex sent it; an object is not repeated, since the payload holds it.
+    value: Option<String>,
+}
+
+impl Unrecognised {
+    /// A string value, such as a status.
+    fn value(what: &'static str, value: String) -> Self {
+        Self {
+            what,
+            value: Some(value),
+        }
+    }
+
+    /// An object, such as an item, whose tag the pinned schema does not name.
+    fn object(what: &'static str) -> Self {
+        Self { what, value: None }
+    }
+}
+
+impl std::fmt::Display for Unrecognised {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.value {
+            Some(value) => write!(f, "the pinned schema names no {} {value:?}", self.what),
+            None => write!(f, "the pinned schema names no such {}", self.what),
+        }
+    }
+}
+
+/// The capture of a turn that ended in a way agentmux could not read.
+fn ended_unreadably(out: &mut Translated, reason: &str, params: &Value) {
+    // The turn is over either way; how it ended is the part that could not be read.
+    out.lines
+        .push(undecoded(m::TurnCompleted::METHOD, reason, params));
+    out.lines.push(failed(format!(
+        "codex ended the turn, but agentmux could not read how: {reason}"
+    )));
+    out.finish = Some(Finish::Failed);
+}
+
 impl Translator {
     /// An id for an item agentmux writes of its own, which codex never names.
-    fn own_id(&mut self) -> Option<String> {
+    fn own_id(&mut self) -> String {
         self.written += 1;
-        Some(format!("agentmux_{}", self.written))
+        format!("agentmux_{}", self.written)
     }
 
     /// A reply, as `exec` writes the delegate's own message.
     pub(super) fn reply(&mut self, text: &str) -> CaptureEvent {
         let id = self.own_id();
         completed_item(
-            id,
+            Some(id),
             Details::AgentMessage(exec::AgentMessageItem {
                 text: Some(text.to_owned()),
             }),
@@ -150,7 +199,7 @@ impl Translator {
     pub(super) fn note(&mut self, text: &str) -> CaptureEvent {
         let id = self.own_id();
         completed_item(
-            id,
+            Some(id),
             Details::Error(exec::ErrorItem {
                 message: Some(text.to_owned()),
             }),
@@ -165,7 +214,7 @@ impl Translator {
     /// Learn the thread the consultation runs in, and return `exec`'s announcement of it.
     pub(super) fn thread_began(&mut self, id: &ThreadId) -> CaptureEvent {
         self.thread_id = Some(id.clone());
-        CaptureEvent::Exec(Exec::ThreadStarted(exec::ThreadStartedEvent {
+        CaptureEvent::from(Exec::ThreadStarted(exec::ThreadStartedEvent {
             thread_id: Some(id.as_str().to_owned()),
         }))
     }
@@ -203,7 +252,7 @@ impl Translator {
         if self.turn_id.is_none() {
             self.turn_id = Some(id.clone());
         }
-        (!std::mem::replace(&mut self.announced, true)).then_some(CaptureEvent::Exec(
+        (!std::mem::replace(&mut self.announced, true)).then_some(CaptureEvent::from(
             Exec::TurnStarted(exec::TurnStartedEvent {}),
         ))
     }
@@ -263,7 +312,7 @@ impl Translator {
             Any::Error(error) => error.decode().map(|error| {
                 let message = with_details(error.error.message, error.error.additional_details);
                 out.lines
-                    .push(CaptureEvent::Exec(Exec::Error(exec::ThreadErrorEvent {
+                    .push(CaptureEvent::from(Exec::Error(exec::ThreadErrorEvent {
                         message: Some(message.clone()),
                     })));
                 self.last_error = Some(message);
@@ -310,7 +359,14 @@ impl Translator {
     fn item_completed(&mut self, completed: Payload<'_, m::ItemCompleted>, out: &mut Translated) {
         let params = completed.raw();
         match completed.decode() {
-            Ok(completed) => out.lines.extend(self.item(completed.item)),
+            Ok(completed) => match self.item(completed.item) {
+                Ok(line) => out.lines.extend(line),
+                Err(unrecognised) => out.lines.push(undecoded(
+                    m::ItemCompleted::METHOD,
+                    &unrecognised.to_string(),
+                    params,
+                )),
+            },
             Err(reason) => {
                 // Said as drift first, with the whole payload; then a reply still readable is
                 // written as one, so the transcript keeps the report.
@@ -347,14 +403,7 @@ impl Translator {
         let completed = match completed.decode() {
             Ok(completed) => completed,
             Err(reason) => {
-                let reason = reason.to_string();
-                // The turn is over either way; how it ended is the part that could not be read.
-                out.lines
-                    .push(undecoded(m::TurnCompleted::METHOD, &reason, params));
-                out.lines.push(failed(format!(
-                    "codex ended the turn, but agentmux could not read how: {reason}"
-                )));
-                out.finish = Some(Finish::Failed);
+                ended_unreadably(&mut out, &reason.to_string(), params);
                 return out;
             }
         };
@@ -369,7 +418,7 @@ impl Translator {
                 self.close_from_items(&turn.items);
                 // Zero when the server reported none, as `exec` writes it.
                 let usage = self.usage.clone().unwrap_or_default();
-                out.lines.push(CaptureEvent::Exec(Exec::TurnCompleted(
+                out.lines.push(CaptureEvent::from(Exec::TurnCompleted(
                     exec::TurnCompletedEvent {
                         usage: Some(exec::Usage {
                             input_tokens: Some(usage.input_tokens),
@@ -400,6 +449,10 @@ impl Translator {
             }
             // Still running, as far as the server says: the turn has not visibly ended.
             wire::TurnStatus::InProgress => {}
+            wire::TurnStatus::Unknown(status) => {
+                let reason = Unrecognised::value("turn status", status).to_string();
+                ended_unreadably(&mut out, &reason, params);
+            }
         }
         out
     }
@@ -410,12 +463,12 @@ impl Translator {
             items.iter().rev().find_map(wanted).map(ToOwned::to_owned)
         };
         if let Some(reply) = text(|item| match item {
-            wire::ThreadItem::AgentMessageThreadItem(message) => Some(&message.text),
+            wire::ThreadItem::AgentMessage(message) => Some(&message.text),
             _ => None,
         }) {
             self.last_message = Some(reply);
         } else if let Some(plan) = text(|item| match item {
-            wire::ThreadItem::PlanThreadItem(plan) => Some(&plan.text),
+            wire::ThreadItem::Plan(plan) => Some(&plan.text),
             _ => None,
         }) {
             self.last_plan = Some(plan);
@@ -426,10 +479,14 @@ impl Translator {
     ///
     /// Every kind is named, so a kind the schema gains is a compile error here once the types are
     /// regenerated, rather than a silent default; each mapping follows `exec`'s own.
-    fn item(&mut self, item: wire::ThreadItem) -> Option<CaptureEvent> {
+    ///
+    /// # Errors
+    ///
+    /// A kind, status or action the pinned schema does not name is [`Unrecognised`].
+    fn item(&mut self, item: wire::ThreadItem) -> Result<Option<CaptureEvent>, Unrecognised> {
         use wire::ThreadItem as Item;
         let (id, details) = match item {
-            Item::AgentMessageThreadItem(message) => {
+            Item::AgentMessage(message) => {
                 if !message.text.trim().is_empty() {
                     self.last_message = Some(message.text.clone());
                 }
@@ -440,145 +497,163 @@ impl Translator {
                     }),
                 )
             }
-            Item::ReasoningThreadItem(reasoning) => {
+            Item::Reasoning(reasoning) => {
                 let text = reasoning.summary.unwrap_or_default().join("\n");
                 if text.trim().is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 (
                     reasoning.id,
                     Details::Reasoning(exec::ReasoningItem { text }),
                 )
             }
-            Item::CommandExecutionThreadItem(command) => (
-                command.id,
-                Details::CommandExecution(exec::CommandExecutionItem {
-                    command: command.command,
-                    aggregated_output: command.aggregated_output.unwrap_or_default(),
-                    exit_code: command.exit_code.and_then(|code| i32::try_from(code).ok()),
-                    status: match command.status {
-                        wire::CommandExecutionStatus::InProgress => {
-                            exec::CommandExecutionStatus::InProgress
-                        }
-                        wire::CommandExecutionStatus::Completed => {
-                            exec::CommandExecutionStatus::Completed
-                        }
-                        wire::CommandExecutionStatus::Failed => {
-                            exec::CommandExecutionStatus::Failed
-                        }
-                        wire::CommandExecutionStatus::Declined => {
-                            exec::CommandExecutionStatus::Declined
-                        }
-                    },
-                }),
-            ),
-            Item::FileChangeThreadItem(change) => (
-                change.id,
-                Details::FileChange(exec::FileChangeItem {
-                    changes: change
-                        .changes
-                        .into_iter()
-                        .map(|file| exec::FileUpdateChange {
-                            path: file.path,
-                            kind: match file.kind {
-                                wire::PatchChangeKind::AddPatchChangeKind(_) => {
-                                    exec::PatchChangeKind::Add
-                                }
-                                wire::PatchChangeKind::DeletePatchChangeKind(_) => {
-                                    exec::PatchChangeKind::Delete
-                                }
-                                wire::PatchChangeKind::UpdatePatchChangeKind(_) => {
-                                    exec::PatchChangeKind::Update
-                                }
-                            },
-                        })
-                        .collect(),
-                    // `exec` has no `declined`; a declined patch is one that failed to apply.
-                    status: match change.status {
-                        wire::PatchApplyStatus::InProgress => exec::PatchApplyStatus::InProgress,
-                        wire::PatchApplyStatus::Completed => exec::PatchApplyStatus::Completed,
-                        wire::PatchApplyStatus::Failed | wire::PatchApplyStatus::Declined => {
-                            exec::PatchApplyStatus::Failed
-                        }
-                    },
-                }),
-            ),
-            Item::McpToolCallThreadItem(call) => (
-                call.id,
-                Details::McpToolCall(exec::McpToolCallItem {
-                    server: call.server,
-                    tool: call.tool,
-                    arguments: call.arguments,
-                    result: call.result.map(|result| exec::McpToolCallItemResult {
-                        content: result.content,
-                        meta: result.meta,
-                        structured_content: result.structured_content,
-                    }),
-                    error: call.error.map(|error| exec::McpToolCallItemError {
-                        message: error.message,
-                    }),
-                    status: match call.status {
-                        wire::McpToolCallStatus::InProgress => exec::McpToolCallStatus::InProgress,
-                        wire::McpToolCallStatus::Completed => exec::McpToolCallStatus::Completed,
-                        wire::McpToolCallStatus::Failed => exec::McpToolCallStatus::Failed,
-                    },
-                }),
-            ),
-            Item::CollabAgentToolCallThreadItem(call) => {
+            Item::CommandExecution(command) => (command.id.clone(), command_execution(*command)?),
+            Item::FileChange(change) => (change.id.clone(), file_change(*change)?),
+            Item::McpToolCall(call) => (call.id.clone(), mcp_tool_call(*call)?),
+            Item::CollabAgentToolCall(call) => {
                 let id = call.id.clone();
-                (id, collab_tool_call(*call)?)
+                let Some(details) = collab_tool_call(*call)? else {
+                    return Ok(None);
+                };
+                (id, details)
             }
-            Item::WebSearchThreadItem(search) => (
+            Item::WebSearch(search) => (
                 search.id,
                 Details::WebSearch(exec::WebSearchItem {
                     query: search.query,
-                    action: web_search_action(search.action),
+                    action: web_search_action(search.action)?,
                     results: search.results,
                 }),
             ),
-            Item::PlanThreadItem(plan) => {
+            Item::Plan(plan) => {
                 self.last_plan = Some(plan.text);
-                return None;
+                return Ok(None);
             }
-            Item::UserMessageThreadItem(_)
-            | Item::ContextCompactionThreadItem(_)
-            | Item::HookPromptThreadItem(_)
-            | Item::FunctionCallOutputThreadItem(_)
-            | Item::DynamicToolCallThreadItem(_)
-            | Item::SubAgentActivityThreadItem(_)
-            | Item::ImageViewThreadItem(_)
-            | Item::SleepThreadItem(_)
-            | Item::ImageGenerationThreadItem(_)
-            | Item::EnteredReviewModeThreadItem(_)
-            | Item::ExitedReviewModeThreadItem(_) => return None,
+            Item::UserMessage(_)
+            | Item::ContextCompaction(_)
+            | Item::HookPrompt(_)
+            | Item::FunctionCallOutput(_)
+            | Item::DynamicToolCall(_)
+            | Item::SubAgentActivity(_)
+            | Item::ImageView(_)
+            | Item::Sleep(_)
+            | Item::ImageGeneration(_)
+            | Item::EnteredReviewMode(_)
+            | Item::ExitedReviewMode(_) => return Ok(None),
+            Item::Unknown(_) => return Err(Unrecognised::object("item")),
         };
-        Some(completed_item(Some(id), details))
+        Ok(Some(completed_item(Some(id), details)))
     }
 }
 
+/// A command, as `exec`'s `command_execution`.
+fn command_execution(command: wire::CommandExecutionThreadItem) -> Result<Details, Unrecognised> {
+    Ok(Details::CommandExecution(exec::CommandExecutionItem {
+        command: command.command,
+        aggregated_output: command.aggregated_output.unwrap_or_default(),
+        exit_code: command.exit_code.and_then(|code| i32::try_from(code).ok()),
+        status: match command.status {
+            wire::CommandExecutionStatus::InProgress => exec::CommandExecutionStatus::InProgress,
+            wire::CommandExecutionStatus::Completed => exec::CommandExecutionStatus::Completed,
+            wire::CommandExecutionStatus::Failed => exec::CommandExecutionStatus::Failed,
+            wire::CommandExecutionStatus::Declined => exec::CommandExecutionStatus::Declined,
+            wire::CommandExecutionStatus::Unknown(status) => {
+                return Err(Unrecognised::value("command status", status));
+            }
+        },
+    }))
+}
+
+/// A patch, as `exec`'s `file_change`.
+fn file_change(change: wire::FileChangeThreadItem) -> Result<Details, Unrecognised> {
+    Ok(Details::FileChange(exec::FileChangeItem {
+        changes: change
+            .changes
+            .into_iter()
+            .map(|file| {
+                let kind = match file.kind {
+                    wire::PatchChangeKind::Add => exec::PatchChangeKind::Add,
+                    wire::PatchChangeKind::Delete => exec::PatchChangeKind::Delete,
+                    wire::PatchChangeKind::Update(_) => exec::PatchChangeKind::Update,
+                    wire::PatchChangeKind::Unknown(_) => {
+                        return Err(Unrecognised::object("file change kind"));
+                    }
+                };
+                Ok(exec::FileUpdateChange {
+                    path: file.path,
+                    kind,
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        // `exec` has no `declined`; a declined patch is one that failed to apply.
+        status: match change.status {
+            wire::PatchApplyStatus::InProgress => exec::PatchApplyStatus::InProgress,
+            wire::PatchApplyStatus::Completed => exec::PatchApplyStatus::Completed,
+            wire::PatchApplyStatus::Failed | wire::PatchApplyStatus::Declined => {
+                exec::PatchApplyStatus::Failed
+            }
+            wire::PatchApplyStatus::Unknown(status) => {
+                return Err(Unrecognised::value("file change status", status));
+            }
+        },
+    }))
+}
+
+/// An MCP tool call, as `exec`'s `mcp_tool_call`.
+fn mcp_tool_call(call: wire::McpToolCallThreadItem) -> Result<Details, Unrecognised> {
+    Ok(Details::McpToolCall(exec::McpToolCallItem {
+        server: call.server,
+        tool: call.tool,
+        arguments: call.arguments,
+        result: call.result.map(|result| exec::McpToolCallItemResult {
+            content: result.content,
+            meta: result.meta,
+            structured_content: result.structured_content,
+        }),
+        error: call.error.map(|error| exec::McpToolCallItemError {
+            message: error.message,
+        }),
+        status: match call.status {
+            wire::McpToolCallStatus::InProgress => exec::McpToolCallStatus::InProgress,
+            wire::McpToolCallStatus::Completed => exec::McpToolCallStatus::Completed,
+            wire::McpToolCallStatus::Failed => exec::McpToolCallStatus::Failed,
+            wire::McpToolCallStatus::Unknown(status) => {
+                return Err(Unrecognised::value("MCP tool call status", status));
+            }
+        },
+    }))
+}
+
 /// What a web search did, as `exec` names it; one that says nothing is `Other`, as in `exec`.
-fn web_search_action(action: Option<wire::WebSearchAction>) -> exec::WebSearchAction {
-    match action {
-        Some(wire::WebSearchAction::SearchWebSearchAction(action)) => {
-            let wire::SearchWebSearchAction { query, queries, .. } = *action;
+fn web_search_action(
+    action: Option<wire::WebSearchAction>,
+) -> Result<exec::WebSearchAction, Unrecognised> {
+    Ok(match action {
+        Some(wire::WebSearchAction::Search(action)) => {
+            let wire::SearchWebSearchAction { query, queries } = *action;
             exec::WebSearchAction::Search { query, queries }
         }
-        Some(wire::WebSearchAction::OpenPageWebSearchAction(action)) => {
+        Some(wire::WebSearchAction::OpenPage(action)) => {
             exec::WebSearchAction::OpenPage { url: action.url }
         }
-        Some(wire::WebSearchAction::FindInPageWebSearchAction(action)) => {
-            let wire::FindInPageWebSearchAction { url, pattern, .. } = *action;
+        Some(wire::WebSearchAction::FindInPage(action)) => {
+            let wire::FindInPageWebSearchAction { url, pattern } = *action;
             exec::WebSearchAction::FindInPage { url, pattern }
         }
-        Some(wire::WebSearchAction::OtherWebSearchAction(_)) | None => exec::WebSearchAction::Other,
-    }
+        Some(wire::WebSearchAction::Other) | None => exec::WebSearchAction::Other,
+        Some(wire::WebSearchAction::Unknown(_)) => {
+            return Err(Unrecognised::object("web search action"));
+        }
+    })
 }
 
 /// A sub-agent tool call, as `exec`'s `collab_tool_call`, or `None` for one `exec` leaves out.
 ///
 /// `exec` names four tools and folds `resumeAgent` into `wait`; it reports neither the other tools
 /// nor an interrupted call.
-fn collab_tool_call(call: wire::CollabAgentToolCallThreadItem) -> Option<Details> {
+fn collab_tool_call(
+    call: wire::CollabAgentToolCallThreadItem,
+) -> Result<Option<Details>, Unrecognised> {
     use wire::CollabAgentTool as Tool;
     let tool = match call.tool {
         Tool::SpawnAgent => exec::CollabTool::SpawnAgent,
@@ -586,14 +661,18 @@ fn collab_tool_call(call: wire::CollabAgentToolCallThreadItem) -> Option<Details
         Tool::ResumeAgent | Tool::Wait => exec::CollabTool::Wait,
         Tool::CloseAgent => exec::CollabTool::CloseAgent,
         Tool::SendMessage | Tool::FollowupTask | Tool::InterruptAgent | Tool::ListAgents => {
-            return None;
+            return Ok(None);
         }
+        Tool::Unknown(tool) => return Err(Unrecognised::value("sub-agent tool", tool)),
     };
     let status = match call.status {
         wire::CollabAgentToolCallStatus::InProgress => exec::CollabToolCallStatus::InProgress,
         wire::CollabAgentToolCallStatus::Completed => exec::CollabToolCallStatus::Completed,
         wire::CollabAgentToolCallStatus::Failed => exec::CollabToolCallStatus::Failed,
-        wire::CollabAgentToolCallStatus::Interrupted => return None,
+        wire::CollabAgentToolCallStatus::Interrupted => return Ok(None),
+        wire::CollabAgentToolCallStatus::Unknown(status) => {
+            return Err(Unrecognised::value("sub-agent call status", status));
+        }
     };
     let agents_states = call
         .agents_states
@@ -607,19 +686,22 @@ fn collab_tool_call(call: wire::CollabAgentToolCallThreadItem) -> Option<Details
                 wire::CollabAgentStatus::Errored => exec::CollabAgentStatus::Errored,
                 wire::CollabAgentStatus::Shutdown => exec::CollabAgentStatus::Shutdown,
                 wire::CollabAgentStatus::NotFound => exec::CollabAgentStatus::NotFound,
+                wire::CollabAgentStatus::Unknown(status) => {
+                    return Err(Unrecognised::value("sub-agent status", status));
+                }
             };
             let message = state.message;
-            (thread, exec::CollabAgentState { status, message })
+            Ok((thread, exec::CollabAgentState { status, message }))
         })
-        .collect();
-    Some(Details::CollabToolCall(exec::CollabToolCallItem {
+        .collect::<Result<_, _>>()?;
+    Ok(Some(Details::CollabToolCall(exec::CollabToolCallItem {
         tool,
         sender_thread_id: call.sender_thread_id,
         receiver_thread_ids: call.receiver_thread_ids,
         prompt: call.prompt,
         agents_states,
         status,
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -835,6 +917,37 @@ mod tests {
         assert_that!(drift.len(), eq(1));
         assert_that!(drift[0]["type"], eq(&json!("agentmux.undecoded")));
         assert_that!(drift[0]["payload"], eq(&novel));
+    }
+
+    /// A value a newer codex sends that the pinned schema does not name is drift with its whole
+    /// payload, as a payload that does not decode is, and a turn that ended on one still ends.
+    #[gtest]
+    fn a_value_the_pinned_schema_does_not_name_is_drift() {
+        let mut t = Translator::default();
+        let command = completed(&json!({
+            "id": "i3", "type": "commandExecution", "command": "ls", "cwd": "/work",
+            "commandActions": [], "status": "paused",
+        }));
+        let novel_item = completed(&json!({"id": "i4", "type": "hologram", "beams": 3}));
+
+        // Neither item is written as an `exec` item; each is drift that keeps what codex said.
+        for params in [&command, &novel_item] {
+            let drift = lines(&mut t, "item/completed", params);
+            assert_that!(drift.len(), eq(1));
+            assert_that!(drift[0]["type"], eq(&json!("agentmux.undecoded")));
+            assert_that!(drift[0]["payload"], eq(params));
+        }
+
+        // A turn that ended with a status nobody named is failed, and says why.
+        let out = t.notification("turn/completed", &turn("tu", "suspended"), false);
+        assert_that!(out.finish, some(eq(Finish::Failed)));
+        assert_that!(
+            written(&out.lines)
+                .iter()
+                .map(|event| event["type"].clone())
+                .collect::<Vec<_>>(),
+            elements_are![eq(&json!("agentmux.undecoded")), eq(&json!("turn.failed"))]
+        );
     }
 
     /// A notification that no longer matches the generated types is drift that keeps its payload,

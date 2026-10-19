@@ -5,13 +5,11 @@
 //! the least a client can rely on.
 
 use codex_app_server_protocol::types::{
-    AgentMessageThreadItem, AgentMessageThreadItemType, ApprovalsReviewer, AskForApproval,
-    AskForApproval0, CommandExecutionRequestApprovalParams, CommandExecutionStatus,
-    CommandExecutionThreadItem, CommandExecutionThreadItemType, ErrorNotification,
-    IdleThreadStatus, IdleThreadStatusType, InitializeResponse, ItemCompletedNotification,
-    PlanThreadItem, PlanThreadItemType, ReadOnlySandboxPolicy, ReadOnlySandboxPolicyType,
-    ReasoningThreadItem, ReasoningThreadItemType, SandboxPolicy, SessionSource, SessionSource0,
-    Thread, ThreadItem, ThreadResumeResponse, ThreadStartResponse, ThreadStatus, ThreadTokenUsage,
+    AgentMessageThreadItem, ApprovalsReviewer, AskForApproval,
+    CommandExecutionRequestApprovalParams, CommandExecutionStatus, CommandExecutionThreadItem,
+    ErrorNotification, InitializeResponse, ItemCompletedNotification, PlanThreadItem,
+    ReadOnlySandboxPolicy, ReasoningThreadItem, SandboxPolicy, SessionSource, Thread, ThreadItem,
+    ThreadResumeResponse, ThreadStartResponse, ThreadStatus, ThreadTokenUsage,
     ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn, TurnCompletedNotification,
     TurnError, TurnInterruptParams, TurnInterruptResponse, TurnStartResponse,
     TurnStartedNotification, TurnStatus, TurnSteerResponse, WarningNotification,
@@ -64,10 +62,8 @@ pub fn thread(id: &str) -> Thread {
         section: None,
         section_entered_at: None,
         session_id: "se-fake".to_owned(),
-        source: SessionSource::SessionSource0(Box::new(SessionSource0::AppServer)),
-        status: ThreadStatus::IdleThreadStatus(Box::new(IdleThreadStatus {
-            type_: IdleThreadStatusType::Idle,
-        })),
+        source: SessionSource::AppServer,
+        status: ThreadStatus::Idle,
         thread_source: None,
         turns: Vec::new(),
         updated_at: 1_790_000_000,
@@ -76,13 +72,12 @@ pub fn thread(id: &str) -> Thread {
 
 /// `never`, the approval policy a thread nobody watches runs under.
 fn never_ask() -> AskForApproval {
-    AskForApproval::AskForApproval0(Box::new(AskForApproval0::Never))
+    AskForApproval::Never
 }
 
 fn read_only() -> SandboxPolicy {
-    SandboxPolicy::ReadOnlySandboxPolicy(Box::new(ReadOnlySandboxPolicy {
+    SandboxPolicy::ReadOnly(Box::new(ReadOnlySandboxPolicy {
         network_access: None,
-        type_: ReadOnlySandboxPolicyType::ReadOnly,
     }))
 }
 
@@ -198,42 +193,39 @@ pub fn turn_interrupt_params(thread: &str, turn_id: &str) -> TurnInterruptParams
 /// A reply of the delegate's.
 #[must_use]
 pub fn agent_message(id: &str, text: &str) -> ThreadItem {
-    ThreadItem::AgentMessageThreadItem(Box::new(AgentMessageThreadItem {
+    ThreadItem::AgentMessage(Box::new(AgentMessageThreadItem {
         delivery: None,
         id: id.to_owned(),
         memory_citation: None,
         phase: None,
         questions: None,
         text: text.to_owned(),
-        type_: AgentMessageThreadItemType::AgentMessage,
     }))
 }
 
 /// A plan of the delegate's.
 #[must_use]
 pub fn plan(id: &str, text: &str) -> ThreadItem {
-    ThreadItem::PlanThreadItem(Box::new(PlanThreadItem {
+    ThreadItem::Plan(Box::new(PlanThreadItem {
         id: id.to_owned(),
         text: text.to_owned(),
-        type_: PlanThreadItemType::Plan,
     }))
 }
 
 /// A reasoning summary.
 #[must_use]
 pub fn reasoning(id: &str, summary: &[&str]) -> ThreadItem {
-    ThreadItem::ReasoningThreadItem(Box::new(ReasoningThreadItem {
+    ThreadItem::Reasoning(Box::new(ReasoningThreadItem {
         content: Some(Vec::new()),
         id: id.to_owned(),
         summary: Some(summary.iter().map(|&line| line.to_owned()).collect()),
-        type_: ReasoningThreadItemType::Reasoning,
     }))
 }
 
 /// A command that ran to completion.
 #[must_use]
 pub fn command(id: &str, command: &str, output: &str, exit_code: i64) -> ThreadItem {
-    ThreadItem::CommandExecutionThreadItem(Box::new(CommandExecutionThreadItem {
+    ThreadItem::CommandExecution(Box::new(CommandExecutionThreadItem {
         aggregated_output: Some(output.to_owned()),
         command: command.to_owned(),
         command_actions: Vec::new(),
@@ -246,7 +238,6 @@ pub fn command(id: &str, command: &str, output: &str, exit_code: i64) -> ThreadI
         script_path: None,
         source: None,
         status: CommandExecutionStatus::Completed,
-        type_: CommandExecutionThreadItemType::CommandExecution,
     }))
 }
 

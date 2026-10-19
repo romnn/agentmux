@@ -92,7 +92,7 @@ fn sandbox_mode(sandbox: CodexSandbox) -> wire::SandboxMode {
 
 /// `never`, which is what `codex exec` runs with: nobody is there to ask.
 fn never_ask() -> wire::AskForApproval {
-    wire::AskForApproval::AskForApproval0(Box::new(wire::AskForApproval0::Never))
+    wire::AskForApproval::Never
 }
 
 /// `thread/start`'s parameters, for a turn that opens a consultation.
@@ -153,30 +153,19 @@ pub(super) fn thread_resume_params(
 }
 
 /// The single text input both `turn/start` and `turn/steer` carry.
-///
-/// `UserInput` itself is generated as plain JSON — progeny cannot tell its branches apart, as the
-/// generated module's header records — so the branch is built as its own generated type and
-/// encoded into that slot.
-fn text_input(text: &str) -> Result<Vec<wire::UserInput>, String> {
-    let input = wire::TextUserInput {
+fn text_input(text: &str) -> Vec<wire::UserInput> {
+    vec![wire::UserInput::Text(Box::new(wire::TextUserInput {
         text: text.to_owned(),
         text_elements: None,
-        type_: wire::TextUserInputType::Text,
-    };
-    let input =
-        serde_json::to_value(&input).map_err(|err| format!("cannot encode the input: {err}"))?;
-    Ok(vec![input])
+    }))]
 }
 
 /// `turn/start`'s parameters.
-pub(super) fn turn_start_params(
-    thread: &ThreadId,
-    question: &str,
-) -> Result<wire::TurnStartParams, String> {
+pub(super) fn turn_start_params(thread: &ThreadId, question: &str) -> wire::TurnStartParams {
     // Everything else is the thread's, which `thread/start` or `thread/resume` already set.
-    Ok(wire::TurnStartParams {
+    wire::TurnStartParams {
         thread_id: thread.as_str().to_owned(),
-        input: text_input(question)?,
+        input: text_input(question),
         approval_policy: None,
         approvals_reviewer: None,
         client_user_message_id: None,
@@ -194,23 +183,20 @@ pub(super) fn turn_start_params(
         summary: None,
         tool_output: None,
         turn_trigger: None,
-    })
+    }
 }
 
 /// `turn/steer`'s parameters.
 ///
 /// `expectedTurnId` is required, and is what makes a steer that arrives after its turn ended a
 /// refusal rather than the opening of a new turn.
-pub(super) fn turn_steer_params(
-    target: TurnTarget<'_>,
-    text: &str,
-) -> Result<wire::TurnSteerParams, String> {
-    Ok(wire::TurnSteerParams {
+pub(super) fn turn_steer_params(target: TurnTarget<'_>, text: &str) -> wire::TurnSteerParams {
+    wire::TurnSteerParams {
         thread_id: target.thread.as_str().to_owned(),
         expected_turn_id: target.turn.as_str().to_owned(),
-        input: text_input(text)?,
+        input: text_input(text),
         client_user_message_id: None,
-    })
+    }
 }
 
 /// `turn/interrupt`'s parameters.
@@ -240,23 +226,19 @@ pub(super) fn decline(id: &RequestId, request: Any<'_>) -> Option<Result<Message
         Message::result::<M>(id.clone(), response)
     }
     let denied = || {
-        wire::ReviewDecision::DeniedReviewDecision(Box::new(wire::DeniedReviewDecision {
-            denied: wire::DeniedReviewDecisionDenied {
-                rejection: UNATTENDED.to_owned(),
-            },
+        wire::ReviewDecision::Denied(Box::new(wire::ReviewDecisionDenied {
+            rejection: UNATTENDED.to_owned(),
         }))
     };
     Some(match request {
-        Any::ItemCommandExecutionRequestApproval(_) => answer::<
-            m::ItemCommandExecutionRequestApproval,
-        >(
-            id,
-            &wire::CommandExecutionRequestApprovalResponse {
-                decision: wire::CommandExecutionApprovalDecision::CommandExecutionApprovalDecision4(
-                    Box::new(wire::CommandExecutionApprovalDecision4::Decline),
-                ),
-            },
-        ),
+        Any::ItemCommandExecutionRequestApproval(_) => {
+            answer::<m::ItemCommandExecutionRequestApproval>(
+                id,
+                &wire::CommandExecutionRequestApprovalResponse {
+                    decision: wire::CommandExecutionApprovalDecision::Decline,
+                },
+            )
+        }
         Any::ItemFileChangeRequestApproval(_) => answer::<m::ItemFileChangeRequestApproval>(
             id,
             &wire::FileChangeRequestApprovalResponse {
@@ -321,7 +303,7 @@ mod tests {
             thread: &ThreadId::new("th-1"),
             turn: &TurnId::new("tu-2"),
         };
-        let params = turn_steer_params(target, "only auth").or_fail()?;
+        let params = turn_steer_params(target, "only auth");
         let line = Message::request::<m::TurnSteer>(RequestId::Integer(7), &params)
             .or_fail()?
             .to_line();

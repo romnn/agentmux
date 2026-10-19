@@ -33,14 +33,9 @@ jobs:
       - run: mise install task
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/codex-app-server-codegen
           cache-on-failure: true
-      - name: Lint the generator
-        run: task codegen:app-server:lint
       - name: Check the protocol crate is what the vendored schema generates
         run: task codegen:app-server:check
 
@@ -61,12 +56,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/codex-app-server-codegen
           cache-on-failure: true
       - name: Read the pin
         id: pin
         run: |
-          pin="$(cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- pin)"
+          pin="$(cargo run --quiet -p codex-app-server-codegen -- pin)"
           echo "codex=$pin" >>"$GITHUB_OUTPUT"
       # Installed once per pin and then restored.
       - name: Restore the pinned codex

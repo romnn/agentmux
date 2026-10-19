@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::Error;
-use crate::openapi::Schemas;
+use crate::{Error, NAMESPACES};
+
 use crate::surface::{Carries, Entry, Surface};
 
 /// Who sends a message, and whether it is answered: one of the bundle's message unions.
@@ -46,6 +46,12 @@ impl Direction {
             Self::ServerRequest => "ServerRequest",
             Self::ServerNotification => "ServerNotification",
         }
+    }
+
+    /// Whether agentmux sends its messages, which makes it the one that reads the answers.
+    #[must_use]
+    pub fn is_sent(self) -> bool {
+        matches!(self, Self::ClientRequest | Self::ClientNotification)
     }
 
     /// Whether its messages are requests, which are answered.
@@ -117,7 +123,7 @@ pub struct Typed {
 /// Returns [`Error::Binding`] for a [`Surface`] entry the bundle does not bear out, or two
 /// methods that would share a type name; and [`Error::Bundle`] for a missing union or a branch
 /// that names no single method.
-pub fn read(bundle: &Value, surface: &Surface, schemas: &Schemas) -> Result<Vec<Method>, Error> {
+pub fn read(bundle: &Value, surface: &Surface) -> Result<Vec<Method>, Error> {
     let mut methods = Vec::new();
     let mut names = BTreeSet::new();
     for direction in Direction::ALL {
@@ -131,7 +137,7 @@ pub fn read(bundle: &Value, surface: &Surface, schemas: &Schemas) -> Result<Vec<
                 return Err(Error::Bundle(format!("`{union}` lists `{wire}` twice")));
             }
         }
-        let mut typed = typed(direction, direction.entries(surface), &listed, schemas)?;
+        let mut typed = typed(direction, direction.entries(surface), &listed, bundle)?;
         for wire in listed.into_keys() {
             let name = type_name(&wire).map_err(|reason| Error::Binding {
                 method: wire.clone(),
@@ -166,7 +172,7 @@ fn typed(
     direction: Direction,
     entries: &[Entry],
     listed: &BTreeMap<String, Result<Params, String>>,
-    schemas: &Schemas,
+    bundle: &Value,
 ) -> Result<BTreeMap<&'static str, Typed>, Error> {
     let union = direction.union();
     let mut typed = BTreeMap::new();
@@ -205,7 +211,7 @@ fn typed(
             )));
         }
         let response = match (direction.is_request(), entry.response) {
-            (true, Some(response)) if schemas.get(response).is_some() => Some(response.to_owned()),
+            (true, Some(response)) if defines(bundle, response) => Some(response.to_owned()),
             (true, Some(response)) => {
                 return Err(refuse(format!(
                     "codex's schema defines no response type `{response}`"
@@ -236,15 +242,57 @@ fn typed(
     Ok(typed)
 }
 
-/// Every schema a method of the [`Surface`] carries, which is what the generated types are grown
-/// from.
+/// Whether one of the bundle's [`NAMESPACES`] defines a schema called `name`.
+fn defines(bundle: &Value, name: &str) -> bool {
+    NAMESPACES.iter().any(|namespace| {
+        bundle
+            .pointer(namespace)
+            .and_then(Value::as_object)
+            .is_some_and(|schemas| schemas.contains_key(name))
+    })
+}
+
+/// Every schema a method of the [`Surface`] carries, and which way it travels, which is what the
+/// generated types are grown from.
+///
+/// A schema carried both ways, such as one a request sends and a notification reads back, is
+/// [`progeny::Direction::Both`].
 #[must_use]
-pub fn roots(methods: &[Method]) -> BTreeSet<&str> {
-    methods
-        .iter()
-        .filter_map(|method| method.typed.as_ref())
-        .flat_map(|typed| [typed.params.schema(), typed.response.as_deref()])
-        .flatten()
+pub fn roots(methods: &[Method]) -> Vec<progeny::SchemaRoot> {
+    let mut roots = BTreeMap::new();
+    for method in methods {
+        let Some(typed) = &method.typed else {
+            continue;
+        };
+        let (params, response) = if method.direction.is_sent() {
+            (progeny::Direction::Sent, progeny::Direction::Received)
+        } else {
+            (progeny::Direction::Received, progeny::Direction::Sent)
+        };
+        let carried = [
+            (typed.params.schema(), params),
+            (typed.response.as_deref(), response),
+        ];
+        for (schema, direction) in carried {
+            let Some(schema) = schema else {
+                continue;
+            };
+            roots
+                .entry(schema)
+                .and_modify(|known| {
+                    if *known != direction {
+                        *known = progeny::Direction::Both;
+                    }
+                })
+                .or_insert(direction);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|(name, direction)| progeny::SchemaRoot {
+            name: name.to_owned(),
+            direction,
+        })
         .collect()
 }
 
@@ -345,7 +393,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{Direction, Method, Params, Typed, read, roots, type_name};
-    use crate::openapi::Schemas;
     use crate::surface::{Carries, Entry, Surface};
 
     fn bundle(client_requests: &[Value], server_notifications: &[Value]) -> Value {
@@ -395,15 +442,6 @@ mod tests {
         }
     }
 
-    fn read_bundle(
-        bundle: &Value,
-        surface: &Surface,
-    ) -> std::result::Result<Vec<Method>, crate::Error> {
-        let schemas =
-            Schemas::from_bundle(bundle).map_err(|err| crate::Error::Bundle(err.to_string()))?;
-        read(bundle, surface, &schemas)
-    }
-
     /// A method of the surface is bound to its params and, for a request, its response; one
     /// outside it is bound by name alone, whatever shape its params have; and only the surface's
     /// payloads are roots.
@@ -445,7 +483,7 @@ mod tests {
                 response: None,
             }],
         );
-        let methods = read_bundle(&bundle, &surface).or_fail()?;
+        let methods = read(&bundle, &surface).or_fail()?;
 
         assert_that!(
             methods,
@@ -483,7 +521,30 @@ mod tests {
                 }),
             ]
         );
-        assert_that!(roots(&methods).len(), eq(5));
+        // What agentmux sends is sent, and what answers it or the server sends is received.
+        let root = |name: &str, direction| progeny::SchemaRoot {
+            name: name.to_owned(),
+            direction,
+        };
+        assert_that!(
+            roots(&methods),
+            elements_are![
+                eq(&root(
+                    "GetAccountRateLimitsParams",
+                    progeny::Direction::Sent
+                )),
+                eq(&root(
+                    "GetAccountRateLimitsResponse",
+                    progeny::Direction::Received
+                )),
+                eq(&root("TurnStartParams", progeny::Direction::Sent)),
+                eq(&root("TurnStartResponse", progeny::Direction::Received)),
+                eq(&root(
+                    "TurnStartedNotification",
+                    progeny::Direction::Received
+                )),
+            ]
+        );
         Ok(())
     }
 
@@ -584,7 +645,7 @@ mod tests {
         ];
         for (requests, notifications, request_entries, notification_entries, reason) in cases {
             assert_that!(
-                read_bundle(
+                read(
                     &bundle(&requests, &notifications),
                     &surface(request_entries, notification_entries)
                 ),
@@ -599,7 +660,7 @@ mod tests {
         let started =
             |method: &str| branch(method, Some(reference("TurnStartedNotification")), true);
         assert_that!(
-            read_bundle(
+            read(
                 &bundle(&[], &[started("turn/started"), started("turnStarted")]),
                 &surface(vec![], vec![])
             ),

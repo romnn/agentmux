@@ -16,7 +16,7 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `crates/agentmux-cli` | binary `agentmux`: `agentmux mcp` serves, the other subcommands are a unified CLI over both vendors |
 | `crates/codex-app-server-protocol` | library: the `codex app-server` protocol — generated payload `types` and `methods` bindings, the hand-written JSON-RPC `envelope` |
 | `crates/codex-app-server-mock` | test support: a scriptable `Peer` playing the server's end, typed `fixtures`, and a `codex` binary that plays a `scenario` as a process |
-| `crates/codex-app-server-codegen` | tool, a workspace of its own: generates the protocol crate's `schema.rs` and `methods.rs` from the vendored codex schema |
+| `crates/codex-app-server-codegen` | tool: generates the protocol crate's `schema.rs` and `methods.rs` from the vendored codex schema |
 
 ## House style
 
@@ -254,11 +254,10 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   `Payload<M>` that decodes only as `M`'s params for a surface method, so a receiver matches
   variants, not strings, and decodes only what it acts on. `decline` matches `AnyServerRequest`
   with no wildcard, so a regeneration that adds a server request fails to build until it is
-  decided. The
-  generator is a workspace of its own because progeny turns on `serde_json/arbitrary_precision`,
-  which feature unification would otherwise hand every agentmux test build; its `Cargo.lock` pins
-  progeny, and progeny's configuration is code. The oracle is a workspace of its own again,
-  because codex's crate is several hundred packages with native dependencies that only the oracle
+  decided. progeny reads the bundle as it is, with the v2 namespace listed first, and grows the
+  types from the surface's payloads, each marked as sent or received; the workspace's
+  `Cargo.lock` pins progeny, and progeny's configuration is code. The oracle is a workspace of its
+  own, because codex's crate is several hundred packages with native dependencies that only the oracle
   should build, and resolves only with codex's `[patch.crates-io]` forks and lockfile pins. Do
   not edit the generated files: change the generator, then `task codegen:app-server`.
   `task codegen:app-server:check` (the generator's tests, no codex needed) fails when they drift.
@@ -269,9 +268,16 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   codegen:app-server:refresh` and `task codegen:app-server:oracle`. `codex-app-server-codegen
   refresh` refuses a codex other than the pin, and one whose app-server accepts
   `--ignore-user-config`, the cue to let isolated delegates be driven. The `codegen` workflow runs
-  all three checks. Two things are hand-written. The JSON-RPC envelope: codex leaves out the
+  all three checks. The generated types read leniently: a status, kind or tagged object the pinned
+  schema does not name decodes as an `Unknown` variant, so a newer codex does not fail the message
+  around it; the translator writes a message carrying one as drift with its whole payload, as it
+  writes one that does not decode, because `exec`'s vocabulary has no word for it. Three things are
+  hand-written. The JSON-RPC envelope: codex leaves out the
   `"jsonrpc"` member, so a message is classified by which of `id` and `method` it carries, and a
-  payload is decoded separately, so drift is recorded rather than the message lost. And `exec`,
+  payload is decoded separately, so drift is recorded rather than the message lost. `rollout`,
+  the usage windows codex records in a session rollout: it reads only a token count's snapshot,
+  every other line and event reading as `Other`, and the oracle converts codex's snapshot into it
+  with every field of codex's named and reads codex's own rollout lines back as it. And `exec`,
   the events `codex exec --json` writes, for which codex publishes no schema: it mirrors codex's
   `exec_events.rs` type for type, and the oracle converts each of codex's types into its mirror
   with every field named on both sides (a change on either side fails to build) and checks that
@@ -306,7 +312,6 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 | `task lint:actions`    | actionlint over `.github/workflows`                                   |
 | `task codegen:app-server` | regenerate `codex-app-server-protocol` from the vendored schema |
 | `task codegen:app-server:check` | the generator's tests: fail when the protocol crate is not what the vendored schema generates — CI runs it |
-| `task codegen:app-server:lint` | clippy over the generator, which `lint:fc` does not reach |
 | `task codegen:app-server:refresh` | re-export the vendored schema from the pinned codex on `PATH`, then regenerate |
 | `task codegen:app-server:oracle` | check the answers table and the `exec` mirror against codex's own crates at the pinned tag — CI runs it |
 | `task codegen:app-server:upstream` | fail when the vendored schema is not what the pinned codex exports — CI runs it |
@@ -326,7 +331,9 @@ native to each harness; agentmux exists only for the cross-vendor direction.
 - Codex reports no rate limits on the stream `codex exec --json` produces. They are recovered
   afterwards from `$CODEX_HOME/sessions/**/rollout-*<thread-id>*.jsonl`, and cached per turn in
   `rate-limit.json`, because that search would otherwise run on every `status` and every page of a
-  `tail`.
+  `tail`. The window recorded is an exhausted one if any, the one reopening last if several are,
+  and otherwise the fullest: a plan with a five-hour and a weekly window is refused against
+  whichever is used up, and advice to wait for the other would be refused again.
 
 ## Testing against the real CLIs
 
@@ -337,6 +344,10 @@ upgrading either CLI:
 ```bash
 cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
 ```
+
+Each turn's `invocation.json` records what the delegate's CLI printed for `--version`
+(`Launcher::version`, asked before the launch with the child's environment) and the agentmux
+release that launched it, so a capture that reads differently can be traced to what wrote it.
 
 A steered turn over `codex app-server` has a live test of its own in the crate that builds the
 driver, which it runs as the delegate; run it outside any sandbox, so the delegate can save its

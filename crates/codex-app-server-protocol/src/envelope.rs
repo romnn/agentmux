@@ -460,13 +460,13 @@ mod tests {
     #[gtest]
     fn an_undecodable_payload_names_its_type_and_why() {
         let decoded = methods::TurnStart::response(
-            &json!({"turn": {"id": "tu", "items": [], "status": "sideways"}}),
+            &json!({"turn": {"id": "tu", "items": "none", "status": "completed"}}),
         );
         assert_that!(
             decoded,
             err(displays_as(all![
                 starts_with("codex sent a TurnStartResponse that does not match"),
-                contains_substring("unknown variant `sideways`"),
+                contains_substring("invalid type"),
             ]))
         );
     }

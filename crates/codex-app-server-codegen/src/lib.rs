@@ -8,7 +8,8 @@
 //!   also the only place that says which type answers a request, since the bundle does not;
 //! - `oracle/Cargo.lock`, whose codex tag is the pinned release: the oracle builds the table
 //!   against that release's own Rust, and the bundle is what that release exports;
-//! - `Cargo.lock`, whose progeny commit renders the types, configured by this crate's code.
+//! - the workspace's `Cargo.lock`, whose progeny commit renders the types, configured by this
+//!   crate's code.
 //!
 //! The outputs are `src/schema.rs` (the payload types, rendered by progeny) and `src/methods.rs`
 //! (the method bindings) of `codex-app-server-protocol`, and they are checked in too.
@@ -21,14 +22,12 @@
 
 pub mod bindings;
 pub mod methods;
-pub mod openapi;
 pub mod surface;
 pub mod upstream;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::openapi::Schemas;
 use crate::surface::Surface;
 
 /// Why generation failed.
@@ -68,9 +67,6 @@ pub enum Error {
     /// oracle runs would not all be against one release.
     #[error("oracle/Cargo.lock resolves codex at more than one revision: {}", .0.join(", "))]
     CodexPins(Vec<String>),
-    /// A schema a method reaches does not exist.
-    #[error("codex's schema defines no `{0}`")]
-    UnknownSchema(String),
     /// A method cannot be bound.
     #[error("cannot bind `{method}`: {reason}")]
     Binding {
@@ -125,6 +121,10 @@ pub enum Error {
     },
 }
 
+/// Where codex's bundle keeps its schemas, in precedence order: the v2 protocol's, then the
+/// top-level ones, so a name both define is the v2 protocol's.
+pub const NAMESPACES: [&str; 2] = ["/definitions/v2", "/definitions"];
+
 /// Where the inputs and outputs live in the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -155,10 +155,10 @@ impl Layout {
         self.root.join("oracle").join("Cargo.lock")
     }
 
-    /// This crate's lockfile, which pins progeny.
+    /// The workspace's lockfile, which pins progeny.
     #[must_use]
     pub fn lockfile(&self) -> PathBuf {
-        self.root.join("Cargo.lock")
+        self.root.join("..").join("..").join("Cargo.lock")
     }
 
     /// The generated payload types.
@@ -300,12 +300,13 @@ impl File {
 pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
     let bundle: serde_json::Value =
         serde_json::from_slice(&inputs.bundle).map_err(Error::BundleJson)?;
-    let schemas = Schemas::from_bundle(&bundle)?;
-    let methods = methods::read(&bundle, &Surface::table(), &schemas)?;
+    let methods = methods::read(&bundle, &Surface::table())?;
 
-    let kept = schemas.closure(methods::roots(&methods))?;
-    let document = schemas.document(&kept, &inputs.codex_version);
-    let output = progeny::generate(document.to_string().as_bytes(), &progeny_config())
+    let input = progeny::SchemaInput {
+        namespaces: NAMESPACES.map(str::to_owned).into(),
+        roots: methods::roots(&methods),
+    };
+    let output = progeny::generate_schemas(&inputs.bundle, &input, &progeny_config())
         .map_err(Error::Progeny)?;
     let module = match output.files.into_values().collect::<Vec<_>>().as_slice() {
         [module] => module.clone(),
@@ -344,9 +345,15 @@ pub fn generate(inputs: &Inputs, layout: &Layout) -> Result<Vec<File>, Error> {
 ///
 /// No client or server: the protocol is JSON-RPC over stdio, which progeny's HTTP renderers do
 /// not describe.
+///
+/// Decoded strictly, so each schema is one type, and what codex sends is the type agentmux would
+/// send.
+/// Its enums and unions stay open, so a value a newer codex adds still decodes, and a payload
+/// that does not decode is recorded whole as drift by the driver.
 fn progeny_config() -> progeny::Config {
     progeny::Config {
         packaging: progeny::Packaging::Module,
+        decoding: progeny::Decoding::Strict,
         derives: [
             progeny::Derive::Clone,
             progeny::Derive::Debug,

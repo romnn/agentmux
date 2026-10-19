@@ -1,56 +1,33 @@
 [package]
 name = "codex-app-server-codegen"
 description = "Generates the codex-app-server-protocol crate from the JSON Schema the codex CLI publishes"
-version = "0.0.0"
-edition = "2024"
 license-file = "../../LICENSE"
 publish = false
 
-# A workspace of its own, excluded from the agentmux workspace, so that nothing building agentmux
-# compiles the generator: progeny turns on `serde_json/arbitrary_precision`, and a feature unified
-# into `cargo test --workspace` would test agentmux against a serde_json its release never links.
-# The oracle is a workspace of its own again, because it builds codex's crate, which only `task
-# codegen:app-server:oracle` should pay for.
-[workspace]
-exclude = ["oracle"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "codex-app-server-codegen"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-indoc = "2"
-# Pinned to a commit, and so by the lockfile beside this manifest: the generated sources carry it
-# in their header, and moving it is a deliberate regeneration.
-progeny = { git = "https://github.com/romnn/progeny", rev = "c8e4888b54954acef8e83a2902feaa26c860cef5" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
-thiserror = "2"
-toml = "0.9"
+clap.workspace = true
+indoc.workspace = true
+# Pinned to a commit, and so by the workspace lockfile: the generated sources carry it in their
+# header, and moving it is a deliberate regeneration.
+progeny = { git = "https://github.com/romnn/progeny", rev = "cf06eccb8511e5e7af418dcf7cb0ce3ba6bcd102" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
-googletest = "0"
-
-# The agentmux workspace's lints, which this manifest cannot inherit from outside it.
-[lints.rust]
-warnings = { level = "warn", priority = -1 }
-unsafe_code = "deny"
-unused_must_use = "deny"
-missing_docs = "warn"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-unreachable = "deny"
-unimplemented = "deny"
-todo = "deny"
-dbg_macro = "deny"
-indexing_slicing = "deny"
-missing_errors_doc = "warn"
-allow_attributes_without_reason = "deny"
-map_unwrap_or = "allow"
+googletest.workspace = true

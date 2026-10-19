@@ -6,11 +6,12 @@ members = [
 	"crates/agentmux-cli",
 	"crates/codex-app-server-protocol",
 	"crates/codex-app-server-mock",
-]
-# The protocol's generator is a workspace of its own, so building agentmux never compiles it; see
-# its manifest.
-exclude = [
 	"crates/codex-app-server-codegen",
+]
+# The oracle builds codex's own crates, several hundred packages with native dependencies, which
+# only `task codegen:app-server:oracle` should pay for.
+exclude = [
+	"crates/codex-app-server-codegen/oracle",
 ]
 default-members = [
 	"crates/agentmux-cli",

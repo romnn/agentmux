@@ -187,32 +187,27 @@ tasks:
     cmds:
       - actionlint
 
-  # The protocol generator is a workspace of its own, which nothing else builds; see its manifest.
+  # The protocol generator; its oracle is a workspace of its own, which nothing else builds.
   codegen:app-server:
     desc: "regenerate codex-app-server-protocol from the vendored codex schema"
     cmds:
-      - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- generate
+      - cargo run --quiet -p codex-app-server-codegen -- generate
 
   codegen:app-server:check:
     desc: "test the protocol generator, which fails if codex-app-server-protocol is not what the vendored schema generates"
     cmds:
-      - cargo test --manifest-path crates/codex-app-server-codegen/Cargo.toml {{.CLI_ARGS}}
-
-  codegen:app-server:lint:
-    desc: "lint the protocol generator"
-    cmds:
-      - cargo clippy --manifest-path crates/codex-app-server-codegen/Cargo.toml --all-targets --no-deps -- -D warnings
+      - cargo test -p codex-app-server-codegen {{.CLI_ARGS}}
 
   codegen:app-server:refresh:
     desc: "re-export the vendored schema from the pinned codex on PATH, then regenerate"
     cmds:
       # Needs the codex release `codex-app-server-codegen pin` names.
-      - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh
+      - cargo run --quiet -p codex-app-server-codegen -- refresh
 
   codegen:app-server:upstream:
     desc: "fail if the vendored schema is not what the pinned codex on PATH exports"
     cmds:
-      - cargo run --quiet --manifest-path crates/codex-app-server-codegen/Cargo.toml -- refresh --check
+      - cargo run --quiet -p codex-app-server-codegen -- refresh --check
 
   codegen:app-server:oracle:
     desc: "fail if the answers table or the exec mirror is not what codex's own crates declare at the pinned tag"

@@ -59,7 +59,13 @@ pub enum CaptureEvent {
     Undecoded(Undecoded),
     /// An event as `codex exec --json` writes it.
     #[serde(untagged)]
-    Exec(ThreadEvent),
+    Exec(Box<ThreadEvent>),
+}
+
+impl From<ThreadEvent> for CaptureEvent {
+    fn from(event: ThreadEvent) -> Self {
+        Self::Exec(Box::new(event))
+    }
 }
 
 /// What the server said that could not be read.
@@ -148,7 +154,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             continue;
         };
         let event = match CaptureEvent::deserialize(&value) {
-            Ok(CaptureEvent::Exec(event)) => event,
+            Ok(CaptureEvent::Exec(event)) => *event,
             Ok(CaptureEvent::Steer { text }) => {
                 turn.messages.push(Message::steer(text));
                 continue;
