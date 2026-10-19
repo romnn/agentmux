@@ -342,12 +342,20 @@ fn open_append(path: &Path) -> Result<File, LaunchError> {
 
 impl Launcher for ProcessLauncher {
     fn version(&self, invocation: &Invocation, cwd: &Path) -> Option<String> {
+        use std::io::{Read as _, Seek as _};
         use std::process::Stdio;
+
+        /// The most of what the CLI prints that is read, which a version fits many times over.
+        const PRINTED_LIMIT: u64 = 4096;
 
         let mut env = invocation.env().clone();
         if invocation.billing() == Billing::Subscription {
             scrub_billing_env(&mut env);
         }
+        // Into a file rather than a pipe: a descendant that inherited a pipe can hold it open
+        // after the CLI itself has exited, and reading it would then outlast the deadline, where
+        // a file is read for what it holds.
+        let mut printed = tempfile::tempfile().ok()?;
         let spawn = |program: &str| {
             std::process::Command::new(program)
                 .arg("--version")
@@ -355,7 +363,7 @@ impl Launcher for ProcessLauncher {
                 .env_clear()
                 .envs(&env)
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
+                .stdout(Stdio::from(printed.try_clone()?))
                 .stderr(Stdio::null())
                 .spawn()
         };
@@ -381,9 +389,11 @@ impl Launcher for ProcessLauncher {
                 }
             }
         }
-        let mut printed = String::new();
-        std::io::Read::read_to_string(&mut child.stdout.take()?, &mut printed).ok()?;
-        Some(printed.trim().to_owned()).filter(|version| !version.is_empty())
+        printed.rewind().ok()?;
+        let mut bytes = Vec::new();
+        printed.take(PRINTED_LIMIT).read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).trim().to_owned())
+            .filter(|version| !version.is_empty())
     }
 
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::appserver::mailbox::{Mailbox, Reply};
+use crate::appserver::mailbox::{Letter, Mailbox, Reply};
 use crate::delegate::{Delegate, Isolation};
 use crate::launch::{Launched, Liveness};
 use crate::transcript::Outcome;
@@ -46,10 +46,11 @@ impl RunStore {
         if message.trim().is_empty() {
             return Err(SteerRefused::Empty.into());
         }
-        let (mailbox, launched) = self.steerable_turn(run_id)?;
-        let letter = mailbox
-            .submit(message)
-            .map_err(RunError::io("submitting the steered message"))?;
+        let Submitted {
+            mailbox,
+            letter,
+            launched,
+        } = self.submit_steer(run_id, message)?;
         let submitted = tokio::time::Instant::now();
         let mut claimed_at: Option<tokio::time::Instant> = None;
         loop {
@@ -93,8 +94,8 @@ impl RunStore {
                     .into());
                 }
                 None if gone || submitted.elapsed() >= Self::STEER_PICKUP => {
-                    // Withdrawn under the same rename the driver claims with, so a message that
-                    // was not taken back is one the driver has and will answer.
+                    // Withdrawn by creating the decision file the driver claims with, so a
+                    // message that was not taken back is one the driver has and will answer.
                     if mailbox
                         .withdraw(&letter)
                         .map_err(RunError::io("withdrawing a steered message"))?
@@ -120,9 +121,12 @@ impl RunStore {
         }
     }
 
-    /// The mailbox of the consultation's running turn, and its driver, when that turn takes a
-    /// steer now; otherwise why not.
-    pub(super) fn steerable_turn(&self, run_id: &RunId) -> Result<(Mailbox, Launched), RunError> {
+    /// Put `message` in the mailbox of the consultation's running turn, when that turn takes a
+    /// steer now; otherwise say why not.
+    ///
+    /// Submitted under the run's lock, so the turn cannot end and its run be removed between the
+    /// check and the write, which would leave a mailbox behind in a run that is gone.
+    fn submit_steer(&self, run_id: &RunId, message: &str) -> Result<Submitted, RunError> {
         let meta = self.meta(run_id)?;
         let not_running = |state| SteerRefused::NotRunning {
             run_id: run_id.clone(),
@@ -156,7 +160,15 @@ impl RunStore {
         let Some(launched) = newest.launch.as_ref().map(|record| record.launched) else {
             return Err(not_running(Idle::NotLaunched).into());
         };
-        Ok((newest.dir.mailbox(), launched))
+        let mailbox = newest.dir.mailbox();
+        let letter = mailbox
+            .submit(message)
+            .map_err(RunError::io("submitting the steered message"))?;
+        Ok(Submitted {
+            mailbox,
+            letter,
+            launched,
+        })
     }
 
     /// Whether the newest turn takes a steer: it runs, over the app-server, its driver is
@@ -178,6 +190,13 @@ impl RunStore {
             && started
             && !turn.cancelling().exists()
     }
+}
+
+/// A steered message in its turn's mailbox, and the driver that is to answer it.
+struct Submitted {
+    mailbox: Mailbox,
+    letter: Letter,
+    launched: Launched,
 }
 
 /// Why a turn of this delegate that was not driven over the app-server offers no way in.

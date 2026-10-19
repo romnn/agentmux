@@ -136,7 +136,10 @@ impl RunStore {
         launcher: Arc<dyn Launcher>,
         host_env: BTreeMap<String, String>,
     ) -> Result<Self, RunError> {
-        let root = root.into();
+        // Absolute, because every path under it is handed to children that run in the
+        // delegate's working directory: the driver's plan, and `AGENTMUX_STATE_DIR` itself.
+        let root = std::path::absolute(root.into())
+            .map_err(RunError::io("resolving the state directory"))?;
         create_private_dir(&root)?;
         Ok(Self {
             root,

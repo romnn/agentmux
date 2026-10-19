@@ -317,13 +317,37 @@ fn a_cli_names_its_version_or_has_none() -> Result<()> {
 
     let named = program(
         "named",
-        "#!/bin/sh\n[ \"$1\" = --version ] && echo '2.1.270 (Claude Code)'\n",
+        indoc::indoc! {r#"
+            #!/bin/sh
+            [ "$1" = --version ] && echo '2.1.270 (Claude Code)'
+        "#},
     )?;
-    let refusing = program("refusing", "#!/bin/sh\necho 'unknown option' >&2\nexit 2\n")?;
+    let refusing = program(
+        "refusing",
+        indoc::indoc! {"
+            #!/bin/sh
+            echo 'unknown option' >&2
+            exit 2
+        "},
+    )?;
+
+    // A wrapper that leaves a daemon behind holding its output, as a version manager's shim may.
+    let leaving = program(
+        "leaving",
+        indoc::indoc! {"
+            #!/bin/sh
+            sleep 30 &
+            echo '0.162.1'
+        "},
+    )?;
 
     // The printed line is kept verbatim, trimmed; a failing or missing CLI says nothing.
     assert_that!(version(named), some(eq("2.1.270 (Claude Code)")));
     assert_that!(version(refusing), none());
     assert_that!(version("/no/such/cli".to_owned()), none());
+    // What the CLI printed is read once it exits, whatever it left holding its output.
+    let asked = std::time::Instant::now();
+    assert_that!(version(leaving), some(eq("0.162.1")));
+    assert_that!(asked.elapsed(), lt(Duration::from_secs(5)));
     Ok(())
 }
