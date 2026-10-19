@@ -13,8 +13,9 @@
 //!
 //! A **machine** file defines accounts: paths, credentials, endpoints, environment.
 //! It also holds the model rewrites — the machine's answer to "when something asks for *this*
-//! model, run *that* one" — and the reasoning effort to use for a model when a caller names none,
-//! which are the other things a caller cannot know from where it sits.
+//! model, run *that* one" — the reasoning effort to use for a model when a caller names none,
+//! and the models it refuses to launch together with what to ask for instead, which are the
+//! other things a caller cannot know from where it sits.
 //! And it says how long a consultation is kept, because every consultation on the machine shares
 //! one store.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
@@ -90,14 +91,14 @@ pub enum ConfigError {
         reason: &'static str,
     },
     /// A project file tried to define an account, a launch environment, a model rewrite, a
-    /// default effort or the retention window, rather than select an account.
+    /// default effort, a blocked model or the retention window, rather than select an account.
     #[error(
-        "{path} defines accounts, model rewrites, default efforts, a retention or a [launch] \
-         environment, and a project agentmux.toml may only select an account with \
+        "{path} defines accounts, model rewrites, default efforts, blocked models, a retention or \
+         a [launch] environment, and a project agentmux.toml may only select an account with \
          [defaults.<vendor>]. Move the definitions to your machine configuration: a file that \
          travels with a repository must not be able to name a credential, an endpoint, an \
-         environment variable, which model answers your questions and how hard it thinks, or \
-         when every consultation on this machine is deleted."
+         environment variable, which model answers your questions and how hard it thinks, which \
+         models you may ask for, or when every consultation on this machine is deleted."
     )]
     ProjectFileOversteps {
         /// The offending file.
@@ -130,6 +131,54 @@ pub enum ConfigError {
         model: ModelId,
         /// What the same file rewrites it to.
         to: ModelId,
+    },
+    /// A model rewrite launches a model the same file blocks.
+    #[error(
+        "the agentmux config at {path} rewrites the {vendor} model \"{from}\" to \"{to}\", which it \
+         blocks, so every request for \"{from}\" would be refused. Rewrite it to a model you allow, \
+         or remove the block."
+    )]
+    RewriteToBlockedModel {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The identifier a caller would ask for.
+        from: ModelId,
+        /// What it is rewritten to, which is blocked.
+        to: ModelId,
+    },
+    /// A blocked model is keyed by an identifier the same file rewrites to another.
+    #[error(
+        "the agentmux config at {path} blocks the {vendor} model \"{model}\", but rewrites that \
+         model to \"{to}\", and a block is checked against the model that runs. This block would \
+         never apply: block \"{to}\", or remove the rewrite."
+    )]
+    BlockForRewrittenModel {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The model the block is keyed by.
+        model: ModelId,
+        /// What the same file rewrites it to.
+        to: ModelId,
+    },
+    /// A blocked model recommends one the same file blocks too.
+    #[error(
+        "the agentmux config at {path} blocks the {vendor} model \"{model}\" and recommends \
+         \"{recommended}\", which it blocks as well, so the refusal would send a caller to another \
+         refusal. Recommend a model this file does not block."
+    )]
+    BlockedRecommendation {
+        /// The file.
+        path: PathBuf,
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The blocked model.
+        model: ModelId,
+        /// What its entry recommends instead, which is blocked too.
+        recommended: ModelId,
     },
     /// A configuration file another user could have written was found.
     #[error(
@@ -580,6 +629,76 @@ mod retention_window {
     }
 }
 
+/// A model this machine refuses to launch, and the one to ask for instead.
+///
+/// Written either as the recommendation alone, `"gpt-5.6-sol" = "sol"`, or as a table that also
+/// says why, `"gpt-6-sol" = { use = "sol", reason = "gpt-6.1-sol is much cheaper" }`.
+/// Both spellings read into this one shape; only deserialising knows there are two.
+///
+/// Serialised back as the table, whichever spelling the file used, so the comparison that finds
+/// [`Config::unknown`] keys can check a written table key by key and report a misspelled
+/// `reason`.
+/// A written string is never compared against the table, so it is never reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedModel {
+    /// The model to ask for instead, spelled as a caller would ask for it.
+    ///
+    /// It goes through the same file's rewrite like any request, so an alias such as `sol`
+    /// recommends whatever that alias launches today.
+    #[serde(rename = "use")]
+    pub recommended: ModelId,
+    /// Why the model is blocked, quoted in the refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for BlockedModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de;
+
+        /// The table spelling, whose `use` is required and `reason` optional.
+        #[derive(Deserialize)]
+        struct Explained {
+            #[serde(rename = "use")]
+            recommended: ModelId,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = BlockedModel;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "the model to use instead, or a table `{ use = \"<model>\", reason = \"<why>\" }`",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<BlockedModel, E> {
+                Ok(BlockedModel {
+                    recommended: ModelId::parse(value).map_err(E::custom)?,
+                    reason: None,
+                })
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<BlockedModel, A::Error> {
+                let Explained {
+                    recommended,
+                    reason,
+                } = Explained::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(BlockedModel {
+                    recommended,
+                    reason,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// The machine's agentmux configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -613,6 +732,15 @@ pub struct Config {
         deserialize_with = "by_vendor::deserialize"
     )]
     pub effort_defaults: BTreeMap<Vendor, BTreeMap<ModelId, Effort>>,
+    /// Models a new consultation may not launch, by vendor, then by the model that would run.
+    ///
+    /// Read through [`Config::blocked_model`].
+    /// Keyed by the identifier that is launched, after any rewrite in [`Self::model_rewrites`], so
+    /// an old spelling the file rewrites to an allowed model still works.
+    /// A block refuses and names its recommendation; it never launches the recommendation in the
+    /// caller's place, because which model answers is the caller's choice to make knowingly.
+    #[serde(default, deserialize_with = "by_vendor::deserialize")]
+    pub blocked: BTreeMap<Vendor, BTreeMap<ModelId, BlockedModel>>,
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
@@ -824,10 +952,12 @@ impl Config {
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
     /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account, a
-    /// model rewrite, a default effort or a retention rather than naming an account,
-    /// [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten, and
+    /// model rewrite, a default effort, a blocked model or a retention rather than naming an
+    /// account, [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten,
     /// [`ConfigError::EffortForRewrittenModel`] for a default effort keyed by a model the same
-    /// file rewrites away.
+    /// file rewrites away, and [`ConfigError::RewriteToBlockedModel`],
+    /// [`ConfigError::BlockForRewrittenModel`] or [`ConfigError::BlockedRecommendation`] for a
+    /// block the same file's rewrites contradict.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         let home = home_dir(host_env);
 
@@ -848,6 +978,7 @@ impl Config {
                 || !project.launch.is_empty()
                 || !project.model_rewrites.is_empty()
                 || !project.effort_defaults.is_empty()
+                || !project.blocked.is_empty()
                 || project.retention.is_some()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
@@ -1063,7 +1194,58 @@ impl Config {
                 }
             }
         }
+        self.validate_blocks(path)?;
         self.launch.validate(path)
+    }
+
+    /// Refuse a block the same file's rewrites contradict.
+    ///
+    /// A block is checked against the model that runs, so a rewrite onto a blocked model refuses
+    /// every request it matches, a block keyed by a model the file rewrites away never applies,
+    /// and a recommendation that launches a blocked model sends the caller to a second refusal.
+    /// Each reads as something it does not do, so each is refused when the file is read.
+    /// The recommendation is checked against this file alone: model ids stay opaque, and whether
+    /// the vendor still offers it is the vendor CLI's to say.
+    fn validate_blocks(&self, path: &Path) -> Result<(), ConfigError> {
+        for (vendor, blocked) in &self.blocked {
+            let vendor = *vendor;
+            for (from, to) in self.model_rewrites(vendor) {
+                if from != to && blocked.contains_key(to) {
+                    return Err(ConfigError::RewriteToBlockedModel {
+                        path: path.to_path_buf(),
+                        vendor,
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                }
+            }
+            for (model, block) in blocked {
+                if let Some(to) = self.rewritten_model(vendor, model) {
+                    return Err(ConfigError::BlockForRewrittenModel {
+                        path: path.to_path_buf(),
+                        vendor,
+                        model: model.clone(),
+                        to: to.clone(),
+                    });
+                }
+                // Resolved as a request for it would be.
+                // A recommendation the file rewrites launches the rewrite's target, which the
+                // first loop has already found unblocked, so what is refused here is a
+                // recommendation that is itself blocked.
+                let launched = self
+                    .rewritten_model(vendor, &block.recommended)
+                    .unwrap_or(&block.recommended);
+                if blocked.contains_key(launched) {
+                    return Err(ConfigError::BlockedRecommendation {
+                        path: path.to_path_buf(),
+                        vendor,
+                        model: model.clone(),
+                        recommended: block.recommended.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The accounts defined for one vendor, which may be none.
@@ -1135,6 +1317,28 @@ impl Config {
     #[must_use]
     pub fn default_effort(&self, vendor: Vendor, model: &ModelId) -> Option<&Effort> {
         self.effort_defaults(vendor).get(model)
+    }
+
+    /// The blocked models defined for one vendor, by the model that would run, which may be none.
+    ///
+    /// For a reader listing what the machine offers; [`Self::blocked_model`] is what a launch
+    /// asks.
+    #[must_use]
+    pub fn blocked_models(&self, vendor: Vendor) -> &BTreeMap<ModelId, BlockedModel> {
+        static NONE: BTreeMap<ModelId, BlockedModel> = BTreeMap::new();
+        self.blocked.get(&vendor).unwrap_or(&NONE)
+    }
+
+    /// Why a new consultation may not launch `model`, if this machine blocks it.
+    ///
+    /// `model` is the identifier that runs — after [`Self::rewritten_model`] — because that is
+    /// what the operator pays for, whatever name the caller asked by.
+    /// Only a new consultation asks: a follow-up keeps the model its consultation pinned at
+    /// `start`, so a block added afterwards does not strand a consultation that is already paid
+    /// for.
+    #[must_use]
+    pub fn blocked_model(&self, vendor: Vendor, model: &ModelId) -> Option<&BlockedModel> {
+        self.blocked_models(vendor).get(model)
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.

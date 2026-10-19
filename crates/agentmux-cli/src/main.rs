@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
             let config = agentmux::config::Config::load(store.host_env(), &cwd)?;
             report::accounts(&config, store.host_env(), cli.json)
         }
-        Command::Quota(args) => report::quota(&store.quota(args.delegate)?, cli.json),
+        Command::Quota(args) => report::quota(&store.quota(args.delegate)?.accounts, cli.json),
         Command::Mcp(args) => serve(store, &args).await,
         Command::Ask(args) => {
             let status = store.start(&start_request(&args.delegate, &args.question)?)?;

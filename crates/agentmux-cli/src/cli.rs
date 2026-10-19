@@ -151,11 +151,13 @@ pub struct DelegateArgs {
     #[arg(long, value_enum)]
     pub delegate: Vendor,
 
-    /// Model identifier, passed to the delegate CLI verbatim, for example `claude-opus-5` or
-    /// `gpt-6-astra`.
-    /// agentmux keeps no roster; the delegate CLI decides what is valid.
+    /// Model identifier, passed to the delegate CLI verbatim, for example the family alias `opus`
+    /// or `sol`.
+    /// agentmux keeps no built-in roster; this machine's rewrites and blocks apply before launch,
+    /// and the delegate CLI decides what else is valid.
     /// A `[models]` rule in `agentmux.toml` may rewrite one identifier to another, which
     /// `agentmux accounts` lists and every report of the consultation names.
+    /// A `[blocked]` entry refuses a model and names the one to ask for instead.
     #[arg(long)]
     pub model: String,
 

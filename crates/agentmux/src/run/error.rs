@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::delegate::{DelegateError, Vendor};
+use crate::delegate::{DelegateError, ModelId, Vendor};
 use crate::launch::LaunchError;
 use crate::transcript::{TurnState, describe_unsaved_session_store};
 
@@ -47,6 +47,27 @@ pub enum RunError {
     VendorDenied {
         /// The vendor that was asked for.
         vendor: Vendor,
+    },
+    /// The machine's configuration blocks the model a new consultation would launch.
+    ///
+    /// Refused rather than exchanged for the recommendation: which model answers decides what the
+    /// caller pays and what it is told, so the caller makes that choice knowingly and asks again.
+    /// The blocked model is the one the caller asked for, because a file that rewrites another
+    /// name onto a blocked model is refused when it is read.
+    #[error(
+        "{vendor} model \"{model}\" is blocked by this machine's agentmux configuration; use model \
+         \"{recommended}\" instead{}. No delegate was launched.",
+        describe_reason(.reason.as_deref())
+    )]
+    ModelBlocked {
+        /// Whose model it is.
+        vendor: Vendor,
+        /// The model that was asked for and would have been launched.
+        model: ModelId,
+        /// What the configuration recommends asking for instead.
+        recommended: ModelId,
+        /// Why, when the configuration says.
+        reason: Option<String>,
     },
     /// A child could not be launched.
     #[error(transparent)]
@@ -119,6 +140,14 @@ impl RunError {
             source,
         }
     }
+}
+
+/// Why a model is blocked, as a parenthesis to follow the recommendation.
+fn describe_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map_or_else(String::new, |reason| format!(" ({reason})"))
 }
 
 /// Why a consultation cannot take a follow-up.

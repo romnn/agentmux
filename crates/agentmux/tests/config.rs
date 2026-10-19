@@ -505,6 +505,7 @@ fn every_documented_config_example_parses() -> Result<()> {
                 "[launch]",
                 "[models.",
                 "[efforts.",
+                "[blocked.",
                 "retention =",
             ]
             .iter()
@@ -1277,5 +1278,288 @@ fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> 
             "{rule} was accepted"
         );
     }
+    Ok(())
+}
+
+/// The two spellings of a blocked model read into one shape, and neither is reported as unknown.
+///
+/// The string names the recommendation alone; the table names it as `use` and may say why.
+/// An operator choosing the shorter spelling must not lose anything the longer one would carry
+/// except the reason.
+#[gtest]
+fn a_blocked_model_reads_the_same_from_either_spelling() -> Result<()> {
+    use agentmux::config::BlockedModel;
+    use agentmux::delegate::{ModelId, Vendor};
+
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+            "gpt-6-sol" = { use = "sol", reason = "gpt-6.1-sol is much cheaper" }
+            "gpt-5.5-sol" = { use = "sol" }
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+    let blocked = |model: &str| -> Result<Option<BlockedModel>> {
+        Ok(config
+            .blocked_model(Vendor::Codex, &ModelId::parse(model).or_fail()?)
+            .cloned())
+    };
+    let sol = ModelId::parse("sol").or_fail()?;
+
+    // The string and the reasonless table are the same entry.
+    let plain = BlockedModel {
+        recommended: sol.clone(),
+        reason: None,
+    };
+    assert_that!(blocked("gpt-5.6-sol")?, some(eq(&plain)));
+    assert_that!(blocked("gpt-5.5-sol")?, some(eq(&plain)));
+    // The table's reason is kept beside the same recommendation.
+    assert_that!(
+        blocked("gpt-6-sol")?,
+        some(eq(&BlockedModel {
+            recommended: sol,
+            reason: Some("gpt-6.1-sol is much cheaper".to_owned()),
+        }))
+    );
+    // A model the file does not name, and the same model for the other vendor, run as asked.
+    assert_that!(blocked("gpt-6.1-sol")?, none());
+    assert_that!(
+        config.blocked_model(Vendor::Claude, &ModelId::parse("gpt-5.6-sol").or_fail()?),
+        none()
+    );
+    assert_that!(config.unknown, is_empty());
+    Ok(())
+}
+
+/// A vendor this build does not know under `[blocked]` is reported like any other, and the rest
+/// of the table takes effect.
+#[gtest]
+fn a_blocked_table_for_an_unknown_vendor_is_reported() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.claude]
+            "claude-opus-5" = "opus"
+
+            [blocked.gemini]
+            "gemini-3" = "gemini"
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|unknown_key| unknown_key.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("blocked.gemini")]
+    );
+    assert_that!(
+        config
+            .blocked_models(agentmux::delegate::Vendor::Claude)
+            .len(),
+        eq(1)
+    );
+    Ok(())
+}
+
+/// A misspelled key inside a blocked entry's table is reported, and valid entries are not.
+///
+/// Left unreported, a misspelled `reason` would silently drop the explanation the operator wrote
+/// for every caller the block refuses.
+#[gtest]
+fn a_misspelled_key_in_a_blocked_entry_is_reported() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+            "gpt-6-sol" = { use = "sol", reasons = "gpt-6.1-sol is much cheaper" }
+            "gpt-5.5-sol" = { use = "sol", reason = "retired" }
+        "#},
+    )
+    .or_fail()?;
+
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+
+    assert_that!(
+        config
+            .unknown
+            .iter()
+            .map(|unknown_key| unknown_key.key.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("blocked.codex.gpt-6-sol.reasons")]
+    );
+    Ok(())
+}
+
+/// A table entry without the model to use instead is refused when the file is read.
+///
+/// A refusal that names nothing to ask for leaves the caller guessing at a model id.
+#[gtest]
+fn a_blocked_entry_without_a_recommendation_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.codex]
+            "gpt-6-sol" = { reason = "too expensive" }
+        "#},
+    )
+    .or_fail()?;
+
+    assert_that!(
+        Config::load(&env(home.path()), home.path()).map(|_| ()),
+        err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+            message: contains_substring("use"),
+            ..
+        }))
+    );
+    Ok(())
+}
+
+/// A rewrite onto a blocked model is refused when the file is read.
+///
+/// A block is checked on the model that runs, so every request the rewrite matches would be
+/// refused; the two lines contradict each other, and neither reading is safe to guess.
+#[gtest]
+fn a_rewrite_onto_a_blocked_model_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-6" = "gpt-5.6-sol"
+
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+        "#},
+    )
+    .or_fail()?;
+
+    let refused = Config::load(&env(home.path()), home.path()).map(|_| ());
+
+    assert_that!(
+        refused,
+        err(matches_pattern!(
+            agentmux::config::ConfigError::RewriteToBlockedModel {
+                from: eq(&agentmux::delegate::ModelId::parse("gpt-6").or_fail()?),
+                to: eq(&agentmux::delegate::ModelId::parse("gpt-5.6-sol").or_fail()?),
+                ..
+            }
+        ))
+    );
+    Ok(())
+}
+
+/// A block keyed by a model the same file rewrites away is refused when the file is read.
+///
+/// The block is checked on the model that runs, so it could never apply, and would read as though
+/// it did.
+#[gtest]
+fn a_block_keyed_by_a_rewritten_model_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.codex]
+            "gpt-5.6-sol" = "gpt-6.1-sol"
+
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+        "#},
+    )
+    .or_fail()?;
+
+    let error = Config::load(&env(home.path()), home.path()).expect_err("the key is rewritten");
+
+    assert_that!(error.to_string(), contains_substring("would never apply"));
+    assert_that!(error.to_string(), contains_substring("gpt-6.1-sol"));
+    Ok(())
+}
+
+/// A recommendation that would launch a blocked model is refused when the file is read, whether it
+/// names the blocked model itself or an alias the file rewrites onto one.
+///
+/// A refusal must name a model that runs, or the caller follows it into a second refusal.
+#[gtest]
+fn a_recommendation_that_launches_a_blocked_model_is_refused_at_load() -> Result<()> {
+    use agentmux::config::ConfigError;
+
+    let home = tempfile::tempdir().or_fail()?;
+
+    // Recommending a blocked model by its own name
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.codex]
+            "gpt-5.6-sol" = "gpt-6-sol"
+            "gpt-6-sol" = "sol"
+        "#},
+    )
+    .or_fail()?;
+    assert_that!(
+        Config::load(&env(home.path()), home.path()).map(|_| ()),
+        err(matches_pattern!(ConfigError::BlockedRecommendation {
+            model: eq(&agentmux::delegate::ModelId::parse("gpt-5.6-sol").or_fail()?),
+            recommended: eq(&agentmux::delegate::ModelId::parse("gpt-6-sol").or_fail()?),
+            ..
+        }))
+    );
+
+    // Recommending an alias the file rewrites onto a blocked model
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [models.codex]
+            "sol" = "gpt-6-sol"
+
+            [blocked.codex]
+            "gpt-5.6-sol" = "sol"
+            "gpt-6-sol" = "astra"
+        "#},
+    )
+    .or_fail()?;
+    assert_that!(
+        Config::load(&env(home.path()), home.path()).map(|_| ()),
+        err(matches_pattern!(ConfigError::RewriteToBlockedModel { .. }))
+    );
+    Ok(())
+}
+
+/// A project file may not block a model.
+///
+/// It arrives with a `git clone`, and which models an operator may ask for is the operator's
+/// decision, as which model answers is.
+#[gtest]
+fn a_project_file_that_blocks_a_model_is_refused() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    let repo = home.path().join("work/cloned");
+    std::fs::create_dir_all(&repo).or_fail()?;
+    agentmux::testing::write_config_file(
+        repo.join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [blocked.claude]
+            "claude-opus-5" = "opus"
+        "#},
+    )
+    .or_fail()?;
+
+    assert_that!(
+        Config::load(&env(home.path()), &repo).map(|_| ()),
+        err(matches_pattern!(
+            agentmux::config::ConfigError::ProjectFileOversteps { .. }
+        ))
+    );
     Ok(())
 }

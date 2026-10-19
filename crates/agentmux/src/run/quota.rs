@@ -56,23 +56,34 @@ impl RunStore {
 
     /// Ask each configured account what it has left, for the given vendors.
     ///
+    /// The configuration is read afresh for every call, as a launch reads it, and handed back
+    /// beside the figures, so a reader that also lists what the machine does with model names
+    /// lists what the same reading said.
+    ///
     /// # Errors
     ///
     /// Returns [`RunError::Config`] when the machine's configuration cannot be read.
-    pub fn quota(
-        &self,
-        vendor: Option<Vendor>,
-    ) -> Result<Vec<crate::quota::AccountQuota>, RunError> {
+    pub fn quota(&self, vendor: Option<Vendor>) -> Result<QuotaReport, RunError> {
         // Discovered from agentmux's own directory: a quota question is about this machine, not
         // about any one consultation.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = crate::config::Config::load(&self.host_env, &cwd)?;
         let vendors: &[Vendor] = vendor.as_ref().map_or(&Vendor::ALL, std::slice::from_ref);
-        Ok(vendors
+        let accounts = vendors
             .iter()
             .flat_map(|vendor| {
                 crate::quota::probe_vendor(*vendor, &config, &self.host_env, self.probe.as_ref())
             })
-            .collect())
+            .collect();
+        Ok(QuotaReport { accounts, config })
     }
+}
+
+/// What [`RunStore::quota`] found, from one reading of the machine's configuration.
+#[derive(Debug, Clone)]
+pub struct QuotaReport {
+    /// What each configured account has left.
+    pub accounts: Vec<crate::quota::AccountQuota>,
+    /// The configuration the accounts were read from.
+    pub config: crate::config::Config,
 }

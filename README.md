@@ -123,17 +123,17 @@ The same ten verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.
-agentmux ask --delegate codex --model gpt-6-astra --effort high \
+agentmux ask --delegate codex --model astra --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 
 # A long review, watched as it arrives.
-agentmux start --delegate claude --model claude-opus-5 --effort xhigh --keep \
+agentmux start --delegate claude --model opus --effort xhigh --keep \
   --file review/brief.md
 agentmux tail <run-id> --follow
 
 # A correction while the turn is still running, from another terminal. Only a Codex turn that
 # inherits its account's settings runs over `codex app-server`, which is what can take one.
-agentmux start --delegate codex --model gpt-6-astra --effort high --inherit-settings \
+agentmux start --delegate codex --model sol --effort high --inherit-settings \
   'Review the diff against main for correctness bugs. Cite file:line.'
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
@@ -226,7 +226,7 @@ account = "clientx"
 ```
 
 A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite, an
-`[efforts]` default or a `retention` is refused by name. It has to be, because such a file arrives
+`[efforts]` default, a `[blocked]` model or a `retention` is refused by name. It has to be, because such a file arrives
 with a `git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a repository and
 asking for one second opinion would send your key to whoever wrote it. For the same reason a project
 file may choose *which* of your accounts pays but nothing more: an account it selects runs isolated
@@ -246,21 +246,23 @@ opposite fixes, and only one of them is fixed by upgrading.
 
 ### Model rewrites
 
-A caller names the exact model it wants, and the name it names is often one a person wrote into a
-prompt weeks ago — "fable 5", the series rather than whichever point release is current. The
-machine file is where the two are reconciled, so a rule written once outlives every prompt that
-predates it:
+A caller names the model it wants, and the name it names is often one a person wrote into a prompt
+weeks ago — "fable", the family rather than whichever point release is current. The machine file is
+where the two are reconciled, so a rule written once outlives every prompt that predates it, and a
+family alias on the left is what a caller is told to prefer:
 
 ```toml
 # ~/.config/agentmux/agentmux.toml
 
 [models.claude]
 # Asked for on the left, launched on the right.
-"fable-5" = "claude-fable-5-1"
-"opus" = "claude-opus-5[1m]"
+"opus" = "claude-opus-5-5[1m]"
+"fable" = "claude-fable-5-1"
+"sonnet" = "claude-sonnet-5"
 
 [models.codex]
-"gpt-6" = "gpt-6-astra"
+"sol" = "gpt-6.1-sol"
+"astra" = "gpt-6-astra"
 ```
 
 agentmux still keeps no roster of models: an identifier the file says nothing about reaches the CLI
@@ -271,7 +273,7 @@ Rules are per vendor, matched exactly as the CLI matches them, and pinned at `st
 between two questions cannot answer the second half of one transcript with a different model.
 
 A consultation whose model was rewritten says so wherever it is described — `codex gpt-6-astra …
-(asked for gpt-6)` — because a caller that pinned a model and read a different one back would
+(asked for astra)` — because a caller that pinned a model and read a different one back would
 otherwise have no way to tell a rule of its own machine from a pin agentmux ignored. `agentmux
 accounts` lists the rules alongside the accounts. Only a machine file may define one, for the same
 reason only a machine file may define an account: a project file arrives with a `git clone`, and
@@ -301,6 +303,42 @@ this file and never an `agentmux` release. A default keyed by a model the same f
 is refused when the file is read, because it could never apply and would read as though it did.
 Every description of a consultation names the effort that ran, and `agentmux accounts` lists the
 defaults under `efforts`.
+
+### Blocked models
+
+A model can be too expensive, or retired in favour of a cheaper one, while prompts written weeks ago
+still name it. The machine file can block it and say what to ask for instead, either as the
+recommendation alone or as a table that also says why:
+
+```toml
+# ~/.config/agentmux/agentmux.toml
+
+[blocked.codex]
+# Blocked on the left; the model to ask for instead on the right.
+"gpt-5.6-sol" = "sol"
+"gpt-6-sol" = { use = "sol", reason = "gpt-6.1-sol is much cheaper" }
+
+[blocked.claude]
+"claude-opus-5" = "opus"
+"claude-fable-5" = "fable"
+```
+
+A new consultation whose model is blocked is refused before anything is launched, naming the model
+to use instead: `codex model "gpt-6-sol" is blocked by this machine's agentmux configuration; use
+model "sol" instead (gpt-6.1-sol is much cheaper). No delegate was launched.` The recommendation is
+never launched in the caller's place, because which model answers is the caller's choice to make
+knowingly. The model checked is the one that would run, after any rewrite above, so an old
+spelling the file rewrites to an allowed model still works. A follow-up is not checked: it keeps the
+model its consultation started with, so a block added later does not strand a review that is
+already paid for.
+
+A file whose rules contradict each other is refused when it is read: a rewrite onto a blocked model,
+a block keyed by a model the same file rewrites away, and a recommendation that would itself launch
+a blocked model. Nothing else is checked about the recommendation, which reaches the CLI like any
+other model a caller names. The MCP server's instructions list the aliases and blocked models it
+found when it started, for the vendors it launches, and `quota` lists them again from the current
+file on every call, saying so when there are none; `agentmux accounts` lists them under `blocked`.
+Only a machine file may block a model.
 
 ### Retention
 
@@ -446,7 +484,7 @@ tooling, and a hook you want applied to every model you run is not usefully supp
 can be turned off, per account or per consultation:
 
 ```bash
-agentmux ask --delegate claude --model claude-opus-5 --effort xhigh \
+agentmux ask --delegate claude --model opus --effort xhigh \
   --inherit-settings "Run the project's own checks and tell me what fails."
 
 agentmux ask ... --isolated      # override an account that asks to inherit

@@ -490,7 +490,8 @@ impl AgentMux {
                        a rate-limited failure to find one that can answer now. Read `severity` \
                        and the per-model windows yourself — agentmux does not rank accounts, \
                        because a percentage means nothing without the plan behind it. An account \
-                       reported as unavailable is NOT an idle account."
+                       reported as unavailable is NOT an idle account. It also lists this \
+                       machine's model aliases and blocked models as its file says them now."
     )]
     fn quota(
         &self,
@@ -500,7 +501,7 @@ impl AgentMux {
             .store
             .quota(params.delegate)
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::quota(&reported)))
+        Ok(text(render::quota(&reported, params.delegate)))
     }
 }
 
@@ -547,7 +548,9 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         // among them; the remedy is to answer, not to retry.
         | RunError::Recursive
         // The operator denied the vendor, and the message names the subagent to use instead.
-        | RunError::VendorDenied { .. } => ErrorData::invalid_params(error.to_string(), None),
+        | RunError::VendorDenied { .. }
+        // The operator blocked the model, and the message names the one to ask for instead.
+        | RunError::ModelBlocked { .. } => ErrorData::invalid_params(error.to_string(), None),
         // A configuration file is read on every launch whatever the call names, so no argument
         // works around it; the message names the file and what to change in it.
         RunError::Config(inner) => ErrorData::invalid_params(
@@ -672,6 +675,23 @@ fn instructions(
         described.push(format!("{vendor}: {names} — {omitted}"));
     }
 
+    // A paragraph of its own, after the accounts, because it answers the next question a caller
+    // has: which `model` to name.
+    // Only for the vendors this server launches; `quota` still reports the machine as a whole.
+    let launched: Vec<Vendor> = Vendor::ALL
+        .into_iter()
+        .filter(|vendor| !denied.contains(vendor))
+        .collect();
+    let models = render::model_rules(&config, &launched).map_or_else(String::new, |rules| {
+        indoc::formatdoc! {"
+
+            {rules} That list is a snapshot from server start: every launch reads the current file,
+            and `quota` re-reads it and lists it again on every call. A blocked model is refused
+            with the model to ask for instead, never swapped in for you; a follow-up keeps the
+            model its consultation started with.
+        "}
+    });
+
     let roster = if described.is_empty() {
         "No named accounts were defined when this server started, so omit `account`.".to_owned()
     } else {
@@ -690,7 +710,7 @@ fn instructions(
         on every call, as every launch does. It reports what each account has left and costs
         nothing: call it before a long consultation, and again after a rate-limited failure to
         find one that can answer now.
-
+        {models}
         A delegate loads no settings, hooks or MCP servers unless its account is marked above as
         inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
         exercise the tooling that configuration sets up, `false` when the answer must not depend
@@ -736,14 +756,18 @@ that a hook reopened after it had finished, and the findings are above all of th
 from the top, or open the file at `transcript:` with your own file tools — the inline text is
 bounded by your host's result limit, the file never is.
 
-Choose a delegate by naming `delegate` (`claude` or `codex`), the exact `model` identifier that
-vendor's CLI spells, and an `effort`. agentmux keeps no model list and checks neither: it forwards
-both verbatim and hands you the CLI's own refusal, which names what it does accept. The machine's
-own configuration may rewrite one model identifier to another, and a result whose model was
-rewritten names both. Pin the model every time — inheriting a default is how an expensive question
-reaches a cheap model. Pin the effort too for anything that matters: left out, the machine's
-configured default for that model is used, or the CLI's own when it has none, and the result says
-which effort ran.
+Choose a delegate by naming `delegate` (`claude` or `codex`), a `model` and an `effort`. Prefer a
+family alias for the model — `opus`, `fable` or `sonnet` for `claude`, `sol` or `astra` for `codex`
+— which this machine's configuration resolves to the current version; the aliases it defines are
+listed below when it defines any. agentmux keeps no built-in model roster; this machine's rewrites
+and blocks apply before launch, and the model and effort that run are forwarded verbatim. When the
+CLI refuses one, its own refusal comes back, usually naming what it accepts: look a current
+identifier up there rather than copying one from an example, which goes stale with the next
+release. A result whose model was rewritten names both, and
+a model the machine blocks is refused with the one to use instead. Pin the model every time —
+inheriting a default is how an expensive question reaches a cheap model. Pin the effort too for
+anything that matters: left out, the machine's configured default for that model is used, or the
+CLI's own when it has none, and the result says which effort ran.
 
 Write the question for a stranger. The delegate shares no conversation with you and cannot ask you
 anything: name the paths it should read and the shape of the answer you want. It reads your project
@@ -782,6 +806,287 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::{AgentMux, SteerParams};
+    use crate::params::QuotaParams;
+
+    /// A machine file defining aliases for both vendors and blocking two Codex models.
+    const MODEL_RULES: &str = indoc::indoc! {r#"
+        [models.claude]
+        "opus" = "claude-opus-5-5[1m]"
+
+        [models.codex]
+        "sol" = "gpt-6.1-sol"
+
+        [blocked.codex]
+        "gpt-5.6-sol" = "sol"
+        "gpt-6-sol" = { use = "sol", reason = "gpt-6.1-sol is much cheaper" }
+    "#};
+
+    /// A server over an empty store whose machine file can be rewritten while it runs.
+    struct ConfiguredServer {
+        server: AgentMux,
+        launcher: Arc<ScriptedLauncher>,
+        /// Where the machine file lives, and the directory a consultation reads.
+        home: tempfile::TempDir,
+        #[expect(
+            dead_code,
+            reason = "holds the store's temporary directory until the test ends; never read"
+        )]
+        state_directory: tempfile::TempDir,
+    }
+
+    impl ConfiguredServer {
+        /// Replace the machine file, as an operator editing it under a running server would.
+        fn write_config(&self, config: &str) -> Result<()> {
+            agentmux::testing::write_config_file(self.home.path().join("agentmux.toml"), config)
+                .or_fail()?;
+            Ok(())
+        }
+
+        /// The text of a `quota` call, for both vendors or one.
+        fn quota_text(&self, delegate: Option<agentmux::delegate::Vendor>) -> Result<String> {
+            let reported = self
+                .server
+                .quota(Parameters(QuotaParams { delegate }))
+                .or_fail()?;
+            Ok(format!("{:?}", reported.content))
+        }
+    }
+
+    /// A server whose machine file says `config`, launching every vendor but `denied`.
+    fn configured_server(
+        config: &str,
+        denied: &[agentmux::delegate::Vendor],
+    ) -> Result<ConfiguredServer> {
+        let home = tempfile::tempdir().or_fail()?;
+        agentmux::testing::write_config_file(home.path().join("agentmux.toml"), config)
+            .or_fail()?;
+        let host_env = [
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            (
+                "HOME".to_owned(),
+                home.path().to_string_lossy().into_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state_directory = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([]));
+        let store = RunStore::open(
+            state_directory.path(),
+            Arc::<ScriptedLauncher>::clone(&launcher),
+            host_env,
+        )
+        .or_fail()?
+        .with_denied_vendors(denied.iter().copied());
+        Ok(ConfiguredServer {
+            server: AgentMux::new(Arc::new(store)),
+            launcher,
+            home,
+            state_directory,
+        })
+    }
+
+    /// The instructions a host delivers once name this machine's aliases and blocked models, and
+    /// say where a fresher reading comes from.
+    #[gtest]
+    fn the_instructions_list_the_machines_aliases_and_blocked_models() -> Result<()> {
+        use rmcp::ServerHandler as _;
+
+        let configured = configured_server(MODEL_RULES, &[])?;
+
+        let instructions = configured.server.get_info().instructions.or_fail()?;
+
+        assert_that!(
+            instructions,
+            contains_substring(
+                "Model aliases on this machine — claude: `opus` → `claude-opus-5-5[1m]`; codex: \
+                 `sol` → `gpt-6.1-sol`."
+            )
+        );
+        assert_that!(
+            instructions,
+            contains_substring(
+                "Blocked models, refused when a new consultation would launch them — codex: \
+                 `gpt-5.6-sol` (use `sol`), `gpt-6-sol` (use `sol`: gpt-6.1-sol is much cheaper)."
+            )
+        );
+        // A snapshot, and the caller is told which call re-reads it.
+        assert_that!(
+            instructions,
+            contains_substring("`quota` re-reads it and lists it again on every call")
+        );
+        // Set apart from the accounts above and the isolation paragraph below.
+        assert_that!(
+            instructions,
+            contains_substring("answer now.\n\nModel aliases on this machine")
+        );
+        assert_that!(
+            instructions,
+            contains_substring("started with.\n\nA delegate loads")
+        );
+        Ok(())
+    }
+
+    /// A machine that defines no aliases and blocks nothing adds no model paragraph, and leaves
+    /// the paragraphs around it as they were.
+    #[gtest]
+    fn the_instructions_omit_model_rules_when_there_are_none() -> Result<()> {
+        use rmcp::ServerHandler as _;
+
+        let configured = configured_server(
+            indoc::indoc! {r#"
+                [accounts.claude.work]
+                config_dir = "/tmp"
+            "#},
+            &[],
+        )?;
+
+        let instructions = configured.server.get_info().instructions.or_fail()?;
+
+        assert_that!(instructions, not(contains_substring("Model aliases on")));
+        assert_that!(instructions, not(contains_substring("Blocked models")));
+        assert_that!(
+            instructions,
+            contains_substring("answer now.\n\nA delegate loads")
+        );
+        Ok(())
+    }
+
+    /// A server that launches only one vendor lists only that vendor's rules in its instructions,
+    /// while `quota` still reports the machine's rules for both, as it reports both vendors'
+    /// accounts.
+    #[gtest]
+    fn a_denied_vendors_rules_are_left_out_of_the_instructions_only() -> Result<()> {
+        use agentmux::delegate::Vendor;
+        use rmcp::ServerHandler as _;
+
+        let configured = configured_server(MODEL_RULES, &[Vendor::Claude])?;
+
+        let instructions = configured.server.get_info().instructions.or_fail()?;
+        assert_that!(
+            instructions,
+            contains_substring("Model aliases on this machine — codex: `sol` → `gpt-6.1-sol`.")
+        );
+        assert_that!(instructions, not(contains_substring("claude-opus-5-5[1m]")));
+        assert_that!(
+            instructions,
+            contains_substring("`gpt-5.6-sol` (use `sol`)")
+        );
+
+        let quota = configured.quota_text(None)?;
+        assert_that!(quota, contains_substring("`opus` → `claude-opus-5-5[1m]`"));
+        assert_that!(quota, contains_substring("`sol` → `gpt-6.1-sol`"));
+        Ok(())
+    }
+
+    /// `quota` lists the aliases and blocked models as the machine file says them now, for the
+    /// vendors it was asked about.
+    ///
+    /// A host delivers the instructions once, so a long-running server's snapshot goes stale;
+    /// this is the call a caller makes to see the current rules.
+    #[gtest]
+    fn quota_lists_the_current_aliases_and_blocked_models() -> Result<()> {
+        let configured = configured_server(
+            indoc::indoc! {r#"
+                [models.claude]
+                "opus" = "claude-opus-5-5[1m]"
+            "#},
+            &[],
+        )?;
+        // Edited after the server started, so only a fresh reading can know it.
+        configured.write_config(MODEL_RULES)?;
+
+        let both = configured.quota_text(None)?;
+        assert_that!(both, contains_substring("`opus` → `claude-opus-5-5[1m]`"));
+        assert_that!(both, contains_substring("`sol` → `gpt-6.1-sol`"));
+        assert_that!(
+            both,
+            contains_substring("`gpt-6-sol` (use `sol`: gpt-6.1-sol is much cheaper)")
+        );
+
+        // Asked about one vendor, it lists that vendor's rules alone, and says it blocks none.
+        let claude_only = configured.quota_text(Some(agentmux::delegate::Vendor::Claude))?;
+        assert_that!(
+            claude_only,
+            contains_substring("`opus` → `claude-opus-5-5[1m]`")
+        );
+        assert_that!(
+            claude_only,
+            contains_substring("No blocked models for claude.")
+        );
+        assert_that!(claude_only, not(contains_substring("gpt-5.6-sol")));
+        Ok(())
+    }
+
+    /// Rules removed after the server started are reported as gone, not left unsaid.
+    ///
+    /// The instructions still advertise what the file said at start, and silence in `quota` would
+    /// leave that snapshot standing; saying there is none is what corrects it.
+    #[gtest]
+    fn quota_says_when_rules_have_been_removed_since_start() -> Result<()> {
+        let configured = configured_server(MODEL_RULES, &[])?;
+
+        // One category removed
+        configured.write_config(indoc::indoc! {r#"
+            [models.codex]
+            "sol" = "gpt-6.1-sol"
+        "#})?;
+        let blocks_removed = configured.quota_text(None)?;
+        assert_that!(blocks_removed, contains_substring("`sol` → `gpt-6.1-sol`"));
+        assert_that!(blocks_removed, contains_substring("No blocked models."));
+        assert_that!(blocks_removed, not(contains_substring("gpt-5.6-sol")));
+
+        // Both categories cleared
+        configured.write_config(indoc::indoc! {r#"
+            [accounts.claude.work]
+            config_dir = "/tmp"
+        "#})?;
+        let cleared = configured.quota_text(None)?;
+        assert_that!(
+            cleared,
+            contains_substring("No model aliases on this machine. No blocked models.")
+        );
+        assert_that!(cleared, not(contains_substring("gpt-6.1-sol")));
+        Ok(())
+    }
+
+    /// A blocked model is refused through `start` and through `ask` as invalid parameters the
+    /// caller can act on, naming the model to ask for instead, and nothing is launched.
+    #[gtest]
+    #[tokio::test]
+    async fn the_start_and_ask_tools_refuse_a_blocked_model() -> Result<()> {
+        let configured = configured_server(MODEL_RULES, &[])?;
+        let arguments = serde_json::json!({
+            "delegate": "codex",
+            "model": "gpt-6-sol",
+            "effort": "high",
+            "question": "Review the diff.",
+            "cwd": configured.home.path(),
+        });
+
+        let started = configured.server.start(Parameters(
+            serde_json::from_value(arguments.clone()).or_fail()?,
+        ));
+        let asked = configured
+            .server
+            .ask(Parameters(serde_json::from_value(arguments).or_fail()?))
+            .await;
+
+        for refused in [started, asked] {
+            let refusal = refused.err().or_fail()?;
+            assert_that!(refusal.code, eq(ErrorCode::INVALID_PARAMS));
+            assert_that!(
+                refusal.message.as_ref(),
+                eq(
+                    "codex model \"gpt-6-sol\" is blocked by this machine's agentmux \
+                     configuration; use model \"sol\" instead (gpt-6.1-sol is much cheaper). No \
+                     delegate was launched."
+                )
+            );
+        }
+        assert_that!(configured.launcher.launches(), is_empty());
+        Ok(())
+    }
 
     /// A steerable consultation behind an MCP server, and the thread playing its driver.
     struct SteerTestContext {

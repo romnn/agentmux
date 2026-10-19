@@ -252,8 +252,8 @@ pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print the account aliases this machine defines, the model rewrites it applies and the efforts
-/// it falls back to.
+/// Print the account aliases this machine defines, the model rewrites it applies, the efforts it
+/// falls back to and the models it blocks.
 ///
 /// The point of the command is discovery: an alias is a name someone has to know, and the error
 /// for guessing wrong is only visible after a consultation has been attempted.
@@ -367,17 +367,7 @@ pub fn accounts(
         }
         // Printed where the accounts are, because it answers the same kind of question: what this
         // machine does with a name a caller hands it.
-        let mut heading = "models";
-        for (from, to) in config.model_rewrites(vendor) {
-            println!("  {heading:<14} {from} -> {to}");
-            heading = "";
-        }
-        // Keyed by the model that runs, which the `->` above may have chosen.
-        let mut heading = "efforts";
-        for (model, effort) in config.effort_defaults(vendor) {
-            println!("  {heading:<14} {model} defaults to {effort}");
-            heading = "";
-        }
+        print_model_rules(config, vendor);
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             println!("  (none configured — omit --account to use the CLI's own default)");
@@ -392,6 +382,34 @@ pub fn accounts(
         }
     }
     Ok(())
+}
+
+/// Print what this machine does with the model names a caller hands it for one vendor: the
+/// rewrites, the default efforts and the blocked models.
+fn print_model_rules(config: &agentmux::config::Config, vendor: agentmux::delegate::Vendor) {
+    let mut heading = "models";
+    for (from, to) in config.model_rewrites(vendor) {
+        println!("  {heading:<14} {from} -> {to}");
+        heading = "";
+    }
+    // Keyed by the model that runs, which the `->` above may have chosen.
+    let mut heading = "efforts";
+    for (model, effort) in config.effort_defaults(vendor) {
+        println!("  {heading:<14} {model} defaults to {effort}");
+        heading = "";
+    }
+    // Also keyed by the model that runs, and refused at `start` naming the recommendation.
+    let mut heading = "blocked";
+    for (model, block) in config.blocked_models(vendor) {
+        match &block.reason {
+            Some(reason) => println!(
+                "  {heading:<14} {model} (use {}: {reason})",
+                block.recommended
+            ),
+            None => println!("  {heading:<14} {model} (use {})", block.recommended),
+        }
+        heading = "";
+    }
 }
 
 /// How one account authenticates, as a list of `field=value` facts.

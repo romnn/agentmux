@@ -135,6 +135,8 @@ impl RunStore {
     /// Returns [`RunError`] when the configuration cannot be read, agentmux is itself running
     /// inside a delegate, the run directory cannot be created, or the delegate cannot be launched
     /// — which includes a working directory that is not there.
+    /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
+    /// would run, before anything is written or launched.
     /// A failed start leaves no run directory behind.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
@@ -152,6 +154,17 @@ impl RunStore {
             delegate,
             rewritten_from,
         } = Self::pin_defaults(&request.delegate, &config);
+        // Checked on the model that would run, and only here: a follow-up keeps the model its
+        // consultation pinned, so a block added later never strands a consultation already paid
+        // for.
+        if let Some(blocked) = config.blocked_model(delegate.vendor(), delegate.model()) {
+            return Err(RunError::ModelBlocked {
+                vendor: delegate.vendor(),
+                model: delegate.model().clone(),
+                recommended: blocked.recommended.clone(),
+                reason: blocked.reason.clone(),
+            });
+        }
         let billing = delegate.resolve_billing(request.billing, &self.host_env, &config)?;
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
