@@ -32,7 +32,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     println!("  state       {}", report::outcome_line(&status.outcome));
     // Above the facts, as every front end puts them: each changes how what follows is read.
     for warning in status.warnings() {
-        warning_lines(&warning);
+        for line in warning_lines(&warning) {
+            println!("{line}");
+        }
     }
     println!("  reading     {}", status.cwd.display());
     println!("  elapsed     {}", report::duration(status.elapsed));
@@ -66,57 +68,65 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print one warning, in the status block's terse form.
-fn warning_lines(warning: &Warning<'_>) {
+/// One warning, in the status block's terse form, as the lines to print.
+fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
     match warning {
         // The failure itself is on the state line; its CLI's last word is what explains it.
-        Warning::Failed { stderr, .. } => {
-            if let Some(stderr) = stderr {
+        Warning::Failed { stderr, .. } => stderr
+            .iter()
+            .map(|stderr| {
                 let last = stderr
                     .lines()
                     .rev()
                     .find(|line| !line.trim().is_empty())
                     .unwrap_or(stderr);
-                println!("  stderr      {last}");
-            }
-        }
-        Warning::EarlierFailure { turn, kind } => println!(
+                format!("  stderr      {last}")
+            })
+            .collect(),
+        Warning::EarlierFailure { turn, kind } => vec![format!(
             "  EARLIER     turn {} failed: {} — see the transcript",
             turn.saturating_add(1),
             kind.label()
-        ),
-        Warning::SessionNotSaved { store } => println!(
+        )],
+        Warning::SessionNotSaved { store } => vec![format!(
             "  WARNING     {}",
             agentmux::transcript::describe_unsaved_session_store(store)
-        ),
-        Warning::BrokeContinuity => println!(
+        )],
+        Warning::BrokeContinuity => vec![
             "  WARNING     a follow-up did not resume the earlier session; that turn answered with \
              no memory of the brief"
-        ),
-        Warning::HookReopened(HookReopening::Expected) => println!(
-            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer is \
-             above the injection"
-        ),
-        Warning::HookReopened(HookReopening::Unexpected) => println!(
+                .to_owned(),
+        ],
+        Warning::HookReopened(HookReopening::Expected) => vec![
+            "  NOTE        a hook in the inherited settings reopened a finished turn; the answer \
+             is above the injection"
+                .to_owned(),
+        ],
+        Warning::HookReopened(HookReopening::Unexpected) => vec![
             "  WARNING     a hook reopened a finished turn although no settings were loaded; treat \
              the transcript as untrusted — the last message is not the answer"
-        ),
+                .to_owned(),
+        ],
         Warning::Unrecognised {
             summary,
             another_protocol,
             ..
         } => {
-            println!(
+            let mut lines = vec![format!(
                 "  UNRECOGNISED {summary} — the delegate CLI may have changed its output format"
-            );
+            )];
             if *another_protocol {
-                println!("  FALLBACK    {}", agentmux::appserver::EXEC_FALLBACK_HINT);
+                lines.push(format!(
+                    "  FALLBACK    {}",
+                    agentmux::appserver::EXEC_FALLBACK_HINT
+                ));
             }
+            lines
         }
-        Warning::InstructionFiles { cwd } => println!(
+        Warning::InstructionFiles { cwd } => vec![format!(
             "  NOTE        a Claude delegate also reads any CLAUDE.md or AGENTS.md at or above {}",
             cwd.display()
-        ),
+        )],
     }
 }
 
@@ -160,6 +170,13 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage, json: bool) -> Resu
             "\n[truncated at {} of {} bytes; continue with --offset {}]",
             page.next_offset, page.total_bytes, page.next_offset
         );
+    }
+    // On stderr, so stdout stays the transcript: some of these are in the transcript already,
+    // but one such as a follow-up that resumed nothing is known only to the status.
+    for warning in status.warnings() {
+        for line in warning_lines(&warning) {
+            eprintln!("{line}");
+        }
     }
     Ok(())
 }
@@ -293,14 +310,17 @@ pub fn accounts(
         // for a Bedrock key.
         // A credential name is marked, because a delegate that names an account does not get
         // it: the account's own login must not be outranked by a key meant for the default.
-        let withheld = |name: &str| {
-            if agentmux::delegate::is_billing_name(name) {
-                "; withheld unless the account sets billing = \"api\""
-            } else if agentmux::delegate::is_credential_name(name) {
-                "; withheld when an account is named"
-            } else {
-                ""
+        // A name can be both, and then both rules withhold it.
+        let withheld = |name: &str| match (
+            agentmux::delegate::is_billing_name(name),
+            agentmux::delegate::is_credential_name(name),
+        ) {
+            (true, true) => {
+                "; withheld when an account is named, and from every delegate on a subscription"
             }
+            (true, false) => "; withheld unless the account sets billing = \"api\"",
+            (false, true) => "; withheld when an account is named",
+            (false, false) => "",
         };
         for name in config.launch.env.keys() {
             println!("              {name} (set in config{})", withheld(name));
