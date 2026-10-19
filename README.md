@@ -458,7 +458,8 @@ guarded by the variable alone.
 The child environment is built as an **allowlist from empty**, never by filtering a denylist. It
 gets `PATH`, `HOME`, locale, proxy and CA settings, and the credential variables its own vendor
 reads, less the API keys [Billing safety](#billing-safety) removes — and nothing else. None of the
-launching agent's session identity reaches it.
+launching agent's session identity reaches it
+([ADR 0022](docs/adr/0022-delegate-env-from-allowlist.md)).
 
 A Claude delegate runs with `--setting-sources ""`, so no user, project or local settings load and
 no hook can reopen its finished turn, and with `--strict-mcp-config` and an empty MCP config so it

@@ -31,6 +31,8 @@ a record names to show where the decision is enforced must be renamed there too.
   refused.
 - [0017](0017-billing-env-scrub.md): Billing-sensitive environment variables require machine-file
   opt-in.
+- [0022](0022-delegate-env-from-allowlist.md): A delegate's environment is built from empty by
+  allowlist.
 
 ## Quota observations
 
@@ -53,6 +55,8 @@ a record names to show where the decision is enforced must be renamed there too.
   is frozen.
 - [0010](0010-pids-and-start-times.md): A pid on disk is trusted only with its start time.
 - [0020](0020-run-state-locking.md): A run changes shape only under its lock.
+- [0023](0023-resume-after-delegate-exit.md): A follow-up resumes a session only once its delegate
+  has exited.
 
 ## Codex integration
 
