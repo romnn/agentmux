@@ -554,6 +554,14 @@ mod tests {
     /// response, and an entry listed twice each stop generation.
     #[gtest]
     fn an_entry_the_bundle_does_not_bear_out_is_refused() {
+        struct Case {
+            requests: Vec<Value>,
+            notifications: Vec<Value>,
+            request_entries: Vec<Entry>,
+            notification_entries: Vec<Entry>,
+            reason: &'static str,
+        }
+
         let turn_start = || branch("turn/start", Some(reference("TurnStartParams")), true);
         let entry = || request("turn/start", "TurnStartParams", "TurnStartResponse");
         let started = || {
@@ -564,86 +572,93 @@ mod tests {
             )
         };
         let cases = [
-            (
-                vec![turn_start()],
-                vec![],
-                vec![request(
+            Case {
+                requests: vec![turn_start()],
+                notifications: vec![],
+                request_entries: vec![request(
                     "turn/begin",
                     "TurnStartParams",
                     "TurnStartResponse",
                 )],
-                vec![],
-                "does not",
-            ),
-            (
-                vec![turn_start()],
-                vec![],
-                vec![request(
+                notification_entries: vec![],
+                reason: "does not",
+            },
+            Case {
+                requests: vec![turn_start()],
+                notifications: vec![],
+                request_entries: vec![request(
                     "turn/start",
                     "TurnBeginParams",
                     "TurnStartResponse",
                 )],
-                vec![],
-                "its params are",
-            ),
-            (
-                vec![branch("turn/start", Some(json!({"type": "object"})), true)],
-                vec![],
-                vec![entry()],
-                vec![],
-                "does not bind",
-            ),
-            (
-                vec![
+                notification_entries: vec![],
+                reason: "its params are",
+            },
+            Case {
+                requests: vec![branch("turn/start", Some(json!({"type": "object"})), true)],
+                notifications: vec![],
+                request_entries: vec![entry()],
+                notification_entries: vec![],
+                reason: "does not bind",
+            },
+            Case {
+                requests: vec![
                     turn_start(),
                     branch("turn/begin", Some(reference("TurnStartParams")), true),
                 ],
-                vec![],
-                vec![entry()],
-                vec![],
-                "cannot tell the two apart",
-            ),
-            (
-                vec![turn_start()],
-                vec![],
-                vec![request(
+                notifications: vec![],
+                request_entries: vec![entry()],
+                notification_entries: vec![],
+                reason: "cannot tell the two apart",
+            },
+            Case {
+                requests: vec![turn_start()],
+                notifications: vec![],
+                request_entries: vec![request(
                     "turn/start",
                     "TurnStartParams",
                     "TurnBeginResponse",
                 )],
-                vec![],
-                "no response type",
-            ),
-            (
-                vec![turn_start()],
-                vec![],
-                vec![Entry {
+                notification_entries: vec![],
+                reason: "no response type",
+            },
+            Case {
+                requests: vec![turn_start()],
+                notifications: vec![],
+                request_entries: vec![Entry {
                     response: None,
                     ..entry()
                 }],
-                vec![],
-                "gives it no response",
-            ),
-            (
-                vec![],
-                vec![started()],
-                vec![],
-                vec![Entry {
+                notification_entries: vec![],
+                reason: "gives it no response",
+            },
+            Case {
+                requests: vec![],
+                notifications: vec![started()],
+                request_entries: vec![],
+                notification_entries: vec![Entry {
                     method: "turn/started",
                     params: Carries::Required("TurnStartedNotification"),
                     response: Some("TurnStartResponse"),
                 }],
-                "gives it a response",
-            ),
-            (
-                vec![turn_start()],
-                vec![],
-                vec![entry(), entry()],
-                vec![],
-                "lists it twice",
-            ),
+                reason: "gives it a response",
+            },
+            Case {
+                requests: vec![turn_start()],
+                notifications: vec![],
+                request_entries: vec![entry(), entry()],
+                notification_entries: vec![],
+                reason: "lists it twice",
+            },
         ];
-        for (requests, notifications, request_entries, notification_entries, reason) in cases {
+        for Case {
+            requests,
+            notifications,
+            request_entries,
+            notification_entries,
+            reason,
+        } in cases
+        {
             assert_that!(
                 read(
                     &bundle(&requests, &notifications),

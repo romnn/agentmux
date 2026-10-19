@@ -25,8 +25,10 @@ use googletest::prelude::*;
 const DRIVER: &str = "/opt/agentmux/bin/agentmux";
 
 /// A running Codex turn, as a driven turn's capture begins.
-const RUNNING: &str =
-    "{\"type\":\"thread.started\",\"thread_id\":\"th-fake\"}\n{\"type\":\"turn.started\"}\n";
+const RUNNING: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"th-fake"}
+    {"type":"turn.started"}
+"#};
 
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
@@ -142,7 +144,12 @@ fn answer_first(mailbox: PathBuf, reply: Reply) -> std::thread::JoinHandle<Optio
 /// with a plan that carries what `codex exec` would have been given.
 #[gtest]
 fn an_inheriting_codex_turn_is_launched_through_the_driver() -> Result<()> {
-    let first = "{\"type\":\"thread.started\",\"thread_id\":\"th-fake\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"i\",\"type\":\"agent_message\",\"text\":\"OK\"}}\n{\"type\":\"turn.completed\"}\n";
+    let first = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th-fake"}
+        {"type":"turn.started"}
+        {"type":"item.completed","item":{"id":"i","type":"agent_message","text":"OK"}}
+        {"type":"turn.completed"}
+    "#};
     let h = harness([Script::completed(first), Script::running(RUNNING)])?;
 
     let request = h.request(codex(Isolation::Inherit)?);
@@ -422,7 +429,9 @@ async fn a_turn_not_yet_running_takes_no_steer() -> Result<()> {
         ("opening its thread", ""),
         (
             "starting its turn",
-            "{\"type\":\"thread.started\",\"thread_id\":\"th-fake\"}\n",
+            indoc::indoc! {r#"
+                {"type":"thread.started","thread_id":"th-fake"}
+            "#},
         ),
     ] {
         let h = harness([Script::running(capture)])?;
@@ -534,7 +543,9 @@ async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
 
     // And an empty message says nothing to steer with.
     assert_that!(
-        h.store.steer(&isolated.run_id, "  \n").await,
+        h.store
+            .steer(&isolated.run_id, indoc::indoc! {"  \n"})
+            .await,
         err(matches_pattern!(RunError::Steer(eq(&SteerRefused::Empty))))
     );
     Ok(())
@@ -629,8 +640,10 @@ async fn a_cancelled_driver_that_never_leaves_is_signalled() -> Result<()> {
 #[gtest]
 #[tokio::test(start_paused = true)]
 async fn a_cancel_after_a_completed_turn_waits_for_driver_cleanup() -> Result<()> {
-    let ended =
-        "{\"type\":\"thread.started\",\"thread_id\":\"th-fake\"}\n{\"type\":\"turn.completed\"}\n";
+    let ended = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"th-fake"}
+        {"type":"turn.completed"}
+    "#};
     let h = harness([Script::running(ended)])?;
     let started = h.store.start(&h.request(codex(Isolation::Inherit)?))?;
     assert_that!(started.outcome.is_terminal(), eq(true));

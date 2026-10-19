@@ -475,7 +475,7 @@ impl Peer {
     fn unexpected(&self, expected: &str, got: impl Into<Got>) -> PeerError {
         PeerError::Unexpected {
             expected: expected.to_owned(),
-            got: got.into().0,
+            got: got.into().into_inner(),
             received: self.received.clone(),
         }
     }
@@ -483,6 +483,12 @@ impl Peer {
 
 /// What arrived instead of what a script expected, as an error message names it.
 struct Got(String);
+
+impl Got {
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
 
 impl From<Message> for Got {
     fn from(message: Message) -> Self {
@@ -508,19 +514,33 @@ mod tests {
     use super::{Peer, PeerError};
     use crate::fixtures;
 
+    struct Connection {
+        peer: Peer,
+        client: std::io::PipeWriter,
+        answers: BufReader<std::io::PipeReader>,
+    }
+
     /// A peer wired to pipes, with the client's ends.
-    fn peer() -> Result<(Peer, std::io::PipeWriter, BufReader<std::io::PipeReader>)> {
+    fn peer() -> Result<Connection> {
         let (from_client, to_peer) = std::io::pipe().or_fail()?;
         let (from_peer, to_client) = std::io::pipe().or_fail()?;
         let peer =
             Peer::new(BufReader::new(from_client), to_client).with_timeout(Duration::from_secs(5));
-        Ok((peer, to_peer, BufReader::new(from_peer)))
+        Ok(Connection {
+            peer,
+            client: to_peer,
+            answers: BufReader::new(from_peer),
+        })
     }
 
     /// A request is received with its typed parameters, and answered under its own id.
     #[gtest]
     fn a_request_is_received_typed_and_answered_under_its_id() -> Result<()> {
-        let (mut peer, mut client, mut answers) = peer()?;
+        let Connection {
+            mut peer,
+            mut client,
+            mut answers,
+        } = peer()?;
         let params = fixtures::turn_interrupt_params("th", "tu");
         let line = Message::request::<m::TurnInterrupt>(RequestId::Integer(4), &params)
             .or_fail()?
@@ -547,7 +567,11 @@ mod tests {
     /// A message other than the one expected fails the step and names both.
     #[gtest]
     fn an_unexpected_message_names_what_arrived() -> Result<()> {
-        let (mut peer, mut client, _answers) = peer()?;
+        let Connection {
+            mut peer,
+            mut client,
+            answers: _answers,
+        } = peer()?;
         writeln!(client, r#"{{"id":1,"method":"turn/steer","params":{{}}}}"#).or_fail()?;
 
         let refused = peer.expect::<m::TurnStart>().err().or_fail()?;
@@ -566,7 +590,11 @@ mod tests {
     /// conversation.
     #[gtest]
     fn a_read_that_fails_is_not_the_end() -> Result<()> {
-        let (mut peer, mut client, _answers) = peer()?;
+        let Connection {
+            mut peer,
+            mut client,
+            answers: _answers,
+        } = peer()?;
         client.write_all(b"\xff\xfe not text\n").or_fail()?;
         assert_that!(peer.recv(), err(matches_pattern!(PeerError::Read { .. })));
         Ok(())
@@ -576,7 +604,11 @@ mod tests {
     /// the next message.
     #[gtest]
     fn a_line_after_an_empty_wait_is_the_next_message() -> Result<()> {
-        let (mut peer, mut client, _answers) = peer()?;
+        let Connection {
+            mut peer,
+            mut client,
+            answers: _answers,
+        } = peer()?;
         assert_that!(
             peer.recv_within(Duration::from_millis(50)).or_fail()?,
             none()
@@ -595,7 +627,11 @@ mod tests {
     /// A client that closes its output is seen to.
     #[gtest]
     fn a_client_that_closes_is_seen_to() -> Result<()> {
-        let (mut peer, client, _answers) = peer()?;
+        let Connection {
+            mut peer,
+            client,
+            answers: _answers,
+        } = peer()?;
         drop(client);
         assert_that!(peer.expect_closed(), ok(anything()));
         Ok(())

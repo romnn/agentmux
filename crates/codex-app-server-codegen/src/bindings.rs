@@ -121,17 +121,31 @@ fn dispatch(direction: Direction, members: &[&Method], codex_version: &str) -> S
                                wire, name, typed, ..
                            }| {
         match typed {
-            Some(_) => format!("    /// `{wire}`.\n    {name}(Payload<'a, {name}>),\n"),
-            None => format!("    /// `{wire}`, which agentmux does not decode.\n    {name},\n"),
+            Some(_) => formatdoc! {"
+            {indent}/// `{wire}`.
+            {indent}{name}(Payload<'a, {name}>),
+        ", indent = "    "},
+            None => formatdoc! {"
+            {indent}/// `{wire}`, which agentmux does not decode.
+            {indent}{name},
+        ", indent = "    "},
         }
     });
     let classify = lines(&|Method { name, typed, .. }| match typed {
-        Some(_) => format!("            {name}::METHOD => Self::{name}(Payload::new(params)),\n"),
-        None => format!("            {name}::METHOD => Self::{name},\n"),
+        Some(_) => formatdoc! {"
+            {indent}{name}::METHOD => Self::{name}(Payload::new(params)),
+        ", indent = "            "},
+        None => formatdoc! {"
+            {indent}{name}::METHOD => Self::{name},
+        ", indent = "            "},
     });
     let names = lines(&|Method { name, typed, .. }| match typed {
-        Some(_) => format!("            Self::{name}(_) => {name}::METHOD,\n"),
-        None => format!("            Self::{name} => {name}::METHOD,\n"),
+        Some(_) => formatdoc! {"
+            {indent}Self::{name}(_) => {name}::METHOD,
+        ", indent = "            "},
+        None => formatdoc! {"
+            {indent}Self::{name} => {name}::METHOD,
+        ", indent = "            "},
     });
     formatdoc! {"
         /// {what}, classified by its method, with the parameters of one agentmux decodes not yet

@@ -961,7 +961,7 @@ mod tests {
         let out = lines(&mut t, "item/completed", &params);
         assert_that!(
             out.iter()
-                .filter_map(|e| e["type"].as_str().map(str::to_owned))
+                .filter_map(|event| event["type"].as_str().map(str::to_owned))
                 .collect::<Vec<_>>(),
             elements_are![eq("agentmux.undecoded"), eq("item.completed")]
         );

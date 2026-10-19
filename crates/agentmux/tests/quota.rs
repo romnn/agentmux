@@ -660,7 +660,14 @@ fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
         let program = bin.join(vendor.program());
         std::fs::write(
             &program,
-            format!("#!/bin/sh\nenv > '{}'\nexit 1\n", dump.display()),
+            indoc::formatdoc!(
+                "
+                    #!/bin/sh
+                    env > '{}'
+                    exit 1
+                ",
+                dump.display()
+            ),
         )
         .or_fail()?;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).or_fail()?;

@@ -633,27 +633,36 @@ pub fn describe_unsaved_session_store(store: &Path) -> String {
 /// Only what was fixed at the launch may go here: this is rendered under the first fold of the
 /// turn, and anything added later would move every byte below it.
 fn render_question(turn: &Turn) -> String {
-    let mut out = format!(
-        "\n## Turn {} — question\n\n{}\n",
+    let mut out = indoc::formatdoc!(
+        "
+
+            ## Turn {} — question
+
+            {}
+        ",
         turn.index.saturating_add(1),
         turn.question.trim_end()
     );
     if let Some(store) = &turn.unsaved_session_store {
-        let _ = write!(
+        let _ = indoc::writedoc!(
             out,
-            "\n> [!WARNING]\n\
-             > **This turn's session was not saved.** {}.\n",
+            "
+
+            > [!WARNING]
+            > **This turn's session was not saved.** {}.
+        ",
             describe_unsaved_session_store(store)
         );
     }
     // Only the exception is said: a note on every subscription turn would teach a reader to skip
     // the one that is not.
     if turn.billing == Some(crate::delegate::Billing::Api) {
-        out.push_str(
-            "\n> [!NOTE]\n\
-             > **This turn may be billed at API prices.** Its account opts into \
-             `billing = \"api\"`, so the key, token or endpoint it names reached the delegate.\n",
-        );
+        out.push_str(indoc::indoc! {"
+
+                > [!NOTE]
+                > **This turn may be billed at API prices.** Its account opts into \
+                `billing = \"api\"`, so the key, token or endpoint it names reached the delegate.
+            "});
     }
     out
 }
@@ -669,49 +678,7 @@ pub fn render_turn(turn: &Turn) -> String {
     let mut out = render_question(turn);
     let number = turn.index.saturating_add(1);
 
-    let mut reopened = false;
-    for message in &turn.messages {
-        match message.source {
-            MessageSource::HookInjection => {
-                reopened = true;
-                let _ = write!(
-                    out,
-                    "\n> [!WARNING]\n\
-                     > **A hook in the delegate's environment reopened this finished turn.**\n\
-                     > Everything below is the reopened turn, not the answer. The answer is above.\n\
-                     >\n\
-                     > Injected text: {}\n",
-                    single_line(&message.text)
-                );
-            }
-            MessageSource::HookContext => {
-                let _ = write!(
-                    out,
-                    "\n> [!NOTE]\n\
-                     > A hook in the delegate's environment added context here, mid-turn. The\n\
-                     > delegate's later messages are still its own.\n\
-                     >\n\
-                     > Injected text: {}\n",
-                    single_line(&message.text)
-                );
-            }
-            MessageSource::Steer => {
-                let _ = write!(out, "\n### user (steer)\n\n{}\n", message.text.trim_end());
-            }
-            MessageSource::Synthetic => {
-                let _ = write!(out, "\n> [!NOTE]\n> {}\n", single_line(&message.text));
-            }
-            MessageSource::Delegate => {
-                let label = match (message.role, reopened) {
-                    (Role::Assistant, false) => "assistant",
-                    (Role::Assistant, true) => "assistant (after hook reopen — not the answer)",
-                    (Role::User, _) => "user",
-                    (Role::System, _) => "system",
-                };
-                let _ = write!(out, "\n### {label}\n\n{}\n", message.text.trim_end());
-            }
-        }
-    }
+    render_messages(&mut out, &turn.messages);
 
     // Everything below is written only once the outcome is terminal.
     // While a turn is running the render must be able to grow only at its end, because `tail`
@@ -723,25 +690,41 @@ pub fn render_turn(turn: &Turn) -> String {
 
     match &turn.outcome {
         Outcome::Completed { usage, cost_usd } => {
-            let _ = write!(
+            let _ = indoc::writedoc!(
                 out,
-                "\n---\n\n_Turn {number} completed{}_\n",
-                accounting(usage, *cost_usd)
+                "
+
+                ---
+
+                _Turn {number} completed{}_
+            ",
+                accounting(usage, *cost_usd),
             );
         }
         Outcome::Failed { kind, detail } => {
-            let _ = write!(
+            let _ = indoc::writedoc!(
                 out,
-                "\n---\n\n_Turn {number} failed: {} — {}_\n\n\
-                 Anything the delegate said before the failure is above and is not affected by it.\n",
+                "
+
+                ---
+
+                _Turn {number} failed: {} — {}_
+
+                Anything the delegate said before the failure is above and is not affected by it.
+            ",
                 kind.label(),
                 single_line(detail),
             );
         }
         Outcome::Cancelled => {
-            let _ = write!(
+            let _ = indoc::writedoc!(
                 out,
-                "\n---\n\n_Turn {number} cancelled. Everything collected before the cancellation is above._\n",
+                "
+
+                ---
+
+                _Turn {number} cancelled. Everything collected before the cancellation is above._
+            ",
             );
         }
         // Unreachable: the guard above returns for a running turn.
@@ -749,28 +732,115 @@ pub fn render_turn(turn: &Turn) -> String {
     }
 
     if let Some(summary) = turn.unrecognised.summary() {
-        let _ = write!(
+        let _ = indoc::writedoc!(
             out,
-            "\n> [!NOTE]\n\
-             > agentmux did not recognise {} event(s) in this turn's stream: {summary}.\n\
-             > The delegate CLI may have changed its output format. The raw stream is kept.\n",
+            "
+
+            > [!NOTE]
+            > agentmux did not recognise {} event(s) in this turn's stream: {summary}.
+            > The delegate CLI may have changed its output format. The raw stream is kept.
+        ",
             turn.unrecognised.total(),
         );
     }
 
     if let Some(recovered) = &turn.recovered {
-        let _ = write!(
+        let _ = indoc::writedoc!(
             out,
-            "\n> [!NOTE]\n\
-             > The delegate's event stream carried no reply, so agentmux recovered the text below\n\
-             > from the file the CLI writes directly.\n\
-             > Anything the delegate said earlier in the turn is not in that file.\n\
-             \n### assistant (recovered)\n\n{}\n",
+            "
+
+            > [!NOTE]
+            > The delegate's event stream carried no reply, so agentmux recovered the text below
+            > from the file the CLI writes directly.
+            > Anything the delegate said earlier in the turn is not in that file.
+
+            ### assistant (recovered)
+
+            {}
+        ",
             recovered.trim_end(),
         );
     }
 
     out
+}
+
+fn render_messages(out: &mut String, messages: &[Message]) {
+    let mut reopened = false;
+    for message in messages {
+        match message.source {
+            MessageSource::HookInjection => {
+                reopened = true;
+                let _ = indoc::writedoc!(
+                    out,
+                    "
+
+                    > [!WARNING]
+                    > **A hook in the delegate's environment reopened this finished turn.**
+                    > Everything below is the reopened turn, not the answer. The answer is above.
+                    >
+                    > Injected text: {}
+                ",
+                    single_line(&message.text)
+                );
+            }
+            MessageSource::HookContext => {
+                let _ = indoc::writedoc!(
+                    out,
+                    "
+
+                    > [!NOTE]
+                    > A hook in the delegate's environment added context here, mid-turn. The
+                    > delegate's later messages are still its own.
+                    >
+                    > Injected text: {}
+                ",
+                    single_line(&message.text)
+                );
+            }
+            MessageSource::Steer => {
+                let _ = indoc::writedoc!(
+                    out,
+                    "
+
+                    ### user (steer)
+
+                    {}
+                ",
+                    message.text.trim_end()
+                );
+            }
+            MessageSource::Synthetic => {
+                let _ = indoc::writedoc!(
+                    out,
+                    "
+
+                    > [!NOTE]
+                    > {}
+                ",
+                    single_line(&message.text)
+                );
+            }
+            MessageSource::Delegate => {
+                let label = match (message.role, reopened) {
+                    (Role::Assistant, false) => "assistant",
+                    (Role::Assistant, true) => "assistant (after hook reopen — not the answer)",
+                    (Role::User, _) => "user",
+                    (Role::System, _) => "system",
+                };
+                let _ = indoc::writedoc!(
+                    out,
+                    "
+
+                    ### {label}
+
+                    {}
+                ",
+                    message.text.trim_end(),
+                );
+            }
+        }
+    }
 }
 
 /// Collapse newlines so a quoted blockquote stays one blockquote.

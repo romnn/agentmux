@@ -112,9 +112,10 @@ pub struct TurnFailedEvent {
 
 /// Token counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
+#[expect(
     clippy::struct_field_names,
-    reason = "the field names are codex's own JSON keys"
+    reason = "every field ends in `_tokens` because the fields are codex's own JSON keys, which \
+              the oracle matches name for name"
 )]
 pub struct Usage {
     /// Input tokens.

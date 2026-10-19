@@ -567,7 +567,7 @@ fn an_unreleased_model_identifier_is_accepted_verbatim() {
     }
     for level in ["ultra", "none", "minimal", "some-future-level"] {
         assert_that!(
-            Effort::parse(level).map(|e| e.as_str().to_owned()),
+            Effort::parse(level).map(|effort| effort.as_str().to_owned()),
             ok(eq(level))
         );
     }

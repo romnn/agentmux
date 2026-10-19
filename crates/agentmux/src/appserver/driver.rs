@@ -140,7 +140,10 @@ pub fn drive(plan_path: &Path) -> i32 {
 
     let adopting = adopt_orphans();
     contain_descendants();
-    let (mut child, to_server) = match spawn_server(&plan) {
+    let Server {
+        mut child,
+        to_server,
+    } = match spawn_server(&plan) {
         Ok(spawned) => spawned,
         Err(error) => {
             eprintln!(
@@ -947,6 +950,17 @@ fn refusal(error: &RpcError) -> String {
     }
 }
 
+struct Server {
+    child: Child,
+    to_server: PipeWriter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    started: u64,
+}
+
 /// Start `codex app-server` for the plan, in the turn's working directory.
 ///
 /// Its stderr is the driver's own, which is the turn's `stderr.log`.
@@ -956,12 +970,12 @@ fn refusal(error: &RpcError) -> String {
 /// with it.
 /// Returns the server and the write end of its input, a pipe of the driver's own so the driver
 /// can hold the input open through a second handle.
-fn spawn_server(plan: &Plan) -> std::io::Result<(Child, PipeWriter)> {
+fn spawn_server(plan: &Plan) -> std::io::Result<Server> {
     let mut env: std::collections::BTreeMap<String, String> = crate::host_env();
     if plan.billing == Billing::Subscription {
         scrub_billing_env(&mut env);
     }
-    let spawn = |program: &str| -> std::io::Result<(Child, PipeWriter)> {
+    let spawn = |program: &str| -> std::io::Result<Server> {
         let (input, to_server) = std::io::pipe()?;
         let child = std::process::Command::new(program)
             .args(&plan.settings.args)
@@ -972,7 +986,7 @@ fn spawn_server(plan: &Plan) -> std::io::Result<(Child, PipeWriter)> {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-        Ok((child, to_server))
+        Ok(Server { child, to_server })
     };
     let program = plan.settings.program.as_str();
     match spawn(program) {
@@ -1000,7 +1014,7 @@ fn spawn_server(plan: &Plan) -> std::io::Result<(Child, PipeWriter)> {
 /// reused meanwhile is left alone.
 /// Elsewhere an orphan neither reading saw is out of reach: one a crashed server's command
 /// started after the last record.
-fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<(u32, u64)>) {
+fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<ProcessIdentity>) {
     let driver = std::process::id();
     let mut seen = earlier;
     for process in descendants(driver) {
@@ -1011,7 +1025,7 @@ fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<(u32, u64)>) {
     // The server is stopped and waited for through `child`; once waited for, its pid is free
     // for another process, which a start time to the second cannot tell apart.
     let server = child.id();
-    seen.retain(|&(pid, _)| pid != server);
+    seen.retain(|process| process.pid != server);
     drop(input);
     let deadline = Instant::now() + SERVER_EXIT_GRACE;
     while Instant::now() < deadline {
@@ -1024,7 +1038,7 @@ fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<(u32, u64)>) {
     let _ = child.wait();
 
     let deadline = Instant::now() + SWEEP_GRACE;
-    let mut asked: Vec<(u32, u64)> = Vec::new();
+    let mut asked: Vec<ProcessIdentity> = Vec::new();
     loop {
         let mut left = descendants(driver);
         for earlier in seen.iter().chain(&asked) {
@@ -1039,7 +1053,7 @@ fn stop_server(child: &mut Child, input: PipeWriter, earlier: Vec<(u32, u64)>) {
             survivors(&left, Some(sysinfo::Signal::Kill));
             return;
         }
-        let fresh: Vec<(u32, u64)> = left
+        let fresh: Vec<ProcessIdentity> = left
             .into_iter()
             .filter(|process| !asked.contains(process))
             .collect();
@@ -1072,16 +1086,16 @@ fn adopt_orphans() -> bool {
 /// sweep in [`stop_server`] can still stop a command whose server crashed and left it to the
 /// system.
 /// Where it adopts, such a command stays below the driver, and the watch instead waits for each
-/// adopted orphan as it exits: an exited process
-/// stays in the process table until its parent waits for it, and a long turn whose commands keep
-/// forking short-lived helpers would otherwise fill that table with them, until the consultation
-/// can start no process at all.
+/// adopted orphan as it exits.
+/// An exited process stays in the process table until its parent waits for it, and a long turn
+/// whose commands keep forking short-lived helpers would otherwise fill that table with them,
+/// until the consultation can start no process at all.
 /// The server is never waited for here, so its exit status stays where `Child` reads it.
 /// Stopped before the sweep: an orphan nobody waited for keeps its pid, so the pid the sweep read
 /// cannot pass to another process before it is signalled.
 struct Watch {
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<Vec<(u32, u64)>>,
+    thread: std::thread::JoinHandle<Vec<ProcessIdentity>>,
 }
 
 impl Watch {
@@ -1093,7 +1107,7 @@ impl Watch {
         let flag = std::sync::Arc::clone(&stopping);
         let driver = std::process::id();
         let thread = std::thread::spawn(move || {
-            let mut seen: Vec<(u32, u64)> = Vec::new();
+            let mut seen: Vec<ProcessIdentity> = Vec::new();
             let mut ticks = 0_u32;
             while !flag.load(std::sync::atomic::Ordering::Acquire) {
                 if adopting {
@@ -1114,7 +1128,7 @@ impl Watch {
     }
 
     /// Stop watching, and return every descendant it recorded.
-    fn stop(self) -> Vec<(u32, u64)> {
+    fn stop(self) -> Vec<ProcessIdentity> {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Release);
         self.thread.join().unwrap_or_default()
@@ -1194,7 +1208,7 @@ fn process_table(pids: Option<&[sysinfo::Pid]>) -> sysinfo::System {
 /// since cannot claim an older process.
 /// Always empty on Windows, where the job object of [`contain_descendants`] stops them instead
 /// and a recorded parent pid proves nothing.
-fn descendants(root: u32) -> Vec<(u32, u64)> {
+fn descendants(root: u32) -> Vec<ProcessIdentity> {
     if cfg!(windows) {
         return Vec::new();
     }
@@ -1205,19 +1219,23 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
     else {
         return Vec::new();
     };
-    let mut found: Vec<(u32, u64)> = Vec::new();
-    let mut parents = vec![(root, root_started)];
-    while let Some((parent, parent_started)) = parents.pop() {
+    let mut found: Vec<ProcessIdentity> = Vec::new();
+    let mut parents = vec![ProcessIdentity {
+        pid: root,
+        started: root_started,
+    }];
+    while let Some(parent) = parents.pop() {
         for (pid, process) in system.processes() {
             let pid = pid.as_u32();
             let started = process.start_time();
-            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent)
-                && started >= parent_started
+            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent.pid)
+                && started >= parent.started
                 && pid != root
-                && !found.iter().any(|&(known, _)| known == pid)
+                && !found.iter().any(|known| known.pid == pid)
             {
-                found.push((pid, started));
-                parents.push((pid, started));
+                let identity = ProcessIdentity { pid, started };
+                found.push(identity);
+                parents.push(identity);
             }
         }
     }
@@ -1228,17 +1246,17 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
 ///
 /// A pid whose start time no longer matches belongs to someone else and is left alone, and a
 /// platform without the polite signal gets the forceful one.
-fn survivors(tree: &[(u32, u64)], signal: Option<sysinfo::Signal>) -> bool {
+fn survivors(tree: &[ProcessIdentity], signal: Option<sysinfo::Signal>) -> bool {
     if tree.is_empty() {
         return false;
     }
     let pids: Vec<sysinfo::Pid> = tree
         .iter()
-        .map(|&(pid, _)| sysinfo::Pid::from_u32(pid))
+        .map(|process| sysinfo::Pid::from_u32(process.pid))
         .collect();
     let system = process_table(Some(&pids));
     let mut any = false;
-    for &(pid, started) in tree {
+    for &ProcessIdentity { pid, started } in tree {
         let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) else {
             continue;
         };

@@ -295,10 +295,35 @@ pub fn probe_vendor(
     host_env: &BTreeMap<String, String>,
     probe: &dyn QuotaProbe,
 ) -> Vec<AccountQuota> {
-    let mut targets: Vec<(Option<AccountAlias>, Option<&Account>)> = config
+    enum Target<'a> {
+        Default,
+        Named {
+            alias: AccountAlias,
+            account: &'a Account,
+        },
+    }
+
+    impl Target<'_> {
+        fn alias(&self) -> Option<&AccountAlias> {
+            match self {
+                Self::Default => None,
+                Self::Named { alias, .. } => Some(alias),
+            }
+        }
+    }
+
+    struct PendingProbe<'scope, 'account> {
+        handle: std::thread::ScopedJoinHandle<'scope, Observation>,
+        target: Target<'account>,
+    }
+
+    let mut targets: Vec<Target<'_>> = config
         .accounts(vendor)
         .iter()
-        .map(|(alias, account)| (Some(alias.clone()), Some(account)))
+        .map(|(alias, account)| Target::Named {
+            alias: alias.clone(),
+            account,
+        })
         .collect();
     // The unnamed login is asked whenever a consultation naming no `account` would resolve to
     // it, which is when no defined account holds the default: the same condition the launch
@@ -311,15 +336,15 @@ pub fn probe_vendor(
         .default_account(vendor)
         .is_some_and(|default| config.account(vendor, default.alias).is_some());
     if !default_is_defined {
-        targets.push((None, None));
+        targets.push(Target::Default);
     }
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .into_iter()
-            .map(|(alias, account)| {
+            .map(|target| {
                 let handle = scope.spawn({
-                    let alias = alias.clone();
+                    let alias = target.alias().cloned();
                     move || match ProbeTarget::of(vendor, alias.as_ref(), config, host_env) {
                         Ok(target) => probe.probe(&ProbeRequest {
                             vendor,
@@ -333,15 +358,21 @@ pub fn probe_vendor(
                         },
                     }
                 });
-                (handle, alias, account)
+                PendingProbe { handle, target }
             })
             .collect();
         handles
             .into_iter()
-            .map(|(handle, alias, account)| AccountQuota {
+            .map(|PendingProbe { handle, target }| AccountQuota {
                 vendor,
-                account: alias,
-                description: account.and_then(|a| a.description.clone()),
+                description: match &target {
+                    Target::Default => None,
+                    Target::Named { account, .. } => account.description.clone(),
+                },
+                account: match target {
+                    Target::Default => None,
+                    Target::Named { alias, .. } => Some(alias),
+                },
                 // A probe that panicked is reported as unavailable rather than dropped: an
                 // account missing from the list reads as "does not exist", which is a different
                 // claim.

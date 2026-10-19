@@ -172,7 +172,12 @@ fn run_with<W: std::io::Write + Send + 'static, R: Send + 'static>(
     for line in &received {
         let request: Value = serde_json::from_str(line).or_fail()?;
         if let Err(reason) = conformance::check(Side::Client, &request) {
-            fail!("the driver sent what codex's schema refuses: {request}\n{reason}")?;
+            fail!(
+                "{}",
+                indoc::formatdoc! {"
+                    the driver sent what codex's schema refuses: {request}
+                    {reason}"}
+            )?;
         }
         requests.push(request);
     }
@@ -298,7 +303,9 @@ fn end(
 }
 
 /// A turn that answers only with a plan, carried in `turn/completed`'s items.
-const PLAN: &str = "1. read the auth module\n2. fix the token check";
+const PLAN: &str = indoc::indoc! {"
+    1. read the auth module
+    2. fix the token check"};
 
 /// A steer reaches the running turn, is answered, and is recorded where the server accepted it.
 ///
@@ -394,13 +401,22 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
     // it produced.
     let rendered = render_turn(&turn);
     let before_at = rendered
-        .find("### assistant\n\nReading the whole repository.")
+        .find(indoc::indoc! {"
+            ### assistant
+
+            Reading the whole repository."})
         .or_fail()?;
     let steer_at = rendered
-        .find("### user (steer)\n\nOnly look at the auth module.")
+        .find(indoc::indoc! {"
+            ### user (steer)
+
+            Only look at the auth module."})
         .or_fail()?;
     let reply_at = rendered
-        .find("### assistant\n\nNarrowed to auth: no findings.")
+        .find(indoc::indoc! {"
+            ### assistant
+
+            Narrowed to auth: no findings."})
         .or_fail()?;
     assert_that!(before_at < steer_at && steer_at < reply_at, eq(true));
 
@@ -788,16 +804,18 @@ fn a_steer_that_is_never_answered_is_unconfirmed() -> Result<()> {
     Ok(())
 }
 
-/// A capture that refuses one line: the transcript the deliverable lives in.
 /// A capture that refuses any line containing its marker, as a full disk would.
-struct Refuses(&'static str, Vec<u8>);
+struct Refuses {
+    marker: &'static str,
+    bytes: Vec<u8>,
+}
 
 impl std::io::Write for Refuses {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if String::from_utf8_lossy(buf).contains(self.0) {
+        if String::from_utf8_lossy(buf).contains(self.marker) {
             return Err(std::io::Error::other("disk full"));
         }
-        self.1.extend_from_slice(buf);
+        self.bytes.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -816,7 +834,10 @@ fn a_steer_the_capture_cannot_record_is_never_reported_accepted() -> Result<()> 
     let mut reply = None;
     let driven = run_with(
         &plan,
-        Driver::capturing(Refuses("agentmux.steer", Vec::new())),
+        Driver::capturing(Refuses {
+            marker: "agentmux.steer",
+            bytes: Vec::new(),
+        }),
         |peer| {
             peer.open_thread(THREAD)?;
             peer.start_turn(THREAD, TURN)?;
@@ -849,7 +870,10 @@ fn an_unreadable_steer_answer_is_replied_to_when_its_drift_cannot_be_recorded() 
     let mut reply = None;
     let driven = run_with(
         &plan,
-        Driver::capturing(Refuses("agentmux.undecoded", Vec::new())),
+        Driver::capturing(Refuses {
+            marker: "agentmux.undecoded",
+            bytes: Vec::new(),
+        }),
         |peer| {
             peer.open_thread(THREAD)?;
             peer.start_turn(THREAD, TURN)?;
@@ -887,7 +911,9 @@ fn a_line_that_is_no_message_is_kept_as_drift() -> Result<()> {
         |peer| {
             peer.open_thread(THREAD)?;
             peer.start_turn(THREAD, TURN)?;
-            peer.send_bytes(b"{\"method\":[\"turn/completed\"]}\n")?;
+            peer.send_bytes(indoc::indoc! {br#"
+                {"method":["turn/completed"]}
+            "#})?;
             finish(peer, "done")
         },
         |_| {},
@@ -1475,6 +1501,12 @@ fn child_thread_notifications_do_not_contaminate_the_consultation() -> Result<()
 /// A capture that takes its time over every line, as a slow disk would.
 struct SlowCapture(Vec<u8>);
 
+impl SlowCapture {
+    fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
 impl std::io::Write for SlowCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.write(buf)
@@ -1523,7 +1555,7 @@ fn a_completion_queued_before_the_server_exits_still_ends_the_turn() -> Result<(
     )?;
 
     assert_that!(driven.ending, eq(&Ending::Finished));
-    let capture = String::from_utf8(driven.out.0).or_fail()?;
+    let capture = String::from_utf8(driven.out.into_inner()).or_fail()?;
     assert_that!(capture, contains_substring("QUEUED-ANSWER"));
     assert_that!(count(&capture, "turn.completed"), eq(1));
     Ok(())
@@ -1582,6 +1614,12 @@ fn a_completed_plan_survives_a_server_that_dies() -> Result<()> {
 /// A capture that refuses the line carrying a reply and takes every other.
 struct RefusesReplies(Vec<u8>);
 
+impl RefusesReplies {
+    fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
 impl std::io::Write for RefusesReplies {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if String::from_utf8_lossy(buf).contains("agent_message") {
@@ -1611,7 +1649,7 @@ fn a_plan_nothing_could_keep_breaks_the_turn() -> Result<()> {
     )?;
 
     assert_that!(driven.ending, matches_pattern!(Ending::Broken(_)));
-    let capture = String::from_utf8(driven.out.0).or_fail()?;
+    let capture = String::from_utf8(driven.out.into_inner()).or_fail()?;
     assert_that!(capture, not(contains_substring("turn.completed")));
     Ok(())
 }
@@ -2101,7 +2139,14 @@ fn messages_are_read_whole_however_the_writes_fall() -> Result<()> {
             move |peer| {
                 peer.open_thread(THREAD)?;
                 peer.start_turn(THREAD, TURN)?;
-                let line = |message: Message| format!("{}\n", message.to_line());
+                let line = |message: Message| {
+                    indoc::formatdoc!(
+                        "
+                            {}
+                        ",
+                        message.to_line()
+                    )
+                };
                 let split = line(Message::notification::<m::ItemCompleted>(
                     &fixtures::item_completed(THREAD, TURN, fixtures::agent_message("a", "SPLIT")),
                 )?);
@@ -2230,7 +2275,15 @@ fn an_answer_with_neither_result_nor_error_acknowledges_no_steer() -> Result<()>
             peer.open_thread(THREAD)?;
             peer.start_turn(THREAD, TURN)?;
             let steer = peer.expect::<m::TurnSteer>()?;
-            peer.send_bytes(format!("{{\"id\":{}}}\n", steer.id).as_bytes())?;
+            peer.send_bytes(
+                indoc::formatdoc!(
+                    r#"
+                        {{"id":{}}}
+                    "#,
+                    steer.id
+                )
+                .as_bytes(),
+            )?;
             finish(peer, "ended")
         },
         |plan| reply = steer(plan, "ACKNOWLEDGED-BY-NOTHING"),
