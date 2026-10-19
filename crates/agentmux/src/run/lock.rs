@@ -1,11 +1,13 @@
-//! The run lock, and [`LockedRun`], the only way to change a run's shape.
+//! The run lock, and [`LockedRun`], the guard every change to a run's shape is made under.
 //!
 //! Several agentmux processes may address one consultation — an MCP server and a terminal, or a
 //! server restarted underneath a `tail` — and every change to a run's shape is a check followed
 //! by a write, which another process could act between.
-//! So each one is a method of [`LockedRun`], which only [`RunStore::lock`] makes: folding a turn
-//! (which may settle it), recovering a late reply, publishing the render, claiming a turn, marking
-//! and recording a cancellation, and removing the run.
+//! So each one runs while a [`LockedRun`] is held, and only [`RunStore::lock`] makes one.
+//! Folding a turn (which may settle it), recovering a late reply, publishing the render and
+//! claiming a turn are methods of [`LockedRun`].
+//! Marking and recording a cancellation, removing the run, the retention sweep and submitting a
+//! steer are methods of [`RunStore`] that hold one across their check and write.
 //! Nothing reachable from a [`LockedRun`] takes the lock again, because a second lock on the same
 //! file from one process waits on the first for ever.
 

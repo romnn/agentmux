@@ -6,8 +6,8 @@
 //!
 //! ```text
 //! runs/<run_id>.lock           held while the run is folded and its render published, a turn is
-//!                              claimed, a cancellation is marked or recorded, or the run is
-//!                              removed
+//!                              claimed, a steer is submitted, a cancellation is marked or
+//!                              recorded, or the run is removed
 //! runs/<run_id>/
 //!   meta.json                  delegate, question, cwd, retention, created_at
 //!   transcript.md              the rendered transcript, a cache of the fold below
@@ -52,8 +52,8 @@
 //! Several agentmux processes may address one consultation — an MCP server and a terminal, or a
 //! server restarted underneath a `tail` — and every change to a run's shape is a check followed
 //! by a write that another process could act between.
-//! So each is a method of [`lock::LockedRun`], which holds the run's advisory lock; the module
-//! says which they are.
+//! So each runs while a [`lock::LockedRun`] holds the run's advisory lock, either as one of its
+//! methods or inside a store method that holds one; the module says which are which.
 
 mod cancel;
 mod error;

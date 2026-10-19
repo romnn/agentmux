@@ -90,13 +90,15 @@ native to each harness; agentmux exists only for the cross-vendor direction.
   checks every fixture at every line cut.
 - **A pid on disk is trusted only with the start time recorded beside it.** `Launched::started`
   comes from `sysinfo` at spawn; liveness after a restart requires it to match, and a settled turn
-  is never observed again. Every change to a run's shape — folding a turn, which may settle it,
-  recovering a late reply, publishing the render, claiming a turn, marking and recording a
-  cancellation, removing the run — is a method of `run::LockedRun`, which only `RunStore::lock`
-  makes, from the advisory lock at `runs/<id>.lock`, which is never unlinked. A fold and the
-  publication of its render happen under one hold, so no reader can publish a reading another
-  caller has since settled differently. Nothing reachable from a `LockedRun` takes the lock
-  again — a second lock on the same file from one process waits on the first for ever.
+  is never observed again. Every change to a run's shape runs while a `run::LockedRun` is held,
+  which only `RunStore::lock` makes, from the advisory lock at `runs/<id>.lock`, which is never
+  unlinked: folding a turn, which may settle it, recovering a late reply, publishing the render
+  and claiming a turn are its methods; marking and recording a cancellation, removing the run,
+  the sweep and submitting a steer are `RunStore` methods that hold one across their check and
+  write. A fold and the publication of its render happen under one hold, so no reader can
+  publish a reading another caller has since settled differently. Nothing reachable from a
+  `LockedRun` takes the lock again — a second lock on the same file from one process waits on
+  the first for ever.
 - **A project file selects an account and switches nothing on.** It arrives with a clone, so an
   account it chose runs isolated, never on API pricing, and without its own `request_env`,
   whatever the machine file configures for it; only an explicit `inherit_settings` from the caller
