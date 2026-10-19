@@ -1263,7 +1263,7 @@ impl Delegate {
             .launch
             .request_env
             .iter()
-            .chain(policy.iter().flat_map(|policy| policy.request_env()))
+            .chain(policy.iter().flat_map(AccountPolicy::request_env))
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
@@ -1567,7 +1567,7 @@ impl<'a> AccountPolicy<'a> {
                     // The file that made the choice, so an unresolvable default sends the reader
                     // to that file rather than to their own tool call.
                     selected_by: chosen_by
-                        .and_then(|chosen_by| chosen_by.path())
+                        .and_then(ChosenBy::path)
                         .map(std::path::Path::to_path_buf),
                 })?;
         if account.is_empty() {
@@ -1584,23 +1584,23 @@ impl<'a> AccountPolicy<'a> {
     }
 
     /// Whether a checkout's file chose the account.
-    fn from_checkout(&self) -> bool {
+    fn chosen_by_checkout(&self) -> bool {
         matches!(self.chosen_by, Some(ChosenBy::Project(_)))
     }
 
     /// Whether delegates on the account load its own settings, hooks and MCP servers.
     pub(crate) fn inherits_settings(&self) -> bool {
-        !self.from_checkout() && self.account.inherit_settings == Some(true)
+        !self.chosen_by_checkout() && self.account.inherit_settings == Some(true)
     }
 
     /// Whether the machine file opted the account into API pricing, and nothing withdrew it.
     fn opted_into_api(&self) -> bool {
-        !self.from_checkout() && self.account.billing == Some(Billing::Api)
+        !self.chosen_by_checkout() && self.account.billing == Some(Billing::Api)
     }
 
     /// The environment names the account lets a request set, beyond the machine's own.
     fn request_env(&self) -> &'a [String] {
-        if self.from_checkout() {
+        if self.chosen_by_checkout() {
             &[]
         } else {
             &self.account.launch.request_env

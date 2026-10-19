@@ -399,7 +399,7 @@ fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
             cwd: w.project.clone(),
             resume: None,
             billing,
-            turn_dir: turn.to_path_buf(),
+            turn_dir: turn.clone(),
         };
         // Cancelled before it starts: the server is spawned, and no turn is begun.
         std::fs::write(plan.cancel_marker(), "").or_fail()?;

@@ -433,13 +433,10 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             turn.unrecognised.record(MALFORMED_LINE);
             continue;
         };
-        let event = match Event::deserialize(&value) {
-            Ok(event) => event,
-            // An event this parser names, in a shape it does not.
-            Err(_) => {
-                turn.unrecognised.record(unparsable(&value));
-                continue;
-            }
+        // An event this parser names, in a shape it does not.
+        let Ok(event) = Event::deserialize(&value) else {
+            turn.unrecognised.record(unparsable(&value));
+            continue;
         };
 
         match event {
