@@ -17,7 +17,7 @@
 //! The decision is created with [`crate::once::create_once`], which says why a rename could not
 //! arbitrate it.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -106,7 +106,9 @@ impl Mailbox {
             text: text.to_owned(),
         })
         .map_err(std::io::Error::other)?;
-        write_whole(&self.path(&stem, REQUEST), &body)?;
+        // Only its sender writes a request, and only the driver a reply, so neither rename has
+        // anything to arbitrate.
+        crate::once::write_whole(&self.path(&stem, REQUEST), body.as_bytes())?;
         Ok(Letter { stem })
     }
 
@@ -205,13 +207,15 @@ impl Mailbox {
                     stem,
                     text: request.text,
                 }),
+                // Its sender waits for a reply until it gives up on the driver, so one that
+                // cannot be written leaves it waiting that long, and says why here.
                 Err(reason) => {
-                    let _ = self.answer_stem(
-                        &stem,
-                        &Reply::Rejected {
-                            reason: format!("the request could not be read: {reason}"),
-                        },
-                    );
+                    let rejected = Reply::Rejected {
+                        reason: format!("the request could not be read: {reason}"),
+                    };
+                    self.answer_stem(&stem, &rejected)
+                        .inspect_err(|err| tracing::warn!(?err, %stem, "cannot reject a steer"))
+                        .ok();
                 }
             }
         }
@@ -229,19 +233,8 @@ impl Mailbox {
 
     fn answer_stem(&self, stem: &str, reply: &Reply) -> std::io::Result<()> {
         let body = serde_json::to_string(reply).map_err(std::io::Error::other)?;
-        write_whole(&self.path(stem, REPLY), &body)
+        crate::once::write_whole(&self.path(stem, REPLY), body.as_bytes())
     }
-}
-
-/// Write a file so that a reader sees all of it or none of it.
-///
-/// Only one writer ever writes `path`, so the rename has nothing to arbitrate.
-fn write_whole(path: &Path, body: &str) -> std::io::Result<()> {
-    let temp = crate::once::temporary(path);
-    std::fs::write(&temp, body)?;
-    std::fs::rename(&temp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
 }
 
 #[cfg(test)]
@@ -273,7 +266,7 @@ mod tests {
         Ok(())
     }
 
-    /// Withdrawing and claiming race on one rename, so only one of them can win.
+    /// Withdrawing and claiming race to create one decision file, so only one of them can win.
     #[gtest]
     fn a_withdrawn_message_is_never_claimed_and_a_claimed_one_cannot_be_withdrawn() -> Result<()> {
         let dir = tempfile::tempdir().or_fail()?;
@@ -341,7 +334,11 @@ mod tests {
             mailbox.submit(text).or_fail()?;
         }
 
-        let texts: Vec<String> = mailbox.claim_all().into_iter().map(|c| c.text).collect();
+        let texts: Vec<String> = mailbox
+            .claim_all()
+            .into_iter()
+            .map(|claim| claim.text)
+            .collect();
         assert_that!(texts, elements_are![eq("one"), eq("two"), eq("three")]);
         Ok(())
     }

@@ -126,7 +126,13 @@ pub(super) fn restrict(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        // A filesystem without Unix permissions refuses this, and refusing the store on it
+        // would refuse every consultation, so the failure is said rather than returned.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .inspect_err(|err| {
+                tracing::warn!(?err, path = %path.display(), "cannot make a run directory private");
+            })
+            .ok();
     }
     #[cfg(not(unix))]
     let _ = path;

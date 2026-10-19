@@ -158,8 +158,9 @@ pub(super) struct InvocationRecord {
     pub(super) billing: Option<Billing>,
     /// The vendor's configuration directory, as the environment the child got resolves it:
     /// where Codex writes the rollout a turn's usage window is recovered from.
-    /// Recorded rather than re-derived, because a request's own environment can move it and
-    /// is not kept; absent from a record older than agentmux keeping it.
+    /// Recorded rather than re-derived, because it depends on the host environment, the
+    /// configuration and the request's environment as they were at launch, any of which can
+    /// change afterwards; absent from a record older than agentmux keeping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) config_dir: Option<PathBuf>,
     /// The delegate CLI's version, as it printed it, for telling apart captures that different
@@ -175,14 +176,9 @@ pub(super) struct InvocationRecord {
 
 /// Write a record, replacing any there before, so that a reader never sees a partial one.
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunError> {
-    let temp = write_json_temp(path, value)?;
-    std::fs::rename(&temp, path).map_err(|source| {
-        let _ = std::fs::remove_file(&temp);
-        RunError::Io {
-            context: format!("writing {}", path.display()),
-            source,
-        }
-    })
+    let text = json_text(path, value)?;
+    crate::once::write_whole(path, text.as_bytes())
+        .map_err(RunError::io(format!("writing {}", path.display())))
 }
 
 /// Write a record once, and hand back whatever record is there afterwards.
@@ -196,32 +192,21 @@ pub(super) fn write_json_once<T: Serialize + for<'de> Deserialize<'de>>(
     path: &Path,
     value: &T,
 ) -> Result<T, RunError> {
-    let text = serde_json::to_string_pretty(value).map_err(|source| RunError::Io {
-        context: format!("serialising {}", path.display()),
-        source: std::io::Error::other(source),
-    })?;
-    crate::once::create_once(path, text.as_bytes()).map_err(|source| RunError::Io {
-        context: format!("writing {}", path.display()),
-        source,
-    })?;
+    let text = json_text(path, value)?;
+    crate::once::create_once(path, text.as_bytes())
+        .map_err(RunError::io(format!("writing {}", path.display())))?;
     read_json(path)?.ok_or_else(|| RunError::Io {
         context: format!("reading back {}", path.display()),
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
     })
 }
 
-/// Write a record's whole text to a temporary file beside `path`, and return where.
-pub(super) fn write_json_temp<T: Serialize>(path: &Path, value: &T) -> Result<PathBuf, RunError> {
-    let text = serde_json::to_string_pretty(value).map_err(|source| RunError::Io {
+/// A record's whole text, as it is written to `path`.
+fn json_text<T: Serialize>(path: &Path, value: &T) -> Result<String, RunError> {
+    serde_json::to_string_pretty(value).map_err(|source| RunError::Io {
         context: format!("serialising {}", path.display()),
         source: std::io::Error::other(source),
-    })?;
-    let temp = crate::once::temporary(path);
-    std::fs::write(&temp, text).map_err(|source| RunError::Io {
-        context: format!("writing {}", temp.display()),
-        source,
-    })?;
-    Ok(temp)
+    })
 }
 
 /// Read the complete, newline-terminated records of a capture file.

@@ -67,15 +67,7 @@ impl LockedRun<'_> {
         {
             return Ok(());
         }
-        let temp = path.with_extension(format!("md.{}.tmp", uuid::Uuid::new_v4().simple()));
-        let write = || -> Result<(), RunError> {
-            std::fs::write(&temp, text).map_err(RunError::io("writing the rendered transcript"))?;
-            std::fs::rename(&temp, &path).map_err(RunError::io("replacing the rendered transcript"))
-        };
-        let result = write();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        result
+        crate::once::write_whole(&path, text.as_bytes())
+            .map_err(RunError::io("replacing the rendered transcript"))
     }
 }

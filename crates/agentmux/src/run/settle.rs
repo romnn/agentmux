@@ -144,14 +144,12 @@ impl LockedRun<'_> {
         {
             return Ok(());
         }
-        let temp = dir
-            .recovered()
-            .with_extension(format!("md.{}.tmp", uuid::Uuid::new_v4().simple()));
-        let kept =
-            std::fs::write(&temp, &text).and_then(|()| std::fs::rename(&temp, dir.recovered()));
-        if let Err(error) = kept {
-            let _ = std::fs::remove_file(&temp);
-            tracing::warn!(%error, path = %dir.recovered().display(), "cannot keep a recovered reply");
+        if let Err(err) = crate::once::write_whole(&dir.recovered(), text.as_bytes()) {
+            tracing::warn!(
+                ?err,
+                path = %dir.recovered().display(),
+                "cannot keep a recovered reply"
+            );
             return Ok(());
         }
         turn.recovered = Some(text);
@@ -306,15 +304,17 @@ impl LockedRun<'_> {
         let mut last_activity: Option<SystemTime> = None;
         let mut rollouts = Vec::new();
 
-        for files in self.store.turn_files(&self.run_id)? {
-            let folded = self.fold_turn(meta, &files)?;
+        let all_files = self.store.turn_files(&self.run_id)?;
+        for files in &all_files {
+            let folded = self.fold_turn(meta, files)?;
             rollouts.extend(folded.rollout);
             newest = Some(NewestTurn {
                 index: files.index,
                 settled_by: folded.settled_by,
                 mode: folded.mode,
                 turn_started: folded.turn_started,
-                departed: self.store.departed(&files),
+                // Asked of the newest turn alone, below: it costs a process lookup.
+                departed: false,
             });
             if folded.session.is_some() {
                 session = folded.session;
@@ -323,6 +323,9 @@ impl LockedRun<'_> {
                 last_activity = Some(last_activity.map_or(seen, |known| known.max(seen)));
             }
             transcript.turns.push(folded.turn);
+        }
+        if let (Some(newest), Some(files)) = (newest.as_mut(), all_files.last()) {
+            newest.departed = self.store.departed(files);
         }
 
         Ok(RunState {

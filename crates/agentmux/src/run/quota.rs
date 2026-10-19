@@ -48,7 +48,9 @@ impl RunStore {
             self.probe.as_ref(),
         );
         // Best effort: a consultation that cannot cache its quota still reports it.
-        let _ = write_json(&path, &reported);
+        write_json(&path, &reported)
+            .inspect_err(|err| tracing::warn!(?err, "cannot cache a consultation's quota"))
+            .ok();
         reported
     }
 

@@ -93,7 +93,9 @@ impl RunStore {
             .get(crate::delegate::DELEGATE_MARKER)
             .is_some_and(|value| !value.is_empty())
             || self.an_ancestor_is_a_live_delegate()?;
-        let _ = self.inside_delegate.set(inside);
+        // A concurrent caller that decided first decided the same, from the same environment
+        // and process tree.
+        self.inside_delegate.set(inside).ok();
         Ok(inside)
     }
 
@@ -166,7 +168,15 @@ impl RunStore {
             .and_then(|()| self.lock(&run_id))
             .and_then(|run| run.launch_turn(&meta, 0, &request.question, None, &config));
         if let Err(error) = started {
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir)
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        ?err,
+                        path = %dir.display(),
+                        "cannot remove a run that never started"
+                    );
+                })
+                .ok();
             return Err(error);
         }
         self.status(&run_id)
@@ -374,7 +384,15 @@ impl LockedRun<'_> {
             .store
             .launch_into(&turn, meta, index, question, resume, config);
         if launched.is_err() {
-            let _ = std::fs::remove_dir_all(&turn.root);
+            std::fs::remove_dir_all(&turn.root)
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        ?err,
+                        path = %turn.root.display(),
+                        "cannot give back a turn claim"
+                    );
+                })
+                .ok();
         }
         launched
     }
@@ -592,11 +610,23 @@ pub(super) fn can_create_files_in(store: &Path) -> bool {
             .open(&probe)
             .map(|file| {
                 drop(file);
-                let _ = std::fs::remove_file(&probe);
+                std::fs::remove_file(&probe)
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            ?err,
+                            path = %probe.display(),
+                            "cannot remove a write probe"
+                        );
+                    })
+                    .ok();
             })
     } else {
         std::fs::create_dir(store).map(|()| {
-            let _ = std::fs::remove_dir(store);
+            std::fs::remove_dir(store)
+                .inspect_err(|err| {
+                    tracing::warn!(?err, path = %store.display(), "cannot remove a write probe");
+                })
+                .ok();
         })
     };
     match attempt {
