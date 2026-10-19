@@ -294,6 +294,34 @@ fn a_child_that_dies_reports_its_stderr() -> Result<()> {
     Ok(())
 }
 
+/// Every turn records which release of the delegate's CLI, and of agentmux, wrote its capture,
+/// so a capture that reads differently can be traced to the release that wrote it.
+#[gtest]
+fn a_turn_records_the_versions_that_wrote_it() -> Result<()> {
+    let h = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = h.store.start(&request(codex()?, "review this"))?;
+
+    let record = std::fs::read_to_string(
+        h.store
+            .root()
+            .join("runs")
+            .join(started.run_id.as_str())
+            .join("turns/0000/invocation.json"),
+    )?;
+    let record = serde_json::from_str::<serde_json::Value>(&record)?;
+
+    // The scripted launcher answers for the CLI it stands in for.
+    assert_that!(
+        record["cli_version"],
+        eq(&serde_json::json!("codex (scripted)"))
+    );
+    assert_that!(
+        record["agentmux_version"],
+        eq(&serde_json::json!(env!("CARGO_PKG_VERSION")))
+    );
+    Ok(())
+}
+
 /// A CLI that exits cleanly but says nothing is drift, and must not read as a silent success.
 #[gtest]
 fn a_clean_exit_with_no_completion_event_is_not_a_success() -> Result<()> {

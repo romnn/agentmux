@@ -213,7 +213,18 @@ pub trait Launcher: Send + Sync {
     /// [`Launcher::liveness`] report it alive forever.
     /// Asking again reports the same status again.
     fn reap(&self, launched: Launched) -> Option<ExitStatus>;
+
+    /// What the CLI an invocation runs says its version is, as it prints it, or `None` when it
+    /// cannot say.
+    ///
+    /// Asked with the environment and working directory the delegate gets, so it names the
+    /// program the turn runs, and bounded by [`VERSION_TIMEOUT`], because it is asked before every
+    /// launch and a launch must not wait on it.
+    fn version(&self, invocation: &Invocation, cwd: &Path) -> Option<String>;
 }
+
+/// How long a CLI is given to say its version.
+pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What one non-blocking wait on a retained handle said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +341,51 @@ fn open_append(path: &Path) -> Result<File, LaunchError> {
 }
 
 impl Launcher for ProcessLauncher {
+    fn version(&self, invocation: &Invocation, cwd: &Path) -> Option<String> {
+        use std::process::Stdio;
+
+        let mut env = invocation.env().clone();
+        if invocation.billing() == Billing::Subscription {
+            scrub_billing_env(&mut env);
+        }
+        let spawn = |program: &str| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .current_dir(cwd)
+                .env_clear()
+                .envs(&env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let program = invocation.program();
+        let spawned = spawn(program);
+        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
+        // bare name.
+        #[cfg(windows)]
+        let spawned = spawned.or_else(|_| spawn(&format!("{program}.cmd")));
+        let mut child = spawned.ok()?;
+
+        let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(Some(_) | None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let mut printed = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take()?, &mut printed).ok()?;
+        Some(printed.trim().to_owned()).filter(|version| !version.is_empty())
+    }
+
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {
         self.collect_finished();
         if !spec.cwd.is_dir() {

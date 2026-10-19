@@ -294,3 +294,36 @@ fn an_api_child_keeps_its_key() -> Result<()> {
     assert_that!(printed, contains_substring("OPENAI_API_KEY=sk-opted-in"));
     Ok(())
 }
+
+/// A CLI's version is what it prints for `--version`, and a CLI that cannot say has none.
+#[gtest]
+fn a_cli_names_its_version_or_has_none() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new()?;
+    let program = |name: &str, script: &str| -> Result<String> {
+        let path = fixture.dir.path().join(name);
+        std::fs::write(&path, script).or_fail()?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+        Ok(path.display().to_string())
+    };
+    let version = |program: String| {
+        let env: BTreeMap<String, String> =
+            std::env::vars().filter(|(key, _)| key == "PATH").collect();
+        let invocation =
+            Invocation::for_launcher_test(&program, Vec::new(), env, Billing::Subscription);
+        fixture.launcher.version(&invocation, fixture.dir.path())
+    };
+
+    let named = program(
+        "named",
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo '2.1.270 (Claude Code)'\n",
+    )?;
+    let refusing = program("refusing", "#!/bin/sh\necho 'unknown option' >&2\nexit 2\n")?;
+
+    // The printed line is kept verbatim, trimmed; a failing or missing CLI says nothing.
+    assert_that!(version(named), some(eq("2.1.270 (Claude Code)")));
+    assert_that!(version(refusing), none());
+    assert_that!(version("/no/such/cli".to_owned()), none());
+    Ok(())
+}

@@ -6,9 +6,10 @@
 //! happens between a spawn and a stream, and none of it is testable against a real CLI in CI.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::delegate::Invocation;
 use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 
 /// Take a lock, recovering from a poisoned one rather than panicking.
@@ -308,6 +309,11 @@ const PIDS_PER_LAUNCHER: u32 = 1024;
 static NEXT_LAUNCHER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Launcher for ScriptedLauncher {
+    /// A scripted delegate is no CLI, and names itself after the program it stands in for.
+    fn version(&self, invocation: &Invocation, _cwd: &Path) -> Option<String> {
+        Some(format!("{} (scripted)", invocation.program()))
+    }
+
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {
         let mut launches = lock(&self.launches);
         let index = launches.len();

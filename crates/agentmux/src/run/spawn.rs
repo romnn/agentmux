@@ -442,6 +442,8 @@ impl RunStore {
         // as its ancestor, and the platform default can differ between the two environments.
         invocation.name_state_dir(Self::STATE_DIR_ENV, &self.root);
 
+        // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
+        let cli_version = self.launcher.version(&invocation, &meta.cwd);
         let mode = self.choose_launch(turn, meta, resume, config, &mut invocation)?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
@@ -481,6 +483,8 @@ impl RunStore {
                 mode,
                 billing: Some(invocation.billing()),
                 config_dir,
+                cli_version,
+                agentmux_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             },
         )?;
 

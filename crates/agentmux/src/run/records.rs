@@ -162,6 +162,15 @@ pub(super) struct InvocationRecord {
     /// is not kept; absent from a record older than agentmux keeping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) config_dir: Option<PathBuf>,
+    /// The delegate CLI's version, as it printed it, for telling apart captures that different
+    /// releases wrote; absent when the CLI could not say, and from a record older than agentmux
+    /// keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cli_version: Option<String>,
+    /// The version of agentmux that launched the turn, whose own capture format changes between
+    /// releases too; absent from a record older than agentmux keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) agentmux_version: Option<String>,
 }
 
 /// Write a record, replacing any there before, so that a reader never sees a partial one.
