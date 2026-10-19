@@ -548,10 +548,13 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::Recursive
         // The operator denied the vendor, and the message names the subagent to use instead.
         | RunError::VendorDenied { .. } => ErrorData::invalid_params(error.to_string(), None),
-        // A malformed or missing config file is the operator's to fix, not the caller's, but the
-        // caller is the one holding the failed request and can at least retry without `account`.
+        // A configuration file is read on every launch whatever the call names, so no argument
+        // works around it; the message names the file and what to change in it.
         RunError::Config(inner) => ErrorData::invalid_params(
-            format!("{inner}\nOmit `account` to run against the CLI's own default configuration."),
+            format!(
+                "{inner}\nThis is the machine's agentmux configuration, which its operator \
+                 fixes; retrying with other arguments meets the same error."
+            ),
             None,
         ),
         RunError::Launch(inner) => ErrorData::internal_error(
@@ -778,7 +781,7 @@ mod tests {
     struct Steering {
         server: AgentMux,
         run_id: String,
-        driver: std::thread::JoinHandle<Option<String>>,
+        driver: std::thread::JoinHandle<std::io::Result<Option<String>>>,
         _dir: tempfile::TempDir,
     }
 
@@ -787,12 +790,13 @@ mod tests {
     /// text it claimed.
     fn steering(reply: Reply) -> Result<Steering> {
         let dir = tempfile::tempdir().or_fail()?;
-        let launcher = Arc::new(ScriptedLauncher::new([Script::running(
-            "{\"type\":\"thread.started\",\"thread_id\":\"th\"}\n{\"type\":\"turn.started\"}\n",
-        )]));
+        let launcher = Arc::new(ScriptedLauncher::new([Script::running(indoc::indoc! {r#"
+            {"type":"thread.started","thread_id":"th"}
+            {"type":"turn.started"}
+        "#})]));
         let env = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
             .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect();
         let store = RunStore::open(dir.path(), launcher.clone(), env)
             .or_fail()?
@@ -820,12 +824,12 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if let Some(claim) = mailbox.claim_all().into_iter().next() {
-                    let _ = mailbox.answer(&claim, &reply);
-                    return Some(claim.text);
+                    mailbox.answer(&claim, &reply)?;
+                    return Ok(Some(claim.text));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            None
+            Ok(None)
         });
         Ok(Steering {
             server: AgentMux::new(Arc::new(store)),
@@ -848,11 +852,14 @@ mod tests {
     #[tokio::test]
     async fn the_steer_tool_delivers_the_whole_message() -> Result<()> {
         let s = steering(Reply::Accepted)?;
-        let message = "Narrow it to «auth»,\nand leave the tests alone.";
+        let message = indoc::indoc! {"
+            Narrow it to «auth»,
+            and leave the tests alone."};
 
         let answered = s.server.steer(params(&s.run_id, message)).await;
 
-        assert_that!(s.driver.join().ok().flatten(), some(eq(message)));
+        let claimed = s.driver.join().ok().or_fail()?.or_fail()?;
+        assert_that!(claimed, some(eq(message)));
         let text = format!("{:?}", answered.or_fail()?.content);
         assert_that!(text, contains_substring("### user (steer)"));
         Ok(())
@@ -878,7 +885,7 @@ mod tests {
 
         let malformed = server.steer(params("not-an-id", "x")).await;
         assert_that!(
-            malformed.err().map(|e| e.code),
+            malformed.err().map(|err| err.code),
             some(eq(ErrorCode::INVALID_PARAMS))
         );
         Ok(())

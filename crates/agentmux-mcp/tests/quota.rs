@@ -209,7 +209,8 @@ fn a_reopened_window_is_retried_rather_than_routed_elsewhere() -> Result<()> {
     Ok(())
 }
 
-/// A window reopening within one `start`'s wait is waited for, not routed around.
+/// A window reopening within the longest wait one call can block for is waited for, not routed
+/// around.
 #[gtest]
 fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
     let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
@@ -228,7 +229,7 @@ fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
 
     let warnings = agentmux_mcp::render::warnings(&status);
 
-    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, contains_substring("wait that long"));
     assert_that!(warnings, not(contains_substring("Retry with a different")));
     Ok(())
 }

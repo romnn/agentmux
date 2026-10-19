@@ -288,7 +288,7 @@ fn no_rendered_result_names_an_answer_field() -> Result<()> {
 /// A rate limit whose window reopens soon must not send the caller to the other vendor.
 ///
 /// Switching vendor costs a whole consultation against a different model, so it is the wrong
-/// advice when the window reopens inside what a single `start` can already wait for.
+/// advice when the window reopens within the longest wait one call can block for.
 /// The reopening time is the only thing that separates this case from the next one, which is why
 /// discarding it made both cases produce the same sentence.
 #[gtest]
@@ -309,7 +309,7 @@ fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()>
     let warnings = agentmux_mcp::render::warnings(&status);
 
     assert_that!(warnings, contains_substring("five_hour"));
-    assert_that!(warnings, contains_substring("wait_seconds"));
+    assert_that!(warnings, contains_substring("wait that long"));
     assert_that!(warnings, not(contains_substring("other vendor")));
     Ok(())
 }

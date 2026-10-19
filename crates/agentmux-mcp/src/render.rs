@@ -250,9 +250,9 @@ fn recovery_advice(
     // A rate limit is the only failure whose advice inverts on a number, so it is decided before
     // the table of fixed answers below.
     if kind == FailureKind::RateLimited {
-        // A window that has already reopened, or reopens inside what one `start` can wait for,
-        // beats every other remedy: switching accounts spends a different subscription to solve a
-        // problem that is about to solve itself, or has already.
+        // A window that has already reopened, or reopens within the longest wait one call can
+        // block for, beats every other remedy: switching accounts spends a different
+        // subscription to solve a problem that is about to solve itself, or has already.
         if let Some(limit) = rate_limit
             && limit.reopens_in(Utc::now()).is_none_or(|remaining| {
                 remaining <= std::time::Duration::from_secs(MAX_WAIT_SECONDS)
@@ -313,9 +313,11 @@ fn recovery_advice(
 
 /// Advice for a rate limit whose window reopening time the vendor disclosed.
 ///
-/// The choice between waiting and switching is not a matter of taste: below the cap a single
-/// `start` call can block for, waiting costs one call, and above it waiting means a caller polling
-/// a run that cannot progress.
+/// The choice between waiting and switching is not a matter of taste: within the longest wait one
+/// call can block for, waiting costs a few minutes and one retry, and beyond it waiting strands
+/// the caller for longer than it would spend asking elsewhere.
+/// The advice is to wait and then retry, never to retry with a wait: a retry before the window
+/// reopens fails the same way at once, whatever it waits for afterwards.
 fn rate_limit_advice(limit: &RateLimit) -> String {
     let window = limit
         .window
@@ -331,9 +333,8 @@ fn rate_limit_advice(limit: &RateLimit) -> String {
 
     if remaining <= std::time::Duration::from_secs(MAX_WAIT_SECONDS) {
         format!(
-            "Nothing to fix in your call. The window{window} reopens in {}, which is inside what \
-             one `start` can wait for — retry with `wait_seconds` set to cover it rather than \
-             switching vendor.",
+            "Nothing to fix in your call. The window{window} reopens in {}: wait that long, then \
+             `start` the same question again rather than switching vendor.",
             duration(remaining)
         )
     } else {
