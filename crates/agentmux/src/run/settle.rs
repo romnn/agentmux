@@ -37,8 +37,8 @@ use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
 use super::layout::TurnDir;
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, Meta, TurnFiles, read_complete_records, read_json,
-    tail_of_file, write_json_once,
+    ExitRecord, InvocationRecord, LaunchMode, Meta, TurnFiles, read_complete_records,
+    read_if_present, read_json, tail_of_file, write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{SessionRef, Vendor};
@@ -125,11 +125,12 @@ impl LockedRun<'_> {
         if !turn.outcome.is_terminal() || turn.messages.iter().any(Message::is_report_content) {
             return Ok(());
         }
-        if let Some(kept) = read_text(&dir.recovered())? {
+        if let Some(kept) = read_if_present(&dir.recovered(), std::fs::read_to_string)? {
             turn.recovered = Some(kept);
             return Ok(());
         }
-        let Some(text) = read_text(&dir.last_message())?.filter(|text| !text.trim().is_empty())
+        let Some(text) = read_if_present(&dir.last_message(), std::fs::read_to_string)?
+            .filter(|text| !text.trim().is_empty())
         else {
             return Ok(());
         };
@@ -156,18 +157,6 @@ impl LockedRun<'_> {
         }
         turn.recovered = Some(text);
         Ok(())
-    }
-}
-
-/// A text file's contents, or `None` for one that is not there.
-fn read_text(path: &std::path::Path) -> Result<Option<String>, RunError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RunError::Io {
-            context: format!("reading {}", path.display()),
-            source,
-        }),
     }
 }
 
@@ -401,16 +390,8 @@ impl LockedRun<'_> {
     pub(super) fn fold_turn(&self, meta: &Meta, files: &TurnFiles) -> Result<FoldedTurn, RunError> {
         let vendor = meta.delegate.vendor();
         let dir = &files.dir;
-        let question = match std::fs::read_to_string(dir.question()) {
-            Ok(question) => question,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(source) => {
-                return Err(RunError::Io {
-                    context: format!("reading {}", dir.question().display()),
-                    source,
-                });
-            }
-        };
+        let question =
+            read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
         // A settled turn's capture is read only up to the length its record froze.
         let frozen_len = files.exit.as_ref().map(ExitRecord::events_len);
         let (events, mut folded_len) = read_complete_records(&dir.events(), frozen_len)?;

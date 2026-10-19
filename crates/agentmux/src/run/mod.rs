@@ -75,11 +75,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
-use crate::launch::{Launcher, Liveness};
+use crate::launch::{Launched, Launcher, Liveness};
 use crate::transcript::{Outcome, Transcript};
 
 use layout::create_private_dir;
-use records::{ExitRecord, LaunchRecord, TurnFiles, read_json, tail_of_file};
+use records::{ExitRecord, LaunchRecord, TurnFiles, read_if_present, read_json, tail_of_file};
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, page_of};
 
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
@@ -271,11 +271,18 @@ impl RunStore {
     fn delegate_has_exited(&self, files: &TurnFiles) -> bool {
         match (&files.exit, &files.launch) {
             (Some(ExitRecord::Exited { .. }), _) | (_, None) => true,
-            (_, Some(record)) => {
-                self.launcher.reap(record.launched).is_some()
-                    || self.launcher.liveness(record.launched) == Liveness::Gone
-            }
+            (_, Some(record)) => self.child_has_gone(record.launched),
         }
+    }
+
+    /// Whether a launched child has gone: reaped through the handle this process kept, or no
+    /// longer the process its record names.
+    ///
+    /// Reaped first, because a finished child of this process lingers as a zombie until it is,
+    /// and its liveness would read alive.
+    /// A child whose identity cannot be checked has not gone.
+    pub(super) fn child_has_gone(&self, launched: Launched) -> bool {
+        self.launcher.reap(launched).is_some() || self.launcher.liveness(launched) == Liveness::Gone
     }
 
     /// Everything currently known about a consultation.
@@ -485,17 +492,8 @@ impl RunStore {
     /// [`RunError::Corrupt`] when its metadata cannot be parsed.
     pub fn meta(&self, run_id: &RunId) -> Result<Meta, RunError> {
         let path = self.run_dir(run_id).join("meta.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RunError::NotFound(run_id.clone()));
-            }
-            Err(source) => {
-                return Err(RunError::Io {
-                    context: format!("reading {}", path.display()),
-                    source,
-                });
-            }
+        let Some(text) = read_if_present(&path, std::fs::read_to_string)? else {
+            return Err(RunError::NotFound(run_id.clone()));
         };
         let mut meta: Meta = serde_json::from_str(&text).map_err(|source| RunError::Corrupt {
             run_id: run_id.clone(),

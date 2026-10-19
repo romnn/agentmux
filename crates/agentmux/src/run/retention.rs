@@ -3,8 +3,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::launch::Liveness;
-
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
@@ -50,10 +48,7 @@ impl RunStore {
                 Some(ExitRecord::Exited { .. }) => false,
             })
             .filter_map(|turn| turn.launch)
-            .any(|record| {
-                self.launcher.reap(record.launched).is_none()
-                    && self.launcher.liveness(record.launched) != Liveness::Gone
-            }))
+            .any(|record| !self.child_has_gone(record.launched)))
     }
 
     /// Delete consultations past their retention.

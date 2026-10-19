@@ -223,6 +223,22 @@ fn text(body: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(body)])
 }
 
+/// The consultation `ask` and `start` begin.
+fn start_request(
+    delegate: &DelegateParams,
+    question: &QuestionParams,
+) -> Result<StartRequest, ErrorData> {
+    Ok(StartRequest {
+        delegate: delegate.build()?,
+        question: question.text()?,
+        cwd: question.working_dir()?,
+        retention: question.retention(),
+        env: question.environment(),
+        billing: delegate.billing,
+        force_codex_exec: delegate.force_codex_exec,
+    })
+}
+
 fn wait(seconds: Option<u64>, default: u64) -> Duration {
     Duration::from_secs(seconds.unwrap_or(default).min(MAX_WAIT_SECONDS))
 }
@@ -268,15 +284,7 @@ impl AgentMux {
     ) -> Result<CallToolResult, ErrorData> {
         let status = self
             .store
-            .start(&StartRequest {
-                delegate: params.delegate.build()?,
-                question: params.question.text()?,
-                cwd: params.question.working_dir()?,
-                retention: params.question.retention(),
-                env: params.question.environment(),
-                billing: params.delegate.billing,
-                force_codex_exec: params.delegate.force_codex_exec,
-            })
+            .start(&start_request(&params.delegate, &params.question)?)
             .map_err(|error| run_error(&error))?;
 
         self.store
@@ -301,15 +309,7 @@ impl AgentMux {
     ) -> Result<CallToolResult, ErrorData> {
         let status = self
             .store
-            .start(&StartRequest {
-                delegate: params.delegate.build()?,
-                question: params.question.text()?,
-                cwd: params.question.working_dir()?,
-                retention: params.question.retention(),
-                env: params.question.environment(),
-                billing: params.delegate.billing,
-                force_codex_exec: params.delegate.force_codex_exec,
-            })
+            .start(&start_request(&params.delegate, &params.question)?)
             .map_err(|error| run_error(&error))?;
         Ok(text(render::status(&status)))
     }

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Delegate, Isolation};
-use crate::launch::{Launched, Liveness};
+use crate::launch::Launched;
 use crate::transcript::Outcome;
 
 use super::RunStore;
@@ -75,8 +75,7 @@ impl RunStore {
             if claimed_at.is_none() && mailbox.is_claimed(&steer_id) {
                 claimed_at = Some(tokio::time::Instant::now());
             }
-            let gone = self.launcher.reap(driver_process).is_some()
-                || self.launcher.liveness(driver_process) == Liveness::Gone;
+            let gone = self.child_has_gone(driver_process);
             match claimed_at {
                 // Claimed and then never answered: the driver went, or the CLI is silent.
                 Some(at) if gone || at.elapsed() >= Self::STEER_CONFIRM_TIMEOUT => {

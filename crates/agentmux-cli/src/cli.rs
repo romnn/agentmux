@@ -9,7 +9,7 @@
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
@@ -286,26 +286,7 @@ impl QuestionArgs {
     /// Returns an error when the file cannot be read, stdin cannot be read, or the question is
     /// empty — a delegate given an empty brief burns money to say nothing.
     pub fn text(&self) -> Result<String> {
-        let text = match (&self.question, &self.file) {
-            (Some(text), _) => text.clone(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .wrap_err_with(|| format!("reading the question from {}", path.display()))?,
-            (None, None) => {
-                use std::io::Read as _;
-                let mut buffer = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buffer)
-                    .wrap_err("reading the question from stdin")?;
-                buffer
-            }
-        };
-        if text.trim().is_empty() {
-            bail!(
-                "the question is empty. Pass it as an argument, with --file, or on stdin. The \
-                 delegate starts with no context, so the question has to be self-contained."
-            );
-        }
-        Ok(text)
+        supplied_text(self.question.as_deref(), self.file.as_deref())
     }
 
     /// The directory the delegate reads from, made absolute.
@@ -364,6 +345,30 @@ impl QuestionArgs {
             Retention::Ttl
         }
     }
+}
+
+/// The text given as an argument, else read from `file`, else from stdin, refused when empty.
+fn supplied_text(text: Option<&str>, file: Option<&Path>) -> Result<String> {
+    let text = match (text, file) {
+        (Some(text), _) => text.to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("reading the question from {}", path.display()))?,
+        (None, None) => {
+            use std::io::Read as _;
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .wrap_err("reading the question from stdin")?;
+            buffer
+        }
+    };
+    if text.trim().is_empty() {
+        bail!(
+            "the question is empty. Pass it as an argument, with --file, or on stdin. The \
+             delegate starts with no context, so the question has to be self-contained."
+        );
+    }
+    Ok(text)
 }
 
 /// Arguments for `agentmux ask`: who to consult, what to ask, and how long to wait.
@@ -465,14 +470,7 @@ impl FollowUpArgs {
     ///
     /// Returns an error when the file or stdin cannot be read, or the question is empty.
     pub fn text(&self) -> Result<String> {
-        QuestionArgs {
-            env: Vec::new(),
-            question: self.question.clone(),
-            file: self.file.clone(),
-            cwd: None,
-            keep: false,
-        }
-        .text()
+        supplied_text(self.question.as_deref(), self.file.as_deref())
     }
 }
 
@@ -498,14 +496,7 @@ impl SteerArgs {
     ///
     /// Returns an error when the file or stdin cannot be read, or the instruction is empty.
     pub fn text(&self) -> Result<String> {
-        QuestionArgs {
-            env: Vec::new(),
-            question: self.message.clone(),
-            file: self.file.clone(),
-            cwd: None,
-            keep: false,
-        }
-        .text()
+        supplied_text(self.message.as_deref(), self.file.as_deref())
     }
 }
 

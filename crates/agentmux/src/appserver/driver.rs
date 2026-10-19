@@ -822,6 +822,10 @@ impl TurnDriver<'_> {
             let Some(turn_id) = self.translator.turn_id().cloned() else {
                 continue;
             };
+            let target = TurnTarget {
+                thread: thread_id,
+                turn: &turn_id,
+            };
             if self.notice_cancellation() {
                 if self
                     .cancellation_observed_at
@@ -845,10 +849,7 @@ impl TurnDriver<'_> {
                             },
                         );
                     }
-                    let interrupt = protocol::turn_interrupt_params(TurnTarget {
-                        thread: thread_id,
-                        turn: &turn_id,
-                    });
+                    let interrupt = protocol::turn_interrupt_params(target);
                     if let Ok(id) = self.enqueue_request::<methods::TurnInterrupt>(&interrupt) {
                         self.pending.insert(id, PendingRequest::Interrupt);
                     }
@@ -856,10 +857,6 @@ impl TurnDriver<'_> {
                 continue;
             }
             for claim in self.mailbox.claim_all() {
-                let target = TurnTarget {
-                    thread: thread_id,
-                    turn: &turn_id,
-                };
                 let params = protocol::turn_steer_params(target, &claim.text);
                 let sent = self.enqueue_request::<methods::TurnSteer>(&params);
                 match sent {
@@ -1114,11 +1111,7 @@ fn spawn_server(plan: &DriverPlan) -> std::io::Result<Server> {
 fn stop_server(child: &mut Child, input: PipeWriter, recorded_descendants: Vec<ProcessIdentity>) {
     let driver_pid = std::process::id();
     let mut known_descendants = recorded_descendants;
-    for process in descendants(driver_pid) {
-        if !known_descendants.contains(&process) {
-            known_descendants.push(process);
-        }
-    }
+    add_unseen(&mut known_descendants, descendants(driver_pid));
     // The server is stopped and waited for through `child`; once waited for, its pid is free
     // for another process, which a start time to the second cannot tell apart.
     let server_pid = child.id();
@@ -1139,11 +1132,13 @@ fn stop_server(child: &mut Child, input: PipeWriter, recorded_descendants: Vec<P
     let mut signalled_processes: Vec<ProcessIdentity> = Vec::new();
     loop {
         let mut processes_to_check = descendants(driver_pid);
-        for known in known_descendants.iter().chain(&signalled_processes) {
-            if !processes_to_check.contains(known) {
-                processes_to_check.push(*known);
-            }
-        }
+        add_unseen(
+            &mut processes_to_check,
+            known_descendants
+                .iter()
+                .chain(&signalled_processes)
+                .copied(),
+        );
         if !signal_live_processes(&processes_to_check, None) {
             return;
         }
@@ -1165,6 +1160,18 @@ fn stop_server(child: &mut Child, input: PipeWriter, recorded_descendants: Vec<P
         }
         signalled_processes.extend(unsignalled_processes);
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Add to `known` each of `processes` it does not hold yet.
+fn add_unseen(
+    known: &mut Vec<ProcessIdentity>,
+    processes: impl IntoIterator<Item = ProcessIdentity>,
+) {
+    for process in processes {
+        if !known.contains(&process) {
+            known.push(process);
+        }
     }
 }
 
@@ -1218,11 +1225,7 @@ impl DescendantMonitor {
                 if adopting {
                     reap_exited_orphans(server_pid);
                 } else if ticks.is_multiple_of(Self::DESCENDANT_SNAPSHOT_TICKS) {
-                    for process in descendants(driver_pid) {
-                        if !recorded_descendants.contains(&process) {
-                            recorded_descendants.push(process);
-                        }
-                    }
+                    add_unseen(&mut recorded_descendants, descendants(driver_pid));
                 }
                 ticks = ticks.wrapping_add(1);
                 std::thread::sleep(POLL_INTERVAL);

@@ -196,11 +196,7 @@ pub fn rate_limit_line(limit: &RateLimit) -> String {
 /// one of them may name that very login, and agentmux cannot tell.
 /// With no other account at all there is nothing to switch to, and the lead-in says what the
 /// figures are instead of inviting a switch to the account that just failed.
-#[must_use]
-pub fn quota_lead_in(
-    consultation_account: Option<&AccountAlias>,
-    others_exist: bool,
-) -> &'static str {
+fn quota_lead_in(consultation_account: Option<&AccountAlias>, others_exist: bool) -> &'static str {
     match (others_exist, consultation_account) {
         (false, _) => "this account's usage:",
         (true, Some(_)) => "other accounts on this machine (pass one as `account`):",
@@ -216,78 +212,31 @@ pub fn quota_lead_in(
 /// Empty for every other outcome, because only a rate limit fetches them.
 /// Both front ends print exactly these lines under their own indentation, so they cannot order
 /// or introduce the list differently.
+///
+/// The account that just failed goes last, flagged: it eats several lines restating what the
+/// failure already said, and a reader skimming the top of the list would otherwise meet the
+/// exhausted one first and conclude nothing is available.
 #[must_use]
 pub fn quota_block(status: &RunStatus) -> Vec<String> {
     let consultation_account = status.delegate.account().alias();
-    let ordered = ordered_quota(
-        &status.quota,
-        status.delegate.vendor(),
-        consultation_account,
-    );
-    if ordered.is_empty() {
-        return Vec::new();
-    }
-    let others_exist = ordered.iter().any(|entry| !entry.is_consultation_account);
-    let mut lines = vec![quota_lead_in(consultation_account, others_exist).to_owned()];
-    for entry in ordered {
-        lines.extend(quota_report_labelled(
-            entry.quota,
-            entry.is_consultation_account,
-        ));
-    }
-    lines
-}
-
-/// One account's figures, and whether the consultation ran on it.
-#[derive(Debug, Clone, Copy)]
-pub struct QuotaReportEntry<'a> {
-    /// The account's figures.
-    pub quota: &'a AccountQuota,
-    /// Whether this is the account the consultation ran on.
-    pub is_consultation_account: bool,
-}
-
-/// This vendor's quota entries, in the order a reader should meet them, with the one that ran
-/// flagged.
-///
-/// The account that just failed goes last: it eats several lines restating what the failure
-/// already said, and a reader skimming the top of the list would otherwise meet the exhausted one
-/// first and conclude nothing is available.
-#[must_use]
-pub fn ordered_quota<'a>(
-    quota: &'a [AccountQuota],
-    vendor: Vendor,
-    consultation_account: Option<&AccountAlias>,
-) -> Vec<QuotaReportEntry<'a>> {
     // Only this vendor's accounts: the lead-in offers each as an `account` value, and an alias
     // from the other vendor's table resolves to nothing but a paid round trip.
-    let (consultation_accounts, others): (Vec<_>, Vec<_>) = quota
+    let (consultation_accounts, others): (Vec<_>, Vec<_>) = status
+        .quota
         .iter()
-        .filter(|entry| entry.vendor == vendor)
+        .filter(|entry| entry.vendor == status.delegate.vendor())
         .partition(|entry| entry.account.as_ref() == consultation_account);
-    others
-        .into_iter()
-        .map(|quota| QuotaReportEntry {
-            quota,
-            is_consultation_account: false,
-        })
-        .chain(
-            consultation_accounts
-                .into_iter()
-                .map(|quota| QuotaReportEntry {
-                    quota,
-                    is_consultation_account: true,
-                }),
-        )
-        .collect()
-}
-
-/// One account's quota, with the account the consultation ran on flagged.
-#[must_use]
-pub fn quota_report_labelled(entry: &AccountQuota, is_consultation_account: bool) -> Vec<String> {
-    let mut lines = quota_report(entry);
-    if is_consultation_account && let Some(first) = lines.first_mut() {
-        first.push_str(" — this consultation");
+    if consultation_accounts.is_empty() && others.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![quota_lead_in(consultation_account, !others.is_empty()).to_owned()];
+    lines.extend(others.into_iter().flat_map(quota_report));
+    for entry in consultation_accounts {
+        let mut report = quota_report(entry);
+        if let Some(first) = report.first_mut() {
+            first.push_str(" — this consultation");
+        }
+        lines.extend(report);
     }
     lines
 }

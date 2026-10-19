@@ -236,16 +236,7 @@ pub(super) fn read_complete_records(
     path: &Path,
     limit: Option<u64>,
 ) -> Result<(String, u64), RunError> {
-    let mut bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(source) => {
-            return Err(RunError::Io {
-                context: format!("reading {}", path.display()),
-                source,
-            });
-        }
-    };
+    let mut bytes = read_if_present(path, std::fs::read)?.unwrap_or_default();
     if let Some(limit) = limit {
         bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
@@ -265,15 +256,8 @@ pub(super) fn read_complete_records(
 /// was damaged or edited, and reading it as absent would change the shape of the turn it
 /// belongs to.
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, RunError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(RunError::Io {
-                context: format!("reading {}", path.display()),
-                source,
-            });
-        }
+    let Some(text) = read_if_present(path, std::fs::read_to_string)? else {
+        return Ok(None);
     };
     serde_json::from_str(&text)
         .map(Some)
@@ -289,19 +273,30 @@ pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opt
 /// is recorded from, and recording "wrote nothing" over a transient failure would freeze the
 /// wrong story.
 pub(super) fn tail_of_file(path: &Path, max_bytes: usize) -> Result<String, RunError> {
-    let text = match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(RunError::Io {
-                context: format!("reading {}", path.display()),
-                source,
-            });
-        }
-    };
+    let text = read_if_present(path, std::fs::read)?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
     if text.len() <= max_bytes {
         return Ok(text);
     }
     let start = text.floor_char_boundary(text.len().saturating_sub(max_bytes));
     Ok(text.get(start..).unwrap_or_default().to_owned())
+}
+
+/// What `read` makes of the file at `path`, or `None` for a file that is not there.
+///
+/// Any other failure is an error, so a file that cannot be read is never taken for one that is
+/// not there yet.
+pub(super) fn read_if_present<'path, T>(
+    path: &'path Path,
+    read: impl FnOnce(&'path Path) -> std::io::Result<T>,
+) -> Result<Option<T>, RunError> {
+    match read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RunError::Io {
+            context: format!("reading {}", path.display()),
+            source,
+        }),
+    }
 }
