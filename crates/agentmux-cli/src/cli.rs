@@ -151,8 +151,8 @@ pub struct DelegateArgs {
     #[arg(long, value_enum)]
     pub delegate: Vendor,
 
-    /// Model identifier, passed to the delegate CLI verbatim, for example the family alias `opus`
-    /// or `sol`.
+    /// Model identifier: a family alias this machine's `agentmux.toml` defines, such as `opus`,
+    /// which `agentmux accounts` lists, or the vendor's own identifier.
     /// agentmux keeps no built-in roster; this machine's rewrites and blocks apply before launch,
     /// and the delegate CLI decides what else is valid.
     /// A `[models]` rule in `agentmux.toml` may rewrite one identifier to another, which

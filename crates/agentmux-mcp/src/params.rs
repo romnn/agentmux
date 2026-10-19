@@ -69,9 +69,9 @@ pub struct DelegateParams {
     /// agentmux keeps no built-in model roster, so a model released tomorrow works today; this
     /// machine's rewrites and blocks apply before launch, and the identifier that runs is passed
     /// to the delegate CLI verbatim.
-    /// Prefer a family alias — `opus`, `fable` or `sonnet` for `claude`, `sol` or `astra` for
-    /// `codex` — which this machine's `agentmux.toml` resolves to the current version; the server
-    /// instructions and `quota` list the aliases it defines.
+    /// Prefer a family alias this machine's `agentmux.toml` defines, which the server
+    /// instructions and `quota` list, and otherwise the vendor's own identifier; `opus` and `sol`
+    /// show an alias's shape, not a list of them.
     /// When the vendor CLI refuses an identifier, its own error comes back, usually naming what it
     /// accepts: look a current identifier up there rather than copying one from an example, which
     /// goes stale with the next release.

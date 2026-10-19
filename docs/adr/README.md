@@ -31,10 +31,10 @@ a record names to show where the decision is enforced must be renamed there too.
   refused.
 - [0017](0017-billing-env-scrub.md): Billing-sensitive environment variables require machine-file
   opt-in.
-- [0024](0024-blocked-models.md): A blocked model is refused at `start`, naming what to ask for
-  instead.
 - [0022](0022-delegate-env-from-allowlist.md): A delegate's environment is built from empty by
   allowlist.
+- [0024](0024-blocked-models.md): A blocked model is refused at `start`, naming what to ask for
+  instead.
 
 ## Quota observations
 

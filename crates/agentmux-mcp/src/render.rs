@@ -21,8 +21,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use agentmux::config::Config;
-use agentmux::delegate::Vendor;
+use agentmux::config::ModelRules;
 use agentmux::quota::{AccountQuota, Observation};
 use agentmux::report::{
     Warning, delegate_line, duration, outcome_line, quota_block, quota_report, summarise,
@@ -539,28 +538,41 @@ pub fn list(runs: &[RunSummary]) -> String {
 /// The model rules sit in the header too, because this is the one call that re-reads them for a
 /// caller whose server instructions were delivered once, at start.
 #[must_use]
-pub fn quota(report: &QuotaReport, vendor: Option<Vendor>) -> String {
-    let vendors: &[Vendor] = vendor.as_ref().map_or(&Vendor::ALL, std::slice::from_ref);
+pub fn quota(report: &QuotaReport) -> String {
+    let scope = match report.asked {
+        Some(vendor) => format!("for {vendor}"),
+        None => "across both vendors".to_owned(),
+    };
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "accounts:   {} across both vendors\nnote:       figures are the vendor's own; agentmux \
-         does not rank accounts, because a percentage means nothing without the plan behind it.\n\
-         warning:    an account reported unavailable is NOT an idle account — it could not be \
-         asked.",
+        "accounts:   {} {scope}\nnote:       figures are the vendor's own; agentmux does not rank \
+         accounts, because a percentage means nothing without the plan behind it.\nwarning:    an \
+         account reported unavailable is NOT an idle account — it could not be asked.",
         report.accounts.len()
     );
+    if let Some(error) = &report.project_error {
+        let _ = writeln!(
+            out,
+            "warning:    the project agentmux.toml could not be read, so these are the machine \
+             file's accounts alone: {error}"
+        );
+    }
     // Both categories are always stated, empty or not: this is the reading that corrects the
     // instructions' start-time snapshot, and a rule removed since start is only corrected by
     // saying there is none.
-    let scope = match vendors {
-        [vendor] => format!(" for {vendor}"),
-        _ => String::new(),
+    let rules: Vec<ModelRules<'_>> = report
+        .vendors()
+        .iter()
+        .map(|vendor| report.model_rules(*vendor))
+        .collect();
+    let scope = match report.asked {
+        Some(vendor) => format!(" for {vendor}"),
+        None => String::new(),
     };
-    let aliases = model_aliases(&report.config, vendors)
+    let aliases = model_aliases(&rules)
         .unwrap_or_else(|| format!("No model aliases on this machine{scope}."));
-    let blocked = blocked_models(&report.config, vendors)
-        .unwrap_or_else(|| format!("No blocked models{scope}."));
+    let blocked = blocked_models(&rules).unwrap_or_else(|| format!("No blocked models{scope}."));
     let _ = writeln!(
         out,
         "models:     {aliases} {blocked} Read from the machine's file just now, as every launch \
@@ -576,65 +588,54 @@ pub fn quota(report: &QuotaReport, vendor: Option<Vendor>) -> String {
     out
 }
 
-/// This machine's model aliases and blocked models for `vendors`, as compact prose, or `None`
-/// when it defines neither.
+/// The model aliases and blocked models in `rules`, as compact prose, or `None` when there are
+/// neither.
 ///
 /// For the server instructions, which leave out what is not there.
 /// The `quota` tool renders the same two sentences through [`model_aliases`] and
 /// [`blocked_models`], so the snapshot a host delivered at start and the fresh reading say the
 /// same thing in the same words.
 #[must_use]
-pub fn model_rules(config: &Config, vendors: &[Vendor]) -> Option<String> {
-    let sentences = [
-        model_aliases(config, vendors),
-        blocked_models(config, vendors),
-    ];
-    let sentences: Vec<String> = sentences.into_iter().flatten().collect();
+pub(crate) fn model_rules(rules: &[ModelRules<'_>]) -> Option<String> {
+    let sentences: Vec<String> = [model_aliases(rules), blocked_models(rules)]
+        .into_iter()
+        .flatten()
+        .collect();
     (!sentences.is_empty()).then(|| sentences.join(" "))
 }
 
-/// This machine's model aliases for `vendors` as one sentence, or `None` when it defines none.
-///
-/// An alias is any `[models.<vendor>]` rule, shown as asked for and launched.
+/// The model aliases in `rules` as one sentence, or `None` when there are none.
 #[must_use]
-pub fn model_aliases(config: &Config, vendors: &[Vendor]) -> Option<String> {
-    let aliases = per_vendor(vendors, |vendor| {
-        config
-            .model_rewrites(vendor)
-            .iter()
-            .filter(|(from, to)| from != to)
-            .map(|(from, to)| format!("`{from}` → `{to}`"))
-            .collect()
-    });
-    (!aliases.is_empty()).then(|| format!("Model aliases on this machine — {aliases}."))
-}
-
-/// This machine's blocked models for `vendors` as one sentence, or `None` when it blocks none.
-#[must_use]
-pub fn blocked_models(config: &Config, vendors: &[Vendor]) -> Option<String> {
-    let blocked = per_vendor(vendors, |vendor| {
-        config
-            .blocked_models(vendor)
-            .iter()
-            .map(|(model, block)| match &block.reason {
-                Some(reason) => format!("`{model}` (use `{}`: {reason})", block.recommended),
-                None => format!("`{model}` (use `{}`)", block.recommended),
-            })
-            .collect()
-    });
-    (!blocked.is_empty()).then(|| {
-        format!("Blocked models, refused when a new consultation would launch them — {blocked}.")
-    })
-}
-
-/// `vendor: a, b; vendor: c` for every vendor with something to list, or empty.
-fn per_vendor(vendors: &[Vendor], describe: impl Fn(Vendor) -> Vec<String>) -> String {
-    vendors
+pub(crate) fn model_aliases(rules: &[ModelRules<'_>]) -> Option<String> {
+    let aliases = rules
         .iter()
-        .filter_map(|vendor| {
-            let entries = describe(*vendor);
-            (!entries.is_empty()).then(|| format!("{vendor}: {}", entries.join(", ")))
+        .filter_map(|rules| {
+            let entries: Vec<String> = rules
+                .aliases()
+                .map(|(from, to)| format!("`{from}` → `{to}`"))
+                .collect();
+            (!entries.is_empty()).then(|| format!("{}: {}", rules.vendor(), entries.join(", ")))
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect::<Vec<_>>();
+    (!aliases.is_empty())
+        .then(|| format!("Model aliases on this machine — {}.", aliases.join("; ")))
+}
+
+/// The blocked models in `rules` as one sentence, or `None` when there are none.
+#[must_use]
+pub(crate) fn blocked_models(rules: &[ModelRules<'_>]) -> Option<String> {
+    let blocked = rules
+        .iter()
+        .flat_map(|rules| {
+            rules
+                .blocked()
+                .map(move |(model, block)| format!("{} `{model}`: {block}", rules.vendor()))
+        })
+        .collect::<Vec<_>>();
+    (!blocked.is_empty()).then(|| {
+        format!(
+            "Blocked models, refused when a new consultation would launch them — {}.",
+            blocked.join("; ")
+        )
+    })
 }

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::config::BlockedModel;
 use crate::delegate::{DelegateError, ModelId, Vendor};
 use crate::launch::LaunchError;
 use crate::transcript::{TurnState, describe_unsaved_session_store};
@@ -52,22 +53,20 @@ pub enum RunError {
     ///
     /// Refused rather than exchanged for the recommendation: which model answers decides what the
     /// caller pays and what it is told, so the caller makes that choice knowingly and asks again.
-    /// The blocked model is the one the caller asked for, because a file that rewrites another
-    /// name onto a blocked model is refused when it is read.
     #[error(
-        "{vendor} model \"{model}\" is blocked by this machine's agentmux configuration; use model \
-         \"{recommended}\" instead{}. No delegate was launched.",
-        describe_reason(.reason.as_deref())
+        "{vendor} model \"{model}\" is blocked by this machine's agentmux configuration; \
+         {blocked}. No delegate was launched."
     )]
     ModelBlocked {
         /// Whose model it is.
         vendor: Vendor,
-        /// The model that was asked for and would have been launched.
+        /// The model that would have been launched, after the machine's rewrite.
+        ///
+        /// It is the one the caller asked for, because a file that rewrites another name onto a
+        /// blocked model is refused when it is read.
         model: ModelId,
-        /// What the configuration recommends asking for instead.
-        recommended: ModelId,
-        /// Why, when the configuration says.
-        reason: Option<String>,
+        /// What the configuration says instead: the recommendation, and why.
+        blocked: BlockedModel,
     },
     /// A child could not be launched.
     #[error(transparent)]
@@ -140,14 +139,6 @@ impl RunError {
             source,
         }
     }
-}
-
-/// Why a model is blocked, as a parenthesis to follow the recommendation.
-fn describe_reason(reason: Option<&str>) -> String {
-    reason
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .map_or_else(String::new, |reason| format!(" ({reason})"))
 }
 
 /// Why a consultation cannot take a follow-up.

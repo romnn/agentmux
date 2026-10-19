@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::config::{Config, ConfigError, ModelRules};
 use crate::delegate::Vendor;
 use crate::transcript::{FailureKind, Outcome};
 
@@ -54,20 +55,25 @@ impl RunStore {
         reported
     }
 
-    /// Ask each configured account what it has left, for the given vendors.
+    /// Ask each configured account what it has left, for `vendor` or for both.
     ///
-    /// The configuration is read afresh for every call, as a launch reads it, and handed back
-    /// beside the figures, so a reader that also lists what the machine does with model names
-    /// lists what the same reading said.
+    /// The configuration is read afresh for every call, as a launch reads it.
+    /// A project file found from agentmux's own directory still decides which identity an
+    /// unnamed account resolves to, as it would for a consultation started there; when it cannot
+    /// be read, the accounts are reported as the machine file alone defines them and the report
+    /// says why, because a checkout's broken file must not hide what the machine offers.
+    /// The model rules are the machine file's alone, which is the only file that may set them.
     ///
     /// # Errors
     ///
     /// Returns [`RunError::Config`] when the machine's configuration cannot be read.
     pub fn quota(&self, vendor: Option<Vendor>) -> Result<QuotaReport, RunError> {
-        // Discovered from agentmux's own directory: a quota question is about this machine, not
-        // about any one consultation.
+        let machine = Config::load_machine(&self.host_env)?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config = crate::config::Config::load(&self.host_env, &cwd)?;
+        let (config, project_error) = match machine.clone().with_project(&self.host_env, &cwd) {
+            Ok(config) => (config, None),
+            Err(error) => (machine.clone(), Some(error)),
+        };
         let vendors: &[Vendor] = vendor.as_ref().map_or(&Vendor::ALL, std::slice::from_ref);
         let accounts = vendors
             .iter()
@@ -75,15 +81,42 @@ impl RunStore {
                 crate::quota::probe_vendor(*vendor, &config, &self.host_env, self.probe.as_ref())
             })
             .collect();
-        Ok(QuotaReport { accounts, config })
+        Ok(QuotaReport {
+            asked: vendor,
+            accounts,
+            project_error,
+            machine,
+        })
     }
 }
 
-/// What [`RunStore::quota`] found, from one reading of the machine's configuration.
-#[derive(Debug, Clone)]
+/// What [`RunStore::quota`] found.
+#[derive(Debug)]
 pub struct QuotaReport {
-    /// What each configured account has left.
+    /// The vendor asked about, or `None` when both were.
+    pub asked: Option<Vendor>,
+    /// What each configured account of [`Self::vendors`] has left.
     pub accounts: Vec<crate::quota::AccountQuota>,
-    /// The configuration the accounts were read from.
-    pub config: crate::config::Config,
+    /// Why the project file was passed over, when it could not be read.
+    ///
+    /// The accounts are then those the machine file alone defines.
+    pub project_error: Option<ConfigError>,
+    /// The machine file as read for this report.
+    machine: Config,
+}
+
+impl QuotaReport {
+    /// The vendors this report covers.
+    #[must_use]
+    pub fn vendors(&self) -> &[Vendor] {
+        self.asked
+            .as_ref()
+            .map_or(&Vendor::ALL, std::slice::from_ref)
+    }
+
+    /// The machine file's model rules for one vendor, as read for this report.
+    #[must_use]
+    pub fn model_rules(&self, vendor: Vendor) -> ModelRules<'_> {
+        self.machine.model_rules(vendor)
+    }
 }

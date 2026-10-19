@@ -11,8 +11,8 @@ it. One machine file is also synced across machines that run different agentmux 
 ## Decision
 
 Vendor, account-alias and model keys, and model and effort values, deserialize directly into their
-validated types — `Vendor`, `AccountAlias`, `ModelId` and `Effort` (`crates/agentmux/src/config.rs`)
-— so nothing downstream re-parses a string. An identifier no argument parser would accept is a
+validated types — `Vendor`, `AccountAlias`, `ModelId` and `Effort` (`crates/agentmux/src/config/`) —
+so nothing downstream re-parses a string. An identifier no argument parser would accept is a
 `ConfigError::Malformed` pointing at its byte offset; the error never quotes the offending line,
 which is as likely as not to hold a key.
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
+use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
     AccountChoice, Billing, Delegate, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
 };
@@ -136,7 +137,8 @@ impl RunStore {
     /// inside a delegate, the run directory cannot be created, or the delegate cannot be launched
     /// — which includes a working directory that is not there.
     /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
-    /// would run, before anything is written or launched.
+    /// would run, before anything is written or launched; a follow-up is never refused for a
+    /// block added after its consultation started.
     /// A failed start leaves no run directory behind.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
@@ -153,18 +155,7 @@ impl RunStore {
         let Pinned {
             delegate,
             rewritten_from,
-        } = Self::pin_defaults(&request.delegate, &config);
-        // Checked on the model that would run, and only here: a follow-up keeps the model its
-        // consultation pinned, so a block added later never strands a consultation already paid
-        // for.
-        if let Some(blocked) = config.blocked_model(delegate.vendor(), delegate.model()) {
-            return Err(RunError::ModelBlocked {
-                vendor: delegate.vendor(),
-                model: delegate.model().clone(),
-                recommended: blocked.recommended.clone(),
-                reason: blocked.reason.clone(),
-            });
-        }
+        } = Self::pin_defaults(&request.delegate, &config)?;
         let billing = delegate.resolve_billing(request.billing, &self.host_env, &config)?;
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
@@ -237,11 +228,17 @@ impl RunStore {
     /// configuration does not define, which the launch then refuses, or the CLI's own login when
     /// there is no default.
     ///
-    /// A model the file rewrites is exchanged here, once: an identifier the file says nothing
-    /// about is untouched, and the rewritten one is never looked up again.
-    /// An effort the caller left unnamed is then filled from the file's default for the model
-    /// that runs, and stays unnamed — the CLI's own default — when the file has none.
-    pub(super) fn pin_defaults(delegate: &Delegate, config: &crate::config::Config) -> Pinned {
+    /// The model is resolved through the machine's model rules: a rewrite is exchanged once, an
+    /// effort the caller left unnamed is filled from the file's default for the model that runs,
+    /// and stays unnamed — the CLI's own default — when the file has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::ModelBlocked`] when the model that would run is blocked.
+    pub(super) fn pin_defaults(
+        delegate: &Delegate,
+        config: &crate::config::Config,
+    ) -> Result<Pinned, RunError> {
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
         if *pinned.account() == AccountChoice::Default {
@@ -252,20 +249,29 @@ impl RunStore {
             };
             pinned = pinned.with_account(resolved);
         }
-        let asked = pinned.model().clone();
-        if let Some(rewritten) = config.rewritten_model(pinned.vendor(), &asked) {
-            pinned = pinned.with_model(rewritten.clone());
-        }
-        // After the rewrite, because the default is keyed by the model that runs.
+        let vendor = pinned.vendor();
+        // Only `start` calls this, so only a new consultation can meet a block.
+        let ResolvedModel {
+            launched,
+            rewritten_from,
+            default_effort,
+        } = config.model_rules(vendor).resolve(pinned.model()).map_err(
+            |RefusedModel { model, blocked }| RunError::ModelBlocked {
+                vendor,
+                model,
+                blocked,
+            },
+        )?;
+        pinned = pinned.with_model(launched);
         if pinned.effort().is_none()
-            && let Some(effort) = config.default_effort(pinned.vendor(), pinned.model())
+            && let Some(effort) = default_effort
         {
-            pinned = pinned.with_effort(effort.clone());
+            pinned = pinned.with_effort(effort);
         }
-        Pinned {
-            rewritten_from: (*pinned.model() != asked).then_some(asked),
+        Ok(Pinned {
+            rewritten_from,
             delegate: pinned.with_isolation(isolation),
-        }
+        })
     }
 
     /// Continue a consultation with another question, in the delegate's own session.

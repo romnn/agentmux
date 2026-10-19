@@ -226,14 +226,14 @@ account = "clientx"
 ```
 
 A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite, an
-`[efforts]` default, a `[blocked]` model or a `retention` is refused by name. It has to be, because such a file arrives
-with a `git clone`: were it able to name a `base_url` and an `api_key_env`, cloning a repository and
-asking for one second opinion would send your key to whoever wrote it. For the same reason a project
-file may choose *which* of your accounts pays but nothing more: an account it selects runs isolated
-unless the call says otherwise, and does not bring its own `request_env` with it. On Unix either
-file is read only when you own it and nobody else can write it (other platforms check only that it
-is a regular file), and a file that cannot be parsed is reported by position, never by quoting the
-line.
+`[efforts]` default, a `[blocked]` model or a `retention` is refused by name. It has to be, because
+such a file arrives with a `git clone`: were it able to name a `base_url` and an `api_key_env`,
+cloning a repository and asking for one second opinion would send your key to whoever wrote it. For
+the same reason a project file may choose *which* of your accounts pays but nothing more: an account
+it selects runs isolated unless the call says otherwise, and does not bring its own `request_env`
+with it. On Unix either file is read only when you own it and nobody else can write it (other
+platforms check only that it is a regular file), and a file that cannot be parsed is reported by
+position, never by quoting the line.
 
 **A key agentmux does not know is a warning, not a failure.** One machine file is read by every
 agentmux on the machine, including the MCP servers that have been running since before you added
@@ -333,12 +333,12 @@ model its consultation started with, so a block added later does not strand a re
 already paid for.
 
 A file whose rules contradict each other is refused when it is read: a rewrite onto a blocked model,
-a block keyed by a model the same file rewrites away, and a recommendation that would itself launch
-a blocked model. Nothing else is checked about the recommendation, which reaches the CLI like any
-other model a caller names. The MCP server's instructions list the aliases and blocked models it
-found when it started, for the vendors it launches, and `quota` lists them again from the current
-file on every call, saying so when there are none; `agentmux accounts` lists them under `blocked`.
-Only a machine file may block a model.
+a block keyed by a model the same file rewrites away, and a recommendation that is itself blocked.
+Nothing else is checked about the recommendation, which reaches the CLI like any other model a
+caller names. The MCP server's instructions list the aliases and blocked models it found when it
+started, for the vendors it launches, and `quota` lists them again from the current file on every
+call, saying so when there are none; `agentmux accounts` lists them under `blocked`. Only a machine
+file may block a model.
 
 ### Retention
 

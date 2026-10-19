@@ -2306,8 +2306,10 @@ fn a_blocked_model_is_refused_before_anything_is_launched() -> Result<()> {
         refused.as_ref().map(|_| ()),
         err(matches_pattern!(RunError::ModelBlocked {
             model: eq(&ModelId::parse("gpt-5.6-sol").or_fail()?),
-            recommended: eq(&ModelId::parse("sol").or_fail()?),
-            reason: some(eq("gpt-6.1-sol is much cheaper")),
+            blocked: eq(&agentmux::config::BlockedModel {
+                recommended: ModelId::parse("sol").or_fail()?,
+                reason: Some("gpt-6.1-sol is much cheaper".to_owned()),
+            }),
             ..
         }))
     );

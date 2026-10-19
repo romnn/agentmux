@@ -18,7 +18,7 @@ agentmux release or a code change. An identifier the file does not name is untou
 Exactly one substitution is applied, and a file whose rules would chain is refused at load
 (`ConfigError::ChainedRewrite`), because either resolution would be a guess made on every launch.
 
-Launch-time rewriting is applied through `Config::rewritten_model` while `RunStore::pin_defaults`
+Launch-time rewriting is applied through `ModelRules::resolve` while `RunStore::pin_defaults`
 prepares the consultation at `start`: the model is frozen together with the account and the
 isolation, so a file edited mid-consultation cannot answer the second half of one transcript with
 another model.

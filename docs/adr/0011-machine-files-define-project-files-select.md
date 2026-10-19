@@ -29,8 +29,8 @@ Machine files live under the home directory only: `XDG_CONFIG_HOME` and `APPDATA
 they point there, and `AGENTMUX_CONFIG` (which must be absolute) is the one deliberate escape hatch.
 A container that points the config base at a workspace therefore cannot promote a checkout to a
 machine file. On Unix, both roles require a regular file owned by the current user and not writable
-by group or others (`refuse_if_untrusted` in `crates/agentmux/src/config.rs`); other platforms do
-not currently enforce equivalent ownership or permission checks.
+by group or others (`refuse_if_untrusted` in `crates/agentmux/src/config/mod.rs`); other platforms
+do not currently enforce equivalent ownership or permission checks.
 
 **A project file's selection switches nothing on.** An account a project file chose runs isolated,
 never on API pricing, and without its own `request_env`, whatever the machine file configures for

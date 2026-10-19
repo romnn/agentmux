@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use agentmux::config::{Config, expand_tilde};
+use agentmux::config::{BlockedModel, Config, expand_tilde};
+use agentmux::delegate::{ModelId, Vendor};
 use googletest::prelude::*;
 
 /// A host environment with `HOME` pointing where the test wants it.
@@ -16,6 +17,40 @@ fn env(home: &Path) -> BTreeMap<String, String> {
     [("HOME".to_owned(), home.to_string_lossy().into_owned())]
         .into_iter()
         .collect()
+}
+
+/// What a new consultation asking `vendor` for `model` would launch, when a rule rewrites it.
+fn rewritten(config: &Config, vendor: Vendor, model: &str) -> Result<Option<String>> {
+    let resolved = config
+        .model_rules(vendor)
+        .resolve(&ModelId::parse(model).or_fail()?)
+        .ok()
+        .or_fail()?;
+    Ok(resolved
+        .rewritten_from
+        .map(|_| resolved.launched.as_str().to_owned()))
+}
+
+/// The effort the machine names for a new consultation asking `vendor` for `model`, if any.
+fn default_effort(config: &Config, vendor: Vendor, model: &str) -> Result<Option<String>> {
+    let resolved = config
+        .model_rules(vendor)
+        .resolve(&ModelId::parse(model).or_fail()?)
+        .ok()
+        .or_fail()?;
+    Ok(resolved
+        .default_effort
+        .map(|effort| effort.as_str().to_owned()))
+}
+
+/// What the machine file says about `model` when a new consultation asking `vendor` for it is
+/// refused, or `None` when it would launch.
+fn blocked(config: &Config, vendor: Vendor, model: &str) -> Result<Option<BlockedModel>> {
+    Ok(config
+        .model_rules(vendor)
+        .resolve(&ModelId::parse(model).or_fail()?)
+        .err()
+        .map(|refused| refused.blocked))
 }
 
 /// Write a machine file defining one Claude account.
@@ -1011,8 +1046,6 @@ fn a_default_naming_an_invalid_alias_is_refused_at_load() -> Result<()> {
 /// business of knowing which models exist.
 #[gtest]
 fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
-    use agentmux::delegate::{ModelId, Vendor};
-
     let home = tempfile::tempdir().or_fail()?;
     agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
@@ -1031,30 +1064,21 @@ fn a_machine_file_rewrites_the_models_it_names_and_no_others() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.rewritten_model(Vendor::Claude, &ModelId::parse("fable-5").or_fail()?),
+        rewritten(&config, Vendor::Claude, "fable-5")?,
         some(eq("claude-fable-5-1"))
     );
     // Released this morning, named by nobody's configuration, launched exactly as asked.
-    assert_that!(
-        config.rewritten_model(Vendor::Claude, &ModelId::parse("claude-opus-6").or_fail()?),
-        none()
-    );
+    assert_that!(rewritten(&config, Vendor::Claude, "claude-opus-6")?, none());
     // The rewritten identifier is not itself a name to be rewritten again, and a rule mapping it
     // to itself is neither a rewrite nor the second link of a chain.
     assert_that!(
-        config.rewritten_model(
-            Vendor::Claude,
-            &ModelId::parse("claude-fable-5-1").or_fail()?
-        ),
+        rewritten(&config, Vendor::Claude, "claude-fable-5-1")?,
         none()
     );
     // One vendor's rules are not the other's: the same name means different things to each CLI.
+    assert_that!(rewritten(&config, Vendor::Codex, "fable-5")?, none());
     assert_that!(
-        config.rewritten_model(Vendor::Codex, &ModelId::parse("fable-5").or_fail()?),
-        none()
-    );
-    assert_that!(
-        config.rewritten_model(Vendor::Codex, &ModelId::parse("gpt-6").or_fail()?),
+        rewritten(&config, Vendor::Codex, "gpt-6")?,
         some(eq("gpt-6-astra"))
     );
     Ok(())
@@ -1151,8 +1175,6 @@ fn a_rewrite_naming_an_unusable_identifier_is_refused_at_load() -> Result<()> {
 /// and the CLI's own is what runs.
 #[gtest]
 fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
-    use agentmux::delegate::{ModelId, Vendor};
-
     let home = tempfile::tempdir().or_fail()?;
     agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
@@ -1169,27 +1191,21 @@ fn a_machine_file_names_a_default_effort_per_running_model() -> Result<()> {
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
 
     assert_that!(
-        config.default_effort(
-            Vendor::Claude,
-            &ModelId::parse("claude-fable-5-1").or_fail()?
-        ),
+        default_effort(&config, Vendor::Claude, "claude-fable-5-1")?,
         some(eq("high"))
     );
     assert_that!(
-        config.default_effort(Vendor::Codex, &ModelId::parse("gpt-6-astra").or_fail()?),
+        default_effort(&config, Vendor::Codex, "gpt-6-astra")?,
         some(eq("medium"))
     );
     // Named by nobody's configuration: no effort, and the CLI decides.
     assert_that!(
-        config.default_effort(Vendor::Claude, &ModelId::parse("claude-opus-5").or_fail()?),
+        default_effort(&config, Vendor::Claude, "claude-opus-5")?,
         none()
     );
     // One vendor's defaults are not the other's.
     assert_that!(
-        config.default_effort(
-            Vendor::Codex,
-            &ModelId::parse("claude-fable-5-1").or_fail()?
-        ),
+        default_effort(&config, Vendor::Codex, "claude-fable-5-1")?,
         none()
     );
     Ok(())
@@ -1288,9 +1304,6 @@ fn a_default_effort_naming_an_unusable_value_is_refused_at_load() -> Result<()> 
 /// except the reason.
 #[gtest]
 fn a_blocked_model_reads_the_same_from_either_spelling() -> Result<()> {
-    use agentmux::config::BlockedModel;
-    use agentmux::delegate::{ModelId, Vendor};
-
     let home = tempfile::tempdir().or_fail()?;
     agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
@@ -1304,11 +1317,6 @@ fn a_blocked_model_reads_the_same_from_either_spelling() -> Result<()> {
     .or_fail()?;
 
     let config = Config::load(&env(home.path()), home.path()).or_fail()?;
-    let blocked = |model: &str| -> Result<Option<BlockedModel>> {
-        Ok(config
-            .blocked_model(Vendor::Codex, &ModelId::parse(model).or_fail()?)
-            .cloned())
-    };
     let sol = ModelId::parse("sol").or_fail()?;
 
     // The string and the reasonless table are the same entry.
@@ -1316,22 +1324,25 @@ fn a_blocked_model_reads_the_same_from_either_spelling() -> Result<()> {
         recommended: sol.clone(),
         reason: None,
     };
-    assert_that!(blocked("gpt-5.6-sol")?, some(eq(&plain)));
-    assert_that!(blocked("gpt-5.5-sol")?, some(eq(&plain)));
+    assert_that!(
+        blocked(&config, Vendor::Codex, "gpt-5.6-sol")?,
+        some(eq(&plain))
+    );
+    assert_that!(
+        blocked(&config, Vendor::Codex, "gpt-5.5-sol")?,
+        some(eq(&plain))
+    );
     // The table's reason is kept beside the same recommendation.
     assert_that!(
-        blocked("gpt-6-sol")?,
+        blocked(&config, Vendor::Codex, "gpt-6-sol")?,
         some(eq(&BlockedModel {
             recommended: sol,
             reason: Some("gpt-6.1-sol is much cheaper".to_owned()),
         }))
     );
     // A model the file does not name, and the same model for the other vendor, run as asked.
-    assert_that!(blocked("gpt-6.1-sol")?, none());
-    assert_that!(
-        config.blocked_model(Vendor::Claude, &ModelId::parse("gpt-5.6-sol").or_fail()?),
-        none()
-    );
+    assert_that!(blocked(&config, Vendor::Codex, "gpt-6.1-sol")?, none());
+    assert_that!(blocked(&config, Vendor::Claude, "gpt-5.6-sol")?, none());
     assert_that!(config.unknown, is_empty());
     Ok(())
 }
@@ -1363,12 +1374,7 @@ fn a_blocked_table_for_an_unknown_vendor_is_reported() -> Result<()> {
             .collect::<Vec<_>>(),
         elements_are![eq("blocked.gemini")]
     );
-    assert_that!(
-        config
-            .blocked_models(agentmux::delegate::Vendor::Claude)
-            .len(),
-        eq(1)
-    );
+    assert_that!(config.model_rules(Vendor::Claude).blocked().count(), eq(1));
     Ok(())
 }
 
@@ -1453,8 +1459,9 @@ fn a_rewrite_onto_a_blocked_model_is_refused_at_load() -> Result<()> {
         refused,
         err(matches_pattern!(
             agentmux::config::ConfigError::RewriteToBlockedModel {
-                from: eq(&agentmux::delegate::ModelId::parse("gpt-6").or_fail()?),
-                to: eq(&agentmux::delegate::ModelId::parse("gpt-5.6-sol").or_fail()?),
+                vendor: eq(&Vendor::Codex),
+                from: eq(&ModelId::parse("gpt-6").or_fail()?),
+                to: eq(&ModelId::parse("gpt-5.6-sol").or_fail()?),
                 ..
             }
         ))
@@ -1481,24 +1488,43 @@ fn a_block_keyed_by_a_rewritten_model_is_refused_at_load() -> Result<()> {
     )
     .or_fail()?;
 
-    let error = Config::load(&env(home.path()), home.path()).expect_err("the key is rewritten");
+    let refused = Config::load(&env(home.path()), home.path());
 
-    assert_that!(error.to_string(), contains_substring("would never apply"));
-    assert_that!(error.to_string(), contains_substring("gpt-6.1-sol"));
+    assert_that!(
+        refused.as_ref().map(|_| ()),
+        err(matches_pattern!(
+            agentmux::config::ConfigError::BlockForRewrittenModel {
+                vendor: eq(&Vendor::Codex),
+                model: eq(&ModelId::parse("gpt-5.6-sol").or_fail()?),
+                to: eq(&ModelId::parse("gpt-6.1-sol").or_fail()?),
+                ..
+            }
+        ))
+    );
+    // The advice names the two settings that are consistent, not a third that contradicts too.
+    let advice = refused.err().map(|err| err.to_string()).or_fail()?;
+    assert_that!(
+        advice,
+        contains_substring("Remove the rewrite to refuse \"gpt-5.6-sol\"")
+    );
+    assert_that!(
+        advice,
+        contains_substring("remove the block to keep sending it to \"gpt-6.1-sol\"")
+    );
     Ok(())
 }
 
-/// A recommendation that would launch a blocked model is refused when the file is read, whether it
-/// names the blocked model itself or an alias the file rewrites onto one.
+/// A recommendation that is itself blocked is refused when the file is read, and one the file
+/// rewrites to an allowed model is accepted.
 ///
 /// A refusal must name a model that runs, or the caller follows it into a second refusal.
+/// A recommendation the file rewrites onto a blocked model is the rewrite contradiction, which
+/// `a_rewrite_onto_a_blocked_model_is_refused_at_load` covers.
 #[gtest]
-fn a_recommendation_that_launches_a_blocked_model_is_refused_at_load() -> Result<()> {
-    use agentmux::config::ConfigError;
-
+fn a_recommendation_that_is_itself_blocked_is_refused_at_load() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
 
-    // Recommending a blocked model by its own name
+    // Recommending a blocked model
     agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
@@ -1510,30 +1536,64 @@ fn a_recommendation_that_launches_a_blocked_model_is_refused_at_load() -> Result
     .or_fail()?;
     assert_that!(
         Config::load(&env(home.path()), home.path()).map(|_| ()),
-        err(matches_pattern!(ConfigError::BlockedRecommendation {
-            model: eq(&agentmux::delegate::ModelId::parse("gpt-5.6-sol").or_fail()?),
-            recommended: eq(&agentmux::delegate::ModelId::parse("gpt-6-sol").or_fail()?),
-            ..
-        }))
+        err(matches_pattern!(
+            agentmux::config::ConfigError::BlockedRecommendation {
+                vendor: eq(&Vendor::Codex),
+                model: eq(&ModelId::parse("gpt-5.6-sol").or_fail()?),
+                recommended: eq(&ModelId::parse("gpt-6-sol").or_fail()?),
+                ..
+            }
+        ))
     );
 
-    // Recommending an alias the file rewrites onto a blocked model
+    // Recommending an alias the file rewrites to an allowed model
     agentmux::testing::write_config_file(
         home.path().join("agentmux.toml"),
         indoc::indoc! {r#"
             [models.codex]
-            "sol" = "gpt-6-sol"
+            "sol" = "gpt-6.1-sol"
 
             [blocked.codex]
             "gpt-5.6-sol" = "sol"
-            "gpt-6-sol" = "astra"
         "#},
     )
     .or_fail()?;
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
     assert_that!(
-        Config::load(&env(home.path()), home.path()).map(|_| ()),
-        err(matches_pattern!(ConfigError::RewriteToBlockedModel { .. }))
+        rewritten(&config, Vendor::Codex, "sol")?,
+        some(eq("gpt-6.1-sol"))
     );
+    Ok(())
+}
+
+/// A block's reason that says nothing, or that would break the one-line refusal it is quoted
+/// in, is refused when the file is read rather than shown.
+#[gtest]
+fn a_blocked_reason_that_is_empty_or_multiline_is_refused_at_load() -> Result<()> {
+    let home = tempfile::tempdir().or_fail()?;
+    for (reason, complaint) in [
+        (r#""""#, "is empty"),
+        (r#""   ""#, "is empty"),
+        (r#""cheaper\nand faster""#, "control character"),
+        (r#""cheaper\tnow""#, "control character"),
+    ] {
+        agentmux::testing::write_config_file(
+            home.path().join("agentmux.toml"),
+            indoc::formatdoc! {r#"
+                [blocked.codex]
+                "gpt-6-sol" = {{ use = "sol", reason = {reason} }}
+            "#},
+        )
+        .or_fail()?;
+        assert_that!(
+            Config::load(&env(home.path()), home.path()).map(|_| ()),
+            err(matches_pattern!(agentmux::config::ConfigError::Malformed {
+                message: contains_substring(complaint),
+                ..
+            })),
+            "the reason {reason} was accepted"
+        );
+    }
     Ok(())
 }
 

@@ -501,7 +501,7 @@ impl AgentMux {
             .store
             .quota(params.delegate)
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::quota(&reported, params.delegate)))
+        Ok(text(render::quota(&reported)))
     }
 }
 
@@ -624,16 +624,77 @@ fn instructions(
     denied: &BTreeSet<Vendor>,
 ) -> String {
     let denial = denial(denied);
-    let config = match agentmux::config::Config::load(host_env, cwd) {
-        Ok(config) => config,
+    let machine = match agentmux::config::Config::load_machine(host_env) {
+        Ok(machine) => machine,
         Err(error) => {
             // Said out loud: a server that starts fine but names no accounts looks like a machine
             // with none, and the operator has no other signal that their file was rejected.
-            tracing::warn!(%error, "account configuration could not be read; instructions omit the roster");
+            tracing::warn!(%error, "the machine configuration could not be read; instructions omit the roster");
             return format!("{INSTRUCTIONS}{denial}");
         }
     };
 
+    // A paragraph of its own, after the accounts, because it answers the next question a caller
+    // has: which `model` to name.
+    // Read from the machine file alone, the only file that may set a rule, so a checkout's
+    // broken file does not hide them; and only for the vendors this server launches, while
+    // `quota` reports the machine as a whole.
+    let rules: Vec<_> = Vendor::ALL
+        .into_iter()
+        .filter(|vendor| !denied.contains(vendor))
+        .map(|vendor| machine.model_rules(vendor))
+        .collect();
+    let models = render::model_rules(&rules).map_or_else(String::new, |rules| {
+        indoc::formatdoc! {"
+
+            {rules} That list is a snapshot from server start: every launch reads the current file,
+            and `quota` re-reads it and lists it again on every call. A blocked model is refused
+            with the model to ask for instead, never swapped in for you; a follow-up keeps the
+            model its consultation started with.
+        "}
+    });
+
+    let config = match machine.clone().with_project(host_env, cwd) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "the project configuration could not be read; instructions omit the roster");
+            return indoc::formatdoc! {"
+                {INSTRUCTIONS}{denial}
+                {models}"};
+        }
+    };
+    let roster = roster(&config);
+
+    indoc::formatdoc! {"
+        {INSTRUCTIONS}{denial}
+
+        {roster} That was read when this server started, and a host delivers these instructions
+        only once, so `quota` is the authority if the two disagree: it re-reads the machine's file
+        on every call, as every launch does. It reports what each account has left and costs
+        nothing: call it before a long consultation, and again after a rate-limited failure to
+        find one that can answer now.
+        {models}
+        A delegate loads no settings, hooks or MCP servers unless its account is marked above as
+        inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
+        exercise the tooling that configuration sets up, `false` when the answer must not depend
+        on this machine, and `env` to set variables the account's own tooling reads.
+
+        No API key or endpoint override from the environment reaches a delegate unless its account
+        is marked above as one that may use an API key: agentmux removes them from its environment
+        and refuses one passed in `env`. Pass `billing` as `api` to insist on the account's key,
+        which only such an account accepts, or as `subscription` to withhold it even there;
+        follow-ups keep what the first turn ran on.
+
+        Those marks are the machine file's settings. An account a checkout's own agentmux.toml
+        selects as its default, in place of the machine's, runs isolated and on subscription
+        pricing even when named explicitly: `inherit_settings: true` still overrides the
+        isolation, `billing: api` is refused, and such an account that configures an API
+        credential or endpoint is refused.
+    "}
+}
+
+/// The paragraph naming this machine's accounts, and which one an omitted `account` uses.
+fn roster(config: &agentmux::config::Config) -> String {
     let mut described = Vec::new();
     for vendor in Vendor::ALL {
         let accounts = config.accounts(vendor);
@@ -675,24 +736,7 @@ fn instructions(
         described.push(format!("{vendor}: {names} — {omitted}"));
     }
 
-    // A paragraph of its own, after the accounts, because it answers the next question a caller
-    // has: which `model` to name.
-    // Only for the vendors this server launches; `quota` still reports the machine as a whole.
-    let launched: Vec<Vendor> = Vendor::ALL
-        .into_iter()
-        .filter(|vendor| !denied.contains(vendor))
-        .collect();
-    let models = render::model_rules(&config, &launched).map_or_else(String::new, |rules| {
-        indoc::formatdoc! {"
-
-            {rules} That list is a snapshot from server start: every launch reads the current file,
-            and `quota` re-reads it and lists it again on every call. A blocked model is refused
-            with the model to ask for instead, never swapped in for you; a follow-up keeps the
-            model its consultation started with.
-        "}
-    });
-
-    let roster = if described.is_empty() {
+    if described.is_empty() {
         "No named accounts were defined when this server started, so omit `account`.".to_owned()
     } else {
         format!(
@@ -700,34 +744,7 @@ fn instructions(
              default; the `delegate:` line of every result names the account that actually ran.",
             described.join("; ")
         )
-    };
-
-    indoc::formatdoc! {"
-        {INSTRUCTIONS}{denial}
-
-        {roster} That was read when this server started, and a host delivers these instructions
-        only once, so `quota` is the authority if the two disagree: it re-reads the machine's file
-        on every call, as every launch does. It reports what each account has left and costs
-        nothing: call it before a long consultation, and again after a rate-limited failure to
-        find one that can answer now.
-        {models}
-        A delegate loads no settings, hooks or MCP servers unless its account is marked above as
-        inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
-        exercise the tooling that configuration sets up, `false` when the answer must not depend
-        on this machine, and `env` to set variables the account's own tooling reads.
-
-        No API key or endpoint override from the environment reaches a delegate unless its account
-        is marked above as one that may use an API key: agentmux removes them from its environment
-        and refuses one passed in `env`. Pass `billing` as `api` to insist on the account's key,
-        which only such an account accepts, or as `subscription` to withhold it even there;
-        follow-ups keep what the first turn ran on.
-
-        Those marks are the machine file's settings. An account a checkout's own agentmux.toml
-        selects as its default, in place of the machine's, runs isolated and on subscription
-        pricing even when named explicitly: `inherit_settings: true` still overrides the
-        isolation, `billing: api` is refused, and such an account that configures an API
-        credential or endpoint is refused.
-    "}
+    }
 }
 
 /// The part of the instructions that is the same on every machine.
@@ -756,18 +773,17 @@ that a hook reopened after it had finished, and the findings are above all of th
 from the top, or open the file at `transcript:` with your own file tools — the inline text is
 bounded by your host's result limit, the file never is.
 
-Choose a delegate by naming `delegate` (`claude` or `codex`), a `model` and an `effort`. Prefer a
-family alias for the model — `opus`, `fable` or `sonnet` for `claude`, `sol` or `astra` for `codex`
-— which this machine's configuration resolves to the current version; the aliases it defines are
-listed below when it defines any. agentmux keeps no built-in model roster; this machine's rewrites
+Choose a delegate by naming `delegate` (`claude` or `codex`), a `model` and an `effort`. For the
+model, prefer a family alias this machine defines — they are listed below when it defines any, and
+`quota` lists them too — and otherwise name the vendor's own identifier; `opus` and `sol` show an
+alias's shape, not a list of them. agentmux keeps no built-in model roster; this machine's rewrites
 and blocks apply before launch, and the model and effort that run are forwarded verbatim. When the
 CLI refuses one, its own refusal comes back, usually naming what it accepts: look a current
-identifier up there rather than copying one from an example, which goes stale with the next
-release. A result whose model was rewritten names both, and
-a model the machine blocks is refused with the one to use instead. Pin the model every time —
-inheriting a default is how an expensive question reaches a cheap model. Pin the effort too for
-anything that matters: left out, the machine's configured default for that model is used, or the
-CLI's own when it has none, and the result says which effort ran.
+identifier up there rather than copying one from an example, which goes stale with the next release.
+A result whose model was rewritten names both. Pin the model every time — inheriting a default is
+how an expensive question reaches a cheap model. Pin the effort too for anything that matters: left
+out, the machine's configured default for that model is used, or the CLI's own when it has none, and
+the result says which effort ran.
 
 Write the question for a stranger. The delegate shares no conversation with you and cannot ask you
 anything: name the paths it should read and the shape of the answer you want. It reads your project
@@ -848,7 +864,12 @@ mod tests {
                 .server
                 .quota(Parameters(QuotaParams { delegate }))
                 .or_fail()?;
-            Ok(format!("{:?}", reported.content))
+            let text = reported
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .or_fail()?;
+            Ok(text.text.clone())
         }
     }
 
@@ -906,8 +927,9 @@ mod tests {
         assert_that!(
             instructions,
             contains_substring(
-                "Blocked models, refused when a new consultation would launch them — codex: \
-                 `gpt-5.6-sol` (use `sol`), `gpt-6-sol` (use `sol`: gpt-6.1-sol is much cheaper)."
+                "Blocked models, refused when a new consultation would launch them — codex \
+                 `gpt-5.6-sol`: use model \"sol\" instead; codex `gpt-6-sol`: use model \"sol\" \
+                 instead (gpt-6.1-sol is much cheaper)."
             )
         );
         // A snapshot, and the caller is told which call re-reads it.
@@ -918,11 +940,17 @@ mod tests {
         // Set apart from the accounts above and the isolation paragraph below.
         assert_that!(
             instructions,
-            contains_substring("answer now.\n\nModel aliases on this machine")
+            contains_substring(indoc::indoc! {"
+                answer now.
+
+                Model aliases on this machine"})
         );
         assert_that!(
             instructions,
-            contains_substring("started with.\n\nA delegate loads")
+            contains_substring(indoc::indoc! {"
+                started with.
+
+                A delegate loads"})
         );
         Ok(())
     }
@@ -947,7 +975,10 @@ mod tests {
         assert_that!(instructions, not(contains_substring("Blocked models")));
         assert_that!(
             instructions,
-            contains_substring("answer now.\n\nA delegate loads")
+            contains_substring(indoc::indoc! {"
+                answer now.
+
+                A delegate loads"})
         );
         Ok(())
     }
@@ -970,7 +1001,7 @@ mod tests {
         assert_that!(instructions, not(contains_substring("claude-opus-5-5[1m]")));
         assert_that!(
             instructions,
-            contains_substring("`gpt-5.6-sol` (use `sol`)")
+            contains_substring("codex `gpt-5.6-sol`: use model \"sol\" instead")
         );
 
         let quota = configured.quota_text(None)?;
@@ -1001,7 +1032,9 @@ mod tests {
         assert_that!(both, contains_substring("`sol` → `gpt-6.1-sol`"));
         assert_that!(
             both,
-            contains_substring("`gpt-6-sol` (use `sol`: gpt-6.1-sol is much cheaper)")
+            contains_substring(
+                "codex `gpt-6-sol`: use model \"sol\" instead (gpt-6.1-sol is much cheaper)"
+            )
         );
 
         // Asked about one vendor, it lists that vendor's rules alone, and says it blocks none.
@@ -1075,13 +1108,10 @@ mod tests {
         for refused in [started, asked] {
             let refusal = refused.err().or_fail()?;
             assert_that!(refusal.code, eq(ErrorCode::INVALID_PARAMS));
+            // The store's own tests own the wording; this proves it reaches the caller.
             assert_that!(
                 refusal.message.as_ref(),
-                eq(
-                    "codex model \"gpt-6-sol\" is blocked by this machine's agentmux \
-                     configuration; use model \"sol\" instead (gpt-6.1-sol is much cheaper). No \
-                     delegate was launched."
-                )
+                contains_substring("use model \"sol\"")
             );
         }
         assert_that!(configured.launcher.launches(), is_empty());
