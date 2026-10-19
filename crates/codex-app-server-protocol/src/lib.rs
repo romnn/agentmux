@@ -54,6 +54,13 @@ mod generated {
                   lists what it could not represent; fix what these flag in \
                   crates/codex-app-server-codegen"
     )]
+    #[allow(
+        rustdoc::broken_intra_doc_links,
+        rustdoc::bare_urls,
+        reason = "the docs are codex's own descriptions, which link to codex's Rust types and \
+                  cite bare URLs; an `allow`, since rustdoc alone runs these lints and an \
+                  `expect` would go unfulfilled under rustc"
+    )]
     pub mod schema;
 }
 
