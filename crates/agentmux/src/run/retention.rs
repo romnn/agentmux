@@ -43,16 +43,26 @@ impl RunStore {
     /// that the child left, and one that outlived its kill is still running.
     /// A child whose identity cannot be checked counts as alive, because deleting under it is
     /// the mistake that cannot be undone.
+    ///
+    /// A turn's supervisor is asked about too, because a settled marker does not mean it has
+    /// finished publishing; and a supervisor that left while spawning its delegate, recording
+    /// none, may have left one running that nothing can name.
     pub(super) fn a_child_is_alive(&self, run_id: &RunId) -> Result<bool, RunError> {
-        Ok(self
-            .turn_files(run_id)?
-            .into_iter()
-            .filter(|turn| match &turn.exit {
-                None | Some(ExitRecord::Cancelled { .. }) => true,
-                Some(ExitRecord::Exited { .. }) => false,
-            })
-            .filter_map(|turn| turn.launch)
-            .any(|record| !self.child_has_gone(record.launched)))
+        Ok(self.turn_files(run_id)?.into_iter().any(|turn| {
+            let delegate_may_run = match &turn.exit {
+                None | Some(ExitRecord::Cancelled { .. }) => turn
+                    .launch
+                    .as_ref()
+                    .is_some_and(|record| !self.child_has_gone(record.launched)),
+                Some(ExitRecord::Exited { .. } | ExitRecord::NotStarted { .. }) => false,
+            };
+            let unrecorded_start = turn.start_is_uncertain();
+            let supervisor_runs = turn
+                .supervisor
+                .as_ref()
+                .is_some_and(|supervisor| !self.child_has_gone(supervisor.launched));
+            delegate_may_run || unrecorded_start || supervisor_runs
+        }))
     }
 
     /// Delete consultations whose delegate last wrote anything more than `after` ago.

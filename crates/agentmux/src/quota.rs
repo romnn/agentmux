@@ -441,6 +441,7 @@ impl QuotaProbe for SystemProbe {
 /// billing variable whatever the account says: the probe of an account on API pricing is never
 /// spawned at all, because [`ProbeTarget::NoSubscriptionWindow`] is answered without one.
 fn probe_command(request: &ProbeRequest<'_>, program: &str) -> std::process::Command {
+    crate::launch::keep_std_handles_from_children();
     let mut command = std::process::Command::new(program);
     command.env_clear();
     let mut env = base_env(request.host_env);

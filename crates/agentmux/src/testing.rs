@@ -46,6 +46,14 @@ pub struct Script {
     /// Such a child reports [`Liveness::Unknown`] until it is
     /// [marked gone](ScriptedLauncher::mark_process_gone).
     pub unidentifiable: bool,
+    /// How many observations — reaps and liveness checks — the child is still there for, after
+    /// which it has exited cleanly; `None` for a child whose [`Script::exit`] decides.
+    ///
+    /// For the race between two observations of one child in one reading of the store.
+    pub alive_for_observations: Option<usize>,
+    /// What such a child writes to `last-message.md` as it leaves, as Codex writes its closing
+    /// message on its way out.
+    pub last_message_on_departure: Option<String>,
 }
 
 impl Script {
@@ -110,6 +118,17 @@ impl Script {
         Self {
             events: events.into(),
             unidentifiable: true,
+            ..Self::default()
+        }
+    }
+
+    /// A child that emits `events` and is still there for the first `observations` times anything
+    /// reaps it or asks after it, and has exited cleanly from then on.
+    #[must_use]
+    pub fn leaves_after(events: impl Into<String>, observations: usize) -> Self {
+        Self {
+            events: events.into(),
+            alive_for_observations: Some(observations),
             ..Self::default()
         }
     }
@@ -200,6 +219,8 @@ pub struct ScriptedLauncher {
     killed: Mutex<Vec<u32>>,
     flushed: Mutex<BTreeSet<u32>>,
     gone_pids: Mutex<BTreeSet<u32>>,
+    /// How many times each child has been reaped or asked after.
+    observations: Mutex<BTreeMap<u32, usize>>,
 }
 
 impl ScriptedLauncher {
@@ -216,6 +237,7 @@ impl ScriptedLauncher {
             killed: Mutex::new(Vec::new()),
             flushed: Mutex::new(BTreeSet::new()),
             gone_pids: Mutex::new(BTreeSet::new()),
+            observations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -275,6 +297,31 @@ impl ScriptedLauncher {
 
     fn script_for(&self, index: usize) -> Script {
         lock(&self.scripts).get(index).cloned().unwrap_or_default()
+    }
+
+    /// Count one observation of `pid`, and say whether a child that leaves after a number of
+    /// them has left by this one, writing its closing message as it goes.
+    fn observe_departure(&self, pid: u32, index: usize, script: &Script) -> bool {
+        let Some(alive_for) = script.alive_for_observations else {
+            return false;
+        };
+        let seen = {
+            let mut observations = lock(&self.observations);
+            let seen = observations.entry(pid).or_insert(0);
+            *seen = seen.saturating_add(1);
+            *seen
+        };
+        if seen == alive_for.saturating_add(1)
+            && let Some(text) = &script.last_message_on_departure
+            && let Some(recorded) = lock(&self.launches).get(index)
+        {
+            std::fs::write(recorded.events.with_file_name("last-message.md"), text)
+                .inspect_err(|err| {
+                    tracing::warn!(?err, "a scripted closing message was not written");
+                })
+                .ok();
+        }
+        seen > alive_for
     }
 
     /// Append the script's late tail the first time the child is observed.
@@ -350,6 +397,7 @@ impl Launcher for ScriptedLauncher {
         self.flush_on_first_observation(launched.pid, index, &script);
 
         if script.exit.is_some()
+            || self.observe_departure(launched.pid, index, &script)
             || (self.stopped(launched.pid) && !script.survives_stop)
             || lock(&self.gone_pids).contains(&launched.pid)
         {
@@ -379,6 +427,9 @@ impl Launcher for ScriptedLauncher {
         let index = self.launch_index_for_pid(launched.pid)?;
         let script = self.script_for(index);
         self.flush_on_first_observation(launched.pid, index, &script);
+        if self.observe_departure(launched.pid, index, &script) {
+            return Some(0.into());
+        }
         script.exit.or_else(|| {
             // A stopped child reports the signal that stopped it, as a real one would.
             (self.stopped(launched.pid) && !script.survives_stop).then_some(ExitStatus {
@@ -387,6 +438,18 @@ impl Launcher for ScriptedLauncher {
             })
         })
     }
+}
+
+/// Keeps this process's standard handles out of the processes it starts, as agentmux does before
+/// every spawn of its own.
+///
+/// A test that runs the real `agentmux` with its output captured calls it before each spawn.
+/// On Windows the test's own standard handles are the runner's capture pipes, and without it
+/// they would pass to `agentmux` beside the pipes the test gives it, and on from there into the
+/// detached supervisor and delegate, where agentmux cannot tell them from any other handle.
+/// Elsewhere it does nothing.
+pub fn keep_std_handles_from_children() {
+    crate::launch::keep_std_handles_from_children();
 }
 
 /// A recorded event stream, committed under `fixtures/`.

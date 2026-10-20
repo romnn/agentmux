@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Billing, Delegate, ModelId, SessionRef};
 use crate::launch::{ExitStatus, Launched};
+use crate::transcript::Outcome;
 
+use super::SettledBy;
 use super::error::RunError;
 use super::id::RunId;
 use super::layout::TurnDir;
@@ -80,10 +82,69 @@ pub struct Meta {
     pub force_codex_exec: bool,
 }
 
+/// The turn's delegate, recorded once it is running.
+///
+/// Under a supervisor this names the delegate the supervisor started, not the supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct LaunchRecord {
     pub(super) launched: Launched,
     pub(super) started_at: DateTime<Utc>,
+}
+
+/// The `agentmux supervise` process responsible for a turn, recorded by the caller that launched
+/// it before the run's lock is released.
+///
+/// Its own identity, apart from the delegate's in [`LaunchRecord`], because the two processes
+/// outlive each other in both directions: a supervisor publishes after its delegate has gone,
+/// and a delegate keeps running when its supervisor crashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct SupervisorRecord {
+    /// The launch this supervisor was started for, which it checks against its plan before
+    /// starting anything.
+    pub(super) launch_id: String,
+    pub(super) launched: Launched,
+    pub(super) started_at: DateTime<Utc>,
+    pub(super) phase: SupervisorPhase,
+}
+
+/// How far a supervisor got towards starting its delegate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupervisorPhase {
+    /// Recorded by its caller; nothing has been spawned.
+    Prepared,
+    /// The supervisor is about to spawn the delegate, under the run's lock.
+    ///
+    /// A supervisor found gone in this phase with no [`LaunchRecord`] may have started a
+    /// delegate it never recorded, so its turn is neither settled nor replaced.
+    Spawning,
+}
+
+/// What a supervisor is to run, written into the turn directory before it is launched.
+///
+/// Carries no environment: the supervisor is launched with the delegate's environment, already
+/// resolved, and hands it on unchanged, so no credential is ever written to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct SupervisorPlan {
+    /// The run store's root, absolute.
+    pub(super) store_root: PathBuf,
+    /// The consultation.
+    pub(super) run_id: RunId,
+    /// The turn's zero-based index.
+    pub(super) turn_index: u32,
+    /// The launch this plan belongs to, which the [`SupervisorRecord`] must name.
+    pub(super) launch_id: String,
+    /// What to run as the delegate.
+    pub(super) producer: ProducerCommand,
+}
+
+/// The delegate a supervisor starts, as the initiating process prepared it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ProducerCommand {
+    pub(super) program: String,
+    pub(super) args: Vec<String>,
+    pub(super) cwd: PathBuf,
+    pub(super) billing: Billing,
 }
 
 /// How a turn's child ended, as far as agentmux could tell.
@@ -114,6 +175,11 @@ pub(super) enum ExitRecord {
         /// child could not be made to go.
         events_len: u64,
     },
+    /// Its supervisor never started it: the spawn failed, or the supervisor left before trying.
+    NotStarted {
+        /// Why, in the words of whoever found out.
+        reason: String,
+    },
 }
 
 impl ExitRecord {
@@ -121,17 +187,243 @@ impl ExitRecord {
     pub(super) fn events_len(&self) -> u64 {
         match self {
             Self::Exited { events_len, .. } | Self::Cancelled { events_len } => *events_len,
+            Self::NotStarted { .. } => 0,
         }
     }
 }
 
-/// One turn's directory with the two records that decide whether it is a turn at all.
+/// One turn's directory with the records that decide whether it is a turn at all, and whether
+/// it has settled.
 #[derive(Debug)]
 pub(super) struct TurnFiles {
     pub(super) index: u32,
     pub(super) dir: TurnDir,
     pub(super) launch: Option<LaunchRecord>,
     pub(super) exit: Option<ExitRecord>,
+    pub(super) supervisor: Option<SupervisorRecord>,
+    pub(super) settled: Option<SettledRecord>,
+}
+
+impl TurnFiles {
+    /// Whether the directory is a turn rather than a claim.
+    pub(super) fn is_recorded(&self) -> bool {
+        self.launch.is_some() || self.exit.is_some() || self.supervisor.is_some()
+    }
+
+    /// Whether the turn's supervisor left while spawning its delegate without recording it, so a
+    /// delegate may be running that nothing names.
+    ///
+    /// Read under the run's lock, this needs no process lookup: a supervisor spawns and records
+    /// its delegate under one hold of the lock, so one seen in that phase with no launch record
+    /// has died there.
+    /// Only a record that the spawn failed resolves it; a cancellation cannot, because nothing it
+    /// could stop is known.
+    pub(super) fn start_is_uncertain(&self) -> bool {
+        self.launch.is_none()
+            && !matches!(self.exit, Some(ExitRecord::NotStarted { .. }))
+            && self
+                .supervisor
+                .as_ref()
+                .is_some_and(|supervisor| supervisor.phase == SupervisorPhase::Spawning)
+    }
+}
+
+/// `settled.json` as it is written: the commitment that a turn's transcript is published and
+/// final.
+///
+/// Read through [`super::SettledTurn`], which validates it against the files it vouches for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct SettledRecord {
+    /// Exactly [`SettledRecord::VERSION`].
+    pub(super) version: u32,
+    pub(super) turn_index: u32,
+    pub(super) outcome: Outcome,
+    pub(super) settled_by: SettledBy,
+    /// The complete-record prefix of `events.jsonl` the turn was folded from.
+    pub(super) events_len: u64,
+    /// The length of `recovered.md` the turn rendered, or `None` when it recovered no reply.
+    pub(super) recovered_bytes: Option<u64>,
+    /// Where the turn's section starts in `transcript.md`.
+    pub(super) transcript_start: u64,
+    /// Where it ends, exclusive: everything before this offset is published and never changes.
+    pub(super) transcript_end: u64,
+}
+
+impl SettledRecord {
+    /// The one schema version this agentmux reads and writes.
+    pub(super) const VERSION: u32 = 1;
+}
+
+/// A turn whose end is committed: its transcript is published through
+/// [`SettledTurn::transcript_end`], and nothing before that offset will change.
+///
+/// Read from the turn's `settled.json`, which is written last, after the transcript it describes,
+/// and only once the turn's delegate has gone or a cancellation froze it.
+/// Built only by validating that record against the files it vouches for, so a value of this type
+/// never names a running turn or bytes that are not on disk.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettledTurn {
+    run_id: RunId,
+    #[serde(rename = "turn", serialize_with = "turn_number")]
+    turn_index: u32,
+    outcome: Outcome,
+    settled_by: SettledBy,
+    transcript_start: u64,
+    transcript_end: u64,
+    transcript_path: PathBuf,
+    #[serde(rename = "settled_path")]
+    marker_path: PathBuf,
+}
+
+/// A zero-based turn index, written as the one-based number the transcript's headings show.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` hands the field over by reference"
+)]
+pub(super) fn turn_number<S: serde::Serializer>(
+    index: &u32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u32(index.saturating_add(1))
+}
+
+impl SettledTurn {
+    /// Check a marker against the inputs it froze, and keep it if it holds.
+    ///
+    /// `transcript_path` is the consultation's published transcript, which is a cache a fold
+    /// writes again whenever it is missing, so its length is checked where a page of it is read,
+    /// in [`SettledTurn::page`], rather than here.
+    pub(super) fn validate(
+        run_id: &RunId,
+        dir: &TurnDir,
+        index: u32,
+        transcript_path: &Path,
+        record: &SettledRecord,
+    ) -> Result<Self, RunError> {
+        let marker_path = dir.settled();
+        let invalid = |reason: String| RunError::InvalidSettlement {
+            path: marker_path.clone(),
+            reason,
+        };
+        if record.version != SettledRecord::VERSION {
+            return Err(invalid(format!(
+                "it has version {}, and this agentmux reads only version {}",
+                record.version,
+                SettledRecord::VERSION
+            )));
+        }
+        if record.turn_index != index {
+            return Err(invalid(format!(
+                "it names turn index {}, but it is in the directory of turn index {index}",
+                record.turn_index
+            )));
+        }
+        if !record.outcome.is_terminal() {
+            return Err(invalid("its outcome is not terminal".to_owned()));
+        }
+        if record.transcript_start > record.transcript_end {
+            return Err(invalid(format!(
+                "its transcript range {}..{} is reversed",
+                record.transcript_start, record.transcript_end
+            )));
+        }
+        // Each length is a prefix of an input the marker froze, so the file it measures must hold
+        // at least that much; a shorter one was truncated or replaced after the commitment.
+        let committed = [
+            (dir.events(), record.events_len),
+            (dir.recovered(), record.recovered_bytes.unwrap_or(0)),
+        ];
+        for (path, committed_len) in committed {
+            if committed_len == 0 {
+                continue;
+            }
+            let on_disk = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            if on_disk < committed_len {
+                return Err(invalid(format!(
+                    "it commits {committed_len} bytes of {}, which holds {on_disk}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(Self {
+            run_id: run_id.clone(),
+            turn_index: index,
+            outcome: record.outcome.clone(),
+            settled_by: record.settled_by,
+            transcript_start: record.transcript_start,
+            transcript_end: record.transcript_end,
+            transcript_path: transcript_path.to_path_buf(),
+            marker_path,
+        })
+    }
+
+    /// The consultation.
+    #[must_use]
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// The turn's zero-based index, as its directory is named.
+    #[must_use]
+    pub fn turn_index(&self) -> u32 {
+        self.turn_index
+    }
+
+    /// The turn's one-based number, as the transcript's headings and every front end show it.
+    #[must_use]
+    pub fn turn_number(&self) -> u32 {
+        self.turn_index.saturating_add(1)
+    }
+
+    /// How the turn ended: completed, failed or cancelled, never running.
+    #[must_use]
+    pub fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
+
+    /// What decided the outcome.
+    #[must_use]
+    pub fn settled_by(&self) -> SettledBy {
+        self.settled_by
+    }
+
+    /// Where the turn's own section starts in the published transcript, in bytes.
+    #[must_use]
+    pub fn transcript_start(&self) -> u64 {
+        self.transcript_start
+    }
+
+    /// Where a reader of this turn starts: the top for the first turn, which carries the
+    /// consultation's header, and the turn's own section for a later one, as a follow-up's reply
+    /// carries that turn alone.
+    #[must_use]
+    pub fn section_offset(&self) -> u64 {
+        if self.turn_index == 0 {
+            0
+        } else {
+            self.transcript_start
+        }
+    }
+
+    /// Where the published transcript through this turn ends, exclusive, in bytes.
+    ///
+    /// A follow-up appends after this offset; nothing before it ever changes.
+    #[must_use]
+    pub fn transcript_end(&self) -> u64 {
+        self.transcript_end
+    }
+
+    /// The consultation's published transcript.
+    #[must_use]
+    pub fn transcript_path(&self) -> &Path {
+        &self.transcript_path
+    }
+
+    /// The turn's `settled.json`.
+    #[must_use]
+    pub fn marker_path(&self) -> &Path {
+        &self.marker_path
+    }
 }
 
 /// What was tried, recorded before the spawn so a failed launch still leaves evidence.

@@ -14,15 +14,21 @@ session.
 
 **A follow-up is admitted only on evidence that the newest turn's delegate has exited.**
 `RunStore::delegate_has_exited` (`crates/agentmux/src/run/mod.rs`) accepts as evidence an `Exited`
-exit record, a turn with no launch record, a child the launcher reaps, or a recorded child the
-launcher reports `Gone`. A child whose identity cannot be checked has not exited
-([0010](0010-pids-and-start-times.md)): it may be the delegate still saving.
+or `NotStarted` exit record, an unsupervised turn with no launch record, a child the launcher
+reaps, or a recorded child the launcher reports `Gone`. A supervised turn whose delegate is not
+recorded yet has not exited: its supervisor is still starting it. A child whose identity cannot be
+checked has not exited ([0010](0010-pids-and-start-times.md)): it may be the delegate still saving.
 
 `resumable_session` (`crates/agentmux/src/run/spawn.rs`) is the one predicate behind both
-`follow_up` and `status.resumable`. It refuses with `NotResumable::AwaitingDelegateExit` when the
-newest turn is terminal but its delegate has not exited, after the checks that the turn is finished,
-was not cancelled and saved its session. Only the newest turn is asked, because its child is the one
-whose session a follow-up continues, and asking costs a process lookup.
+`follow_up` and `status.resumable`. `follow_up` asks it after publishing the consultation and
+committing every settled turn under the admission lock, and the evidence it reads is that commit:
+the newest turn is settled, which the fold decides from one observation of its delegate, so the
+turn it continues has its `settled.json`, with any reply its CLI wrote on the way out, before the
+next one is claimed ([0025](0025-eager-settlement-and-terminal-waiting.md)). It refuses with
+`NotResumable::AwaitingDelegateExit` when the newest turn is terminal but not yet settled, after
+the checks that the turn is finished, was not cancelled and saved its session. Only
+the newest turn is asked, because its child is the one whose session a follow-up continues, and
+asking costs a process lookup.
 
 The same evidence decides when a Codex turn's rate-limit lookup is final: a rollout read before the
 delegate exited may be incomplete, so a miss is cached only after it has

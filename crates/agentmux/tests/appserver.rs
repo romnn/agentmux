@@ -1409,12 +1409,14 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
     assert_that!(witness.completion_observed, eq(true));
     assert_that!(witness.closing_message_at_completion, some(eq(PLAN)));
 
-    // The store reads the same two files the driver left.
+    // The store reads the same two files the driver left, while the driver is still there, as
+    // it is when it writes them: a turn is settled with what it recovered once its driver has
+    // gone.
     let state = tempfile::tempdir().or_fail()?;
     let capture = String::from_utf8(witness.capture).or_fail()?;
     let store = RunStore::open(
         state.path(),
-        Arc::new(ScriptedLauncher::new([LaunchScript::completed(capture)])),
+        Arc::new(ScriptedLauncher::new([LaunchScript::running(capture)])),
         [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))

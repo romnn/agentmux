@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use agentmux::delegate::Vendor;
 use googletest::prelude::*;
 
-/// The ten tools, and nothing else.
+/// The eleven tools, and nothing else.
 #[gtest]
 fn the_server_offers_exactly_the_documented_tools() {
     let names: BTreeSet<String> = agentmux_mcp::tool_router(&BTreeSet::new())
@@ -26,6 +26,7 @@ fn the_server_offers_exactly_the_documented_tools() {
         "result",
         "follow_up",
         "steer",
+        "wait",
         "cancel",
         "list",
         "quota",
@@ -144,7 +145,7 @@ fn the_required_arguments_are_the_unguessable_ones() {
     );
     assert_that!(required("follow_up"), eq(&set(&["run_id", "question"])));
     assert_that!(required("steer"), eq(&set(&["run_id", "message"])));
-    for name in ["status", "tail", "result", "cancel"] {
+    for name in ["status", "tail", "result", "wait", "cancel"] {
         assert_that!(required(name), eq(&set(&["run_id"])), "{name}");
     }
     assert_that!(required("list"), is_empty());

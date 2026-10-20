@@ -17,7 +17,8 @@ use super::id::RunId;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, read_json, write_json,
+    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SupervisorPhase,
+    SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
 use super::status::RunStatus;
@@ -139,7 +140,9 @@ impl RunStore {
     /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
     /// would run, before anything is written or launched; a follow-up is never refused for a
     /// block added after its consultation started.
-    /// A failed start leaves no run directory behind.
+    /// A start that fails before its turn is recorded leaves no run directory behind.
+    /// Under a supervisor, a delegate that then cannot be started is a failed turn, kept with the
+    /// reason.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
         // refused request leaves no half-made consultation for `list` to report as running.
@@ -293,8 +296,11 @@ impl RunStore {
             // Admitted and claimed under one lock, so the turn a follow-up was admitted against is
             // the one it continues: nobody can claim the next index, or settle the newest turn
             // differently, in between.
+            // Published and settled under that same hold, so the turn being continued is committed
+            // before the next one is claimed, and a waiter pinned to it can never be handed the
+            // follow-up instead.
             let run = self.lock(run_id)?;
-            let state = run.fold_run(&meta)?;
+            let state = run.fold_and_publish(&meta)?.state;
             let session = Self::resumable_session(run_id, &state)?;
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
@@ -341,9 +347,12 @@ impl RunStore {
                 store: store.to_path_buf(),
             });
         }
+        // Settled, so the turn being continued is committed, with the reply its CLI wrote on the
+        // way out, before another turn is claimed after it; and exited, because a turn a
+        // cancellation froze is settled while a delegate that survived it may still be saving.
         if state
             .newest
-            .is_some_and(|newest| !newest.delegate_has_exited)
+            .is_some_and(|newest| !(newest.settled && newest.delegate_gone))
         {
             return Err(NotResumable::AwaitingDelegateExit {
                 run_id: run_id.clone(),
@@ -546,6 +555,9 @@ impl RunStore {
             "launching delegate",
         );
 
+        if let Some(supervisor) = &self.supervisor {
+            return self.launch_supervisor(turn, meta, index, &invocation, supervisor);
+        }
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
@@ -570,6 +582,73 @@ impl RunStore {
         tracing::debug!(run_id = %meta.run_id, turn = index, pid = launched.pid, "delegate running");
         Ok(())
     }
+
+    /// Launch the turn's supervisor, which starts `delegate` itself, and record it.
+    ///
+    /// The plan names what to run and the launch it belongs to; the environment travels as the
+    /// supervisor's own, so nothing secret is written down and nothing is resolved twice.
+    /// The supervisor waits on the run's lock, which the caller holds until the record below is
+    /// written, and starts nothing unless that record names it and its launch.
+    /// Everything that fails from here on is a turn that failed, kept with its evidence.
+    fn launch_supervisor(
+        &self,
+        turn: &TurnDir,
+        meta: &Meta,
+        index: u32,
+        delegate: &crate::delegate::Invocation,
+        supervisor: &Path,
+    ) -> Result<(), RunError> {
+        let launch_id = uuid::Uuid::new_v4().simple().to_string();
+        let plan_path = turn.supervisor_plan_path();
+        write_json(
+            &plan_path,
+            &SupervisorPlan {
+                store_root: self.root.clone(),
+                run_id: meta.run_id.clone(),
+                turn_index: index,
+                launch_id: launch_id.clone(),
+                producer: ProducerCommand {
+                    program: delegate.program().to_owned(),
+                    args: delegate.args().to_vec(),
+                    cwd: meta.cwd.clone(),
+                    billing: delegate.billing(),
+                },
+            },
+        )?;
+        let mut invocation = delegate.clone();
+        invocation.set_driver_command(supervisor, super::SUPERVISE_SUBCOMMAND, &plan_path);
+        // Its stdout and stderr are its own log, never the capture.
+        let log = turn.supervisor_log();
+        let launched = self.launcher.launch(&LaunchSpec {
+            invocation: &invocation,
+            cwd: &meta.cwd,
+            question: &turn.question(),
+            events: &log,
+            stderr: &log,
+        })?;
+        let recorded = write_json(
+            &turn.supervisor(),
+            &SupervisorRecord {
+                launch_id,
+                launched,
+                started_at: Utc::now(),
+                phase: SupervisorPhase::Prepared,
+            },
+        );
+        if let Err(error) = recorded {
+            // Unrecorded, it would start nothing, but it is stopped rather than left to find out.
+            self.launcher.terminate(launched);
+            self.launcher.kill(launched);
+            return Err(error);
+        }
+        tracing::debug!(
+            run_id = %meta.run_id,
+            turn = index,
+            pid = launched.pid,
+            "supervisor running"
+        );
+        Ok(())
+    }
 }
 
 /// Claim a turn index by creating its directory.
@@ -592,7 +671,8 @@ pub(super) fn claim_turn(turn: &TurnDir, index: u32, run_id: &RunId) -> Result<(
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
             let recorded = read_json::<LaunchRecord>(&turn.launch())?.is_some()
-                || read_json::<ExitRecord>(&turn.exit())?.is_some();
+                || read_json::<ExitRecord>(&turn.exit())?.is_some()
+                || read_json::<SupervisorRecord>(&turn.supervisor())?.is_some();
             if recorded {
                 return Err(RunError::TurnAlreadyClaimed {
                     run_id: run_id.clone(),

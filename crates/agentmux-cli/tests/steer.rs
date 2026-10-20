@@ -1,10 +1,10 @@
-//! A steered consultation end to end: the real `agentmux` executable as the driver, against a
-//! fake `codex` that speaks the app-server protocol.
+//! A steered consultation end to end: the real `agentmux` executable as the supervisor and the
+//! driver, against a fake `codex` that speaks the app-server protocol.
 //!
 //! Everything between the caller and the server is real here — the `agentmux steer` command, the
-//! detached launch, the driver's handshake, the mailbox, `turn/steer`, the follow-up's
-//! `thread/resume`, and the cancellation that interrupts over the protocol — and nothing reaches
-//! a vendor.
+//! detached supervisor and the driver it starts, the driver's handshake, the mailbox,
+//! `turn/steer`, the follow-up's `thread/resume`, and the cancellation that interrupts over the
+//! protocol — and nothing reaches a vendor.
 //! The fake is `codex-app-server-mock`'s `codex` binary, built for the test run on first use; it
 //! reads its scenario ([`codex_app_server_mock::scenario`]) from codex's home, where the driver
 //! lets codex's own variables through.
@@ -75,8 +75,8 @@ struct CliTestHarness {
     command_pids_path: PathBuf,
 }
 
-/// A store whose Codex turns are driven by the `agentmux` under test, with the fake on `PATH` and
-/// keys for both vendors in the environment agentmux was started with.
+/// A store whose Codex turns are supervised and driven by the `agentmux` under test, with the fake
+/// on `PATH` and keys for both vendors in the environment agentmux was started with.
 ///
 /// Each turn runs until steered, which completes it, or interrupted, and starts a command in a
 /// session of its own that it leaves running however it ends, as codex's sandbox does.
@@ -116,7 +116,8 @@ fn cli_harness() -> Result<CliTestHarness> {
         host_env.clone(),
     )
     .or_fail()?
-    .with_codex_app_server(env!("CARGO_BIN_EXE_agentmux"));
+    .with_codex_app_server(env!("CARGO_BIN_EXE_agentmux"))
+    .with_supervisor(env!("CARGO_BIN_EXE_agentmux"));
     Ok(CliTestHarness {
         _root: root,
         store,
@@ -254,6 +255,18 @@ async fn until_received(log: &Path, method: &str, count: usize) -> bool {
     false
 }
 
+/// Wait a few seconds for `path` to exist.
+async fn until_exists(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Wait for the driver to announce the consultation's turn, which takes no steer before that.
 async fn until_steerable(store: &RunStore, id: &RunId) -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -314,6 +327,20 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     assert_that!(
         String::from_utf8_lossy(&steered.stdout).into_owned(),
         contains_substring("steered: the delegate accepted the message")
+    );
+    // The supervisor settles the turn once the driver has cleaned up and gone, with nothing
+    // asking: its marker appears on its own.
+    let turn_dir = |index: u32| {
+        harness
+            .state_dir
+            .join("runs")
+            .join(id.as_str())
+            .join("turns")
+            .join(format!("{index:04}"))
+    };
+    assert_that!(
+        until_exists(&turn_dir(0).join("settled.json")).await,
+        eq(true)
     );
     harness
         .store
@@ -395,6 +422,11 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     );
     let (_, page) = harness.store.view(&id, 0, 1_000_000)?;
     assert_that!(page.text, contains_substring("_Turn 2 cancelled."));
+    let cancelled_turn = harness
+        .store
+        .wait_for_settlement(&harness.store.pin_turn(&id, Some(2))?)
+        .await?;
+    assert_that!(cancelled_turn.outcome(), eq(&Outcome::Cancelled));
     // And so did the one the cancelled turn left running, in a session no signal to the driver
     // would have reached.
     assert_that!(

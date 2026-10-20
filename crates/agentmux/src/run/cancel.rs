@@ -8,6 +8,7 @@ use crate::launch::{Launched, Liveness};
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
+use super::layout::TurnDir;
 use super::records::{
     ExitRecord, InvocationRecord, LaunchMode, read_complete_records, read_json, write_json_once,
 };
@@ -50,8 +51,9 @@ impl RunStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::NotFound`] when there is no such consultation, and [`RunError::Io`]
-    /// when the cancellation cannot be recorded.
+    /// Returns [`RunError::NotFound`] when there is no such consultation,
+    /// [`RunError::UncertainStart`] when the newest turn's supervisor died while starting a
+    /// delegate it never recorded, and [`RunError::Io`] when the cancellation cannot be recorded.
     pub async fn cancel(&self, run_id: &RunId) -> Result<RunStatus, RunError> {
         let meta = self.meta(run_id)?;
         // Marked under the lock, which is released before anything slow: stopping can take
@@ -61,6 +63,16 @@ impl RunStore {
             let newest = self.turn_files(run_id)?.into_iter().last();
             match newest {
                 None => None,
+                // A turn whose supervisor died while spawning may have a delegate nothing names,
+                // so nothing could be stopped, and a cancellation recorded over it would read as
+                // the end of a turn that may still be running and billing.
+                Some(newest) if newest.start_is_uncertain() => {
+                    return Err(RunError::UncertainStart {
+                        run_id: run_id.clone(),
+                        turn: newest.index.saturating_add(1),
+                        dir: newest.dir.root.clone(),
+                    });
+                }
                 Some(newest) => {
                     let cancelling = !run.fold_turn(&meta, &newest)?.turn.outcome.is_terminal();
                     if cancelling {
@@ -76,27 +88,56 @@ impl RunStore {
         let Some((newest, cancelling)) = marked else {
             return self.status(run_id);
         };
+        // A supervised turn whose delegate is not recorded yet has nothing to stop: its
+        // supervisor starts nothing once it sees the marker, under the same lock.
+        // A supervisor that is running stops its delegate too, the same way, and either stop is
+        // checked against the delegate's identity, so the second finds nothing to do.
         if let Some(record) = newest.launch.as_ref() {
-            // A driven turn sees the marker and interrupts itself over the protocol, which lets
-            // the server close the turn and save it; it is given the chance before any signal.
-            // A driver whose turn has already ended may still be stopping what its server left
-            // running, and is given the same chance to finish.
-            let uses_app_server = read_json::<InvocationRecord>(&newest.dir.invocation())?
-                .is_some_and(|invocation| invocation.launch_mode == LaunchMode::AppServer);
-            if uses_app_server {
-                self.wait_for_delegate_exit(record.launched, Self::DRIVER_EXIT_GRACE)
-                    .await;
-            }
-            self.stop(record.launched).await;
+            self.stop_delegate(&newest.dir, record.launched).await?;
         }
         if cancelling {
-            // Frozen at the complete records that exist now, which is exactly what a later fold
-            // reads back, and under the lock, so no fold that publishes can read past it first.
-            let _run = self.lock(run_id)?;
-            let (_, events_len) = read_complete_records(&newest.dir.events(), None)?;
-            write_json_once(&newest.dir.exit(), &ExitRecord::Cancelled { events_len })?;
+            self.record_cancellation(run_id, &newest.dir)?;
         }
         self.status(run_id)
+    }
+
+    /// Stop a turn's delegate, giving a driven turn the chance to interrupt itself first.
+    ///
+    /// A driven turn sees the `cancelling` marker and interrupts itself over the protocol, which
+    /// lets the server close the turn and save it; it is given the chance before any signal.
+    /// A driver whose turn has already ended may still be stopping what its server left running,
+    /// and is given the same chance to finish.
+    pub(super) async fn stop_delegate(
+        &self,
+        dir: &TurnDir,
+        launched: Launched,
+    ) -> Result<(), RunError> {
+        let uses_app_server = read_json::<InvocationRecord>(&dir.invocation())?
+            .is_some_and(|invocation| invocation.launch_mode == LaunchMode::AppServer);
+        if uses_app_server {
+            self.wait_for_delegate_exit(launched, Self::DRIVER_EXIT_GRACE)
+                .await;
+        }
+        self.stop(launched).await;
+        Ok(())
+    }
+
+    /// Record a turn's cancellation and settle it, whether or not its delegate left.
+    ///
+    /// Frozen at the complete records that exist now, which is exactly what a later fold reads
+    /// back, and under the lock, so no fold that publishes can read past it first.
+    /// A record another caller wrote first is adopted.
+    pub(super) fn record_cancellation(
+        &self,
+        run_id: &RunId,
+        dir: &TurnDir,
+    ) -> Result<(), RunError> {
+        let meta = self.meta(run_id)?;
+        let run = self.lock(run_id)?;
+        let (_, events_len) = read_complete_records(&dir.events(), None)?;
+        write_json_once(&dir.exit(), &ExitRecord::Cancelled { events_len })?;
+        run.fold_and_publish(&meta)?;
+        Ok(())
     }
 
     /// Ask a child to stop, then make it, and wait until it has gone.
