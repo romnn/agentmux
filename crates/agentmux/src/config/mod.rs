@@ -38,8 +38,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
+use trust::refuse_if_untrusted;
 
 mod model_rules;
+mod trust;
 
 pub use model_rules::{BlockedModel, ModelRules, RefusedModel, ResolvedModel};
 
@@ -1176,54 +1178,6 @@ fn warn_unknown(unknown: &[UnknownKey]) {
         // unexpectedly, not whoever started the process.
         tracing::warn!(%unknown, "this agentmux does not read that key, and is ignoring it");
     }
-}
-
-/// Refuse a configuration file that another user owns or could write.
-///
-/// It can name commands, endpoints and credentials, so a writable file is an injection point
-/// rather than merely an exposed one — the same reason `ssh` refuses a group-writable config.
-/// Ownership matters for the same reason: a project walk can pass through directories other
-/// users write to, and a file they own with tidy permissions is still theirs.
-/// Readability is not checked: `0644` is normal inside a container image, and failing a delegation
-/// over it would cost a turn for no gain.
-#[cfg(unix)]
-fn refuse_if_untrusted(path: &Path, file: &std::fs::File) -> Result<(), ConfigError> {
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let Ok(metadata) = file.metadata() else {
-        // An unreadable file is reported by the read that follows, with a better message.
-        return Ok(());
-    };
-    let refuse = |problem| {
-        Err(ConfigError::Untrusted {
-            path: path.to_path_buf(),
-            problem,
-        })
-    };
-    if !metadata.is_file() {
-        return refuse("is not a regular file");
-    }
-    if metadata.uid() != nix::unistd::geteuid().as_raw() {
-        return refuse("is owned by another user");
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return refuse("is writable by other users");
-    }
-    Ok(())
-}
-
-/// Permission bits and ownership do not carry the same meaning on Windows, so only the shape is
-/// checked there.
-#[cfg(not(unix))]
-fn refuse_if_untrusted(path: &Path, file: &std::fs::File) -> Result<(), ConfigError> {
-    if file.metadata().is_ok_and(|metadata| !metadata.is_file()) {
-        return Err(ConfigError::Untrusted {
-            path: path.to_path_buf(),
-            problem: "is not a regular file",
-        });
-    }
-    Ok(())
 }
 
 /// The user's home directory, as the host environment reports it.

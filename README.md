@@ -231,9 +231,10 @@ such a file arrives with a `git clone`: were it able to name a `base_url` and an
 cloning a repository and asking for one second opinion would send your key to whoever wrote it. For
 the same reason a project file may choose *which* of your accounts pays but nothing more: an account
 it selects runs isolated unless the call says otherwise, and does not bring its own `request_env`
-with it. On Unix either file is read only when you own it and nobody else can write it (other
-platforms check only that it is a regular file), and a file that cannot be parsed is reported by
-position, never by quoting the line.
+with it. On Unix either file is read only when you own it and nobody else can write it: a group
+write bit is accepted only when the account databases report you as the group's sole member, as in
+the user-private groups behind Ubuntu's default umask `002` (other platforms check only that it is a
+regular file), and a file that cannot be parsed is reported by position, never by quoting the line.
 
 **A key agentmux does not know is a warning, not a failure.** One machine file is read by every
 agentmux on the machine, including the MCP servers that have been running since before you added
