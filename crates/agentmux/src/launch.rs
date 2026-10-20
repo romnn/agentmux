@@ -639,6 +639,12 @@ mod identity {
 /// Called before every spawn, because it is the process's state that is changed, and a library
 /// cannot know what its embedder did with it since.
 ///
+/// Only the standard handles are covered.
+/// Any other inheritable handle the process holds, such as one an embedder opened as inheritable
+/// or one this process inherited beside its standard handles, still reaches every child;
+/// excluding those would take a per-child list of the handles to inherit, which the standard
+/// library does not offer.
+///
 /// Elsewhere nothing is needed: a child's standard descriptors are replaced by its own, and every
 /// other descriptor the standard library opens is closed on exec.
 pub(crate) fn keep_std_handles_from_children() {
@@ -658,10 +664,13 @@ pub(crate) fn keep_std_handles_from_children() {
             if handle.is_null() {
                 continue;
             }
-            // SAFETY: `handle` is one of this process's standard handles as the standard library
-            // reads them, which nothing in the process closes, or `INVALID_HANDLE_VALUE`, which
-            // the call refuses without effect; clearing the inherit flag touches no memory, only
-            // whether later children receive the handle.
+            // SAFETY: The call dereferences no memory through `handle`.
+            // It only clears the inherit flag in the entry the process's handle table holds for
+            // that value, which changes nothing but whether later children receive the handle.
+            // A value that names no open handle, such as `INVALID_HANDLE_VALUE` or a standard
+            // handle closed since, makes the call fail without effect.
+            // A value reused by another handle since would make that one non-inheritable instead,
+            // which is equally harmless to memory.
             #[expect(
                 unsafe_code,
                 reason = "the standard library offers no safe way to stop a handle being inherited, \

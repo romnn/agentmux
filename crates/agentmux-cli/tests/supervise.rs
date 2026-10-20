@@ -18,23 +18,39 @@ use std::time::{Duration, Instant};
 use agentmux::testing::fixtures;
 use googletest::prelude::*;
 
-/// The fake delegate, built once per test process with the profile and target the tests run with.
-fn fake_delegate() -> Result<PathBuf> {
-    static BUILT: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
-        std::sync::OnceLock::new();
-    BUILT
+/// An example of this package, built once per test process into `built` with the profile and
+/// target the tests run with.
+fn example(
+    built: &std::sync::OnceLock<std::result::Result<PathBuf, String>>,
+    name: &str,
+) -> Result<PathBuf> {
+    built
         .get_or_init(|| {
             escargot::CargoBuild::new()
                 .package("agentmux-cli")
-                .example("fake-delegate")
+                .example(name)
                 .current_release()
                 .current_target()
                 .run()
                 .map(|built| built.path().to_path_buf())
-                .map_err(|err| format!("cannot build the fake delegate: {err}"))
+                .map_err(|err| format!("cannot build the {name} example: {err}"))
         })
         .clone()
         .or_fail()
+}
+
+/// The fake delegate.
+fn fake_delegate() -> Result<PathBuf> {
+    static BUILT: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+        std::sync::OnceLock::new();
+    example(&BUILT, "fake-delegate")
+}
+
+/// A caller that captures the command it runs, standing between a test and `agentmux`.
+fn capture_wrapper() -> Result<PathBuf> {
+    static BUILT: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+        std::sync::OnceLock::new();
+    example(&BUILT, "capture-wrapper")
 }
 
 /// What the fake delegate does, as its configuration file spells it.
@@ -83,8 +99,13 @@ fn machine(run: &FakeRun<'_>) -> Result<Machine> {
 impl Machine {
     /// `agentmux` with `args`, in the project, with this machine's environment and nothing else.
     fn agentmux(&self, args: &[&str]) -> Command {
+        self.command(Path::new(env!("CARGO_BIN_EXE_agentmux")), args)
+    }
+
+    /// `program` with `args`, in the project, with this machine's environment and nothing else.
+    fn command(&self, program: &Path, args: &[&str]) -> Command {
         let home = self.root.path().join("home");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agentmux"));
+        let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(self.root.path().join("project"))
@@ -108,25 +129,7 @@ impl Machine {
     /// Its output is a pipe, as a host capturing it has: the supervisor and the delegate it
     /// starts outlive the command, and must hold none of that pipe.
     fn start(&self) -> Result<String> {
-        let output = run_in_background(self.agentmux(&[
-            "start",
-            "--json",
-            "--delegate",
-            "claude",
-            "--model",
-            "opus",
-            "Review it.",
-        ]))?
-        .finish(COMMAND_LIMIT)?;
-        if !output.status.success() {
-            fail!("start failed: {}", output.stderr)?;
-        }
-        let status: serde_json::Value = serde_json::from_str(&output.stdout).or_fail()?;
-        status
-            .get("run_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_fail()
+        started_run(&run_in_background(self.agentmux(START))?.finish(COMMAND_LIMIT)?)
     }
 
     /// Start `agentmux wait` on the consultation, in the background.
@@ -172,6 +175,30 @@ fn until_exists(path: &Path, limit: Duration) -> bool {
     path.exists()
 }
 
+/// The arguments of the `agentmux start` every test begins with.
+const START: &[&str] = &[
+    "start",
+    "--json",
+    "--delegate",
+    "claude",
+    "--model",
+    "opus",
+    "Review it.",
+];
+
+/// The id of the consultation `agentmux start` reported, once it succeeded.
+fn started_run(output: &Finished) -> Result<String> {
+    if !output.status.success() {
+        fail!("start failed: {}", output.stderr)?;
+    }
+    let status: serde_json::Value = serde_json::from_str(&output.stdout).or_fail()?;
+    status
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_fail()
+}
+
 /// The longest any one `agentmux` command these tests run may take, so a test that would hang
 /// fails instead.
 const COMMAND_LIMIT: Duration = Duration::from_secs(60);
@@ -192,7 +219,12 @@ struct Finished {
 }
 
 /// Start `command` with both outputs piped and read in the background.
+///
+/// This process's own standard handles are kept from it first, as agentmux keeps its own from
+/// the processes it starts, so the runner capturing this test is not held open by a supervisor
+/// that outlives it.
 fn run_in_background(mut command: Command) -> Result<Running> {
+    agentmux::testing::keep_std_handles_from_children();
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -302,6 +334,35 @@ fn a_turn_settles_with_nothing_asking() -> Result<()> {
     );
     assert_that!(transcript, contains_substring("FIXTURE_OK"));
     assert_that!(transcript, contains_substring("_Turn 1 completed"));
+    Ok(())
+}
+
+/// A caller capturing a wrapper that itself captures `agentmux start` sees the end of the
+/// wrapper's output once the wrapper exits, while the turn it started still runs.
+///
+/// On Windows the wrapper's captured output is inheritable in it, so a wrapper that did not keep
+/// its standard handles from `agentmux` would pass them on beside the pipes it gives it, and on
+/// into the supervisor and the delegate, past where agentmux can tell them apart.
+/// Elsewhere a child's standard descriptors replace its parent's, and nothing can leak this way.
+#[gtest]
+fn a_caller_of_a_wrapper_that_captures_agentmux_sees_its_output_end() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: fixtures::CLAUDE_HAPPY,
+        stderr: "",
+        exit_code: 0,
+    })?;
+    let mut args = vec![env!("CARGO_BIN_EXE_agentmux")];
+    args.extend_from_slice(START);
+    let wrapper = run_in_background(machine.command(&capture_wrapper()?, &args))?;
+
+    // The wrapper's output ended with the wrapper, before the delegate it led to was let go.
+    let run_id = started_run(&wrapper.finish(COMMAND_LIMIT)?)?;
+    let marker = machine.marker(&run_id);
+    assert_that!(marker.exists(), eq(false));
+
+    // The turn still settles as usual once the delegate leaves.
+    machine.release()?;
+    assert_that!(until_exists(&marker, Duration::from_secs(10)), eq(true));
     Ok(())
 }
 

@@ -440,6 +440,18 @@ impl Launcher for ScriptedLauncher {
     }
 }
 
+/// Keeps this process's standard handles out of the processes it starts, as agentmux does before
+/// every spawn of its own.
+///
+/// A test that runs the real `agentmux` with its output captured calls it before each spawn.
+/// On Windows the test's own standard handles are the runner's capture pipes, and without it
+/// they would pass to `agentmux` beside the pipes the test gives it, and on from there into the
+/// detached supervisor and delegate, where agentmux cannot tell them from any other handle.
+/// Elsewhere it does nothing.
+pub fn keep_std_handles_from_children() {
+    crate::launch::keep_std_handles_from_children();
+}
+
 /// A recorded event stream, committed under `fixtures/`.
 ///
 /// Every fixture was captured from a real CLI run with the exact flags [`crate::delegate`] builds.

@@ -9,19 +9,29 @@
 //!
 //! Asked for `--version` it says so and exits.
 //! Otherwise it reads its question from stdin, writes the configured stream and stderr, waits
-//! until the configured release file exists or its directory has gone, writes what it was told to
-//! write last, and exits with the configured status.
+//! until the configured release file exists, its directory has gone or [`LONGEST_WAIT`] has
+//! passed, writes what it was told to write last, and exits with the configured status.
 //! It is portable, so the same scenario runs on every platform agentmux supports.
 
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 /// The configuration's file name, beside the executable.
 const FAKE_DELEGATE_CONFIG: &str = "fake-delegate.json";
+
+/// How long the fake waits for its release before it goes on regardless.
+///
+/// A test that is killed while its fake waits, as nextest kills one that outlives its timeout,
+/// runs none of its destructors and removes nothing, and on Unix the kill reaches only the
+/// test's own process group, which neither the supervisor nor the fake is in.
+/// Leaving on its own after a while is then what keeps the fake, and the supervisor waiting on
+/// it, from running on forever.
+/// It is longer than nextest lets any of these tests run.
+const LONGEST_WAIT: Duration = Duration::from_secs(300);
 
 /// What one run of the fake does.
 #[derive(Debug, Deserialize)]
@@ -80,7 +90,11 @@ fn run() -> Result<u8, String> {
     // A release file whose directory has gone belongs to a test that has finished, which is
     // released too, so a fake never outlives the test that started it.
     if let Some(release) = &config.release_path {
-        while !release.exists() && release.parent().is_some_and(std::path::Path::exists) {
+        let deadline = Instant::now() + LONGEST_WAIT;
+        while !release.exists()
+            && release.parent().is_some_and(std::path::Path::exists)
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
