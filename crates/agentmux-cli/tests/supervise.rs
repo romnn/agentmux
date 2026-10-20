@@ -570,7 +570,8 @@ fn a_dead_supervisor_leaves_its_turn_to_the_next_observer() -> Result<()> {
 
 /// The supervisor starts the delegate with exactly the argument vector the launch recorded, so a
 /// Codex turn's permissions — its sandbox, network, unattended approval and the permission
-/// profile named for that one launch — reach the CLI the supervisor runs.
+/// profile named for that one launch — reach the CLI it runs, on the first turn and on a
+/// follow-up, which names a profile of its own.
 #[gtest]
 fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
     let machine = machine(&FakeRun {
@@ -600,36 +601,72 @@ fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
     ]))?
     .finish(COMMAND_LIMIT)?;
     let run_id = started_run(&started)?;
-    let turn = machine.run_dir(&run_id).join("turns").join("0000");
-
-    let read = |name: &str| -> Result<serde_json::Value> {
-        serde_json::from_slice(&std::fs::read(turn.join(name)).or_fail()?).or_fail()
-    };
-    let recorded = read("invocation.json")?;
-    let plan = read("supervisor-plan.json")?;
-    assert_that!(
-        plan.pointer("/producer/args"),
-        some(eq(recorded.get("args").or_fail()?))
-    );
-    let args: Vec<&str> = recorded
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .or_fail()?
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .collect();
-    assert_that!(args, contains(eq(&"approval_policy=\"never\"")));
-    assert_that!(args, contains(eq(&"approvals_reviewer=\"user\"")));
-    assert_that!(
-        args,
-        contains(starts_with("default_permissions=\"agentmux_ro_"))
-    );
-    assert_that!(args, not(contains(eq(&"--sandbox"))));
-
     machine.release()?;
     assert_that!(
         until_exists(&machine.marker(&run_id), Duration::from_secs(10)),
         eq(true)
     );
+
+    // The follow-up resumes the session, its fake released already.
+    let followed = run_in_background(machine.agentmux(&[
+        "--codex-launch",
+        "exec",
+        "follow-up",
+        &run_id,
+        "--json",
+        "--wait",
+        "30",
+        "And again.",
+    ]))?
+    .finish(COMMAND_LIMIT)?;
+    if !followed.status.success() {
+        fail!("follow-up failed: {}", followed.stderr)?;
+    }
+
+    // What each run of the fake was started with, in order.
+    let received: Vec<Vec<String>> =
+        std::fs::read_to_string(machine.bin.join("fake-delegate-argv.jsonl"))
+            .or_fail()?
+            .lines()
+            .map(|line| serde_json::from_str(line).or_fail())
+            .collect::<Result<_>>()?;
+    let mut profiles = Vec::new();
+    for (index, turn) in ["0000", "0001"].into_iter().enumerate() {
+        let recorded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                machine
+                    .run_dir(&run_id)
+                    .join("turns")
+                    .join(turn)
+                    .join("invocation.json"),
+            )
+            .or_fail()?,
+        )
+        .or_fail()?;
+        let recorded: Vec<String> =
+            serde_json::from_value(recorded.get("args").or_fail()?.clone()).or_fail()?;
+        // The delegate received exactly what the launch recorded.
+        assert_that!(received.get(index), some(eq(&recorded)), "turn {turn}");
+        assert_that!(
+            recorded,
+            contains(eq("approval_policy=\"never\"")),
+            "turn {turn}"
+        );
+        assert_that!(
+            recorded,
+            contains(eq("approvals_reviewer=\"user\"")),
+            "turn {turn}"
+        );
+        assert_that!(recorded, not(contains(eq("--sandbox"))), "turn {turn}");
+        let profile = recorded
+            .iter()
+            .find(|arg| arg.starts_with("default_permissions=\"agentmux_ro_"))
+            .cloned()
+            .or_fail()?;
+        profiles.push(profile);
+    }
+    assert_that!(received.get(1), some(contains(eq("resume"))));
+    // A resume names a profile of its own rather than reusing the first turn's.
+    assert_that!(profiles.first(), not(eq(profiles.get(1))));
     Ok(())
 }
