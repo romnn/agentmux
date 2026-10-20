@@ -29,8 +29,16 @@ Machine files live under the home directory only: `XDG_CONFIG_HOME` and `APPDATA
 they point there, and `AGENTMUX_CONFIG` (which must be absolute) is the one deliberate escape hatch.
 A container that points the config base at a workspace therefore cannot promote a checkout to a
 machine file. On Unix, both roles require a regular file owned by the current user and not writable
-by group or others (`refuse_if_untrusted` in `crates/agentmux/src/config/mod.rs`); other platforms
-do not currently enforce equivalent ownership or permission checks.
+by others (`refuse_if_untrusted` in `crates/agentmux/src/config/trust.rs`). A group write bit is
+accepted only when the owner is the group's sole member, the rule Debian's OpenSSH applies to
+`StrictModes`: every account whose primary group it is must be the owner, the group may list no
+member but the owner, and it must have a member by one route or the other. Membership is what the
+account databases report: the primary-group side walks the password database with `getpwent`, which
+sees no account of an NSS source that does not enumerate, and takes a walk that ends early as
+complete, as Debian's check does. Distributions with user-private groups default to umask `002`, so
+refusing every group-writable file would refuse every file the user writes while protecting nothing;
+a failed lookup of the file's owner or group refuses, and so does an account name that is not valid
+UTF-8. Other platforms do not currently enforce equivalent ownership or permission checks.
 
 **A project file's selection switches nothing on.** An account a project file chose runs isolated,
 never on API pricing, and without its own `request_env`, whatever the machine file configures for
