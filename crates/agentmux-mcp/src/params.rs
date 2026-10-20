@@ -11,7 +11,10 @@
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use agentmux::delegate::{Billing, CodexSandbox, Delegate, DelegateError, Isolation, Vendor};
+use agentmux::delegate::{
+    Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, DelegateError, Isolation,
+    PermissionOptions, Vendor,
+};
 use agentmux::run::{Retention, RunId};
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -52,7 +55,13 @@ fn billing_schema(_generator: &mut SchemaGenerator) -> Schema {
 
 fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
     string_enum_schema::<CodexSandbox>(
-        "How much of the working directory a Codex delegate may write.",
+        "`codex` only: how much its commands may write. Codex's own sandbox modes.",
+    )
+}
+
+fn permission_mode_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_enum_schema::<ClaudePermissionMode>(
+        "`claude` only: the permission mode, as `claude --permission-mode` spells it.",
     )
 }
 
@@ -98,31 +107,10 @@ pub struct DelegateParams {
     #[schemars(with = "String")]
     pub account: Option<String>,
 
-    /// Whether the delegate loads the account's own settings, hooks and MCP servers.
-    ///
-    /// Omit this and the account decides.
-    /// Most accounts are isolated, but one may be configured to inherit, so the account list in
-    /// these instructions is the only way to know which.
-    /// Pass `false` to force isolation when you need an answer that does not depend on this
-    /// machine.
-    ///
-    /// Pass `true` only when the point of the consultation is to exercise the tooling that
-    /// configuration sets up.
-    /// It costs three things: a hook can reopen the delegate's finished turn, so its last message
-    /// is then not the answer; the delegate gains whatever MCP servers that account configures;
-    /// and the same question asked elsewhere may answer differently.
-    #[serde(default)]
-    #[schemars(with = "bool")]
-    pub inherit_settings: Option<bool>,
-
-    /// `codex` only.
-    /// `read_only` is right for a review.
-    /// Use `workspace_write` only when the delegate must write a file itself — a read-only
-    /// delegate told to write its report completes the work, fails the write, and reports the
-    /// failure instead of the findings.
-    #[serde(default)]
-    #[schemars(schema_with = "sandbox_schema")]
-    pub sandbox: Option<CodexSandbox>,
+    /// Whether the delegate loads the user's configuration, and what it may do.
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    pub permissions: PermissionParams,
 
     /// Whether the delegate's environment may carry an API key; omit it and the account decides.
     ///
@@ -147,18 +135,130 @@ pub struct DelegateParams {
     pub force_codex_exec: bool,
 }
 
-impl DelegateParams {
-    /// The isolation the caller asked for, or `None` to let the account decide.
-    fn isolation(&self) -> Option<Isolation> {
-        self.inherit_settings.map(|inherit| {
-            if inherit {
-                Isolation::Inherit
-            } else {
-                Isolation::Isolated
-            }
-        })
-    }
+/// Whether the delegate loads the user's configuration, and what it may do.
+///
+/// Every field is optional.
+/// On `start` and `ask` an omitted one takes this machine's default, which the server
+/// instructions and `quota` list; on `follow_up` it keeps what the newest turn ran with.
+/// A value beyond this machine's limits is refused, never lowered to fit, and the refusal names
+/// what may be asked for instead.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct PermissionParams {
+    /// Whether the delegate skips the user's own CLI configuration: settings, hooks and MCP
+    /// servers.
+    ///
+    /// Omitted, this machine's default for the vendor decides, which the server instructions
+    /// state; a project-selected account always runs with `true` unless you pass `false`.
+    /// Pass `true` when the answer must not depend on this machine.
+    /// With `false` a hook can reopen the delegate's finished turn, so its last message is then
+    /// not the answer; the delegate gains the MCP servers the configuration names; and the same
+    /// question asked elsewhere may answer differently.
+    /// A `codex` consultation with `true` runs over `codex exec` and cannot be steered.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub ignore_user_config: Option<bool>,
 
+    /// The inverse of `ignore_user_config`, accepted for older callers; pass one or the other.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub inherit_settings: Option<bool>,
+
+    /// `codex` only.
+    /// `read_only` is right for a review.
+    /// Use `workspace_write` only when the delegate must write a file itself — a read-only
+    /// delegate told to write its report completes the work, fails the write, and reports the
+    /// failure instead of the findings.
+    /// `danger_full_access` lifts the sandbox and is refused unless this machine allows it.
+    #[serde(default)]
+    #[schemars(schema_with = "sandbox_schema")]
+    pub sandbox: Option<CodexSandbox>,
+
+    /// `codex` only: whether the delegate's commands may reach the network, such as `cargo`
+    /// fetching a crate or `gh` reading an issue.
+    /// Omitted, this machine's default decides, or Codex's own configuration when it has none.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub network_access: Option<bool>,
+
+    /// `claude` only: the permission mode; `plan` unless this machine's default says otherwise.
+    /// `bypassPermissions` is refused unless this machine allows it.
+    #[serde(default)]
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: Option<ClaudePermissionMode>,
+
+    /// `claude` only: the built-in tools offered at all, such as `["Read", "Grep", "WebFetch"]`;
+    /// `[]` offers none.
+    /// Omitted, a read-only list: `Bash`, `Read`, `Grep`, `Glob`, `WebFetch` and `WebSearch`.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub tools: Option<Vec<String>>,
+
+    /// `claude` only: tool calls to preapprove, such as `["WebFetch", "Bash(cargo check *)"]`.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub allowed_tools: Option<Vec<String>>,
+
+    /// `claude` only: tool calls to deny, such as `["Bash(git push *)"]`.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub disallowed_tools: Option<Vec<String>>,
+}
+
+impl PermissionParams {
+    /// Parse the flat wire shape into the options the core applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error when the two isolation spellings disagree or a tool rule
+    /// is not one the CLI can take.
+    pub fn options(&self) -> Result<PermissionOptions, ErrorData> {
+        let tools =
+            |list: &Option<Vec<String>>| list.as_deref().map(ClaudeTool::parse_all).transpose();
+        let parsed = (|| {
+            Ok::<_, DelegateError>(PermissionOptions {
+                isolation: Isolation::from_spellings(
+                    self.ignore_user_config,
+                    self.inherit_settings,
+                )?,
+                sandbox: self.sandbox,
+                network_access: self.network_access,
+                permission_mode: self.permission_mode,
+                tools: tools(&self.tools)?,
+                allowed_tools: tools(&self.allowed_tools)?,
+                disallowed_tools: tools(&self.disallowed_tools)?,
+            })
+        })();
+        parsed.map_err(|error| invalid_delegate(&error))
+    }
+}
+
+/// An invalid-params error for a refused delegate argument, saying what shape would have been
+/// accepted, because the caller is a model that will retry from this text alone.
+pub(crate) fn invalid_delegate(error: &DelegateError) -> ErrorData {
+    let hint = match error {
+        DelegateError::Argument { field: "model", .. } => {
+            " `model` is passed to the CLI as a single argument, so it must look like a model \
+             identifier."
+        }
+        DelegateError::Argument {
+            field: "effort", ..
+        } => " Try `high` or `xhigh`.",
+        DelegateError::Argument {
+            field: "account", ..
+        } => " An account alias is a name from `agentmux.toml`.",
+        DelegateError::Argument { field: "tool", .. } => {
+            " A tool is a name such as `Read`, or a rule such as `Bash(git diff *)`, with no comma."
+        }
+        DelegateError::NotForVendor { .. } => {
+            " `sandbox` and `network_access` are Codex's; `permission_mode` and the tool lists are \
+             Claude's."
+        }
+        _ => "",
+    };
+    ErrorData::invalid_params(format!("{error}.{hint}"), None)
+}
+
+impl DelegateParams {
     /// Parse the flat wire shape into the closed enum.
     ///
     /// Only shapes are checked here; whether an alias exists is a property of the machine, and
@@ -167,38 +267,18 @@ impl DelegateParams {
     ///
     /// # Errors
     ///
-    /// Returns an invalid-params error when the model, effort or alias is not argv-safe, or when
-    /// a vendor-specific field was set for the other vendor.
+    /// Returns an invalid-params error when the model, effort, alias or a tool rule is not
+    /// argv-safe, when the two isolation spellings disagree, or when a vendor-specific field was
+    /// set for the other vendor.
     pub fn build(&self) -> Result<Delegate, ErrorData> {
         Delegate::from_parts(
             self.delegate,
             &self.model,
             self.effort.as_deref(),
             self.account.as_deref(),
-            self.isolation(),
-            self.sandbox,
+            self.permissions.options()?,
         )
-        .map_err(|error| {
-            // Each refusal says what shape would have been accepted, because the caller is a
-            // model that will retry from this text alone.
-            let hint = match &error {
-                DelegateError::Argument { field: "model", .. } => {
-                    " `model` is passed to the CLI as a single argument, so it must look like a \
-                     model identifier."
-                }
-                DelegateError::Argument {
-                    field: "effort", ..
-                } => " Try `high` or `xhigh`.",
-                DelegateError::Argument {
-                    field: "account", ..
-                } => " An account alias is a name from `agentmux.toml`.",
-                DelegateError::NotForVendor { .. } => {
-                    " A `claude` delegate runs in plan mode and is offered no editing tools."
-                }
-                _ => "",
-            };
-            ErrorData::invalid_params(format!("{error}.{hint}"), None)
-        })
+        .map_err(|error| invalid_delegate(&error))
     }
 }
 

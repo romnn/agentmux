@@ -7,7 +7,8 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Billing, Delegate, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
+    AccountChoice, Billing, Delegate, DelegateError, Isolation, ModelId, PermissionOptions,
+    SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
 use crate::launch::{LaunchSpec, Liveness};
 use crate::transcript::Outcome;
@@ -50,6 +51,19 @@ pub struct StartRequest {
     /// For a codex whose app-server protocol no longer matches this agentmux; such a turn cannot
     /// be steered.
     pub force_codex_exec: bool,
+}
+
+/// One turn to launch: as which delegate, at which index, asking what, continuing which session.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NextTurn<'a> {
+    /// What the turn runs as, held to the machine file's limits by whoever admitted it.
+    pub(super) delegate: &'a Delegate,
+    /// The index the turn claims.
+    pub(super) index: u32,
+    /// The question, which becomes the child's stdin.
+    pub(super) question: &'a str,
+    /// The delegate's own session to continue, for a follow-up.
+    pub(super) resume: Option<&'a SessionRef>,
 }
 
 /// What the machine's configuration decided about a requested delegate.
@@ -137,8 +151,10 @@ impl RunStore {
     /// inside a delegate, the run directory cannot be created, or the delegate cannot be launched
     /// — which includes a working directory that is not there.
     /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
-    /// would run, before anything is written or launched; a follow-up is never refused for a
-    /// block added after its consultation started.
+    /// would run, and [`RunError::Delegate`] with [`DelegateError::Permission`] when the
+    /// isolation or a permission exceeds the machine file's limits, both before anything is
+    /// written or launched; a follow-up is never refused for a block added after its
+    /// consultation started, but is for a limit tightened since.
     /// A failed start leaves no run directory behind.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
@@ -173,7 +189,15 @@ impl RunStore {
         };
         let started = write_json(&dir.join("meta.json"), &meta)
             .and_then(|()| self.lock(&run_id))
-            .and_then(|run| run.launch_turn(&meta, 0, &request.question, None, &config));
+            .and_then(|run| {
+                let first = NextTurn {
+                    delegate: &meta.delegate,
+                    index: 0,
+                    question: &request.question,
+                    resume: None,
+                };
+                run.launch_turn(&meta, &first, &config)
+            });
         if let Err(error) = started {
             std::fs::remove_dir_all(&dir)
                 .inspect_err(|err| {
@@ -232,9 +256,13 @@ impl RunStore {
     /// effort the caller left unnamed is filled from the file's default for the model that runs,
     /// and stays unnamed — the CLI's own default — when the file has none.
     ///
+    /// The permissions are filled from the machine file's defaults and held to its limits, and
+    /// what the limits let run is what is recorded.
+    ///
     /// # Errors
     ///
-    /// Returns [`RunError::ModelBlocked`] when the model that would run is blocked.
+    /// Returns [`RunError::ModelBlocked`] when the model that would run is blocked, and
+    /// [`RunError::Delegate`] when the isolation or a permission exceeds the limits.
     pub(super) fn pin_defaults(
         delegate: &Delegate,
         config: &crate::config::Config,
@@ -268,15 +296,21 @@ impl RunStore {
         {
             pinned = pinned.with_effort(effort);
         }
+        let delegate = pinned
+            .with_isolation(isolation)
+            .with_default_permissions(config)
+            .held_to_limits(config)?;
         Ok(Pinned {
+            delegate,
             rewritten_from,
-            delegate: pinned.with_isolation(isolation),
         })
     }
 
     /// Continue a consultation with another question, in the delegate's own session.
     ///
     /// The run id does not change: a consultation is a conversation.
+    /// Every choice recorded when it started is kept; see [`RunStore::follow_up_with`] for a
+    /// follow-up that changes some.
     ///
     /// # Errors
     ///
@@ -284,25 +318,91 @@ impl RunStore {
     /// [`RunError::NotResumable`] when the previous turn is still running, was cancelled, never
     /// announced a session id, or ended without the delegate saying anything.
     pub fn follow_up(&self, run_id: &RunId, question: &str) -> Result<RunStatus, RunError> {
-        let mut meta = self.meta(run_id)?;
-        // A record from before isolation was pinned could only have run isolated.
-        if meta.delegate.isolation().is_none() {
-            meta.delegate = meta.delegate.clone().with_isolation(Isolation::Isolated);
-        }
+        self.follow_up_with(run_id, question, PermissionOptions::default())
+    }
+
+    /// Continue a consultation, with the isolation or permissions `overrides` names in place of
+    /// the ones its newest turn ran with.
+    ///
+    /// What `overrides` leaves out keeps what the newest turn ran with, or what `start` recorded
+    /// for a turn launched before agentmux kept that; the machine file's defaults are not
+    /// consulted again.
+    /// Its current limits are, before every turn, so a limit tightened since the consultation
+    /// began refuses this turn rather than letting it run past the owner's new ceiling.
+    /// What the turn runs with is recorded with the turn, and the next follow-up starts from it;
+    /// the consultation's own record, and the transcript header rendered from it, never change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`RunStore::follow_up`], [`RunError::Delegate`] with
+    /// [`DelegateError::NotForVendor`] for an override of the other vendor, and with
+    /// [`DelegateError::Permission`] when the turn would exceed the current limits, before the
+    /// turn is claimed.
+    pub fn follow_up_with(
+        &self,
+        run_id: &RunId,
+        question: &str,
+        overrides: PermissionOptions,
+    ) -> Result<RunStatus, RunError> {
+        // Asked before the lock, which would otherwise leave a lock file for a run that is not
+        // there.
+        self.meta(run_id)?;
         {
-            // Admitted and claimed under one lock, so the turn a follow-up was admitted against is
-            // the one it continues: nobody can claim the next index, or settle the newest turn
-            // differently, in between.
+            // Read, resolved, held and claimed under one lock, so the turn a follow-up was admitted
+            // against is the one it continues and the one whose choices it starts from: nobody can
+            // claim the next index, settle the newest turn differently, or launch one with other
+            // permissions in between.
             let run = self.lock(run_id)?;
+            let meta = self.meta(run_id)?;
             let state = run.fold_run(&meta)?;
             let session = Self::resumable_session(run_id, &state)?;
+            let mut delegate =
+                self.current_delegate(&meta, state.newest.map(|newest| newest.index))?;
+            // A record from before isolation was pinned could only have run isolated.
+            if delegate.isolation().is_none() {
+                delegate = delegate.with_isolation(Isolation::Isolated);
+            }
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
-            let next = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
-            run.launch_turn(&meta, next, question, Some(&session), &config)?;
+            let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
+            let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
+            let next = NextTurn {
+                delegate: &delegate,
+                index,
+                question,
+                resume: Some(&session),
+            };
+            run.launch_turn(&meta, &next, &config)?;
         }
         self.status(run_id)
+    }
+
+    /// The delegate a consultation's next turn starts from: the consultation's own, with the
+    /// isolation and permissions its turn at `newest` ran with.
+    ///
+    /// What `start` recorded stands for a run with no turn yet, and for a turn launched before
+    /// agentmux kept that; see [`Delegate::with_settings_of`] for what a turn's record may change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
+    /// cannot be read.
+    pub(super) fn current_delegate(
+        &self,
+        meta: &Meta,
+        newest: Option<u32>,
+    ) -> Result<Delegate, RunError> {
+        let Some(index) = newest else {
+            return Ok(meta.delegate.clone());
+        };
+        let ran_as =
+            read_json::<InvocationRecord>(&self.turn_dir(&meta.run_id, index).invocation())?
+                .and_then(|record| record.delegate);
+        Ok(match ran_as {
+            Some(ran_as) => meta.delegate.clone().with_settings_of(&ran_as),
+            None => meta.delegate.clone(),
+        })
     }
 
     /// The session a follow-up would continue, or why there is none.
@@ -390,12 +490,13 @@ impl LockedRun<'_> {
     pub(super) fn launch_turn(
         &self,
         meta: &Meta,
-        index: u32,
-        question: &str,
-        resume: Option<&SessionRef>,
+        next: &NextTurn<'_>,
         config: &crate::config::Config,
     ) -> Result<(), RunError> {
-        self.store.refuse_to_spawn(meta.delegate.vendor())?;
+        let NextTurn {
+            delegate, index, ..
+        } = *next;
+        self.store.refuse_to_spawn(delegate.vendor())?;
         // The run may have been swept or removed while this caller waited for the lock, and a
         // turn launched into a directory with no metadata would be a child nothing can reach.
         if !self.store.run_dir(&self.run_id).join("meta.json").is_file() {
@@ -405,9 +506,7 @@ impl LockedRun<'_> {
         claim_turn(&turn, index, &self.run_id)?;
         // A claim that does not end in a running child is given back, so a refused follow-up
         // does not leave a phantom failed turn in the transcript.
-        let launched = self
-            .store
-            .launch_into(&turn, meta, index, question, resume, config);
+        let launched = self.store.launch_into(&turn, meta, next, config);
         if launched.is_err() {
             std::fs::remove_dir_all(&turn.root)
                 .inspect_err(|err| {
@@ -432,13 +531,14 @@ impl RunStore {
         &self,
         turn: &TurnDir,
         meta: &Meta,
+        delegate: &Delegate,
         resume: Option<&SessionRef>,
         config: &crate::config::Config,
         invocation: &mut crate::delegate::Invocation,
     ) -> Result<LaunchMode, RunError> {
         let (Some(driver), Some(settings), false) = (
             &self.codex_driver,
-            meta.delegate.app_server_settings(config),
+            delegate.app_server_settings(config),
             meta.force_codex_exec,
         ) else {
             return Ok(LaunchMode::DirectCli);
@@ -459,15 +559,22 @@ impl RunStore {
     }
 
     /// Everything between claiming a turn directory and recording the running child in it.
+    ///
+    /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
+    /// [`Delegate::invocation`] holds it once more as it builds the launch.
     pub(super) fn launch_into(
         &self,
         turn: &TurnDir,
         meta: &Meta,
-        index: u32,
-        question: &str,
-        resume: Option<&SessionRef>,
+        next: &NextTurn<'_>,
         config: &crate::config::Config,
     ) -> Result<(), RunError> {
+        let NextTurn {
+            delegate,
+            index,
+            question,
+            resume,
+        } = *next;
         std::fs::write(turn.question(), question)
             .map_err(RunError::io(format!("writing turn {index} question")))?;
 
@@ -479,7 +586,7 @@ impl RunStore {
             extra_env: &meta.env,
             billing: meta.billing,
         };
-        let mut invocation = meta.delegate.invocation(&plan, &self.host_env, config)?;
+        let mut invocation = delegate.invocation(&plan, &self.host_env, config)?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
@@ -487,14 +594,32 @@ impl RunStore {
 
         // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
-        let launch_mode = self.prepare_launch_mode(turn, meta, resume, config, &mut invocation)?;
+        let launch_mode =
+            self.prepare_launch_mode(turn, meta, delegate, resume, config, &mut invocation)?;
+        // `codex exec` reaches read-only with network only through a permission profile, which a
+        // codex that does not honour it would replace with whatever its configuration selects.
+        // The app-server sets the same policy as a field of the turn instead, and needs no
+        // profile.
+        if launch_mode == LaunchMode::DirectCli
+            && delegate
+                .codex_permissions()
+                .is_some_and(|permissions| permissions.needs_permission_profile())
+            && !codex_supports_permission_profiles(cli_version.as_deref())
+        {
+            return Err(DelegateError::Permission(
+                crate::config::PermissionRefusal::PermissionProfileUnsupported {
+                    version: cli_version,
+                },
+            )
+            .into());
+        }
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
         // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
-        let vendor = meta.delegate.vendor();
+        let vendor = delegate.vendor();
         let config_dir = vendor
             .config_dir(invocation.env())
             .map(|dir| meta.cwd.join(dir));
@@ -528,6 +653,7 @@ impl RunStore {
                 config_dir,
                 cli_version,
                 agentmux_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                delegate: Some(delegate.clone()),
             },
         )?;
 

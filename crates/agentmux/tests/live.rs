@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -64,6 +66,7 @@ async fn consult(
 async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
     let (store, status) = consult(
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             account: AccountChoice::Default,
@@ -93,7 +96,10 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
         Delegate::Codex {
             model: ModelId::parse(CODEX_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: None,
         },
@@ -127,6 +133,52 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
     Ok(())
 }
 
+/// Read-only with network, over `codex exec`, reaches the network and still writes nothing, on the
+/// first turn and again after a resume: the permission profile agentmux defines with `-c` is
+/// honoured by today's codex.
+#[gtest]
+#[tokio::test]
+#[ignore = "spends money, needs a logged-in codex CLI and network"]
+async fn a_live_read_only_codex_turn_with_network_reaches_it_and_writes_nothing() -> Result<()> {
+    let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-probe");
+    let question = indoc::indoc! {"
+        Run exactly these two shell commands in the working directory and report what happened:
+        `curl -s -o /dev/null -w '%{http_code}' https://example.com` and `touch agentmux-live-probe`.
+        Reply on one line as LIVE_NET=<the HTTP code curl printed> LIVE_WRITE=<ok or refused>.
+    "};
+    let (store, status) = consult(
+        Delegate::Codex {
+            model: ModelId::parse(CODEX_MODEL).or_fail()?,
+            effort: Some(Effort::parse("low").or_fail()?),
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: Some(true),
+            },
+            account: AccountChoice::Default,
+            // Isolated, so the turn runs over `exec`, whose profile path this checks.
+            isolation: Some(agentmux::delegate::Isolation::Isolated),
+        },
+        question,
+    )
+    .await?;
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+
+    let followed = store.follow_up(&status.run_id, question).or_fail()?;
+    store
+        .wait_until_terminal(&followed.run_id, Duration::from_secs(300))
+        .await
+        .or_fail()?;
+
+    let page = store.page(&status.run_id, 0, usize::MAX).or_fail()?;
+    assert_that!(
+        page.text.matches("LIVE_NET=200").count(),
+        ge(2),
+        "a turn had no network"
+    );
+    assert_that!(probe.exists(), eq(false), "a read-only turn wrote a file");
+    Ok(())
+}
+
 /// A model the vendor does not have must reach the caller as the vendor's own words.
 #[gtest]
 #[tokio::test]
@@ -134,6 +186,7 @@ async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
 async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()> {
     let (_store, status) = consult(
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: ModelId::parse("does-not-exist-9000").or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             account: AccountChoice::Default,

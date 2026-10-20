@@ -348,7 +348,9 @@ impl std::fmt::Display for UnsteerableReason {
                 "it runs isolated, which takes `codex exec --ignore-user-config`, and `codex exec` \
                  reads its question once. `codex app-server`, the only Codex launch that can be \
                  steered, has no way to skip the account's own configuration, so only a \
-                 consultation started with `inherit_settings: true` runs over it"
+                 consultation that loads it runs over it: one with `ignore_user_config: false`, \
+                 which is the default unless this machine's agentmux.toml says otherwise, and \
+                 which a follow-up may also ask for"
             }
         })
     }

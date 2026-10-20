@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux::config::{BlockedModel, Config, expand_tilde};
-use agentmux::delegate::{ModelId, Vendor};
+use agentmux::delegate::{ClaudePermissions, ModelId, Vendor};
 use googletest::prelude::*;
 
 /// A host environment with `HOME` pointing where the test wants it.
@@ -541,6 +541,8 @@ fn every_documented_config_example_parses() -> Result<()> {
                 "[models.",
                 "[efforts.",
                 "[blocked.",
+                "[codex.",
+                "[claude.",
                 "retention =",
             ]
             .iter()
@@ -764,6 +766,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     );
 
     let chosen_by_the_checkout = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
@@ -777,6 +780,7 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
     // Named by the caller, it is still the checkout's choice: a follow-up names the default it
     // resolved, and the checkout's instructions could name it too.
     let named = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),

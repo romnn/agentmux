@@ -18,6 +18,8 @@
 //! other things a caller cannot know from where it sits.
 //! And it says how long a consultation is kept, because every consultation on the machine shares
 //! one store.
+//! Each vendor's permission defaults and limits live there too: what a delegate may do, and
+//! whether it loads the user's own configuration, are the owner's to decide.
 //! It is found only at fixed locations under the home directory, or at the one absolute path
 //! `AGENTMUX_CONFIG` names.
 //!
@@ -41,9 +43,14 @@ use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
 use trust::refuse_if_untrusted;
 
 mod model_rules;
+mod permissions;
 mod trust;
 
 pub use model_rules::{BlockedModel, ModelRules, RefusedModel, ResolvedModel};
+pub use permissions::{
+    BUILT_IN_MAX_SANDBOX, ClaudeDefaults, ClaudeLimits, ClaudePolicy, CodexDefaults, CodexLimits,
+    CodexPolicy, LimitSource, PERMISSION_PROFILE_MIN_CODEX, PermissionPolicy, PermissionRefusal,
+};
 
 /// Environment variable holding an explicit path to the configuration file.
 pub const CONFIG_PATH_ENV: &str = "AGENTMUX_CONFIG";
@@ -97,18 +104,35 @@ pub enum ConfigError {
         reason: &'static str,
     },
     /// A project file tried to define an account, a launch environment, a model rewrite, a
-    /// default effort, a blocked model or the retention window, rather than select an account.
+    /// default effort, a blocked model, the retention window, or a vendor's permission defaults
+    /// or limits, rather than select an account.
     #[error(
-        "{path} defines accounts, model rewrites, default efforts, blocked models, a retention or \
-         a [launch] environment, and a project agentmux.toml may only select an account with \
-         [defaults.<vendor>]. Move the definitions to your machine configuration: a file that \
-         travels with a repository must not be able to name a credential, an endpoint, an \
-         environment variable, which model answers your questions and how hard it thinks, which \
-         models you may ask for, or when every consultation on this machine is deleted."
+        "{path} defines accounts, model rewrites, default efforts, blocked models, a retention, \
+         [codex] or [claude] permission defaults or limits, or a [launch] environment, and a \
+         project agentmux.toml may only select an account with [defaults.<vendor>]. Move the \
+         definitions to your machine configuration: a file that travels with a repository must \
+         not be able to name a credential, an endpoint, an environment variable, which model \
+         answers your questions and how hard it thinks, which models you may ask for, what a \
+         delegate may do, or when every consultation on this machine is deleted."
     )]
     ProjectFileOversteps {
         /// The offending file.
         path: PathBuf,
+    },
+    /// A permission default, or an account's `inherit_settings`, is one the same file's limits
+    /// refuse, so every consultation relying on it would be refused.
+    #[error(
+        "the agentmux config at {path} sets {setting} that its own limits refuse, so every \
+         consultation relying on it would be refused; change the default or the limit. A launch \
+         would say: {refusal}"
+    )]
+    DefaultBeyondLimit {
+        /// The file.
+        path: PathBuf,
+        /// Which setting the limits refuse.
+        setting: String,
+        /// The refusal a launch relying on it would meet.
+        refusal: String,
     },
     /// A model rewrite names a model the same file rewrites again.
     #[error(
@@ -685,6 +709,16 @@ pub struct Config {
     /// Environment applied to every delegate launch.
     #[serde(default)]
     pub launch: LaunchEnv,
+    /// What a Codex delegate gets by default and may ask for: `[codex.defaults]` and
+    /// `[codex.limits]`.
+    ///
+    /// Only a machine file may set either: what a delegate may do is the owner's decision.
+    #[serde(default)]
+    pub codex: CodexPolicy,
+    /// What a Claude delegate gets by default and may ask for: `[claude.defaults]` and
+    /// `[claude.limits]`.
+    #[serde(default)]
+    pub claude: ClaudePolicy,
     /// How long a consultation without `keep` survives after its delegate last wrote anything,
     /// written as a duration such as `"7d"`, `"1w"`, `"36h"` or `"2w 3d"`.
     ///
@@ -893,12 +927,13 @@ impl Config {
     /// [`ConfigError::Unreadable`], [`ConfigError::Malformed`], [`ConfigError::Untrusted`] or
     /// [`ConfigError::InvalidName`] for a file that is there; and
     /// [`ConfigError::ProjectFileOversteps`] for a project file that describes an account, a
-    /// model rewrite, a default effort, a blocked model or a retention rather than naming an
-    /// account, [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten,
+    /// model rewrite, a default effort, a blocked model, a retention or a vendor's permission
+    /// defaults or limits rather than naming an account, [`ConfigError::ChainedRewrite`] for a rewrite whose result is itself rewritten,
     /// [`ConfigError::EffortForRewrittenModel`] for a default effort keyed by a model the same
     /// file rewrites away, and [`ConfigError::RewriteToBlockedModel`],
     /// [`ConfigError::BlockForRewrittenModel`] or [`ConfigError::BlockedRecommendation`] for a
-    /// block the same file's rewrites contradict.
+    /// block the same file's rewrites contradict, and [`ConfigError::DefaultBeyondLimit`] for a
+    /// permission default the same file's limits refuse.
     pub fn load(host_env: &BTreeMap<String, String>, start: &Path) -> Result<Self, ConfigError> {
         Self::load_machine(host_env)?.with_project(host_env, start)
     }
@@ -950,6 +985,8 @@ impl Config {
                 || !project.effort_defaults.is_empty()
                 || !project.blocked.is_empty()
                 || project.retention.is_some()
+                || !project.codex.is_empty()
+                || !project.claude.is_empty()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
@@ -986,14 +1023,32 @@ impl Config {
             if !path.exists() {
                 return Err(ConfigError::MissingExplicit { path });
             }
-            return Self::read(&path);
+            return Self::read_as_machine(&path);
         }
         for path in Self::machine_paths(host_env) {
             if path.is_file() {
-                return Self::read(&path);
+                return Self::read_as_machine(&path);
             }
         }
         Ok(Self::default())
+    }
+
+    /// Read one file as the machine file, refusing permission defaults its own limits refuse.
+    ///
+    /// Only here: a project file may set neither, and is refused for setting them at all.
+    fn read_as_machine(path: &Path) -> Result<Self, ConfigError> {
+        let config = Self::read(path)?;
+        for vendor in Vendor::ALL {
+            permissions::validate(
+                path,
+                vendor,
+                config.permissions(vendor),
+                &config.codex,
+                &config.claude,
+                config.accounts(vendor),
+            )?;
+        }
+        Ok(config)
     }
 
     /// Read and parse one file.
@@ -1142,6 +1197,42 @@ impl Config {
             efforts: self.effort_defaults.get(&vendor),
             blocked: self.blocked.get(&vendor),
         }
+    }
+
+    /// What one vendor's tables say about loading the user's own configuration: the default and
+    /// the limit, and the machine file a refusal names.
+    #[must_use]
+    pub fn permissions(&self, vendor: Vendor) -> PermissionPolicy<'_> {
+        let (ignore_user_config, allow_user_config) = match vendor {
+            Vendor::Claude => (
+                self.claude.defaults.ignore_user_config,
+                self.claude.limits.allow_user_config,
+            ),
+            Vendor::Codex => (
+                self.codex.defaults.ignore_user_config,
+                self.codex.limits.allow_user_config,
+            ),
+        };
+        PermissionPolicy::new(
+            vendor,
+            ignore_user_config,
+            allow_user_config,
+            self.source.as_deref(),
+        )
+    }
+
+    /// One line naming what a delegate of `vendor` gets by default and may ask for: whether it
+    /// loads the user's configuration, then the vendor's own permissions, each with its limit.
+    ///
+    /// What every listing of this machine's rules says, so a caller can choose a value that will
+    /// not be refused.
+    #[must_use]
+    pub fn describe_permissions(&self, vendor: Vendor) -> String {
+        let vendor_rules = match vendor {
+            Vendor::Claude => self.claude.describe(),
+            Vendor::Codex => self.codex.describe(),
+        };
+        format!("{} {vendor_rules}", self.permissions(vendor).describe())
     }
 
     /// The account to use for one vendor when the caller names none, and which file chose it.

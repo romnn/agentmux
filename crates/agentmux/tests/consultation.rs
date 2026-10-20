@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+    AccountAlias, AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate,
+    Effort, Isolation, ModelId,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
@@ -25,6 +26,7 @@ fn env() -> BTreeMap<String, String> {
 
 fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
@@ -36,7 +38,10 @@ fn codex() -> Result<Delegate> {
     Ok(Delegate::Codex {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation: None,
     })
@@ -460,9 +465,20 @@ fn recent_consultations_are_listed_newest_first() -> Result<()> {
 /// Everything a caller needs to poll a long review is in `status`.
 #[gtest]
 fn status_surfaces_drift_and_hook_interference() -> Result<()> {
-    let harness = harness([Script::completed(fixtures::CLAUDE_STOP_HOOK)])?;
-    let started = harness.store.start(&request(claude()?, "q"))?;
+    let harness = harness([
+        Script::completed(fixtures::CLAUDE_STOP_HOOK),
+        Script::completed(fixtures::CLAUDE_STOP_HOOK),
+    ])?;
+    // An isolated run loads no hook, so one that reopened it is a surprise.
+    let isolated = claude()?.with_isolation(Isolation::Isolated);
+    let started = harness.store.start(&request(isolated, "q"))?;
     let status = harness.store.status(&started.run_id)?;
+    // A run that took the default loads the user's settings, and their hook is expected.
+    let defaulted = harness.store.start(&request(claude()?, "q"))?;
+    assert_that!(
+        harness.store.status(&defaulted.run_id)?.hook_reopening,
+        some(eq(HookReopening::Expected))
+    );
 
     assert_that!(status.hook_reopening, some(eq(HookReopening::Unexpected)));
     assert_that!(status.unrecognised.is_empty(), eq(true));
@@ -1025,6 +1041,7 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CLAUDE_HAPPY)])?;
     let refused = harness.store.start(&request(
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: ModelId::parse("claude-opus-5").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
             account: AccountChoice::Named(AccountAlias::parse("nobody").or_fail()?),
@@ -1285,6 +1302,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
     let started = store
         .start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 // The caller names neither the account nor the isolation.
@@ -1359,6 +1377,7 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
     let started = store
         .start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: AccountChoice::Default,
@@ -1674,6 +1693,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
     let with_env = |account: Option<&str>| -> Result<StartRequest> {
         Ok(StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: account
@@ -1844,7 +1864,10 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
     let asked = Delegate::Codex {
         model: ModelId::parse("gpt-6").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation: None,
     };
@@ -1923,7 +1946,10 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
         Ok(Delegate::Codex {
             model: ModelId::parse(model).or_fail()?,
             effort: effort.map(Effort::parse).transpose().or_fail()?,
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: None,
         })
@@ -2270,7 +2296,10 @@ fn codex_request(model: &str, cwd: &Path) -> Result<StartRequest> {
         delegate: Delegate::Codex {
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: None,
         },

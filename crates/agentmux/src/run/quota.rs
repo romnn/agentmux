@@ -114,6 +114,13 @@ impl QuotaReport {
             .map_or(&Vendor::ALL, std::slice::from_ref)
     }
 
+    /// What the machine file lets a delegate of one vendor do, as read for this report; see
+    /// [`Config::describe_permissions`].
+    #[must_use]
+    pub fn permissions(&self, vendor: Vendor) -> String {
+        self.machine.describe_permissions(vendor)
+    }
+
     /// The machine file's model rules for one vendor, as read for this report.
     #[must_use]
     pub fn model_rules(&self, vendor: Vendor) -> ModelRules<'_> {

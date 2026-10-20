@@ -108,7 +108,11 @@ async fn main() -> Result<()> {
             report::transcript(&status, &page, cli.json)
         }
         Command::FollowUp(args) => {
-            let status = store.follow_up(args.run_id.id(), &args.text()?)?;
+            let status = store.follow_up_with(
+                args.run_id.id(),
+                &args.text()?,
+                args.permissions.options()?,
+            )?;
             store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
                 .await?;
@@ -184,9 +188,9 @@ async fn serve(store: RunStore, args: &McpArgs) -> Result<()> {
     if store.running_inside_a_delegate()? {
         bail!(
             "this agentmux was started inside a delegate that agentmux launched, so it will not \
-             serve consultations to it. A delegate that inherits its account's MCP servers also \
-             inherits agentmux; leave it out of that account's configuration, or run the account \
-             isolated."
+             serve consultations to it. A delegate that loads its account's configuration also \
+             loads the MCP servers it names, agentmux among them; leave agentmux out of that \
+             configuration, or launch the delegate with ignore_user_config set to true."
         );
     }
     // The sweep runs once at server start.

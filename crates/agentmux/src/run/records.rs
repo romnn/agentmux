@@ -177,6 +177,14 @@ pub(super) struct InvocationRecord {
     /// releases too; absent from a record older than agentmux keeping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) agentmux_version: Option<String>,
+    /// The delegate this turn ran as: its isolation and permissions as held to the machine
+    /// file's limits, which the consultation's next follow-up starts from.
+    ///
+    /// Kept with the turn rather than in the consultation's record, whose header must not change
+    /// once rendered; absent from a record older than agentmux keeping it, whose turn ran as the
+    /// consultation's record says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) delegate: Option<Delegate>,
 }
 
 /// Write a record, replacing any there before, so that a reader never sees a partial one.

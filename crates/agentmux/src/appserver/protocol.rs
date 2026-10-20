@@ -90,12 +90,41 @@ fn sandbox_mode(sandbox: CodexSandbox) -> wire::SandboxMode {
     match sandbox {
         CodexSandbox::ReadOnly => wire::SandboxMode::ReadOnly,
         CodexSandbox::WorkspaceWrite => wire::SandboxMode::WorkspaceWrite,
+        CodexSandbox::DangerFullAccess => wire::SandboxMode::DangerFullAccess,
+    }
+}
+
+/// The sandbox policy a `turn/start` carries, for a read-only delegate whose commands may reach
+/// the network; `None` leaves the thread's sandbox as `thread/start` or `thread/resume` set it.
+///
+/// The legacy read-only mode a thread is opened with has no network switch, so the policy goes
+/// with the turn, which is where the protocol takes one.
+/// Every turn carries it, a resumed thread's first turn included, so no turn depends on what an
+/// earlier one left behind.
+pub(super) fn turn_sandbox_policy(
+    sandbox: CodexSandbox,
+    network_access: Option<bool>,
+) -> Option<wire::SandboxPolicy> {
+    match (sandbox, network_access) {
+        (CodexSandbox::ReadOnly, Some(true)) => Some(wire::SandboxPolicy::ReadOnly(Box::new(
+            wire::ReadOnlySandboxPolicy {
+                network_access: Some(true),
+            },
+        ))),
+        (CodexSandbox::ReadOnly, Some(false) | None)
+        | (CodexSandbox::WorkspaceWrite | CodexSandbox::DangerFullAccess, _) => None,
     }
 }
 
 /// `never`, which is what `codex exec` runs with: nobody is there to ask.
 fn never_ask() -> wire::AskForApproval {
     wire::AskForApproval::Never
+}
+
+/// The `user` reviewer, so an `auto_review` reviewer the loaded configuration names cannot approve
+/// anything on the consultation's behalf, as `codex exec` is told too.
+fn user_reviews() -> wire::ApprovalsReviewer {
+    wire::ApprovalsReviewer::User
 }
 
 /// `thread/start`'s parameters, for a turn that opens a consultation.
@@ -113,7 +142,7 @@ pub(super) fn thread_start_params(
         sandbox: Some(sandbox_mode(sandbox)),
         approval_policy: Some(never_ask()),
         ephemeral: Some(false),
-        approvals_reviewer: None,
+        approvals_reviewer: Some(user_reviews()),
         base_instructions: None,
         config: None,
         developer_instructions: None,
@@ -145,7 +174,7 @@ pub(super) fn thread_resume_params(
         sandbox: Some(sandbox_mode(sandbox)),
         approval_policy: Some(never_ask()),
         exclude_turns: Some(true),
-        approvals_reviewer: None,
+        approvals_reviewer: Some(user_reviews()),
         base_instructions: None,
         config: None,
         developer_instructions: None,
@@ -163,8 +192,12 @@ fn text_input(text: &str) -> Vec<wire::UserInput> {
     }))]
 }
 
-/// `turn/start`'s parameters.
-pub(super) fn turn_start_params(thread_id: &ThreadId, question: &str) -> wire::TurnStartParams {
+/// `turn/start`'s parameters, with the sandbox policy [`turn_sandbox_policy`] decides.
+pub(super) fn turn_start_params(
+    thread_id: &ThreadId,
+    question: &str,
+    sandbox_policy: Option<wire::SandboxPolicy>,
+) -> wire::TurnStartParams {
     // Everything else is the thread's, which `thread/start` or `thread/resume` already set.
     wire::TurnStartParams {
         thread_id: thread_id.as_str().to_owned(),
@@ -180,7 +213,7 @@ pub(super) fn turn_start_params(thread_id: &ThreadId, question: &str) -> wire::T
         parent_turn_id: None,
         personality: None,
         root_turn_id: None,
-        sandbox_policy: None,
+        sandbox_policy,
         service_tier: None,
         service_tier_for_turn: None,
         summary: None,

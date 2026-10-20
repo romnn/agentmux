@@ -1,4 +1,4 @@
-# 0018. An inheriting Codex turn is driven over `codex app-server` by agentmux itself
+# 0018. A Codex turn that loads the user's configuration is driven over `codex app-server`
 
 Status: Accepted
 
@@ -35,8 +35,9 @@ becomes follows codex's own exec client, written as the `codex_app_server_protoc
 ([0019](0019-generated-app-server-protocol.md)).
 
 `Delegate::app_server_settings` is the one place that decides a delegate can run this way — Codex
-and `Isolation::Inherit` only — and `RunStore::with_codex_app_server` opts a store in; without it
-every Codex turn is `exec`.
+and `Isolation::Inherit` only, which is what a Codex consultation gets unless the caller or the
+machine file chooses `ignore_user_config = true` ([0026](0026-delegate-permissions.md)) — and
+`RunStore::with_codex_app_server` opts a store in; without it every Codex turn is `exec`.
 
 **One driver runs one turn and exits.** Follow-ups resume the persisted thread through a new driver;
 keeping a server idle between turns would leave a process per retained consultation without being
@@ -61,7 +62,16 @@ record names it, preventing an abandoned driver from using a replacement turn's 
 admission, and a turn whose capture does not yet say `turn.started` is refused as
 `SteerError::Starting`, so a steer never waits on setup.
 
-**Nobody is there to approve.** Threads start and resume with `approvalPolicy: never`. Approval and
+**The sandbox is set on the thread and the network on the turn.** Threads start and resume with
+the consultation's sandbox mode; a workspace-write network choice is a `-c` on the server's command
+line, as `exec` passes it; and a read-only delegate with network sends
+`sandboxPolicy: {type: readOnly, networkAccess: true}` with every `turn/start`
+(`protocol::turn_sandbox_policy`), because the legacy read-only mode has no network switch. `exec`
+reaches the same policy through a permission profile
+([0026](0026-delegate-permissions.md)).
+
+**Nobody is there to approve.** Threads start and resume with `approvalPolicy: never` and
+`approvalsReviewer: user`, so a reviewer the loaded configuration names cannot approve anything. Approval and
 input requests are declined; requests requiring unsupported client capabilities receive a JSON-RPC
 error, because a consultation has nobody available to answer them.
 
@@ -74,8 +84,9 @@ Linux, a once-a-second record elsewhere, a job object on Windows — are documen
 
 ## Consequences
 
-- Isolation is never traded for steering silently: a consultation is steerable only when it inherits
-  its account's settings. The codex release whose app-server accepts `--ignore-user-config` lifts
+- Isolation is never traded for steering silently: a consultation is steerable only when it loads
+  its account's configuration, which is the default unless the caller or the machine file says
+  otherwise. The codex release whose app-server accepts `--ignore-user-config` lifts
   this, and `codex-app-server-codegen refresh` refuses such a release as the cue to revisit it.
 - `--codex-launch exec`, `AGENTMUX_CODEX_LAUNCH=exec`, or `codex_exec` on one consultation runs
   every Codex turn as `exec` instead; nothing is steerable then.

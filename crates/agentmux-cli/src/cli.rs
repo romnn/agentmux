@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{Billing, CodexSandbox, Delegate, Isolation, Vendor};
+use agentmux::delegate::{
+    Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, Isolation,
+    PermissionOptions, Vendor,
+};
 use agentmux::run::{Retention, RunId};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
@@ -176,26 +179,9 @@ pub struct DelegateArgs {
     #[arg(long)]
     pub account: Option<String>,
 
-    /// Run the delegate with the account's own settings, hooks and MCP servers.
-    ///
-    /// Off by default: a consultation is a second opinion, not a second copy of your setup.
-    /// Use it when the point is to exercise the tooling that configuration sets up, and accept
-    /// that a hook can then reopen the delegate's finished turn.
-    #[arg(long, conflicts_with = "isolated")]
-    pub inherit_settings: bool,
-
-    /// Load none of the account's settings, hooks or MCP servers.
-    ///
-    /// This is what happens with neither flag, unless the account sets `inherit_settings = true`.
-    /// Pass this to override that for one run, when the answer must not depend on this machine.
-    /// `agentmux accounts` marks which accounts inherit.
-    #[arg(long, conflicts_with = "inherit_settings")]
-    pub isolated: bool,
-
-    /// How much of the filesystem the delegate may write, for `--delegate codex`.
-    /// Defaults to `read-only`.
-    #[arg(long, value_enum)]
-    pub sandbox: Option<CodexSandbox>,
+    /// Whether the delegate loads the user's configuration, and what it may do.
+    #[command(flatten)]
+    pub permissions: PermissionArgs,
 
     /// Whether the delegate's environment may carry an API key; omitted, the account decides.
     ///
@@ -217,16 +203,107 @@ pub struct QuotaArgs {
     pub delegate: Option<Vendor>,
 }
 
-impl DelegateArgs {
-    /// The isolation asked for on the command line, or `None` to let the account decide.
-    fn isolation(&self) -> Option<Isolation> {
-        match (self.inherit_settings, self.isolated) {
-            (true, _) => Some(Isolation::Inherit),
-            (_, true) => Some(Isolation::Isolated),
-            _ => None,
-        }
-    }
+/// Whether the delegate loads the user's configuration, and what it may do.
+///
+/// On `start` and `ask` an omitted flag takes the machine's default, which `agentmux accounts`
+/// lists; on `follow-up` it keeps what the newest turn ran with.
+/// A value beyond the machine's limits is refused, never lowered to fit.
+#[derive(Debug, Args)]
+pub struct PermissionArgs {
+    /// Skip the user's own CLI configuration: settings, hooks and MCP servers.
+    ///
+    /// `--ignore-user-config` alone means `true`; `--ignore-user-config=false` loads them.
+    /// Omitted, the machine's default for the vendor decides, which `agentmux accounts` shows.
+    /// With `false`, a hook can reopen the delegate's finished turn.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub ignore_user_config: Option<bool>,
 
+    /// Load the account's own settings, hooks and MCP servers: `--ignore-user-config=false`.
+    #[arg(long, conflicts_with = "isolated")]
+    pub inherit_settings: bool,
+
+    /// Load none of the account's settings, hooks or MCP servers: `--ignore-user-config`.
+    #[arg(long, conflicts_with = "inherit_settings")]
+    pub isolated: bool,
+
+    /// How much the delegate's commands may write, for `--delegate codex`.
+    /// Omitted, the machine's default, or `read-only`.
+    /// `danger-full-access` is refused unless the machine allows it.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<CodexSandbox>,
+
+    /// Whether the delegate's commands may reach the network, for `--delegate codex`.
+    /// `--network-access` alone means `true`.
+    /// Omitted, the machine's default, or Codex's own configuration.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub network_access: Option<bool>,
+
+    /// The permission mode, for `--delegate claude`; omitted, the machine's default, or `plan`.
+    #[arg(long, value_enum)]
+    pub permission_mode: Option<ClaudePermissionMode>,
+
+    /// The built-in tools offered, comma-separated, for `--delegate claude`; `""` offers none.
+    #[arg(long, value_delimiter = ',', value_name = "TOOLS")]
+    pub tools: Option<Vec<String>>,
+
+    /// Tool calls to preapprove, comma-separated, such as `WebFetch,Bash(cargo check *)`, for
+    /// `--delegate claude`.
+    #[arg(long, value_delimiter = ',', value_name = "RULES")]
+    pub allowed_tools: Option<Vec<String>>,
+
+    /// Tool calls to deny, comma-separated, such as `Bash(git push *)`, for `--delegate claude`.
+    #[arg(long, value_delimiter = ',', value_name = "RULES")]
+    pub disallowed_tools: Option<Vec<String>>,
+}
+
+impl PermissionArgs {
+    /// The options asked for on the command line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the isolation is spelled twice and the spellings disagree, or a
+    /// tool rule is not one the CLI can take.
+    pub fn options(&self) -> Result<PermissionOptions> {
+        let inherit_settings = match (self.inherit_settings, self.isolated) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        };
+        // An empty value, as `--tools ""` gives, is no entry rather than an empty rule.
+        let tools = |list: &Option<Vec<String>>| {
+            list.as_ref()
+                .map(|list| {
+                    let entries: Vec<&String> =
+                        list.iter().filter(|entry| !entry.is_empty()).collect();
+                    ClaudeTool::parse_all(&entries)
+                })
+                .transpose()
+        };
+        Ok(PermissionOptions {
+            isolation: Isolation::from_spellings(self.ignore_user_config, inherit_settings)?,
+            sandbox: self.sandbox,
+            network_access: self.network_access,
+            permission_mode: self.permission_mode,
+            tools: tools(&self.tools)?,
+            allowed_tools: tools(&self.allowed_tools)?,
+            disallowed_tools: tools(&self.disallowed_tools)?,
+        })
+    }
+}
+
+impl DelegateArgs {
     /// Build the delegate, rejecting an option that belongs to the other vendor.
     ///
     /// Existence of the alias is not checked here: which aliases are defined depends on the
@@ -234,16 +311,16 @@ impl DelegateArgs {
     ///
     /// # Errors
     ///
-    /// Returns an error when the model, effort or alias is not argv-safe, or when a
-    /// vendor-specific option was set for the wrong vendor.
+    /// Returns an error when the model, effort, alias or a tool rule is not argv-safe, when the
+    /// isolation is spelled twice and the spellings disagree, or when a vendor-specific option
+    /// was set for the wrong vendor.
     pub fn build(&self) -> Result<Delegate> {
         Delegate::from_parts(
             self.delegate,
             &self.model,
             self.effort.as_deref(),
             self.account.as_deref(),
-            self.isolation(),
-            self.sandbox,
+            self.permissions.options()?,
         )
         .wrap_err("invalid delegate arguments")
     }
@@ -267,8 +344,9 @@ pub struct QuestionArgs {
 
     /// Extra environment for the delegate, as a repeatable `KEY=VALUE` pair.
     ///
-    /// Only useful with `--inherit-settings`: an isolated delegate loads no settings, hooks or
-    /// MCP servers, so nothing in it reads these.
+    /// Only useful for a delegate that loads the user's configuration: an isolated one
+    /// (`--ignore-user-config`) loads no settings, hooks or MCP servers, so nothing in it reads
+    /// these.
     /// Standing settings belong in `agentmux.toml`, which applies them to every launch.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -448,6 +526,7 @@ pub struct ResultArgs {
 /// Deliberately does not take `--cwd` or `--keep`.
 /// A follow-up continues the delegate's own session, so the working directory and the retention
 /// were both fixed when the consultation started.
+/// It does take the isolation and permission flags, as changes to what was recorded.
 #[derive(Debug, Args)]
 pub struct FollowUpArgs {
     /// The consultation id.
@@ -464,6 +543,11 @@ pub struct FollowUpArgs {
     /// How long to wait for the answer, in seconds.
     #[arg(long, default_value_t = 600)]
     pub wait: u64,
+
+    /// Changes to the consultation's isolation or permissions for this turn and the ones after
+    /// it; whatever is omitted keeps what the newest turn ran with.
+    #[command(flatten)]
+    pub permissions: PermissionArgs,
 }
 
 impl FollowUpArgs {
@@ -534,5 +618,90 @@ impl std::str::FromStr for RunIdArg {
     type Err = agentmux::run::RunIdError;
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         RunId::parse(value).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agentmux::delegate::{ClaudePermissionMode, CodexSandbox, Isolation, PermissionOptions};
+    use clap::Parser as _;
+    use googletest::prelude::*;
+
+    use super::{Cli, Command};
+
+    /// The permission flags of `agentmux follow-up <id> q <flags>`.
+    fn follow_up_permissions(flags: &[&str]) -> Result<super::PermissionArgs> {
+        let argv = ["agentmux", "follow-up", "20261020T005204-388ea0d8", "q"]
+            .into_iter()
+            .chain(flags.iter().copied());
+        let cli = Cli::try_parse_from(argv).or_fail()?;
+        let follow_up = match cli.command {
+            Command::FollowUp(follow_up) => Some(follow_up),
+            _ => None,
+        }
+        .or_fail()?;
+        Ok(follow_up.permissions)
+    }
+
+    /// The permission options `agentmux follow-up <id> q <flags>` parses to.
+    fn follow_up_options(flags: &[&str]) -> Result<PermissionOptions> {
+        follow_up_permissions(flags)?.options().or_fail()
+    }
+
+    /// Every spelling of the isolation reaches the same choice, and a bare boolean flag means
+    /// `true`.
+    #[gtest]
+    fn each_isolation_spelling_parses_to_one_choice() -> Result<()> {
+        for (flags, expected) in [
+            (&["--ignore-user-config"][..], Some(Isolation::Isolated)),
+            (
+                &["--ignore-user-config=false"][..],
+                Some(Isolation::Inherit),
+            ),
+            (&["--isolated"][..], Some(Isolation::Isolated)),
+            (&["--inherit-settings"][..], Some(Isolation::Inherit)),
+            (
+                &["--ignore-user-config=false", "--inherit-settings"][..],
+                Some(Isolation::Inherit),
+            ),
+            (&[][..], None),
+        ] {
+            assert_that!(
+                follow_up_options(flags)?.isolation,
+                eq(expected),
+                "{flags:?}"
+            );
+        }
+        // Two spellings that disagree are refused, not resolved one way.
+        let args = follow_up_permissions(&["--ignore-user-config", "--inherit-settings"])?;
+        assert_that!(
+            args.options().map_err(|err| err.to_string()),
+            err(contains_substring("Conflicting settings"))
+        );
+        Ok(())
+    }
+
+    /// The permission flags parse in the CLI's own spellings, and an empty tool list offers none.
+    #[gtest]
+    fn the_permission_flags_parse() -> Result<()> {
+        let codex = follow_up_options(&["--sandbox", "workspace-write", "--network-access"])?;
+        assert_that!(codex.sandbox, some(eq(CodexSandbox::WorkspaceWrite)));
+        assert_that!(codex.network_access, some(eq(true)));
+
+        let claude = follow_up_options(&[
+            "--permission-mode",
+            "acceptEdits",
+            "--tools",
+            "",
+            "--disallowed-tools",
+            "Bash(git push *),WebSearch",
+        ])?;
+        assert_that!(
+            claude.permission_mode,
+            some(eq(ClaudePermissionMode::AcceptEdits))
+        );
+        assert_that!(claude.tools, some(is_empty()));
+        assert_that!(claude.disallowed_tools.map(|list| list.len()), some(eq(2)));
+        Ok(())
     }
 }

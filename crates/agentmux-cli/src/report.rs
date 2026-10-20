@@ -277,6 +277,10 @@ pub fn accounts(
             project_config_path: config.project_source.as_deref(),
             config,
             unknown_keys: &config.unknown,
+            permits: Vendor::ALL
+                .into_iter()
+                .map(|vendor| (vendor, config.describe_permissions(vendor)))
+                .collect(),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -300,7 +304,9 @@ pub fn accounts(
         // The account rows below are the machine file's, and a project file's choice of
         // default switches none of what they say on.
         println!("              the default it selects runs isolated and on a subscription, even");
-        println!("              when named; --inherit-settings still overrides the isolation,");
+        println!(
+            "              when named; --ignore-user-config=false still overrides the isolation,"
+        );
         println!("              and --billing api is refused, as is an account that sets an API");
         println!("              credential or endpoint");
     }
@@ -366,8 +372,8 @@ pub fn accounts(
             None => println!("{label:<11} default: the {vendor} CLI's own login"),
         }
         // Printed where the accounts are, because it answers the same kind of question: what this
-        // machine does with a name a caller hands it.
-        print_model_rules(config.model_rules(vendor));
+        // machine does with what a caller asks for.
+        print_vendor_rules(config, vendor);
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             println!("  (none configured — omit --account to use the CLI's own default)");
@@ -382,6 +388,16 @@ pub fn accounts(
         }
     }
     Ok(())
+}
+
+/// Print what this machine does with what a caller asks of one vendor: its model rules, and what
+/// a delegate loads and may do with the limits a request is held to.
+fn print_vendor_rules(config: &agentmux::config::Config, vendor: agentmux::delegate::Vendor) {
+    print_model_rules(config.model_rules(vendor));
+    print_rows(
+        "permits",
+        std::iter::once(config.describe_permissions(vendor)),
+    );
 }
 
 /// Print what this machine does with the model names a caller hands it for one vendor: the
@@ -446,8 +462,10 @@ fn describe_account(account: &agentmux::config::Account, home: Option<&Path>) ->
     if how.is_empty() {
         how.push("the CLI's own login".to_owned());
     }
-    if account.inherit_settings == Some(true) {
-        how.push("inherits settings and hooks".to_owned());
+    match account.inherit_settings {
+        Some(true) => how.push("inherits settings and hooks".to_owned()),
+        Some(false) => how.push("runs isolated".to_owned()),
+        None => {}
     }
     // Said only for the exception, like inheritance: the default is a subscription, and a
     // credential named without the opt-in is refused at launch, which `refused` makes visible here.
@@ -522,4 +540,7 @@ struct AccountsJson<'a> {
     config: &'a agentmux::config::Config,
     #[serde(rename = "unknown")]
     unknown_keys: &'a [agentmux::config::UnknownKey],
+    /// Each vendor's effective permission defaults and limits, built-in ones included, which the
+    /// `codex` and `claude` tables above hold only as far as the file sets them.
+    permits: std::collections::BTreeMap<agentmux::delegate::Vendor, String>,
 }

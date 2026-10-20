@@ -41,7 +41,7 @@ use super::records::{
     read_if_present, read_json, tail_of_file, write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
-use crate::delegate::{SessionRef, Vendor};
+use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
 use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Transcript, Turn};
@@ -478,6 +478,12 @@ impl LockedRun<'_> {
         let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
         turn.unsaved_session_store = invocation.unsaved_session_store;
         turn.billing = invocation.billing;
+        turn.isolation = invocation.delegate.as_ref().and_then(Delegate::isolation);
+        turn.ran_as = invocation
+            .delegate
+            .as_ref()
+            .map(Delegate::summary)
+            .filter(|summary| *summary != meta.delegate.summary());
         let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),

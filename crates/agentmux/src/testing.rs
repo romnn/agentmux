@@ -200,6 +200,7 @@ pub struct ScriptedLauncher {
     killed: Mutex<Vec<u32>>,
     flushed: Mutex<BTreeSet<u32>>,
     gone_pids: Mutex<BTreeSet<u32>>,
+    cli_version: Option<String>,
 }
 
 impl ScriptedLauncher {
@@ -216,7 +217,16 @@ impl ScriptedLauncher {
             killed: Mutex::new(Vec::new()),
             flushed: Mutex::new(BTreeSet::new()),
             gone_pids: Mutex::new(BTreeSet::new()),
+            cli_version: None,
         }
+    }
+
+    /// The same launcher, answering `version` for every CLI as `version`, which a launch that
+    /// depends on the release it runs, such as a Codex permission profile, reads.
+    #[must_use]
+    pub fn with_cli_version(mut self, version: &str) -> Self {
+        self.cli_version = Some(version.to_owned());
+        self
     }
 
     /// Everything the launcher was asked to run, in order.
@@ -311,9 +321,14 @@ const PIDS_PER_LAUNCHER: u32 = 1024;
 static NEXT_LAUNCHER_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Launcher for ScriptedLauncher {
-    /// A scripted delegate is no CLI, and names itself after the program it stands in for.
+    /// A scripted delegate is no CLI, and names itself after the program it stands in for, unless
+    /// [`ScriptedLauncher::with_cli_version`] gave it a release to claim.
     fn version(&self, invocation: &Invocation, _cwd: &Path) -> Option<String> {
-        Some(format!("{} (scripted)", invocation.program()))
+        Some(
+            self.cli_version
+                .clone()
+                .unwrap_or_else(|| format!("{} (scripted)", invocation.program())),
+        )
     }
 
     fn launch(&self, spec: &LaunchSpec<'_>) -> Result<Launched, LaunchError> {

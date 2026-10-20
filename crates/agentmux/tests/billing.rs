@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{AccountAlias, Billing, Delegate, Effort, ModelId};
+use agentmux::delegate::{AccountAlias, Billing, ClaudePermissions, Delegate, Effort, ModelId};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::fixtures;
@@ -156,6 +156,7 @@ impl BillingTestEnvironment {
         let store = self.store()?;
         let started = store.start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: account

@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
+    ModelId,
+};
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, RateLimit};
@@ -23,7 +26,10 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
         Delegate::Codex {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: None,
         },
@@ -38,6 +44,7 @@ fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tem
     consult_with(
         events,
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
             account: AccountChoice::Default,
@@ -170,10 +177,12 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
     let status = store
         .start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: AccountChoice::Default,
-                isolation: None,
+                // Isolated, so the hook that reopened the turn is the alarming kind.
+                isolation: Some(Isolation::Isolated),
             },
             question: "Reply with exactly: THE_REPORT_BODY".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -244,7 +253,10 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
             delegate: Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                sandbox: CodexSandbox::ReadOnly,
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
                 account: AccountChoice::Default,
                 isolation: None,
             },
@@ -422,6 +434,7 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
     let status = store
         .start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("sonnet").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 account: AccountChoice::Default,
@@ -502,6 +515,7 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
     let status = store
         .start(&StartRequest {
             delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 account: AccountChoice::Default,

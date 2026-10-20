@@ -50,6 +50,8 @@ a record names to show where the decision is enforced must be renamed there too.
 - [0007](0007-recursion-guard.md): agentmux refuses to run inside its own delegate.
 - [0016](0016-unsaved-session-store.md): Session-store write restrictions are probed before every
   turn.
+- [0026](0026-delegate-permissions.md): A delegate's permissions are the CLI's own controls,
+  bounded by machine-file limits.
 
 ## Run lifecycle and transcripts
 
@@ -62,8 +64,8 @@ a record names to show where the decision is enforced must be renamed there too.
 
 ## Codex integration
 
-- [0018](0018-codex-app-server-driver.md): An inheriting Codex turn is driven over
-  `codex app-server`, so it steers.
+- [0018](0018-codex-app-server-driver.md): A Codex turn that loads the user's configuration is
+  driven over `codex app-server`, so it steers.
 - [0019](0019-generated-app-server-protocol.md): The app-server protocol is generated from codex's
   schema.
 - [0021](0021-mock-validates-against-codex-schema.md): The mock app-server validates messages

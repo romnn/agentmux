@@ -15,7 +15,7 @@ use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::params::{DelegateParams, QuestionParams, QuotaParams, run_id};
+use crate::params::{DelegateParams, PermissionParams, QuestionParams, QuotaParams, run_id};
 use crate::render;
 
 /// Default seconds a blocking tool waits.
@@ -189,6 +189,12 @@ pub struct FollowUpParams {
     #[serde(default)]
     #[schemars(with = "usize")]
     pub max_bytes: Option<usize>,
+
+    /// Changes to the consultation's isolation or permissions for this turn and the ones after
+    /// it; whatever is omitted keeps what the newest turn ran with.
+    #[serde(flatten)]
+    #[schemars(flatten)]
+    pub permissions: PermissionParams,
 }
 
 /// Arguments for `steer`: which running consultation, and what to tell it.
@@ -400,6 +406,7 @@ impl AgentMux {
                 None,
             ));
         }
+        let overrides = params.permissions.options()?;
         // Read before the turn is claimed, so it is the length through the previous turn exactly.
         // The rendered transcript is append-only, which is what makes that a turn boundary and
         // not a cut through the middle of one.
@@ -410,7 +417,7 @@ impl AgentMux {
             .transcript_bytes;
         let status = self
             .store
-            .follow_up(&id, &params.question)
+            .follow_up_with(&id, &params.question, overrides)
             .map_err(|error| run_error(&error))?;
         self.store
             .wait_until_terminal(
@@ -664,6 +671,7 @@ fn instructions(
         }
     };
     let roster = roster(&config);
+    let permissions = permissions(&machine, denied);
 
     indoc::formatdoc! {"
         {INSTRUCTIONS}{denial}
@@ -674,10 +682,7 @@ fn instructions(
         nothing: call it before a long consultation, and again after a rate-limited failure to
         find one that can answer now.
         {models}
-        A delegate loads no settings, hooks or MCP servers unless its account is marked above as
-        inheriting them. Pass `inherit_settings: true` when the point of the consultation is to
-        exercise the tooling that configuration sets up, `false` when the answer must not depend
-        on this machine, and `env` to set variables the account's own tooling reads.
+        {permissions}
 
         No API key or endpoint override from the environment reaches a delegate unless its account
         is marked above as one that may use an API key: agentmux removes them from its environment
@@ -687,10 +692,39 @@ fn instructions(
 
         Those marks are the machine file's settings. An account a checkout's own agentmux.toml
         selects as its default, in place of the machine's, runs isolated and on subscription
-        pricing even when named explicitly: `inherit_settings: true` still overrides the
+        pricing even when named explicitly: `ignore_user_config: false` still overrides the
         isolation, `billing: api` is refused, and such an account that configures an API
         credential or endpoint is refused.
     "}
+}
+
+/// The paragraph saying what a delegate loads and may do: each launched vendor's defaults and
+/// limits, read from the machine file alone, which is the only file that may set them.
+fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) -> String {
+    let rules: String = Vendor::ALL
+        .into_iter()
+        .filter(|vendor| !denied.contains(vendor))
+        .map(|vendor| {
+            indoc::formatdoc! {"
+                - {vendor}: {}
+            ", machine.describe_permissions(vendor)}
+        })
+        .collect();
+    indoc::formatdoc! {"
+        What a delegate loads and may do, as this machine's file said at server start:
+        {rules}A delegate with `ignore_user_config=false` loads this machine's own CLI
+        configuration: its settings, hooks and MCP servers, so a hook can reopen its finished turn
+        and its answer can depend on this machine. Pass `ignore_user_config: true` to skip that
+        configuration (a `codex` delegate still applies this machine's exec-policy rules), `false` when the point is to exercise that tooling, and `env`
+        to set variables that tooling reads. Within the limits, `sandbox` and `network_access`
+        choose what a `codex` delegate's commands may do, and `permission_mode`, `tools`,
+        `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted, the
+        default above applies. A value beyond a limit is refused, naming the limit, and never
+        lowered to fit. A limit is a ceiling on what agentmux requests, not on what this machine's
+        own Codex `.rules` allow, which can run a matching command outside the sandbox. `follow_up` takes the same fields to change them for the next turn, and
+        keeps what the newest turn ran with for any it omits; the limits are rechecked on every
+        turn, and `quota` reports them as they are now."
+    }
 }
 
 /// The paragraph naming this machine's accounts, and which one an omitted `account` uses.
@@ -709,9 +743,13 @@ fn roster(config: &agentmux::config::Config) -> String {
                     notes.push(description.clone());
                 }
                 // The one property a caller cannot discover and must not be surprised by.
-                if account.inherit_settings == Some(true) {
-                    notes
-                        .push("INHERITS this machine's settings, hooks and MCP servers".to_owned());
+                match account.inherit_settings {
+                    Some(true) => notes
+                        .push("LOADS this machine's settings, hooks and MCP servers".to_owned()),
+                    Some(false) => {
+                        notes.push("runs ISOLATED from this machine's settings".to_owned());
+                    }
+                    None => {}
                 }
                 // The other property a caller must not be surprised by: whether a key reaches it.
                 if account.billing == Some(agentmux::delegate::Billing::Api) {
@@ -787,8 +825,10 @@ the result says which effort ran.
 
 Write the question for a stranger. The delegate shares no conversation with you and cannot ask you
 anything: name the paths it should read and the shape of the answer you want. It reads your project
-from `cwd`, is offered no editing tools, and never inherits your session's identity, settings,
-hooks or MCP servers."#;
+from `cwd`, is offered no editing tools unless its permissions say otherwise, and never inherits
+your session's identity. Unless this machine's agentmux.toml or your request says otherwise, it
+does load this machine's own CLI settings, hooks and MCP servers; `quota` reports what this machine
+sets."#;
 
 // The generated `list_tools`/`get_tool` are async by the trait's shape and await nothing, which
 // the macro cannot change.
@@ -814,7 +854,9 @@ mod tests {
 
     use agentmux::appserver::DriverPlan;
     use agentmux::appserver::mailbox::{Mailbox, SteerReply};
-    use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+    use agentmux::delegate::{
+        AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+    };
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
     use googletest::prelude::*;
@@ -950,7 +992,7 @@ mod tests {
             contains_substring(indoc::indoc! {"
                 started with.
 
-                A delegate loads"})
+                What a delegate loads"})
         );
         Ok(())
     }
@@ -978,7 +1020,7 @@ mod tests {
             contains_substring(indoc::indoc! {"
                 answer now.
 
-                A delegate loads"})
+                What a delegate loads"})
         );
         Ok(())
     }
@@ -1150,7 +1192,10 @@ mod tests {
             delegate: Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                sandbox: CodexSandbox::ReadOnly,
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
                 account: AccountChoice::Default,
                 isolation: Some(Isolation::Inherit),
             },
