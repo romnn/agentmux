@@ -59,20 +59,25 @@ async fn main() -> Result<()> {
     if let Command::CodexAppServer(args) = &cli.command {
         std::process::exit(agentmux::appserver::drive(&args.plan_path));
     }
+    // So is the supervisor: the store it opens is the one its plan names, and the environment it
+    // was started with is its delegate's, which it hands on.
+    if let Command::Supervise(args) = &cli.command {
+        std::process::exit(agentmux::run::supervise(&args.plan_path, agentmux::host_env()).await);
+    }
 
     let host_env = agentmux::host_env();
     let root = match &cli.state_dir {
         Some(dir) => dir.clone(),
         None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
     };
+    // This executable is the supervisor of every turn and the driver of a driven one, so a turn
+    // it starts is run and settled by the same build that will read it back.
+    let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
-        .with_quota_probe(Arc::new(agentmux::quota::SystemProbe));
-    // This executable is the driver, so a turn it starts is run by the same build that will read
-    // it back.
+        .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
+        .with_supervisor(&executable);
     if cli.codex_launch == CodexLaunchArg::AppServer {
-        let driver_executable =
-            std::env::current_exe().wrap_err("locating the agentmux executable")?;
-        store = store.with_codex_app_server(driver_executable);
+        store = store.with_codex_app_server(executable);
     }
 
     match cli.command {
@@ -124,10 +129,19 @@ async fn main() -> Result<()> {
             }
             report::status(&status, cli.json)
         }
+        Command::Wait(args) => {
+            let waited = report::wait(&store, &args, cli.json).await?;
+            if waited != report::WaitStatus::Completed {
+                // Exiting skips the flush a return would make.
+                std::io::Write::flush(&mut std::io::stdout())?;
+                std::process::exit(waited.code());
+            }
+            Ok(())
+        }
         Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
         Command::List(args) => report::list(&store.list(args.limit)?, cli.json),
         // Dispatched before the store was opened.
-        Command::CodexAppServer(_) => Ok(()),
+        Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
         Command::Prune(args) => {
             if let Some(run_id) = args.run_id {
                 store.remove(run_id.id())?;

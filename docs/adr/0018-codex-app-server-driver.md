@@ -38,11 +38,16 @@ becomes follows codex's own exec client, written as the `codex_app_server_protoc
 and `Isolation::Inherit` only — and `RunStore::with_codex_app_server` opts a store in; without it
 every Codex turn is `exec`.
 
+Under a supervisor ([0025](0025-eager-settlement-and-terminal-waiting.md)) the driver is the
+delegate the supervisor starts and records, and the supervisor settles the turn once the driver has
+gone; nothing about the driver changes.
+
 **One driver runs one turn and exits.** Follow-ups resume the persisted thread through a new driver;
 keeping a server idle between turns would leave a process per retained consultation without being
 needed for session continuity. Before starting its server, a driver verifies that the turn's launch
 record names it, preventing an abandoned driver from using a replacement turn's directory
-([0020](0020-run-state-locking.md)).
+([0020](0020-run-state-locking.md)); a supervisor makes the same check of its own record before it
+starts anything.
 
 **Steering and cancelling go through files**, so a restarted agentmux can reach a running driver:
 

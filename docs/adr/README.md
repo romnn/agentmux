@@ -59,6 +59,8 @@ a record names to show where the decision is enforced must be renamed there too.
 - [0020](0020-run-state-locking.md): A run changes shape only under its lock.
 - [0023](0023-resume-after-delegate-exit.md): A follow-up resumes a session only once its delegate
   has exited.
+- [0025](0025-eager-settlement-and-terminal-waiting.md): A supervisor settles each turn as its
+  delegate leaves, and waits return only then.
 
 ## Codex integration
 

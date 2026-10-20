@@ -1,4 +1,4 @@
-//! The MCP surface: ten tools over one run store, spoken over stdio.
+//! The MCP surface: eleven tools over one run store, spoken over stdio.
 //!
 //! Changes when the tool API changes.
 //!
@@ -10,10 +10,13 @@
 //!
 //! Both hosts cap how long a tool call may block — Codex at sixty seconds by default, Claude Code
 //! at ten minutes — and a review runs for far longer than either.
-//! So no tool waits for a review: `start` returns an id the moment the child is
+//! So no tool has to wait for a review: `start` returns an id the moment the child is
 //! running, and the child is detached so it survives an agentmux restart.
 //! `ask` is the same thing with a bounded wait folded in, for the common case where
 //! the answer arrives quickly.
+//! `wait` is the one tool that waits for as long as a turn takes, and returns only once the turn
+//! has settled; a host that would end the call first is served by the `agentmux wait` command,
+//! run from a shell.
 //!
 //! Claude Code also caps tool result size and handles `structuredContent` unreliably, so every
 //! tool returns plain text and always names a path.

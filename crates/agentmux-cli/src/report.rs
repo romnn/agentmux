@@ -11,12 +11,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux::report::{self, Warning};
-use agentmux::run::{HookReopening, RunId, RunStatus, RunStore, RunSummary, TranscriptPage};
-use agentmux::transcript::Outcome;
+use agentmux::run::{
+    HookReopening, RunError, RunId, RunStatus, RunStore, RunSummary, SettledTurn, TranscriptPage,
+    TurnRef, WaitFor,
+};
+use agentmux::transcript::{Outcome, TurnState};
 use color_eyre::eyre::Result;
 use serde::Serialize;
 
-use crate::cli::TailArgs;
+use crate::cli::{TailArgs, WaitArgs};
 
 /// Print a consultation's state.
 ///
@@ -140,10 +143,15 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
 pub fn answer(store: &RunStore, run_id: &RunId, json: bool) -> Result<()> {
     let (status, page) = store.view(run_id, 0, usize::MAX)?;
     if !status.is_terminal() {
-        eprintln!(
-            "still running after the wait. Nothing is lost — collect it with:\n  agentmux result \
-             {} --wait 600",
-            status.run_id
+        eprint!(
+            "{}",
+            indoc::formatdoc! {"
+                still running after the wait. Nothing is lost — wait for it to settle with:
+                  agentmux wait {id} --turn {turn}
+                ",
+                id = status.run_id,
+                turn = status.turns,
+            }
         );
         return self::status(&status, json);
     }
@@ -223,6 +231,167 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// How `agentmux wait` ended, as its exit status says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitStatus {
+    /// Every turn returned completed.
+    Completed,
+    /// A turn returned failed.
+    Failed,
+    /// A turn returned cancelled, and none failed.
+    Cancelled,
+    /// The timeout passed first.
+    TimedOut,
+    /// An argument named a consultation or a turn there is not.
+    Unusable,
+}
+
+impl WaitStatus {
+    /// The process exit status.
+    ///
+    /// 124 for a timeout is what `timeout(1)` exits with, and 1 and 2 stay what every other
+    /// command exits with for an error and for arguments it cannot act on.
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Failed => 10,
+            Self::Cancelled => 11,
+            Self::TimedOut => 124,
+            Self::Unusable => 2,
+        }
+    }
+
+    /// How a set of settled turns ended: a failure outweighs a cancellation, which outweighs
+    /// completion.
+    fn of(settled: &[SettledTurn]) -> Self {
+        let has = |state: TurnState| settled.iter().any(|turn| turn.outcome().state() == state);
+        if has(TurnState::Failed) {
+            Self::Failed
+        } else if has(TurnState::Cancelled) {
+            Self::Cancelled
+        } else {
+            Self::Completed
+        }
+    }
+}
+
+/// Wait for the turns `args` names to settle, print them, and say how it ended.
+///
+/// Every turn is pinned before anything waits, so a follow-up started meanwhile is not returned
+/// in its place, and an argument naming nothing is refused before any wait.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be read or a settlement does not hold, which the
+/// binary exits 1 for.
+pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitStatus> {
+    // The clock starts with the command, before anything is read, and a timeout too large to add
+    // to it is no timeout.
+    let deadline = args
+        .timeout
+        .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+    let mut targets = Vec::with_capacity(args.run_ids.len());
+    for run_id in &args.run_ids {
+        match store.pin_turn(run_id.id(), args.turn) {
+            Ok(target) => targets.push(target),
+            Err(err @ (RunError::NotFound(_) | RunError::NoSuchTurn { .. })) => {
+                eprintln!("agentmux: {err}");
+                return Ok(WaitStatus::Unusable);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let until = if args.any { WaitFor::Any } else { WaitFor::All };
+    let waited = store.wait_for(&targets, until, deadline).await?;
+    let status = if waited.timed_out {
+        WaitStatus::TimedOut
+    } else {
+        WaitStatus::of(&waited.settled)
+    };
+
+    let mut reports = Vec::with_capacity(waited.settled.len());
+    for settled in &waited.settled {
+        let offset = settled.section_offset();
+        let page = settled.page(offset, usize::MAX)?;
+        reports.push(SettledJson {
+            settled,
+            text_offset: offset,
+            text: page.text,
+        });
+    }
+    if json {
+        let report = WaitJson {
+            result: if waited.timed_out {
+                "timed_out"
+            } else {
+                "settled"
+            },
+            settled: &reports,
+            pending: &waited.pending,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(status);
+    }
+    if waited.timed_out {
+        let pending = waited
+            .pending
+            .iter()
+            .map(|target| format!("{} turn {}", target.run_id(), target.turn_number()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "timed out; still waiting for {pending}. Nothing is lost — the consultation carries \
+             on, and `agentmux wait` again picks it up."
+        );
+        return Ok(status);
+    }
+    for (position, settled_report) in reports.iter().enumerate() {
+        if position > 0 {
+            println!();
+        }
+        let settled = settled_report.settled;
+        print!(
+            "{}",
+            indoc::formatdoc! {"
+                {id}  turn {turn} settled
+                  state       {state}
+                  transcript  {transcript}
+                  settled     {marker}
+
+                ---
+
+                {text}",
+                id = settled.run_id(),
+                turn = settled.turn_number(),
+                state = report::outcome_line(settled.outcome()),
+                transcript = settled.transcript_path().display(),
+                marker = settled.marker_path().display(),
+                text = settled_report.text,
+            }
+        );
+    }
+    Ok(status)
+}
+
+/// One settled turn in `wait --json`: the settlement, and its transcript from `text_offset`.
+#[derive(Serialize)]
+struct SettledJson<'a> {
+    #[serde(flatten)]
+    settled: &'a SettledTurn,
+    text_offset: u64,
+    text: String,
+}
+
+/// `wait --json`: whether the wait ended in settlement or a timeout, what settled, and what did
+/// not.
+#[derive(Serialize)]
+struct WaitJson<'a> {
+    result: &'static str,
+    settled: &'a [SettledJson<'a>],
+    pending: &'a [TurnRef],
 }
 
 /// Print recent consultations.

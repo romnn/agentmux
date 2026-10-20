@@ -1,4 +1,4 @@
-//! The ten tools.
+//! The eleven tools.
 //!
 //! Changes when the tool API changes.
 
@@ -7,11 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::Vendor;
-use agentmux::run::{RunId, RunStore, StartRequest};
+use agentmux::run::{RunId, RunStore, SettledTurn, StartRequest, TurnRef};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -191,6 +195,34 @@ pub struct FollowUpParams {
     pub max_bytes: Option<usize>,
 }
 
+/// Arguments for `wait`: which turn to wait for, and which page of the transcript to return.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitParams {
+    /// The consultation id, from `ask`, `start` or `list`.
+    pub run_id: String,
+
+    /// The turn to wait for, counted from 1 as the transcript's turn headings count.
+    /// Defaults to the newest turn when the call arrives, and stays that turn: a follow-up started
+    /// meanwhile is not returned in its place.
+    #[serde(default)]
+    #[schemars(with = "u32")]
+    pub turn: Option<u32>,
+
+    /// Byte offset to read from, in the same coordinates as `result`.
+    /// Defaults to 0 for the first turn, and to the start of the turn for a later one, so a
+    /// follow-up's reply carries that turn alone.
+    #[serde(default)]
+    #[schemars(with = "u64")]
+    pub offset: Option<u64>,
+
+    /// Most bytes to return.
+    /// Defaults to 40000.
+    /// Read the transcript file for the whole thing.
+    #[serde(default)]
+    #[schemars(with = "usize")]
+    pub max_bytes: Option<usize>,
+}
+
 /// Arguments for `steer`: which running consultation, and what to tell it.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SteerParams {
@@ -300,8 +332,9 @@ impl AgentMux {
     #[tool(
         description = "Begin a consultation and return its id immediately, without waiting. Use \
                        this for work that will take many minutes — a deep review, a whole-repo \
-                       analysis — then watch it with `tail` or block for the answer with \
-                       `result`. The delegate runs detached and survives an agentmux restart."
+                       analysis — then collect it with `wait`, which returns once the turn has \
+                       settled, and watch it with `tail` meanwhile if you like. The delegate runs \
+                       detached and survives an agentmux restart."
     )]
     fn start(
         &self,
@@ -357,8 +390,10 @@ impl AgentMux {
     #[tool(
         description = "Return a consultation's complete transcript, in order, including anything \
                        a hook injected, clearly marked. With `wait_seconds` it blocks up to that \
-                       long for the consultation to finish first. Always also names the \
-                       transcript file, which holds the whole thing when the reply is truncated."
+                       long for the consultation to finish first; coming back still running is an \
+                       observation, not a completion, and `wait` is what returns only once the \
+                       turn has settled. Always also names the transcript file, which holds the \
+                       whole thing when the reply is truncated."
     )]
     async fn result(
         &self,
@@ -380,6 +415,47 @@ impl AgentMux {
             )
             .map_err(|error| run_error(&error))?;
         Ok(text(render::transcript(&status, &page)))
+    }
+
+    #[tool(
+        description = "Block until a consultation's turn has settled, then return its \
+                       transcript. Settled means finished and final: the delegate has exited, \
+                       or a cancellation froze the turn although the delegate would not stop, \
+                       and the transcript through that turn is published and will never change. It \
+                       never returns early with a running state, and it has no time limit of its \
+                       own, however long the review takes; while it waits it sends a progress \
+                       notification every 30 seconds to a caller that asked for progress. Use it \
+                       after `start` instead of polling. A host may still end a long call: Codex \
+                       stops one after its `tool_timeout_sec`, and progress does not extend that, \
+                       so there wait with the `agentmux wait` command in a shell instead. \
+                       Cancelling the call stops the wait, never the consultation."
+    )]
+    async fn wait(
+        &self,
+        Parameters(params): Parameters<WaitParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let id = run_id(&params.run_id)?;
+        let target = self
+            .store
+            .pin_turn(&id, params.turn)
+            .map_err(|error| run_error(&error))?;
+        let settled = wait_reporting_progress(&self.store, &target, &context).await?;
+        let page = settled
+            .page(
+                params.offset.unwrap_or_else(|| settled.section_offset()),
+                slice(params.max_bytes, DEFAULT_RESULT_BYTES),
+            )
+            .map_err(|error| run_error(&error))?;
+        // Rendered from the settlement and what never changes; the newest turn's number is an
+        // aside that a later turn's records cannot fail the call over.
+        let meta = self.store.meta(&id).map_err(|error| run_error(&error))?;
+        let newest = self
+            .store
+            .pin_turn(&id, None)
+            .ok()
+            .map(|newest| newest.turn_number());
+        Ok(text(render::settled(&settled, &meta, newest, &page)))
     }
 
     #[tool(
@@ -505,6 +581,73 @@ impl AgentMux {
     }
 }
 
+/// How often a waiting call tells a caller that asked for progress that it is still waiting.
+///
+/// Claude Code ends a stdio call that says nothing for thirty minutes, and resets that clock on
+/// progress; thirty seconds is far inside it without flooding the channel.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Longest a progress notification may take to send before it is given up, so a host that stops
+/// reading cannot hold back the wait it is about.
+const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wait for `target` to settle, sending progress while it does when the request asked for it.
+///
+/// Returns the settlement, or an error when the wait fails or the caller cancels the request; the
+/// consultation itself is never touched.
+async fn wait_reporting_progress(
+    store: &RunStore,
+    target: &TurnRef,
+    context: &RequestContext<RoleServer>,
+) -> Result<SettledTurn, ErrorData> {
+    let progress_token = context.meta.get_progress_token();
+    let started = tokio::time::Instant::now();
+    let mut ticks = tokio::time::interval_at(started + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
+    let waiting = store.wait_for_settlement(target);
+    tokio::pin!(waiting);
+    loop {
+        tokio::select! {
+            settled = &mut waiting => return settled.map_err(|error| run_error(&error)),
+            () = context.ct.cancelled() => {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "the wait for consultation {} turn {} was cancelled; the consultation \
+                         carries on",
+                        target.run_id(),
+                        target.turn_number()
+                    ),
+                    None,
+                ));
+            }
+            _ = ticks.tick(), if progress_token.is_some() => {
+                let Some(token) = progress_token.clone() else {
+                    continue;
+                };
+                let elapsed = started.elapsed().as_secs();
+                let notification = ProgressNotificationParam::new(
+                    token,
+                    f64::from(u32::try_from(elapsed).unwrap_or(u32::MAX)),
+                )
+                .with_message(format!(
+                    "consultation {} turn {} has not settled after {elapsed}s; still waiting",
+                    target.run_id(),
+                    target.turn_number()
+                ));
+                match tokio::time::timeout(
+                    PROGRESS_SEND_TIMEOUT,
+                    context.peer.notify_progress(notification),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::debug!(?err, "a progress notification was not sent"),
+                    Err(_) => tracing::debug!("a progress notification timed out"),
+                }
+            }
+        }
+    }
+}
+
 impl AgentMux {
     /// The transcript of a consultation once a wait has ended, or its state if it is still going.
     ///
@@ -543,6 +686,7 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         | RunError::Steer(_)
         | RunError::TurnAlreadyClaimed { .. }
         | RunError::StillRunning { .. }
+        | RunError::NoSuchTurn { .. }
         | RunError::Delegate(_)
         // The caller is a delegate that inherited its account's MCP servers and found agentmux
         // among them; the remedy is to answer, not to retry.
@@ -567,8 +711,12 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
             ),
             None,
         ),
+        // A turn that cannot settle, or a settlement that does not hold, is the store's to repair;
+        // the message names the files to look at.
         RunError::Corrupt { .. }
         | RunError::CorruptRecord { .. }
+        | RunError::InvalidSettlement { .. }
+        | RunError::UncertainStart { .. }
         | RunError::Io { .. }
         | RunError::NoStateDir => ErrorData::internal_error(error.to_string(), None),
     }
@@ -756,16 +904,33 @@ same-vendor subagents natively and more cheaply; agentmux exists to cross the ve
 where a disagreement is worth paying for.
 
 A consultation is slow and durable. `start` returns a run id immediately and the delegate runs
-detached, surviving a restart of this server. Then poll `status` — it is cheap and carries no
-transcript text — about once a minute; a review at high effort takes five to forty minutes. Use
-`tail` when you want to see what the delegate is actually doing, `result` to collect the answer,
-and `cancel` to stop one while keeping what it collected. `ask` is `start` plus a 45-second wait,
-for a question you expect answered quickly; a review is not that. A call that comes back "still
-running" has lost nothing, and `list` recovers an id you did not keep. `follow_up` continues the
-delegate's own session, so ask only the new thing. `steer` adds an instruction to a turn that is
-still running, which the delegate sees before its next model call; only a turn `status` reports as
-`steerable: yes` takes one, which today means a `codex` consultation that inherits its account's
-settings, because only those are launched over Codex's app-server.
+detached, surviving a restart of this server; a review at high effort takes five to forty minutes.
+Collect it by waiting for its turn to settle rather than by polling. Settled means final: the
+delegate has exited, or a cancellation froze the turn although the delegate would not stop, and
+the transcript through that turn is published and will never change. Two
+waits return exactly then, never earlier, and have no time limit of their own:
+
+- The `wait` tool blocks the call until the turn settles, and sends a progress notification every
+  30 seconds to a caller that asked for progress. Under Claude Code a `wait` the host moved to the
+  background reports its completion when the turn has truly finished.
+- The `agentmux wait <run_id> --turn <n>` command does the same from a shell, then prints the turn
+  and exits 0 if it completed, 10 if it failed and 11 if it was cancelled. Under Claude Code, run
+  it with `run_in_background`, and its exit is the completion notice. Under Codex, which ends a
+  tool call after its `tool_timeout_sec` however much progress the call reports, run it as a shell
+  command and wait for that command to finish. Run it with the `AGENTMUX_STATE_DIR` this server
+  was given, if it was given one.
+
+A bounded wait that comes back "still running" — `result` with `wait_seconds`, or `ask` — has
+observed the consultation, not seen it finish. It has lost nothing; wait for the turn instead of
+calling again. Use `status` for a cheap look that carries no transcript text, `tail` when you want
+to see what the delegate is actually doing, `result` to page the transcript, and `cancel` to stop
+one while keeping what it collected. `ask` is `start` plus a 45-second wait, for a question you
+expect answered quickly; a review is not that. `list` recovers an id you did not keep.
+`follow_up` continues the delegate's own session, so ask only the new thing. `steer` adds an
+instruction to a turn that is still running, which the delegate sees before its next model call;
+only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`
+consultation that inherits its account's settings, because only those are launched over Codex's
+app-server.
 
 The transcript is the deliverable and the last message is not the answer. No tool returns "the
 answer", deliberately: a delegate's report is routinely followed by wrap-up, a warning, or a turn

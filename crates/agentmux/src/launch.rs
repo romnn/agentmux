@@ -440,6 +440,17 @@ impl Launcher for ProcessLauncher {
             }
             #[cfg(unix)]
             command.process_group(0);
+            // Detached from this process's console and its Ctrl+C, the Windows counterpart of a
+            // process group of its own.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                /// `DETACHED_PROCESS`: no console is inherited.
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                /// `CREATE_NEW_PROCESS_GROUP`: a console Ctrl+C is not delivered to it.
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            }
             command.spawn().map_err(|source| LaunchError::Spawn {
                 program: program.to_owned(),
                 source,

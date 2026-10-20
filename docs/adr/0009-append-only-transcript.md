@@ -29,9 +29,15 @@ frozen once something settles it:
   go missing once rendered. Text that cannot be kept is not rendered.
 - Whatever record settles a turn, the turn is re-folded from exactly the length that record froze,
   so two observers publish the same bytes.
+- Once a turn's outcome is terminal and its delegate has gone, or a record settled it, its
+  `settled.json` commits the capture prefix, the recovered reply and the transcript range it was
+  rendered from, written after the transcript and never rewritten
+  ([0025](0025-eager-settlement-and-terminal-waiting.md)). From then on the turn is read only as
+  far as the marker says, and no reply is recovered into it again.
 - The consultation header contains only creation-time values; mutable status never enters it.
 - `RunStore::remove` and `RunStore::sweep` refuse a run while a recorded child may still be alive,
-  including a child with a cancellation record. Unknown liveness blocks deletion.
+  including a child with a cancellation record, or while a turn's supervisor is. Unknown liveness
+  blocks deletion.
 - A follow-up is refused (`NotResumable::AwaitingDelegateExit`) until the newest turn's delegate has
   left, because both CLIs save the session it resumes on their way out.
 

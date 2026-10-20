@@ -4,10 +4,11 @@
 //! server restarted underneath a `tail` — and every change to a run's shape is a check followed
 //! by a write, which another process could act between.
 //! So each one runs while a [`LockedRun`] is held, and only [`RunStore::lock`] makes one.
-//! Folding a turn (which may settle it), recovering a late reply, publishing the render and
-//! claiming a turn are methods of [`LockedRun`].
-//! Marking and recording a cancellation, removing the run, the retention sweep and submitting a
-//! steer are methods of [`RunStore`] that hold one across their check and write.
+//! Folding a turn (which may settle it), recovering a late reply, publishing the render,
+//! committing a turn's settlement and claiming a turn are methods of [`LockedRun`].
+//! Marking and recording a cancellation, finalizing a turn, a supervisor's admission and the
+//! start of its delegate, removing the run, the retention sweep and submitting a steer are
+//! methods of [`RunStore`] that hold one across their check and write.
 //! Nothing reachable from a [`LockedRun`] takes the lock again, because a second lock on the same
 //! file from one process waits on the first for ever.
 //!
@@ -50,6 +51,41 @@ impl RunStore {
     /// It is an advisory lock the operating system releases when its holder dies, so a crashed
     /// holder leaves nothing to recover from.
     pub(super) fn lock(&self, run_id: &RunId) -> Result<LockedRun<'_>, RunError> {
+        let lock = self.open_lock(run_id)?;
+        lock.lock().map_err(|source| RunError::Io {
+            context: format!("locking {}", self.lock_path(run_id).display()),
+            source,
+        })?;
+        Ok(LockedRun {
+            store: self,
+            run_id: run_id.clone(),
+            lock,
+        })
+    }
+
+    /// Take the consultation's lock if nobody holds it, or say that somebody does.
+    ///
+    /// For a wait, which must never sit behind another process's lock: it looks again on its
+    /// next poll, keeping one cadence and one deadline, and reading a marker that the holder may
+    /// have published meanwhile.
+    pub(super) fn try_lock(&self, run_id: &RunId) -> Result<Option<LockedRun<'_>>, RunError> {
+        let lock = self.open_lock(run_id)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(LockedRun {
+                store: self,
+                run_id: run_id.clone(),
+                lock,
+            })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => Err(RunError::Io {
+                context: format!("locking {}", self.lock_path(run_id).display()),
+                source,
+            }),
+        }
+    }
+
+    /// Open the consultation's lock file, creating it if needed, without locking it.
+    fn open_lock(&self, run_id: &RunId) -> Result<File, RunError> {
         let path = self.lock_path(run_id);
         let lock = File::options()
             .create(true)
@@ -60,14 +96,6 @@ impl RunStore {
                 context: format!("opening {}", path.display()),
                 source,
             })?;
-        lock.lock().map_err(|source| RunError::Io {
-            context: format!("locking {}", path.display()),
-            source,
-        })?;
-        Ok(LockedRun {
-            store: self,
-            run_id: run_id.clone(),
-            lock,
-        })
+        Ok(lock)
     }
 }

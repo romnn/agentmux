@@ -73,6 +73,29 @@ impl TurnDir {
     pub(super) fn app_server_plan_path(&self) -> PathBuf {
         self.root.join("app-server.json")
     }
+    /// The plan the turn's supervisor runs under.
+    pub(super) fn supervisor_plan_path(&self) -> PathBuf {
+        self.root.join("supervisor-plan.json")
+    }
+    /// The supervisor's identity and how far it got, written by whoever launched it.
+    pub(super) fn supervisor(&self) -> PathBuf {
+        self.root.join("supervisor.json")
+    }
+    /// Everything the supervisor itself prints, which is never part of the capture.
+    pub(super) fn supervisor_log(&self) -> PathBuf {
+        self.root.join("supervisor.log")
+    }
+    /// The commitment that the turn's transcript is published and final, written last.
+    pub(super) fn settled(&self) -> PathBuf {
+        self.root.join("settled.json")
+    }
+    /// Whether the directory holds a record that makes it a turn rather than a claim, judged by
+    /// which records exist rather than by what they say: every record is written whole.
+    pub(super) fn holds_a_record(&self) -> bool {
+        [self.launch(), self.exit(), self.supervisor()]
+            .iter()
+            .any(|record| record.exists())
+    }
     /// Where steered messages wait for the driver of a turn driven over the app-server.
     pub(crate) fn steer_dir(&self) -> PathBuf {
         self.root.join("steer")

@@ -139,8 +139,8 @@ impl DriverOutcome {
 ///
 /// The question is read from stdin and the capture is written to stdout, which the launcher has
 /// pointed at the turn's files; a turn that breaks says why on stderr.
-/// Nothing is started until the turn's launch record names this process, which the caller writes
-/// once the spawn returns.
+/// Nothing is started until the turn's launch record names this process, which whoever launched
+/// it — the run store, or the turn's supervisor — writes once the spawn returns.
 /// Returns the process's exit status.
 #[must_use]
 pub fn drive(plan_path: &Path) -> i32 {
