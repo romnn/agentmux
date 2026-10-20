@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
 
 env:
   MISE_GITHUB_TOKEN: ${{ github.token }}
@@ -12,7 +12,6 @@ env:
 
 jobs:
   goreleaser:
-    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
