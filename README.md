@@ -77,7 +77,8 @@ That writes the entry below, which can also be added by hand: to `~/.claude.json
 command = "agentmux"
 args = ["mcp", "--deny", "codex"]
 # Codex kills a tool call after 60 seconds by default, which is shorter than the wait `ask` and
-# `result` accept. Raising it lets a caller block for a whole short consultation.
+# `result` accept. Raising it lets a caller block for a whole short consultation; a long one is
+# waited for with `agentmux wait` in a shell, which no tool timeout ends.
 tool_timeout_sec = 600
 ```
 
@@ -99,10 +100,11 @@ reach a second account of your own vendor — it refuses the vendor as a whole, 
 ### Tools
 
 Both hosts cap how long a tool may block — Codex at 60 seconds by default, Claude Code at ten
-minutes — and both cap how much a tool may return. A review takes longer than either. So no tool
-waits for a whole review: `start` returns an id the moment the delegate is running, the child is
-detached and survives an `agentmux` restart, and every result carries the path to the transcript on
-disk. The inline text is a bounded convenience; the file is the record.
+minutes — and both cap how much a tool may return. A review takes longer than either. So `start`
+returns an id the moment the delegate is running, the child is detached and survives an `agentmux`
+restart, and every result carries the path to the transcript on disk. The inline text is a bounded
+convenience; the file is the record. `wait` is the one tool that blocks for as long as a turn
+takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 
 | Tool        | What it does                                                                       |
 | ----------- | ---------------------------------------------------------------------------------- |
@@ -113,23 +115,25 @@ disk. The inline text is a bounded convenience; the file is the record.
 | `result`    | The complete transcript, paged, optionally after blocking for the consultation      |
 | `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
 | `steer`     | Add an instruction to a turn that is still running, read before its next model call |
+| `wait`      | Block until a turn has settled, then return it — never earlier, with no time limit   |
 | `cancel`    | Stop a running consultation, keeping everything collected so far; returns once it has  |
 | `list`      | Recent consultations with their ids, so an id can be recovered                       |
 | `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
 
 ### Use from the command line
 
-The same ten verbs are available directly, as a unified CLI over both vendors:
+The same eleven verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.
 agentmux ask --delegate codex --model astra --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 
-# A long review, watched as it arrives.
+# A long review, watched as it arrives, then collected once it has settled.
 agentmux start --delegate claude --model opus --effort xhigh --keep \
   --file review/brief.md
 agentmux tail <run-id> --follow
+agentmux wait <run-id>    # exits 0 completed, 10 failed, 11 cancelled
 
 # A correction while the turn is still running, from another terminal. Only a Codex turn that
 # loads its account's configuration, which is the default, runs over `codex app-server`, which is
@@ -531,7 +535,8 @@ on. Every limit is the machine file's alone; `agentmux accounts`, `quota` and th
 instructions list each vendor's defaults and limits.
 
 The transcript header names what a consultation started with, as `sandbox=read-only+network`, and
-never changes. `status` and `list` name what its newest turn ran with. A follow-up keeps that
+never changes. `status` and `list` name what its newest turn ran with, and `wait` what the turn it
+returns ran with. A follow-up keeps that
 unless it passes the same parameters or flags to change them, and a turn that ran with other
 settings than the header names says so under its question. The current limits
 are checked again before every turn, so a limit tightened since refuses the next turn until it asks
@@ -679,6 +684,40 @@ it. When a driven turn fails, or codex sends something agentmux cannot read, the
 points at these switches: that is what a codex whose app-server protocol has moved looks like.
 A running turn keeps the mode it started in.
 
+### Waiting for a consultation
+
+A turn **settles** once its delegate has gone, or once a cancellation has frozen it even if the
+delegate could not be made to stop: its transcript through that turn is published and will never
+change, and `turns/<n>/settled.json` beside it says so, with the turn's outcome and where its
+section of `transcript.md` ends. Every turn runs under a supervisor — the hidden
+`agentmux supervise`, which starts the delegate itself and settles the turn the moment it leaves —
+so the settlement is on disk within moments whether or not anything is asking, and a file watch on
+`settled.json` sees it.
+
+Two waits return exactly then, never earlier, and have no deadline of their own:
+
+- the `wait` tool, which sends a progress notification every 30 seconds to a caller that asked for
+  progress, and
+- `agentmux wait <run-id>... [--turn N] [--any | --all] [--timeout D] [--json]`, which prints the
+  turn and exits 0 completed, 10 failed, 11 cancelled, 124 when `--timeout` passed first, 1 when
+  agentmux itself failed and 2 for an id or a turn there is not.
+
+A wait is pinned to one turn — the newest when it starts, or `--turn N`, counted from 1 — and a
+follow-up started meanwhile is not returned in its place. `ask`, `result` with `wait_seconds`, and
+`follow_up` stay bounded: one that comes back still running has observed the consultation, not seen
+it finish.
+
+- **Claude Code**: `start` through the MCP server, then call `wait`, or run
+  `agentmux wait <run-id> --turn <n>` with `run_in_background`; the background task ends when the
+  turn has settled, and its exit status says how.
+- **Codex**: `start` through the MCP server, then run `agentmux wait <run-id> --turn <n>` as a
+  shell command and wait for it to finish. Codex ends a tool call after its `tool_timeout_sec`
+  however much progress the call reports, so the `wait` tool suits only consultations shorter than
+  that.
+
+The command reads the same store as the server: give it the server's `AGENTMUX_STATE_DIR`, if the
+server has one.
+
 ### Stopping, and what survives a restart
 
 `cancel` marks the turn as cancelling, asks the delegate to stop, waits a few seconds, makes it
@@ -697,9 +736,13 @@ A delegate that exits without a closing event is recorded once, with its exit st
 of its stderr, and the transcript is rendered from that record from then on — never from files a
 tool subprocess the delegate started may still be writing to.
 
-A delegate outlives the `agentmux` that started it. While that process lives it holds the child's
-handle; afterwards the pid on disk is trusted only together with the process start time recorded
-beside it, so a recycled pid is never mistaken for a delegate. On Windows a restarted `agentmux`
+A delegate outlives the `agentmux` that started it. Its supervisor holds the child's handle and
+records how it exited; any other process trusts the pid on disk only together with the process
+start time recorded beside it, so a recycled pid is never mistaken for a delegate. A supervisor
+that dies leaves its delegate running in a process group of its own, and the next `status`, `wait`
+or other read settles the turn once the delegate has gone. One that dies in the instant between
+starting the delegate and recording it leaves a turn nothing can tell is running: it is neither
+settled nor removed, and a wait on it says so. On Windows a restarted `agentmux`
 can stop a delegate but its signal reaches only the delegate process: a turn run over
 `codex app-server` holds its descendants in a job that ends with the driver, while a directly
 launched CLI's tool subprocesses are not contained.

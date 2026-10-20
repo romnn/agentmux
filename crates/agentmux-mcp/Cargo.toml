@@ -29,10 +29,16 @@ indoc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+# `macros` for the `select!` a waiting tool runs its progress notifications beside.
+tokio = { workspace = true, features = ["macros", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
 googletest.workspace = true
+# A client on the other end of an in-memory transport, for the tests that hold the server to
+# what a host sees on the wire.
+rmcp = { workspace = true, features = ["client"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# `io-util` for that in-memory transport, `test-util` for a clock a wait of many minutes can run
+# against in an instant.
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "test-util", "time"] }

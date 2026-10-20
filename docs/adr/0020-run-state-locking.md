@@ -12,12 +12,17 @@ process could act between any check and its write.
 
 ## Decision
 
-**Turn admission, settlement, reply recovery, transcript publication and removal of recorded runs
-are serialized by the run lock.** A `run::LockedRun` (`crates/agentmux/src/run/lock.rs`) is the
+**Turn admission, settlement, reply recovery, transcript publication, the commitment of a turn's
+`settled.json`, a supervisor's start of its delegate and removal of recorded runs are serialized by
+the run lock.** A `run::LockedRun` (`crates/agentmux/src/run/lock.rs`) is the
 guard; only `RunStore::lock` makes one.
 
-- Folding a turn (which may settle it), recovering a late reply, publishing the render and claiming
-  and launching a turn are methods of `LockedRun`.
+- Folding a turn (which may settle it), recovering a late reply, publishing the render, committing
+  a settlement (`LockedRun::fold_and_publish`) and claiming and launching a turn are methods of
+  `LockedRun`.
+- Finalizing a turn (`RunStore::finalize_turn`) and a supervisor's admission, which checks its
+  record and spawns and records the delegate under one hold, are `RunStore` methods that hold
+  one ([0025](0025-eager-settlement-and-terminal-waiting.md)).
 - Marking and recording a cancellation, removing the run, the retention sweep and submitting a steer
   are `RunStore` methods that hold one across their check and write.
 - A fold and the publication of its render happen under one hold, so no reader can publish a reading
@@ -33,9 +38,10 @@ run removes nothing another process may be holding, and two processes locking tw
 under one name would each believe they held the lock. It is an advisory lock the operating system
 releases when its holder dies.
 
-**A turn directory is a turn once it holds a launch or exit record.** Creating the directory is the
-claim on its index, and the launch is recorded before the lock is released. A directory without
-either record found under the lock is therefore an abandoned claim (`claim_turn` in
+**A turn directory is a turn once it holds a launch, supervisor or exit record.** Creating the
+directory is the claim on its index, and the launch — the delegate's, or its supervisor's — is
+recorded before the lock is released. A directory without any of them found under the lock is
+therefore an abandoned claim (`claim_turn` in
 `crates/agentmux/src/run/spawn.rs`). It is renamed outside the indexed turn sequence before the
 index is reused, preserving files an unrecorded child may still hold open. This does not discover or
 stop that child. The app-server driver must confirm its own launch record before starting work

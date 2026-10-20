@@ -11,9 +11,13 @@
 //! Terminal state is decided in one order, and the order is the point:
 //!
 //! 1. a terminal event in the stream, which is authoritative because it survives everything else;
-//! 2. `exit.json`, when the child was reaped, observed gone, or cancelled;
+//! 2. `exit.json`, when the child was reaped, observed gone, cancelled, or never started;
 //! 3. process liveness, as a last resort — and only for a turn nothing has settled yet, so a
 //!    settled turn is never observed again and a recycled pid cannot be mistaken for it.
+//!
+//! A turn's departure is left to its supervisor while the supervisor lives, because only the
+//! supervisor holds the handle that knows the exit status; a supervisor gone settles nothing, and
+//! the next observer records the departure in its place.
 //!
 //! # Why a settled turn's fold input is frozen
 //!
@@ -28,17 +32,30 @@
 //! removing a run still asks about a cancelled turn's child.
 //! Whatever record settles a turn, the turn is rendered from exactly the capture length that
 //! record froze, whichever caller wrote it.
+//!
+//! # Committing a settlement
+//!
+//! A terminal outcome is what the stream or a record says; a settled turn is one whose final
+//! transcript is published and committed by `settled.json`.
+//! [`RunStore::finalize_turn`] is the one step that commits, and every fold that publishes takes
+//! it for each turn that is ready: the outcome is terminal, and either a record settled it or the
+//! delegate has gone, so nothing it renders — a recovered reply above all — can still arrive.
+//! The marker is written after the transcript, never rewritten, and from then on it is the
+//! turn's frozen input: the capture and the recovered reply are read only as far as it says, and
+//! no reply is recovered into the turn again.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::SystemTime;
 
 use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
 
+use super::id::RunId;
 use super::layout::TurnDir;
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, Meta, TurnFiles, read_complete_records,
-    read_if_present, read_json, tail_of_file, write_json_once,
+    ExitRecord, InvocationRecord, LaunchMode, Meta, SettledRecord, SettledTurn, SupervisorPhase,
+    TurnFiles, read_complete_records, read_if_present, read_json, tail_of_file, write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
@@ -69,6 +86,34 @@ pub(super) struct FoldedTurn {
     pub(super) turn_started: bool,
     /// Where its usage window is still to be read from, when its stream carried none.
     pub(super) pending_rate_limit_lookup: Option<RateLimitLookup>,
+    /// Whether its settlement is committed, can be, or cannot be yet.
+    pub(super) finality: Finality,
+    /// Whether its delegate has gone, as this fold observed it once.
+    pub(super) delegate_gone: bool,
+}
+
+/// Whether a folded turn's settlement can be committed with `settled.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Finality {
+    /// Its marker is on disk, and the fold read only what the marker froze.
+    Committed,
+    /// Its outcome and everything its render reads are final, so the marker can be written.
+    Ready(Frozen),
+    /// It is still running, or it ended while its delegate may still write what it renders.
+    Open,
+    /// Its supervisor left while spawning the delegate and recorded none, so nothing can say
+    /// whether a delegate is running: it is neither settled nor replaced.
+    UncertainStart,
+}
+
+/// What a turn ready to settle was folded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Frozen {
+    pub(super) settled_by: SettledBy,
+    /// The complete-record prefix of the capture the fold read.
+    pub(super) events_len: u64,
+    /// The length of the recovered reply the turn renders, if it renders one.
+    pub(super) recovered_bytes: Option<u64>,
 }
 
 /// A finished Codex turn whose usage window is still to be read from its session rollout.
@@ -96,6 +141,21 @@ struct Departure {
     stderr_tail: String,
 }
 
+/// What an observation of a turn nothing has settled established.
+enum Evidence {
+    /// Its delegate was observed gone.
+    Departed {
+        departure: Departure,
+        /// The capture read after the departure was observed, which is final.
+        final_events: String,
+    },
+    /// Its supervisor left before spawning anything, which a record says once.
+    NeverStarted {
+        /// Why, for the record.
+        reason: String,
+    },
+}
+
 /// Recover a report the event stream lost but the CLI wrote out anyway.
 ///
 /// Codex's `--output-last-message` file is written by the codex process rather than by the agent,
@@ -116,10 +176,14 @@ struct Departure {
 /// A file that lands for an earlier turn after a later one exists is left where it is rather
 /// than inserted above the turn that followed; one kept before then stays.
 impl LockedRun<'_> {
+    /// When `committing`, the turn is about to be settled, and a reply that cannot be kept is an
+    /// error rather than a warning: a marker must never vouch for a transcript that left out a
+    /// reply it could have shown.
     fn recover_from_last_message(
         &self,
         files: &TurnFiles,
         turn: &mut Turn,
+        committing: bool,
     ) -> Result<(), RunError> {
         let dir = &files.dir;
         if !turn.outcome.is_terminal() || turn.messages.iter().any(Message::is_report_content) {
@@ -148,6 +212,15 @@ impl LockedRun<'_> {
             return Ok(());
         }
         if let Err(err) = crate::atomic_file::write_whole(&dir.recovered(), text.as_bytes()) {
+            if committing {
+                return Err(RunError::Io {
+                    context: format!(
+                        "keeping the reply recovered into {}",
+                        dir.recovered().display()
+                    ),
+                    source: err,
+                });
+            }
             tracing::warn!(
                 ?err,
                 path = %dir.recovered().display(),
@@ -302,18 +375,20 @@ impl LockedRun<'_> {
         let mut newest = None;
         let mut last_activity: Option<SystemTime> = None;
         let mut pending_rate_limit_lookups = Vec::new();
+        let mut finality = BTreeMap::new();
 
         let all_files = self.store.turn_files(&self.run_id)?;
         for files in &all_files {
             let folded = self.fold_turn(meta, files)?;
             pending_rate_limit_lookups.extend(folded.pending_rate_limit_lookup);
+            finality.insert(files.index, folded.finality);
             newest = Some(NewestTurn {
                 index: files.index,
                 settled_by: folded.settled_by,
                 launch_mode: folded.launch_mode,
                 turn_started: folded.turn_started,
-                // Asked of the newest turn alone, below: it costs a process lookup.
-                delegate_has_exited: false,
+                settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
+                delegate_gone: folded.delegate_gone,
             });
             if folded.session.is_some() {
                 session = folded.session;
@@ -323,9 +398,6 @@ impl LockedRun<'_> {
             }
             transcript.turns.push(folded.turn);
         }
-        if let (Some(newest), Some(files)) = (newest.as_mut(), all_files.last()) {
-            newest.delegate_has_exited = self.store.delegate_has_exited(files);
-        }
 
         Ok(RunState {
             transcript,
@@ -333,6 +405,7 @@ impl LockedRun<'_> {
             newest,
             last_activity,
             pending_rate_limit_lookups,
+            finality,
         })
     }
 
@@ -349,36 +422,26 @@ impl LockedRun<'_> {
         Ok(Some(self.fold_turn(meta, newest)?.turn))
     }
 
-    /// Read a finished Codex turn's remembered usage window, or say where to search for one.
+    /// Whether a folded turn's delegate has gone, asked once per fold.
     ///
-    /// Codex says nothing about usage on the stream agentmux captures, but records it in the
-    /// session rollout it writes anyway.
-    /// Reading that afterwards is the only way a Codex consultation reports a usage window at
-    /// all, and it costs neither a process nor a token.
-    /// Only once the turn is over: a running turn's rollout is still being written, and the
-    /// search is too expensive to repeat on every fold.
-    /// A remembered answer is read here; a search is left to the caller, after the lock.
-    fn cached_rate_limit_or_lookup(
+    /// A record says so for one that left or never started.
+    /// A cancellation record does not, since a delegate can survive being stopped, so its
+    /// process is asked whether or not the turn is committed.
+    /// Otherwise a committed turn's delegate had gone when it was committed, and the process is
+    /// asked only for a turn whose stream has ended: nothing waits on a running one's departure.
+    fn delegate_gone(
         &self,
         files: &TurnFiles,
-        turn: &mut Turn,
-        thread_id: Option<&SessionRef>,
-        codex_home: Option<&Path>,
-    ) -> Option<RateLimitLookup> {
-        let thread_id =
-            thread_id.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
-        match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
-            Ok(Some(remembered)) => {
-                turn.rate_limit = remembered;
-                None
+        record: Option<&ExitRecord>,
+        outcome: &Outcome,
+    ) -> bool {
+        match record.or(files.exit.as_ref()) {
+            Some(ExitRecord::Exited { .. } | ExitRecord::NotStarted { .. }) => true,
+            Some(ExitRecord::Cancelled { .. }) => self.store.delegate_has_exited(files),
+            None => {
+                files.settled.is_some()
+                    || (outcome.is_terminal() && self.store.delegate_has_exited(files))
             }
-            Ok(None) | Err(_) => Some(RateLimitLookup {
-                turn_index: files.index,
-                turn_dir: files.dir.clone(),
-                codex_home: codex_home.map(Path::to_path_buf),
-                thread_id: thread_id.clone(),
-                delegate_has_exited: self.store.delegate_has_exited(files),
-            }),
         }
     }
 
@@ -387,13 +450,20 @@ impl LockedRun<'_> {
     ///
     /// Reading a turn never depends on another turn's capture, which is what lets a caller that
     /// only needs the newest turn's state fold that one alone.
+    /// A turn whose settlement is committed is read only as far as its marker froze, and is never
+    /// observed or recovered into again.
     pub(super) fn fold_turn(&self, meta: &Meta, files: &TurnFiles) -> Result<FoldedTurn, RunError> {
         let vendor = meta.delegate.vendor();
         let dir = &files.dir;
         let question =
             read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
-        // A settled turn's capture is read only up to the length its record froze.
-        let frozen_len = files.exit.as_ref().map(ExitRecord::events_len);
+        // A settled turn's capture is read only up to the length its records froze: the
+        // marker's, which agrees with an exit record's wherever both exist.
+        let frozen_len = files
+            .settled
+            .as_ref()
+            .map(|settled| settled.events_len)
+            .or_else(|| files.exit.as_ref().map(ExitRecord::events_len));
         let (events, mut folded_len) = read_complete_records(&dir.events(), frozen_len)?;
         let mut fold = stream::fold(vendor, files.index, &question, &events);
 
@@ -407,38 +477,22 @@ impl LockedRun<'_> {
             .as_ref()
             .and_then(|record| self.store.launcher.reap(record.launched));
 
-        // One observation of the child, made only while nothing has settled the turn, so a
-        // settled turn's pid is never asked about again.
-        //
-        // If it is gone, the capture is read again.
-        // The first read happened before this observation and a child can flush its terminal
-        // event in between, so settling on the older read would record a failure that the next
-        // call re-folds as a success, moving bytes a `tail` cursor had already passed.
-        // A child observed gone has written everything it will write, so this read is final, and
-        // its length is what the record freezes.
-        let mut departure = None;
-        if !fold.turn.outcome.is_terminal()
-            && files.exit.is_none()
-            && let Some(record) = files.launch.as_ref()
+        // One observation, made only while nothing has settled the turn, so a settled turn's pid
+        // is never asked about again.
+        let evidence = if !fold.turn.outcome.is_terminal() && files.exit.is_none() {
+            self.observe_unsettled(files, reaped)?
+        } else {
+            None
+        };
+        if let Some(Evidence::Departed {
+            departure,
+            final_events,
+        }) = &evidence
         {
-            let liveness = if reaped.is_some() {
-                Liveness::Gone
-            } else {
-                self.store.launcher.liveness(record.launched)
-            };
-            if liveness == Liveness::Gone {
-                let (settled, settled_len) = read_complete_records(&dir.events(), None)?;
-                if settled.len() != events.len() {
-                    fold = stream::fold(vendor, files.index, &question, &settled);
-                }
-                folded_len = settled_len;
-                // The record freezes what was folded, by construction rather than by timing.
-                departure = Some(Departure {
-                    status: reaped,
-                    events_len: settled_len,
-                    stderr_tail: tail_of_file(&dir.stderr(), STDERR_TAIL)?,
-                });
+            if final_events.len() != events.len() {
+                fold = stream::fold(vendor, files.index, &question, final_events);
             }
+            folded_len = departure.events_len;
         }
 
         // Settle, and then render from exactly what the record froze.
@@ -448,13 +502,15 @@ impl LockedRun<'_> {
         let record = if fold.turn.outcome.is_terminal() {
             None
         } else {
-            RunStore::settle_unfinished(dir, files.exit.as_ref(), departure)?
+            RunStore::settle_unfinished(dir, files.exit.as_ref(), evidence)?
         };
         if let Some(record) = &record
             && record.events_len() != folded_len
         {
-            let (frozen, _) = read_complete_records(&dir.events(), Some(record.events_len()))?;
+            let (frozen, frozen_len) =
+                read_complete_records(&dir.events(), Some(record.events_len()))?;
             fold = stream::fold(vendor, files.index, &question, &frozen);
+            folded_len = frozen_len;
         }
 
         let Fold {
@@ -476,14 +532,7 @@ impl LockedRun<'_> {
         // What the launch recorded before the spawn: which session it asked to resume, and
         // whether the child was ever going to be able to save its own.
         let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
-        turn.unsaved_session_store = invocation.unsaved_session_store;
-        turn.billing = invocation.billing;
-        turn.isolation = invocation.delegate.as_ref().and_then(Delegate::isolation);
-        turn.ran_as = invocation
-            .delegate
-            .as_ref()
-            .map(Delegate::summary)
-            .filter(|summary| *summary != meta.delegate.summary());
+        note_launch_record(&mut turn, &invocation, &meta.delegate);
         let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),
@@ -491,20 +540,38 @@ impl LockedRun<'_> {
             &mut turn,
         );
 
+        // One answer to whether the delegate has gone, read by everything in this fold that
+        // depends on it — whether the turn can settle, and so whether a follow-up may continue it,
+        // and whether a usage-window miss is final — so no two of them can disagree.
+        let delegate_gone = self.delegate_gone(files, record.as_ref(), &turn.outcome);
+
         let pending_rate_limit_lookup = if vendor == Vendor::Codex {
-            self.cached_rate_limit_or_lookup(
+            cached_rate_limit_or_lookup(
                 files,
                 &mut turn,
                 turn_session.as_ref(),
                 invocation.config_dir.as_deref(),
+                delegate_gone,
             )
         } else {
             None
         };
 
-        self.recover_from_last_message(files, &mut turn)?;
+        let finality = self.settle_inputs(
+            files,
+            &mut turn,
+            SettlementInputs {
+                // Any exit record, including a cancellation over a stream that ended anyway: its
+                // frozen length is what the turn is read to, whichever source gives the outcome.
+                recorded: record.is_some() || files.exit.is_some(),
+                delegate_gone,
+                settled_by,
+                folded_len,
+            },
+        )?;
 
         Ok(FoldedTurn {
+            delegate_gone,
             turn,
             session: turn_session,
             last_activity: last_write(dir),
@@ -512,8 +579,280 @@ impl LockedRun<'_> {
             launch_mode,
             turn_started,
             pending_rate_limit_lookup,
+            finality,
         })
     }
+}
+
+impl LockedRun<'_> {
+    /// Decide whether a folded turn can settle, keeping a reply its CLI wrote out late first, or
+    /// read a settled one's recovered reply back as far as its marker froze it.
+    ///
+    /// A record settles a turn by itself: it was written once the delegate had gone, was never
+    /// started, or was cancelled, and a cancellation freezes the capture whether or not the child
+    /// left.
+    /// A terminal event settles it only once its delegate has gone, because both CLIs save the
+    /// session, and Codex writes the closing message a reply is recovered from, on their way out.
+    fn settle_inputs(
+        &self,
+        files: &TurnFiles,
+        turn: &mut Turn,
+        inputs: SettlementInputs,
+    ) -> Result<Finality, RunError> {
+        if let Some(settled) = files.settled.as_ref() {
+            turn.recovered = read_recovered(&files.dir, settled.recovered_bytes)?;
+            return Ok(Finality::Committed);
+        }
+        let final_inputs = turn.outcome.is_terminal() && (inputs.recorded || inputs.delegate_gone);
+        self.recover_from_last_message(files, turn, final_inputs)?;
+        Ok(match inputs.settled_by {
+            _ if files.start_is_uncertain() => Finality::UncertainStart,
+            Some(settled_by) if final_inputs => Finality::Ready(Frozen {
+                settled_by,
+                events_len: inputs.folded_len,
+                recovered_bytes: turn
+                    .recovered
+                    .as_ref()
+                    .map(|text| u64::try_from(text.len()).unwrap_or(u64::MAX)),
+            }),
+            Some(_) | None => Finality::Open,
+        })
+    }
+}
+
+/// What a fold established that decides whether its turn can settle.
+#[derive(Debug, Clone, Copy)]
+struct SettlementInputs {
+    /// Whether an exit record settled the turn.
+    recorded: bool,
+    /// Whether the turn's delegate has gone, as this fold observed it once.
+    delegate_gone: bool,
+    settled_by: Option<SettledBy>,
+    /// The complete-record prefix the fold read.
+    folded_len: u64,
+}
+
+impl LockedRun<'_> {
+    /// Look at a turn nothing has settled: whether its delegate has gone, or its supervisor left
+    /// before starting one.
+    ///
+    /// A delegate a live supervisor will see go is left to that supervisor, which alone holds the
+    /// exit status.
+    fn observe_unsettled(
+        &self,
+        files: &TurnFiles,
+        reaped: Option<ExitStatus>,
+    ) -> Result<Option<Evidence>, RunError> {
+        let dir = &files.dir;
+        let Some(record) = files.launch.as_ref() else {
+            // A supervised turn whose delegate is not recorded yet: its supervisor is waiting to
+            // start it, or left before it could.
+            // One that left while spawning is an uncertain start, which no observation resolves.
+            let never_started = files.supervisor.as_ref().is_some_and(|supervisor| {
+                supervisor.phase == SupervisorPhase::Prepared
+                    && !super::is_this_process(supervisor.launched)
+                    && self.store.child_has_gone(supervisor.launched)
+            });
+            return Ok(never_started
+                .then(|| supervisor_left_before_starting(dir))
+                .transpose()?
+                .map(|reason| Evidence::NeverStarted { reason }));
+        };
+        let liveness = if reaped.is_some() {
+            Liveness::Gone
+        } else {
+            self.store.launcher.liveness(record.launched)
+        };
+        if liveness != Liveness::Gone
+            || self.store.supervisor_will_settle(files.supervisor.as_ref())
+        {
+            return Ok(None);
+        }
+        // If it is gone, the capture is read again.
+        // The first read happened before this observation and a child can flush its terminal
+        // event in between, so settling on the older read would record a failure that the next
+        // call re-folds as a success, moving bytes a `tail` cursor had already passed.
+        // A child observed gone has written everything it will write, so this read is final, and
+        // its length is what the record freezes.
+        let (final_events, events_len) = read_complete_records(&dir.events(), None)?;
+        // The record freezes what was folded, by construction rather than by timing.
+        Ok(Some(Evidence::Departed {
+            departure: Departure {
+                status: reaped,
+                events_len,
+                stderr_tail: tail_of_file(&dir.stderr(), STDERR_TAIL)?,
+            },
+            final_events,
+        }))
+    }
+}
+
+/// Read a finished Codex turn's remembered usage window, or say where to search for one.
+///
+/// Codex says nothing about usage on the stream agentmux captures, but records it in the
+/// session rollout it writes anyway.
+/// Reading that afterwards is the only way a Codex consultation reports a usage window at
+/// all, and it costs neither a process nor a token.
+/// Only once the turn is over: a running turn's rollout is still being written, and the
+/// search is too expensive to repeat on every fold.
+/// A remembered answer is read here; a search is left to the caller, after the lock.
+fn cached_rate_limit_or_lookup(
+    files: &TurnFiles,
+    turn: &mut Turn,
+    thread_id: Option<&SessionRef>,
+    codex_home: Option<&Path>,
+    delegate_gone: bool,
+) -> Option<RateLimitLookup> {
+    let thread_id =
+        thread_id.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
+    match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
+        Ok(Some(remembered)) => {
+            turn.rate_limit = remembered;
+            None
+        }
+        Ok(None) | Err(_) => Some(RateLimitLookup {
+            turn_index: files.index,
+            turn_dir: files.dir.clone(),
+            codex_home: codex_home.map(Path::to_path_buf),
+            thread_id: thread_id.clone(),
+            delegate_has_exited: delegate_gone,
+        }),
+    }
+}
+
+/// Why a supervised turn's delegate never started, when its supervisor left before spawning it.
+///
+/// Whatever the supervisor printed is the only evidence, so its tail is quoted.
+fn supervisor_left_before_starting(dir: &TurnDir) -> Result<String, RunError> {
+    let log = tail_of_file(&dir.supervisor_log(), STDERR_TAIL)?;
+    let log = log.trim();
+    Ok(if log.is_empty() {
+        "its agentmux supervisor exited before starting it and wrote nothing".to_owned()
+    } else {
+        format!("its agentmux supervisor exited before starting it: {log}")
+    })
+}
+
+/// The reply a settled turn recovered, read back only as far as its marker froze it.
+fn read_recovered(dir: &TurnDir, recovered_bytes: Option<u64>) -> Result<Option<String>, RunError> {
+    let Some(len) = recovered_bytes else {
+        return Ok(None);
+    };
+    let mut text = read_if_present(&dir.recovered(), std::fs::read_to_string)?.unwrap_or_default();
+    text.truncate(text.floor_char_boundary(usize::try_from(len).unwrap_or(usize::MAX)));
+    Ok(Some(text))
+}
+
+impl RunStore {
+    /// Commit a turn's settlement if it can be, and return it once it is.
+    ///
+    /// The one step every party that settles a turn takes — the turn's supervisor once its
+    /// delegate has gone, a waiter, `cancel`, a follow-up's admission, and every read — so all of
+    /// them commit the same thing.
+    /// Under the run's lock it adopts a marker already there, or folds the consultation from its
+    /// frozen inputs, publishes the transcript, and only then writes the turn's `settled.json`.
+    ///
+    /// Returns `None` while the turn cannot settle yet: it is running, or its stream has ended
+    /// and its delegate may still be writing what the turn renders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotFound`] when there is no such consultation,
+    /// [`RunError::NoSuchTurn`] when it has no turn `turn_index`, [`RunError::UncertainStart`]
+    /// when the turn's supervisor left while starting its delegate without recording one, and
+    /// [`RunError::InvalidSettlement`] when a marker on disk does not hold.
+    pub fn finalize_turn(
+        &self,
+        run_id: &RunId,
+        turn_index: u32,
+    ) -> Result<Option<SettledTurn>, RunError> {
+        let meta = self.meta(run_id)?;
+        self.lock(run_id)?.finalize(&meta, turn_index)
+    }
+
+    /// [`RunStore::finalize_turn`] if the lock is free now, or `None` when another process
+    /// holds it, which a waiter takes as "not settled yet" and looks again.
+    pub(super) fn try_finalize_turn(
+        &self,
+        run_id: &RunId,
+        turn_index: u32,
+    ) -> Result<Option<SettledTurn>, RunError> {
+        let meta = self.meta(run_id)?;
+        match self.try_lock(run_id)? {
+            Some(run) => run.finalize(&meta, turn_index),
+            None => Ok(None),
+        }
+    }
+}
+
+impl LockedRun<'_> {
+    /// [`RunStore::finalize_turn`] under a lock already held.
+    fn finalize(&self, meta: &Meta, turn_index: u32) -> Result<Option<SettledTurn>, RunError> {
+        let run_id = &self.run_id;
+        // A marker is adopted as it is, unless the transcript it vouches for has gone or been cut
+        // short: that is a cache, and the fold below writes it again from the frozen inputs while
+        // keeping the marker.
+        if let Some(settled) = self.store.read_settled(run_id, turn_index)?
+            && settled.is_published()
+        {
+            return Ok(Some(settled));
+        }
+        let state = self.fold_and_publish(meta)?.state;
+        match state.finality.get(&turn_index) {
+            None => Err(RunError::NoSuchTurn {
+                run_id: run_id.clone(),
+                turn: turn_index.saturating_add(1),
+                turns: u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX),
+            }),
+            Some(Finality::UncertainStart) => Err(RunError::UncertainStart {
+                run_id: run_id.clone(),
+                turn: turn_index.saturating_add(1),
+                dir: self.store.turn_dir(run_id, turn_index).root,
+            }),
+            Some(Finality::Committed | Finality::Ready(_) | Finality::Open) => {
+                self.store.read_settled(run_id, turn_index)
+            }
+        }
+    }
+}
+
+impl RunStore {
+    /// A turn's committed settlement, validated, or `None` while it has none.
+    ///
+    /// Read without the lock: the marker is written whole and never rewritten, and every file it
+    /// vouches for only grows.
+    pub(super) fn read_settled(
+        &self,
+        run_id: &RunId,
+        turn_index: u32,
+    ) -> Result<Option<SettledTurn>, RunError> {
+        let dir = self.turn_dir(run_id, turn_index);
+        let Some(record) = read_json::<SettledRecord>(&dir.settled())? else {
+            return Ok(None);
+        };
+        SettledTurn::validate(
+            run_id,
+            &dir,
+            turn_index,
+            &self.transcript_path(run_id),
+            &record,
+        )
+        .map(Some)
+    }
+}
+
+/// Note on `turn` what its launch record says before the child ran: whether it could save its
+/// session, its pricing, its isolation, and the delegate it ran as when a follow-up changed that
+/// from `header`, the one the transcript header names.
+fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &Delegate) {
+    turn.unsaved_session_store
+        .clone_from(&invocation.unsaved_session_store);
+    turn.billing = invocation.billing;
+    let ran_as = invocation.delegate.as_ref();
+    turn.isolation = ran_as.and_then(Delegate::isolation);
+    turn.ran_as = ran_as
+        .map(Delegate::summary)
+        .filter(|summary| *summary != header.summary());
 }
 
 impl RunStore {
@@ -524,16 +863,19 @@ impl RunStore {
     fn settle_unfinished(
         dir: &TurnDir,
         exit: Option<&ExitRecord>,
-        departure: Option<Departure>,
+        evidence: Option<Evidence>,
     ) -> Result<Option<ExitRecord>, RunError> {
-        match (exit, departure) {
+        match (exit, evidence) {
             (Some(record), _) => Ok(Some(record.clone())),
             // Alive, or unobservable: nothing to settle.
             // Guessing "dead" for a platform that cannot answer would abandon a live review.
             (None, None) => Ok(None),
+            (None, Some(Evidence::NeverStarted { reason })) => {
+                write_json_once(&dir.exit(), &ExitRecord::NotStarted { reason }).map(Some)
+            }
             // Recorded once, so a second caller observing the same departure adopts this record
             // rather than settling on its own, possibly different, reading.
-            (None, Some(departure)) => {
+            (None, Some(Evidence::Departed { departure, .. })) => {
                 // A child that went after a cancellation was asked for went because of it, and
                 // is recorded as cancelled by whichever caller sees it go first.
                 let record = if dir.cancelling().exists() {
@@ -560,6 +902,14 @@ impl RunStore {
     fn outcome_of(dir: &TurnDir, record: &ExitRecord, vendor: Vendor) -> Outcome {
         match record {
             ExitRecord::Cancelled { .. } => Outcome::Cancelled,
+            ExitRecord::NotStarted { reason } => {
+                let detail = format!("the {vendor} CLI was never started: {reason}");
+                let kind = match stream::classify(&detail) {
+                    FailureKind::Unclassified => FailureKind::LaunchFailed,
+                    classified => classified,
+                };
+                Outcome::Failed { kind, detail }
+            }
             ExitRecord::Exited {
                 status,
                 stderr_tail,

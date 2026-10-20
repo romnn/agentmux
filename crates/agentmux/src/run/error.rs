@@ -101,6 +101,48 @@ pub enum RunError {
         #[source]
         source: serde_json::Error,
     },
+    /// A turn's `settled.json` does not hold for the files it vouches for.
+    ///
+    /// The marker is the commitment every waiter returns on, so one that names a running turn or
+    /// bytes that are not on disk is refused loudly rather than handed out.
+    #[error("the settlement record at {path} is invalid: {reason}")]
+    InvalidSettlement {
+        /// The marker.
+        path: PathBuf,
+        /// What does not hold.
+        reason: String,
+    },
+    /// A consultation has no turn with that number.
+    #[error(
+        "consultation {run_id} has no turn {turn}; it has {turns} turn(s), numbered from 1 as \
+         the transcript's headings show them."
+    )]
+    NoSuchTurn {
+        /// Which consultation.
+        run_id: RunId,
+        /// The one-based turn number asked for.
+        turn: u32,
+        /// How many turns it has.
+        turns: u32,
+    },
+    /// A turn's supervisor left while starting its delegate, without recording one.
+    ///
+    /// A delegate may be running that nothing recorded, so the turn is neither settled, nor
+    /// followed up, nor removed.
+    #[error(
+        "turn {turn} of consultation {run_id} cannot settle: its agentmux supervisor exited while \
+         starting the delegate and recorded none, so whether a delegate is running is unknown. \
+         Its files are in {dir}; check for a delegate process there before starting another \
+         consultation."
+    )]
+    UncertainStart {
+        /// Which consultation.
+        run_id: RunId,
+        /// The one-based turn number.
+        turn: u32,
+        /// The turn's directory.
+        dir: PathBuf,
+    },
     /// A follow-up was asked of a consultation that cannot take one.
     #[error("{0}")]
     NotResumable(#[from] NotResumable),
@@ -120,7 +162,8 @@ pub enum RunError {
     },
     /// The operation needs the consultation finished, and it is not.
     #[error(
-        "consultation {run_id} is still running. Wait for it with `result`, or `cancel` it first."
+        "consultation {run_id} is still running. Wait for it to settle with `wait`, or `cancel` it \
+         first."
     )]
     StillRunning {
         /// Which consultation.
@@ -150,7 +193,7 @@ pub enum NotResumable {
     /// The newest turn has not finished, so there is nothing to continue yet.
     #[error(
         "consultation {run_id} is still running, so it has nothing to continue yet. Wait for it \
-         with `result` and its `wait_seconds`, then ask the follow-up."
+         to settle with `wait`, then ask the follow-up."
     )]
     StillRunning {
         /// Which consultation.

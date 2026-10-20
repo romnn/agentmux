@@ -1584,13 +1584,33 @@ impl Invocation {
     }
 
     /// Run this executable's hidden `subcommand` on `plan_path` in place of the vendor's CLI, with
-    /// the same environment and pricing: the app-server driver that is then the delegate.
+    /// the same environment and pricing: the app-server driver that is then the delegate, or the
+    /// supervisor that starts it.
     pub(crate) fn set_driver_command(&mut self, driver: &Path, subcommand: &str, plan_path: &Path) {
         self.program = driver.to_string_lossy().into_owned();
         self.args = vec![
             subcommand.to_owned(),
             plan_path.to_string_lossy().into_owned(),
         ];
+    }
+
+    /// The delegate a supervisor starts: what its plan names, in the environment the supervisor
+    /// was started with, which is the one the initiating process built.
+    ///
+    /// Nothing is resolved again, so the supervisor runs exactly what was recorded in
+    /// `invocation.json`, and no credential needs to be written down for it.
+    pub(crate) fn prepared(
+        program: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        billing: Billing,
+    ) -> Self {
+        Self {
+            program,
+            args,
+            env,
+            billing,
+        }
     }
 
     /// An invocation of anything at all, for a test of the launcher itself.

@@ -53,14 +53,18 @@ instead. The one value the check fills in is a network nobody chose under `allow
 which becomes an explicit `false` so the user's configuration cannot switch it on.
 
 **Follow-ups start from the newest turn, and the limits are current.** Each turn records the
-delegate it ran as in its own `invocation.json` (`InvocationRecord::delegate`). A follow-up starts
-from the newest turn's record, under the run's lock so no concurrent follow-up can launch from an
-older one (`RunStore::current_delegate`), and applies its overrides (`Delegate::with_options`).
+delegate it ran as in its own `invocation.json` (`InvocationRecord::delegate`), written before the
+turn's supervisor starts it ([0025](0025-eager-settlement-and-terminal-waiting.md)); the
+supervisor runs exactly the argument vector recorded there (`SupervisorPlan`), so the permission
+flags, the approval pins and the profile named for that launch are what the CLI gets. A follow-up
+is admitted, resolved and claimed under one hold of the run's lock: the newest turn published and
+settled, its delegate gone, then its record read (`RunStore::current_delegate`) and the overrides
+applied (`Delegate::with_options`), so no concurrent follow-up can launch from an older record.
 `Meta` and the transcript header rendered from it never change: the transcript stays append-only
 ([0009](0009-append-only-transcript.md)), so a turn that ran with other settings says so under its
 own question, and what a hook reopening a turn means is judged by that turn's own isolation
 (`HookReopening::of_turns`). `status`, `list` and a steer refusal describe the newest turn's
-isolation and permissions; only those are taken from a turn's record, while who is consulted —
+isolation and permissions, and `wait` those of the turn it returns (`RunStore::turn_delegate`); only those are taken from a turn's record, while who is consulted —
 vendor, model, effort, account — stays `Meta`'s (`Delegate::with_settings_of`). The current
 limits are applied before every turn, so a limit tightened after a consultation began refuses its
 next turn. That differs deliberately from blocked models

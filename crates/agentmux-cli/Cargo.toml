@@ -24,6 +24,9 @@ agentmux-mcp = { path = "../agentmux-mcp" }
 
 clap.workspace = true
 color-eyre.workspace = true
+indoc.workspace = true
+# Reads `wait --timeout` (`90s`, `2h`), as the library reads `retention`.
+humantime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # `io-std` is the stdio transport the MCP server runs on.

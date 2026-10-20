@@ -18,7 +18,8 @@ use super::id::RunId;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, read_json, write_json,
+    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SupervisorPhase,
+    SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
 use super::status::RunStatus;
@@ -155,7 +156,9 @@ impl RunStore {
     /// isolation or a permission exceeds the machine file's limits, both before anything is
     /// written or launched; a follow-up is never refused for a block added after its
     /// consultation started, but is for a limit tightened since.
-    /// A failed start leaves no run directory behind.
+    /// A start that fails before its turn is recorded leaves no run directory behind.
+    /// Under a supervisor, a delegate that then cannot be started is a failed turn, kept with the
+    /// reason.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
         // refused request leaves no half-made consultation for `list` to report as running.
@@ -352,9 +355,12 @@ impl RunStore {
             // against is the one it continues and the one whose choices it starts from: nobody can
             // claim the next index, settle the newest turn differently, or launch one with other
             // permissions in between.
+            // Published and settled under that same hold, so the turn being continued is committed
+            // before the next one is claimed, and a waiter pinned to it can never be handed the
+            // follow-up instead.
             let run = self.lock(run_id)?;
             let meta = self.meta(run_id)?;
-            let state = run.fold_run(&meta)?;
+            let state = run.fold_and_publish(&meta)?.state;
             let session = Self::resumable_session(run_id, &state)?;
             let mut delegate =
                 self.current_delegate(&meta, state.newest.map(|newest| newest.index))?;
@@ -405,6 +411,20 @@ impl RunStore {
         })
     }
 
+    /// Who a consultation's turn `turn_index` ran as: what `status` and `list` say of its newest
+    /// turn, said of any one.
+    ///
+    /// Read from that turn's own launch record and the consultation's, so a later turn neither
+    /// changes nor fails the answer, which is what a wait pinned to an earlier turn reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
+    /// cannot be read.
+    pub fn turn_delegate(&self, meta: &Meta, turn_index: u32) -> Result<Delegate, RunError> {
+        self.current_delegate(meta, Some(turn_index))
+    }
+
     /// The session a follow-up would continue, or why there is none.
     ///
     /// The one predicate behind both `follow_up` and `status.resumable`, so what is advertised
@@ -441,9 +461,12 @@ impl RunStore {
                 store: store.to_path_buf(),
             });
         }
+        // Settled, so the turn being continued is committed, with the reply its CLI wrote on the
+        // way out, before another turn is claimed after it; and exited, because a turn a
+        // cancellation froze is settled while a delegate that survived it may still be saving.
         if state
             .newest
-            .is_some_and(|newest| !newest.delegate_has_exited)
+            .is_some_and(|newest| !(newest.settled && newest.delegate_gone))
         {
             return Err(NotResumable::AwaitingDelegateExit {
                 run_id: run_id.clone(),
@@ -596,23 +619,7 @@ impl RunStore {
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
         let launch_mode =
             self.prepare_launch_mode(turn, meta, delegate, resume, config, &mut invocation)?;
-        // `codex exec` reaches read-only with network only through a permission profile, which a
-        // codex that does not honour it would replace with whatever its configuration selects.
-        // The app-server sets the same policy as a field of the turn instead, and needs no
-        // profile.
-        if launch_mode == LaunchMode::DirectCli
-            && delegate
-                .codex_permissions()
-                .is_some_and(|permissions| permissions.needs_permission_profile())
-            && !codex_supports_permission_profiles(cli_version.as_deref())
-        {
-            return Err(DelegateError::Permission(
-                crate::config::PermissionRefusal::PermissionProfileUnsupported {
-                    version: cli_version,
-                },
-            )
-            .into());
-        }
+        refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
@@ -672,6 +679,9 @@ impl RunStore {
             "launching delegate",
         );
 
+        if let Some(supervisor) = &self.supervisor {
+            return self.launch_supervisor(turn, meta, index, &invocation, supervisor);
+        }
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
@@ -696,6 +706,101 @@ impl RunStore {
         tracing::debug!(run_id = %meta.run_id, turn = index, pid = launched.pid, "delegate running");
         Ok(())
     }
+
+    /// Launch the turn's supervisor, which starts `delegate` itself, and record it.
+    ///
+    /// The plan names what to run and the launch it belongs to; the environment travels as the
+    /// supervisor's own, so nothing secret is written down and nothing is resolved twice.
+    /// The supervisor waits on the run's lock, which the caller holds until the record below is
+    /// written, and starts nothing unless that record names it and its launch.
+    /// Everything that fails from here on is a turn that failed, kept with its evidence.
+    fn launch_supervisor(
+        &self,
+        turn: &TurnDir,
+        meta: &Meta,
+        index: u32,
+        delegate: &crate::delegate::Invocation,
+        supervisor: &Path,
+    ) -> Result<(), RunError> {
+        let launch_id = uuid::Uuid::new_v4().simple().to_string();
+        let plan_path = turn.supervisor_plan_path();
+        write_json(
+            &plan_path,
+            &SupervisorPlan {
+                store_root: self.root.clone(),
+                run_id: meta.run_id.clone(),
+                turn_index: index,
+                launch_id: launch_id.clone(),
+                producer: ProducerCommand {
+                    program: delegate.program().to_owned(),
+                    args: delegate.args().to_vec(),
+                    cwd: meta.cwd.clone(),
+                    billing: delegate.billing(),
+                },
+            },
+        )?;
+        let mut invocation = delegate.clone();
+        invocation.set_driver_command(supervisor, super::SUPERVISE_SUBCOMMAND, &plan_path);
+        // Its stdout and stderr are its own log, never the capture.
+        let log = turn.supervisor_log();
+        let launched = self.launcher.launch(&LaunchSpec {
+            invocation: &invocation,
+            cwd: &meta.cwd,
+            question: &turn.question(),
+            events: &log,
+            stderr: &log,
+        })?;
+        let recorded = write_json(
+            &turn.supervisor(),
+            &SupervisorRecord {
+                launch_id,
+                launched,
+                started_at: Utc::now(),
+                phase: SupervisorPhase::Prepared,
+            },
+        );
+        if let Err(error) = recorded {
+            // Unrecorded, it would start nothing, but it is stopped rather than left to find out.
+            self.launcher.terminate(launched);
+            self.launcher.kill(launched);
+            return Err(error);
+        }
+        tracing::debug!(
+            run_id = %meta.run_id,
+            turn = index,
+            pid = launched.pid,
+            "supervisor running"
+        );
+        Ok(())
+    }
+}
+
+/// Refuse a `codex exec` turn that needs a permission profile from a codex whose `--version`,
+/// `cli_version`, is not one verified to honour it.
+///
+/// `codex exec` reaches read-only with network only through a permission profile, which a codex
+/// that does not honour it would replace with whatever its configuration selects.
+/// The app-server sets the same policy as a field of the turn instead, and needs no profile.
+fn refuse_an_unverified_profile(
+    launch_mode: LaunchMode,
+    delegate: &Delegate,
+    cli_version: Option<&str>,
+) -> Result<(), RunError> {
+    let needs_profile = delegate
+        .codex_permissions()
+        .is_some_and(|permissions| permissions.needs_permission_profile());
+    if launch_mode == LaunchMode::DirectCli
+        && needs_profile
+        && !codex_supports_permission_profiles(cli_version)
+    {
+        return Err(DelegateError::Permission(
+            crate::config::PermissionRefusal::PermissionProfileUnsupported {
+                version: cli_version.map(ToOwned::to_owned),
+            },
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Claim a turn index by creating its directory.
@@ -718,7 +823,8 @@ pub(super) fn claim_turn(turn: &TurnDir, index: u32, run_id: &RunId) -> Result<(
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
             let recorded = read_json::<LaunchRecord>(&turn.launch())?.is_some()
-                || read_json::<ExitRecord>(&turn.exit())?.is_some();
+                || read_json::<ExitRecord>(&turn.exit())?.is_some()
+                || read_json::<SupervisorRecord>(&turn.supervisor())?.is_some();
             if recorded {
                 return Err(RunError::TurnAlreadyClaimed {
                     run_id: run_id.clone(),

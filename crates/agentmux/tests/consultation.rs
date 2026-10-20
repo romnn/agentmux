@@ -669,7 +669,9 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
     // type or malformed lines — are both counted.
     // A fixture without the drift note would leave the ordering this test exists to check
     // untested.
-    let harness = harness([Script::completed(indoc::indoc! {r#"
+    // Still running when the file lands, as codex is: it writes the file on its way out, and a
+    // turn whose delegate has gone is settled with whatever it had recovered by then.
+    let harness = harness([Script::running(indoc::indoc! {r#"
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"the findings, in full"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
@@ -704,6 +706,15 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
         eq(true),
         "recovering a report rewrote bytes a caller may already have paged past"
     );
+
+    // Once the delegate has gone the turn settles with the recovered reply, and reads the same.
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+    let status = harness.store.status(&started.run_id)?;
+    assert_that!(status.settled, eq(true));
+    let settled = harness.store.page(&started.run_id, 0, 1_000_000)?;
+    assert_that!(settled.text, eq(&page.text));
     Ok(())
 }
 
@@ -1097,26 +1108,46 @@ fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
 /// follow it would then have bytes inserted above it.
 #[gtest]
 fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
-    let harness = harness([
-        Script::completed(indoc::indoc! {r#"
-            {"type":"thread.started","thread_id":"01a0"}
-            {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
-            {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
-        "#}),
-        Script::completed(fixtures::CODEX_HAPPY),
-    ])?;
-    let started = harness.store.start(&request(codex()?, "q"))?;
+    let silent = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"renamed away"}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#};
+
+    // A delegate that left having said nothing: its turn settled with nothing to continue, and a
+    // file landing after that changes nothing, because a delegate that has gone wrote all it will.
+    let harness_gone = harness([Script::completed(silent)])?;
+    let started = harness_gone.store.start(&request(codex()?, "q"))?;
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(started.resumable, eq(false));
-    let refused = harness.store.follow_up(&started.run_id, "again");
+    let refused = harness_gone.store.follow_up(&started.run_id, "again");
     assert_that!(
         refused.map(|_| ()),
         err(matches_pattern!(RunError::NotResumable(matches_pattern!(
             NotResumable::NothingSaid { .. }
         ))))
     );
+    let settled = harness_gone.store.page(&started.run_id, 0, 1_000_000)?;
+    std::fs::write(
+        harness_gone
+            .store
+            .root()
+            .join("runs")
+            .join(started.run_id.as_str())
+            .join("turns/0000/last-message.md"),
+        "too late",
+    )?;
+    let after_settlement = harness_gone.store.page(&started.run_id, 0, 1_000_000)?;
+    assert_that!(after_settlement.text, eq(&settled.text));
 
-    // Once the CLI's own file lands, the turn has said something and may be continued.
+    // One whose CLI writes its own file before leaving, as codex does, has said something by the
+    // time it has gone, and may be continued.
+    let harness = harness([
+        Script::running(silent),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    assert_that!(started.resumable, eq(false));
     let last = harness
         .store
         .root()
@@ -1124,6 +1155,9 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
         .join(started.run_id.as_str())
         .join("turns/0000/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
     let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let before = page.text;
     let followed = harness.store.follow_up(&started.run_id, "again")?;

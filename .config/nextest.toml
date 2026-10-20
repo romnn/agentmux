@@ -1,0 +1,14 @@
+[profile.default]
+# Hard cap per test, so a test that hangs fails the run within minutes rather than holding a CI job
+# until its own timeout.
+# Generous for the real-process suites, which build their fake CLIs on first use and take over a
+# minute for that on a cold Windows runner.
+# The fake delegate gives up waiting on its own after five minutes, past this cap, because a killed
+# test cannot release it.
+slow-timeout = { period = "180s", terminate-after = 1, grace-period = "10s" }
+
+# The live tests drive real CLIs through whole consultations and a follow-up, waiting up to five
+# minutes for each turn.
+[[profile.default.overrides]]
+filter = 'binary(live)'
+slow-timeout = { period = "1200s", terminate-after = 1, grace-period = "10s" }

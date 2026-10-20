@@ -22,11 +22,15 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use agentmux::config::ModelRules;
+use agentmux::delegate::Delegate;
 use agentmux::quota::{AccountQuota, Observation};
 use agentmux::report::{
     Warning, delegate_line, duration, outcome_line, quota_block, quota_report, summarise,
 };
-use agentmux::run::{HookReopening, QuotaReport, RunStatus, RunSummary, TranscriptPage};
+use agentmux::run::{
+    HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn, TranscriptPage,
+    describe_delegate,
+};
 use agentmux::transcript::{FailureKind, RateLimit, describe_unsaved_session_store};
 use chrono::Utc;
 
@@ -408,11 +412,12 @@ pub fn next_steps(status: &RunStatus) -> String {
         next_steps_text
     } else {
         let cursor = status.transcript_bytes;
+        let turn = status.turns.max(1);
         let mut next_steps_text = indoc::formatdoc! {r#"
 
             Still working. The delegate is detached and survives an agentmux restart.
-            next:       tail {{"run_id": "{id}", "cursor": {cursor}}} — new output only
-                        result {{"run_id": "{id}", "wait_seconds": 45}} — block for the answer
+            next:       wait {{"run_id": "{id}", "turn": {turn}}} — returns once it has settled
+                        tail {{"run_id": "{id}", "cursor": {cursor}}} — new output only
                         cancel {{"run_id": "{id}"}} — stop it, keeping what was collected
         "#};
         // Offered only where it would be accepted, because a caller that takes the suggestion
@@ -479,6 +484,71 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
     out
 }
 
+/// What `wait` returns: a settled turn's transcript, under a header built from the settlement,
+/// from what the consultation recorded when it began, and from `delegate`, who that turn ran as.
+///
+/// Nothing in it depends on a later turn, so a follow-up that is running, or one whose records
+/// cannot be read, neither delays nor fails a wait for a turn that has settled; `newest` is the
+/// newest turn's number where it could be read, and names a follow-up that has begun since.
+/// The page is the settlement's own, ending where the settled turn does.
+#[must_use]
+pub fn settled(
+    settled: &SettledTurn,
+    meta: &Meta,
+    delegate: &Delegate,
+    newest: Option<u32>,
+    page: &TranscriptPage,
+) -> String {
+    let id = settled.run_id();
+    let turn = settled.turn_number();
+    let mut out = indoc::formatdoc! {"
+        run_id:     {id}
+        state:      {state}
+        delegate:   {delegate}
+        reading:    {cwd}
+        settled:    turn {turn} is final; its record is {marker}
+        transcript: {transcript}
+        ",
+        state = outcome_line(settled.outcome()),
+        delegate = describe_delegate(delegate, meta.rewritten_from.as_ref()),
+        cwd = meta.cwd.display(),
+        marker = settled.marker_path().display(),
+        transcript = settled.transcript_path().display(),
+    };
+    let bytes = format!(
+        "{}-{} of {}",
+        page.offset, page.next_offset, page.total_bytes
+    );
+    if page.at_end {
+        let _ = writeln!(out, "bytes:      {bytes}");
+    } else {
+        let next = page.next_offset;
+        let _ = writeln!(
+            out,
+            "bytes:      {bytes} — more follows; call wait with offset {next}"
+        );
+    }
+    if let Some(newest) = newest.filter(|newest| *newest > turn) {
+        out.push_str(&indoc::formatdoc! {r#"
+            newer:      turn {newest} has begun since;
+                        wait {{"run_id": "{id}", "turn": {newest}}} for it
+        "#});
+    }
+    out.push_str("\n---\n\n");
+    out.push_str(&page.text);
+    if !page.at_end {
+        let next = page.next_offset;
+        out.push_str(&indoc::formatdoc! {r#"
+
+
+            ---
+            [truncated. Continue with wait {{"run_id": "{id}", "turn": {turn}, "offset": {next}}}, or
+            read the transcript from the file named above with your own file tools.]
+        "#});
+    }
+    out
+}
+
 /// New transcript bytes since a cursor.
 #[must_use]
 pub fn tail(status: &RunStatus, page: &TranscriptPage) -> String {
@@ -499,8 +569,8 @@ pub fn tail(status: &RunStatus, page: &TranscriptPage) -> String {
     } else if !status.is_terminal() {
         let _ = write!(
             out,
-            "\n\n---\n[caught up. Call tail again with next_cursor {}, or result with \
-             wait_seconds to block for the answer.]\n",
+            "\n\n---\n[caught up. Call tail again with next_cursor {}, or wait to block until \
+             the turn has settled.]\n",
             page.next_offset,
         );
     }

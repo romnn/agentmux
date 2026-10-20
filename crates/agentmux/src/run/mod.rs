@@ -5,9 +5,10 @@
 //! # The shape on disk
 //!
 //! ```text
-//! runs/<run_id>.lock           held while the run is folded and its render published, a turn is
-//!                              claimed, a steer is submitted, a cancellation is marked or
-//!                              recorded, or the run is removed
+//! runs/<run_id>.lock           held while the run is folded, its render published and its turns
+//!                              settled, a turn is claimed or its delegate started, a steer is
+//!                              submitted, a cancellation is marked or recorded, or the run is
+//!                              removed
 //! runs/<run_id>/
 //!   meta.json                  delegate, question, cwd, retention, created_at
 //!   transcript.md              the rendered transcript, a cache of the fold below
@@ -19,18 +20,29 @@
 //!     last-message.md          Codex's closing message, written by the CLI itself
 //!     recovered.md             that message, once agentmux has rendered it in place of a reply
 //!                              the stream lost
-//!     launch.json              pid, start time and process group, so a later call can check on it
+//!     launch.json              the delegate's pid, start time and process group, so a later call
+//!                              can check on it
+//!     supervisor-plan.json     what the turn's supervisor runs, with no environment in it
+//!     supervisor.json          the supervisor's own pid and start time, and how far it got
+//!     supervisor.log           what the supervisor printed
 //!     app-server.json          the plan a turn driven over `codex app-server` runs under
 //!     steer/                   messages steered into such a turn, and the driver's replies
 //!     cancelling               present once a cancellation was asked for
 //!     exit.json                how the child ended and how much it had written, written once and
 //!                              never rewritten
+//!     settled.json             the commitment that the turn's transcript is published and final,
+//!                              written last and never rewritten
 //! ```
 //!
-//! A turn directory counts as a turn once it holds a launch or an exit record.
+//! A turn directory counts as a turn once it holds a launch, a supervisor or an exit record.
 //! Before that it is a claim: the directory is created under the run's lock as the claim on its
-//! index, and the launch is recorded before the lock is released, so a claim with neither record
-//! can only have been abandoned by a caller that died in between.
+//! index, and the launch is recorded before the lock is released, so a claim with no record can
+//! only have been abandoned by a caller that died in between.
+//!
+//! A store opened [`with_supervisor`](RunStore::with_supervisor) launches each turn's
+//! `agentmux supervise`, which starts the delegate itself and settles the turn the moment the
+//! delegate has gone; one opened without launches the delegate directly, and its turns settle
+//! when they are next read.
 //!
 //! One directory per turn, because each turn is a separate child process.
 //! Nothing ever appends to another turn's capture file, so the "the child owns the file
@@ -41,6 +53,8 @@
 //! `events.jsonl` is the state; everything else is derived.
 //! `transcript.md` is a cache, rewritten from the fold on every read, so an agentmux that died
 //! mid-review loses nothing.
+//! `settled.json` is the one record a waiter returns on: written after the transcript holding the
+//! turn's final section, by whichever settles the turn first, under the lock.
 //! Terminal state is decided in this order:
 //!
 //! 1. a terminal event in the stream — authoritative, because it survives everything else;
@@ -68,6 +82,8 @@ mod settle;
 mod spawn;
 mod status;
 mod steer;
+mod supervise;
+mod wait;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -79,16 +95,21 @@ use crate::launch::{Launched, Launcher, Liveness};
 use crate::transcript::{Outcome, Transcript};
 
 use layout::create_private_dir;
-use records::{ExitRecord, LaunchRecord, TurnFiles, read_if_present, read_json, tail_of_file};
+use records::{
+    ExitRecord, LaunchRecord, SettledRecord, SupervisorRecord, TurnFiles, read_if_present,
+    read_json, tail_of_file,
+};
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, page_of};
 
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
 pub use quota::QuotaReport;
-pub use records::{LaunchMode, Meta};
+pub use records::{LaunchMode, Meta, SettledTurn};
 pub use retention::Retention;
 pub use spawn::StartRequest;
 pub use status::{HookReopening, RunStatus, RunSummary, TranscriptPage, describe_delegate};
+pub use supervise::{SUBCOMMAND as SUPERVISE_SUBCOMMAND, supervise};
+pub use wait::{TurnRef, WaitFor, Waited};
 
 /// The run store: one directory per consultation under a state directory.
 pub struct RunStore {
@@ -104,6 +125,9 @@ pub struct RunStore {
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
     /// launches such turns that way.
     codex_driver: Option<PathBuf>,
+    /// The agentmux executable that supervises each turn this store launches, when it launches
+    /// them that way.
+    supervisor: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RunStore {
@@ -152,7 +176,25 @@ impl RunStore {
             // `exec` for every Codex turn until a caller names a driver: embedding this library
             // must not start an executable the embedder did not provide.
             codex_driver: None,
+            // Unsupervised for the same reason.
+            supervisor: None,
         })
+    }
+
+    /// Launch every turn under a supervisor, `<supervisor> supervise <plan>`, which starts the
+    /// turn's delegate, waits for it to go, and settles the turn the moment it has.
+    ///
+    /// `supervisor` is an `agentmux` executable, which runs [`supervise`](fn@supervise).
+    /// With one, a turn's `settled.json` and its final transcript are on disk within moments of
+    /// its delegate leaving, whether or not anything is asking about the consultation.
+    /// Without one, the delegate is launched directly and its turn settles when something next
+    /// reads it.
+    /// Independent of [`RunStore::with_codex_app_server`]: a driven turn's driver is the delegate
+    /// the supervisor starts.
+    #[must_use]
+    pub fn with_supervisor(mut self, supervisor: impl Into<PathBuf>) -> Self {
+        self.supervisor = Some(supervisor.into());
+        self
     }
 
     /// Drive every Codex turn that can run over `codex app-server` through `driver`, so it can be
@@ -244,19 +286,42 @@ impl RunStore {
     fn turn_files(&self, run_id: &RunId) -> Result<Vec<TurnFiles>, RunError> {
         let mut turns = Vec::new();
         for (index, dir) in self.turn_dirs(run_id) {
-            let launch = read_json::<LaunchRecord>(&dir.launch())?;
-            let exit = read_json::<ExitRecord>(&dir.exit())?;
-            if launch.is_none() && exit.is_none() {
+            let files = self.read_turn_files(run_id, index, dir)?;
+            if !files.is_recorded() {
                 break;
             }
-            turns.push(TurnFiles {
-                index,
-                dir,
-                launch,
-                exit,
-            });
+            turns.push(files);
         }
         Ok(turns)
+    }
+
+    /// One turn directory's records, whether or not they make it a turn.
+    ///
+    /// A settlement marker is validated as it is read, so no reader folds, renders or continues
+    /// a turn from a marker that does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::InvalidSettlement`] for a marker that does not hold, besides what
+    /// reading a record fails with.
+    fn read_turn_files(
+        &self,
+        run_id: &RunId,
+        index: u32,
+        dir: layout::TurnDir,
+    ) -> Result<TurnFiles, RunError> {
+        let settled = read_json::<SettledRecord>(&dir.settled())?;
+        if let Some(record) = &settled {
+            SettledTurn::validate(run_id, &dir, index, &self.transcript_path(run_id), record)?;
+        }
+        Ok(TurnFiles {
+            index,
+            launch: read_json::<LaunchRecord>(&dir.launch())?,
+            exit: read_json::<ExitRecord>(&dir.exit())?,
+            supervisor: read_json::<SupervisorRecord>(&dir.supervisor())?,
+            settled,
+            dir,
+        })
     }
 
     /// Whether a turn's delegate has gone, so nothing it does can still change its session.
@@ -266,11 +331,30 @@ impl RunStore {
     /// write beside the process still saving it.
     /// A child whose identity cannot be checked has not gone: it may be the delegate still
     /// saving, and the uncertainty clears once nothing holds its pid.
+    ///
+    /// A supervised turn whose delegate is not recorded yet has not gone either: its supervisor
+    /// is still starting it, unless a record says it never started.
     fn delegate_has_exited(&self, files: &TurnFiles) -> bool {
         match (&files.exit, &files.launch) {
-            (Some(ExitRecord::Exited { .. }), _) | (_, None) => true,
+            // A supervisor starts nothing once a record exists, so a turn cancelled before its
+            // delegate was recorded never had one.
+            (Some(ExitRecord::Exited { .. } | ExitRecord::NotStarted { .. }), _)
+            | (Some(ExitRecord::Cancelled { .. }), None) => true,
             (_, Some(record)) => self.child_has_gone(record.launched),
+            (None, None) => files.supervisor.is_none(),
         }
+    }
+
+    /// Whether a live supervisor other than this process will settle its turn's departure.
+    ///
+    /// Only the supervisor holds its delegate's handle, so only it can record the exit status a
+    /// silent failure is explained by; another observer that recorded the departure first would
+    /// freeze an exit of unknown status in its place.
+    /// A supervisor that has gone settles nothing, and the next observer repairs its turn.
+    fn supervisor_will_settle(&self, supervisor: Option<&SupervisorRecord>) -> bool {
+        supervisor.is_some_and(|supervisor| {
+            !is_this_process(supervisor.launched) && !self.child_has_gone(supervisor.launched)
+        })
     }
 
     /// Whether a launched child has gone: reaped through the handle this process kept, or no
@@ -336,13 +420,12 @@ impl RunStore {
         let meta = self.meta(run_id)?;
         // Folded and published under the lock, so the reading that is published is one no other
         // caller can settle differently in between; everything slow happens after it.
-        let (mut state, full) = {
-            let run = self.lock(run_id)?;
-            let state = run.fold_run(&meta)?;
-            let full = Self::render(&meta, &state);
-            run.publish_transcript(&full)?;
-            (state, full)
-        };
+        // Every turn that has become final is settled by the same hold, so a reader repairs what
+        // a supervisor that died left behind, and an older store is settled as it is read.
+        let publish::Published {
+            mut state,
+            rendered: publish::Rendered { text: full, .. },
+        } = self.lock(run_id)?.fold_and_publish(&meta)?;
         self.resolve_rate_limit_lookups(&meta, &mut state);
 
         // A run with no turn yet describes where its first one will be.
@@ -419,6 +502,7 @@ impl RunStore {
                 Self::accepts_steers(&outcome, newest.launch_mode, newest.turn_started, &turn)
             }),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
+            settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
             outcome,
         };
         Ok((status, full))
@@ -509,15 +593,21 @@ impl RunStore {
         Ok(meta)
     }
 
-    /// Poll until a consultation reaches a terminal state, or until `timeout` elapses.
+    /// Poll until a consultation's newest turn reaches a terminal state, or until `timeout`
+    /// elapses.
     ///
     /// Never fails for taking too long: on timeout it simply returns, the consultation carries
     /// on, and the caller's next `status` or `view` says so.
     /// Both hosts cap how long a tool call may block — Codex at sixty seconds by default — so
     /// callers pass a cap well under theirs.
+    /// This is a bounded observation, not a completion signal: it returns when the stream says
+    /// the turn ended, which may be before the turn has settled.
+    /// [`RunStore::wait_for_settlement`] is the wait that returns only then.
     ///
-    /// The wait folds only the newest turn on each poll, renders and writes nothing, and backs
-    /// its interval off towards a two-second ceiling.
+    /// The turn is the newest one when the wait begins, and stays that one: a follow-up started
+    /// meanwhile is not waited for in its place.
+    /// The wait folds only that turn on each poll, renders and writes nothing, and backs its
+    /// interval off towards a two-second ceiling.
     /// A quick answer still returns almost immediately; a ninety-minute review is not re-rendered
     /// several thousand times on its way there.
     ///
@@ -530,25 +620,37 @@ impl RunStore {
         timeout: Duration,
     ) -> Result<(), RunError> {
         let meta = self.meta(run_id)?;
+        // A run with no turn at all has nothing to wait for.
+        let Some(pinned) = self.turn_files(run_id)?.last().map(|files| files.index) else {
+            return Ok(());
+        };
         // A timeout too large to add to the clock is a wait with no deadline.
         let deadline = tokio::time::Instant::now().checked_add(timeout);
         let mut interval = Self::MIN_POLL;
-        // A run with no turn at all has nothing to wait for.
-        while self
-            .lock(run_id)?
-            .fold_newest_turn(&meta)?
-            .is_some_and(|turn| !turn.outcome.is_terminal())
-        {
+        loop {
+            let running = {
+                let run = self.lock(run_id)?;
+                match self
+                    .turn_files(run_id)?
+                    .iter()
+                    .find(|files| files.index == pinned)
+                {
+                    Some(files) => !run.fold_turn(&meta, files)?.turn.outcome.is_terminal(),
+                    None => false,
+                }
+            };
+            if !running {
+                return Ok(());
+            }
             let now = tokio::time::Instant::now();
             let sleep = match deadline {
-                Some(deadline) if now >= deadline => break,
+                Some(deadline) if now >= deadline => return Ok(()),
                 Some(deadline) => interval.min(deadline - now),
                 None => interval,
             };
             tokio::time::sleep(sleep).await;
             interval = (interval * 2).min(Self::MAX_POLL);
         }
-        Ok(())
     }
 
     fn run_ids(&self) -> Result<Vec<RunId>, RunError> {
@@ -583,6 +685,8 @@ pub(super) struct RunState {
     pub(super) last_activity: Option<SystemTime>,
     /// The usage windows the fold left to [`RunStore::resolve_rate_limit_lookups`].
     pending_rate_limit_lookups: Vec<settle::RateLimitLookup>,
+    /// Whether each turn, by index, has settled or can.
+    finality: BTreeMap<u32, settle::Finality>,
 }
 
 /// What the fold established about a run's newest turn, which is the one `status` describes, a
@@ -597,14 +701,20 @@ pub(super) struct NewestTurn {
     pub(super) launch_mode: LaunchMode,
     /// Whether its capture says the turn itself began.
     pub(super) turn_started: bool,
-    /// Whether its delegate has gone, which a follow-up waits for: see
-    /// [`RunStore::delegate_has_exited`].
-    pub(super) delegate_has_exited: bool,
+    /// Whether it is settled, committed by this fold or an earlier one, which a follow-up waits
+    /// for.
+    pub(super) settled: bool,
+    /// Whether its delegate has gone, from the same observation the settlement was decided on.
+    ///
+    /// Apart from `settled` only for a cancellation the delegate survived: the turn is frozen
+    /// and settled, but the process saving its session is still there.
+    pub(super) delegate_gone: bool,
 }
 
 /// What decided a turn's outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SettledBy {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettledBy {
     /// A terminal event in its stream.
     TerminalEvent,
     /// Its exit record, because the stream carried no terminal event.
@@ -622,4 +732,10 @@ impl RunState {
             .last()
             .and_then(|turn| turn.unsaved_session_store.as_deref())
     }
+}
+
+/// Whether a recorded process is this one, which a supervisor asks of its own record so that
+/// it never waits on itself.
+fn is_this_process(launched: Launched) -> bool {
+    launched.pid == std::process::id()
 }

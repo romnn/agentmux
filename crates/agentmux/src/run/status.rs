@@ -123,6 +123,12 @@ pub struct RunStatus {
     /// kept it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
+    /// Whether the newest turn's settlement is committed: its transcript is published and final,
+    /// and `wait` returns it.
+    ///
+    /// Apart from [`RunStatus::outcome`], which says what the stream reported: a turn whose
+    /// stream has ended settles once its delegate has gone, a moment later.
+    pub settled: bool,
 }
 
 pub(super) fn whole_seconds<S: serde::Serializer>(

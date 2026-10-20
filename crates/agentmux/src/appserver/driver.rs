@@ -139,8 +139,8 @@ impl DriverOutcome {
 ///
 /// The question is read from stdin and the capture is written to stdout, which the launcher has
 /// pointed at the turn's files; a turn that breaks says why on stderr.
-/// Nothing is started until the turn's launch record names this process, which the caller writes
-/// once the spawn returns.
+/// Nothing is started until the turn's launch record names this process, which whoever launched
+/// it — the run store, or the turn's supervisor — writes once the spawn returns.
 /// Returns the process's exit status.
 #[must_use]
 pub fn drive(plan_path: &Path) -> i32 {
@@ -1068,6 +1068,9 @@ fn spawn_server(plan: &DriverPlan) -> std::io::Result<Server> {
     if plan.billing == Billing::Subscription {
         scrub_billing_env(&mut env);
     }
+    // The driver's own stdio is the turn's capture files, which the server must not hold beyond
+    // what it is given.
+    crate::launch::keep_std_handles_from_children();
     let spawn = |program: &str| -> std::io::Result<Server> {
         let (input, to_server) = std::io::pipe()?;
         let child = std::process::Command::new(program)

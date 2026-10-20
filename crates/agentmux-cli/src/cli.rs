@@ -2,10 +2,11 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same ten verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! The same eleven verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
-//! One more, `codex-app-server`, is hidden: it is the driver the run store launches for a Codex
-//! turn it runs over `codex app-server`.
+//! Two more are hidden: `supervise`, the process the run store launches for every turn to start
+//! its delegate and settle it, and `codex-app-server`, the driver it launches as the delegate of a
+//! Codex turn it runs over `codex app-server`.
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
@@ -88,6 +89,15 @@ pub enum Command {
     /// turn is steerable.
     Steer(SteerArgs),
 
+    /// Block until consultations' turns have settled, then print them.
+    ///
+    /// Returns only once each turn's transcript is published and final, never on a transcript
+    /// that merely looks finished, and as long as that takes unless `--timeout` says otherwise.
+    /// The exit status says how it ended: 0 completed, 10 failed, 11 cancelled, 124 when the
+    /// timeout passed first, 1 when agentmux itself failed and 2 for arguments it cannot act on.
+    /// Run it in a background shell and its exit is the completion notice.
+    Wait(WaitArgs),
+
     /// Stop a running consultation, keeping everything collected so far.
     Cancel(RunArgs),
 
@@ -112,6 +122,12 @@ pub enum Command {
     /// Launched by the run store as a consultation's delegate, never by hand.
     #[command(name = "codex-app-server", hide = true)]
     CodexAppServer(CodexAppServerArgs),
+
+    /// Start one turn's delegate, wait for it, and settle the turn.
+    ///
+    /// Launched by the run store for every turn, never by hand.
+    #[command(name = "supervise", hide = true)]
+    Supervise(SuperviseArgs),
 }
 
 /// How a Codex turn that can be steered is launched.
@@ -126,6 +142,14 @@ pub enum CodexLaunchArg {
 /// The plan a driven Codex turn runs under.
 #[derive(Debug, Args)]
 pub struct CodexAppServerArgs {
+    /// The plan the run store wrote into the turn's directory.
+    #[arg(value_name = "PLAN")]
+    pub plan_path: PathBuf,
+}
+
+/// The plan a supervised turn runs under.
+#[derive(Debug, Args)]
+pub struct SuperviseArgs {
     /// The plan the run store wrote into the turn's directory.
     #[arg(value_name = "PLAN")]
     pub plan_path: PathBuf,
@@ -585,6 +609,32 @@ impl SteerArgs {
     pub fn text(&self) -> Result<String> {
         supplied_text(self.message.as_deref(), self.file.as_deref())
     }
+}
+
+/// Arguments for `agentmux wait`: which turns to wait for, and for how many of them.
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// The consultation ids.
+    #[arg(required = true, value_name = "RUN")]
+    pub run_ids: Vec<RunIdArg>,
+
+    /// The turn to wait for, counted from 1 as the transcript's headings count, in every RUN.
+    /// Defaults to each consultation's newest turn as the wait begins; a follow-up started
+    /// afterwards is not waited for.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub turn: Option<u32>,
+
+    /// Return once any one has settled; among several that have, the first named.
+    #[arg(long, conflicts_with = "all")]
+    pub any: bool,
+
+    /// Return once every one has settled, which is the default.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Give up after this long, such as `90s` or `2h`, and exit 124; the consultations carry on.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Arguments for `agentmux list`: how many consultations to show.

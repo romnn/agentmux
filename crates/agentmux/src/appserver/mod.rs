@@ -19,6 +19,9 @@
 //! - It is launched by the same [`crate::launch::Launcher`], into the same turn directory, with
 //!   the same environment, so the launch record, liveness, reaping, settlement and the recursion
 //!   guard need nothing new.
+//!   Under a supervisor ([`crate::run::supervise`](fn@crate::run::supervise)) it is the
+//!   supervisor that launches it, as the delegate it starts, and records it; the driver itself is
+//!   unchanged, and the supervisor settles the turn once the driver has gone.
 //! - Its stdin is the turn's question file; its stdout is the turn's `events.jsonl`, written in
 //!   the `codex exec --json` shape, so [`crate::stream::codex`] folds both launch modes and the
 //!   rendered transcript does not depend on which one ran; its stderr, shared with the server it
