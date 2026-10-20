@@ -367,6 +367,7 @@ impl Launcher for ProcessLauncher {
                 .stderr(Stdio::null())
                 .spawn()
         };
+        keep_std_handles_from_children();
         let program = invocation.program();
         let spawned = spawn(program);
         // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
@@ -457,6 +458,7 @@ impl Launcher for ProcessLauncher {
             })
         };
 
+        keep_std_handles_from_children();
         let program = spec.invocation.program();
         let child = match spawn(program) {
             Ok(child) => child,
@@ -619,6 +621,59 @@ mod identity {
             Some(started) if started == process.start_time() => Liveness::Alive,
             Some(_) => Liveness::Gone,
             None => Liveness::Unknown,
+        }
+    }
+}
+
+/// Keep this process's own standard handles out of every child it starts.
+///
+/// On Windows a child is handed every inheritable handle of its parent, whatever its own stdio
+/// is, and the standard library always asks for that.
+/// A process whose standard handles are pipes — an MCP server, or `agentmux start` under a
+/// caller that captures its output — holds them as inheritable handles, since it inherited them
+/// itself.
+/// A detached supervisor or delegate started from it would then hold the caller's pipes open for
+/// as long as the turn runs, and the caller would never see the end of the output it is reading.
+/// Each child is still given its own stdio, which the standard library duplicates for it, so the
+/// originals never need to be inheritable.
+/// Called before every spawn, because it is the process's state that is changed, and a library
+/// cannot know what its embedder did with it since.
+///
+/// Elsewhere nothing is needed: a child's standard descriptors are replaced by its own, and every
+/// other descriptor the standard library opens is closed on exec.
+pub(crate) fn keep_std_handles_from_children() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        let handles = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        for handle in handles {
+            // A process without one, such as a detached supervisor's missing console, has none to
+            // keep.
+            if handle.is_null() {
+                continue;
+            }
+            // SAFETY: `handle` is one of this process's standard handles as the standard library
+            // reads them, which nothing in the process closes, or `INVALID_HANDLE_VALUE`, which
+            // the call refuses without effect; clearing the inherit flag touches no memory, only
+            // whether later children receive the handle.
+            #[expect(
+                unsafe_code,
+                reason = "the standard library offers no safe way to stop a handle being inherited, \
+                          and this call only clears that flag on the process's own std handles"
+            )]
+            let cleared = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            if cleared == 0 {
+                tracing::debug!(
+                    error = %std::io::Error::last_os_error(),
+                    "a standard handle stays inheritable"
+                );
+            }
         }
     }
 }

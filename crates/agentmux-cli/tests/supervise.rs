@@ -9,8 +9,10 @@
 //! themselves rather than asking agentmux.
 //! Nothing here is specific to one platform.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use agentmux::testing::fixtures;
@@ -101,24 +103,25 @@ impl Machine {
     }
 
     /// Start a consultation, as a caller's `agentmux start` does, and return its id once that
-    /// command has exited.
+    /// command has exited and its output has ended.
+    ///
+    /// Its output is a pipe, as a host capturing it has: the supervisor and the delegate it
+    /// starts outlive the command, and must hold none of that pipe.
     fn start(&self) -> Result<String> {
-        let output = self
-            .agentmux(&[
-                "start",
-                "--json",
-                "--delegate",
-                "claude",
-                "--model",
-                "opus",
-                "Review it.",
-            ])
-            .output()
-            .or_fail()?;
+        let output = run_in_background(self.agentmux(&[
+            "start",
+            "--json",
+            "--delegate",
+            "claude",
+            "--model",
+            "opus",
+            "Review it.",
+        ]))?
+        .finish(COMMAND_LIMIT)?;
         if !output.status.success() {
-            fail!("start failed: {}", String::from_utf8_lossy(&output.stderr))?;
+            fail!("start failed: {}", output.stderr)?;
         }
-        let status: serde_json::Value = serde_json::from_slice(&output.stdout).or_fail()?;
+        let status: serde_json::Value = serde_json::from_str(&output.stdout).or_fail()?;
         status
             .get("run_id")
             .and_then(serde_json::Value::as_str)
@@ -127,14 +130,10 @@ impl Machine {
     }
 
     /// Start `agentmux wait` on the consultation, in the background.
-    fn spawn_wait(&self, run_id: &str, extra: &[&str]) -> Result<Child> {
+    fn spawn_wait(&self, run_id: &str, extra: &[&str]) -> Result<Running> {
         let mut args = vec!["wait", run_id];
         args.extend_from_slice(extra);
-        self.agentmux(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .or_fail()
+        run_in_background(self.agentmux(&args))
     }
 
     fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -173,6 +172,85 @@ fn until_exists(path: &Path, limit: Duration) -> bool {
     path.exists()
 }
 
+/// The longest any one `agentmux` command these tests run may take, so a test that would hang
+/// fails instead.
+const COMMAND_LIMIT: Duration = Duration::from_secs(60);
+
+/// An `agentmux` command running in the background, its output read as it is written, so a full
+/// pipe never stalls it.
+struct Running {
+    child: Child,
+    stdout: Receiver<String>,
+    stderr: Receiver<String>,
+}
+
+/// How a command ended, and everything it printed.
+struct Finished {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Start `command` with both outputs piped and read in the background.
+fn run_in_background(mut command: Command) -> Result<Running> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .or_fail()?;
+    let stdout = read_in_background(child.stdout.take().or_fail()?);
+    let stderr = read_in_background(child.stderr.take().or_fail()?);
+    Ok(Running {
+        child,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read `pipe` to its end on a thread of its own, and hand over what it held.
+fn read_in_background(mut pipe: impl Read + Send + 'static) -> Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if pipe.read_to_string(&mut text).is_ok() {
+            sender.send(text).ok();
+        }
+    });
+    receiver
+}
+
+impl Running {
+    /// Whether it is still running.
+    fn is_running(&mut self) -> Result<bool> {
+        Ok(self.child.try_wait().or_fail()?.is_none())
+    }
+
+    /// Wait up to `limit` for it to exit and for its output to end, failing rather than hanging.
+    ///
+    /// Output that stays open after the command has exited is held by a process it started,
+    /// which is the leak of a caller's pipes into a detached supervisor this suite guards
+    /// against.
+    fn finish(mut self, limit: Duration) -> Result<Finished> {
+        let deadline = Instant::now() + limit;
+        let status = exit_within(&mut self.child, limit)?;
+        // A moment at least, for the reader threads to see the end once the command has gone.
+        let remaining = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(2))
+        };
+        // Output that stays open after the command has exited is held by a process it started.
+        let stdout = self.stdout.recv_timeout(remaining()).ok();
+        let stderr = self.stderr.recv_timeout(remaining()).ok();
+        let (stdout, stderr) = stdout.zip(stderr).or_fail()?;
+        Ok(Finished {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
 /// Wait up to `limit` for `child` to exit, killing it rather than hanging the test.
 fn exit_within(child: &mut Child, limit: Duration) -> Result<ExitStatus> {
     let deadline = Instant::now() + limit;
@@ -187,13 +265,6 @@ fn exit_within(child: &mut Child, limit: Duration) -> Result<ExitStatus> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// What a finished child printed on stdout.
-fn stdout_of(child: &mut Child) -> Result<String> {
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take().or_fail()?, &mut text).or_fail()?;
-    Ok(text)
 }
 
 /// A delegate that leaves with nothing asking about its consultation leaves its turn settled on
@@ -277,17 +348,18 @@ fn agentmux_wait_returns_on_settlement_with_its_outcome() -> Result<()> {
 
         // Still running, so still waiting.
         std::thread::sleep(Duration::from_millis(500));
-        assert_that!(waiter.try_wait().or_fail()?, none(), "{expected}");
+        assert_that!(waiter.is_running()?, eq(true), "{expected}");
 
         let ended = Instant::now();
         if cancel {
-            let cancelled = machine.agentmux(&["cancel", &run_id]).output().or_fail()?;
+            let cancelled =
+                run_in_background(machine.agentmux(&["cancel", &run_id]))?.finish(COMMAND_LIMIT)?;
             assert_that!(cancelled.status.success(), eq(true));
         } else {
             machine.release()?;
         }
-        let status = exit_within(&mut waiter, Duration::from_secs(20))?;
-        assert_that!(status.code(), some(eq(expected)));
+        let waited = waiter.finish(Duration::from_secs(20))?;
+        assert_that!(waited.status.code(), some(eq(expected)));
         // Settled by the supervisor within a tenth of a second, seen within half of one; the
         // rest is slack for a loaded machine.
         if !cancel {
@@ -298,8 +370,11 @@ fn agentmux_wait_returns_on_settlement_with_its_outcome() -> Result<()> {
                 ended.elapsed()
             );
         }
-        let printed = stdout_of(&mut waiter)?;
-        assert_that!(printed, contains_substring("turn 1 settled"), "{expected}");
+        assert_that!(
+            waited.stdout,
+            contains_substring("turn 1 settled"),
+            "{expected}"
+        );
         assert_that!(machine.marker(&run_id).exists(), eq(true));
     }
     Ok(())
@@ -315,10 +390,11 @@ fn a_wait_that_times_out_exits_124() -> Result<()> {
         exit_code: 0,
     })?;
     let run_id = machine.start()?;
-    let mut waiter = machine.spawn_wait(&run_id, &["--timeout", "1s", "--json"])?;
-    let status = exit_within(&mut waiter, Duration::from_secs(20))?;
-    assert_that!(status.code(), some(eq(124)));
-    let report: serde_json::Value = serde_json::from_str(&stdout_of(&mut waiter)?).or_fail()?;
+    let waited = machine
+        .spawn_wait(&run_id, &["--timeout", "1s", "--json"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(waited.status.code(), some(eq(124)));
+    let report: serde_json::Value = serde_json::from_str(&waited.stdout).or_fail()?;
     assert_that!(
         report.get("result"),
         some(eq(&serde_json::json!("timed_out")))
@@ -354,9 +430,10 @@ fn a_delegate_that_cannot_start_is_a_failed_turn() -> Result<()> {
     )
     .or_fail()?;
     let run_id = machine.start()?;
-    let mut waiter = machine.spawn_wait(&run_id, &[])?;
-    let status = exit_within(&mut waiter, Duration::from_secs(20))?;
-    assert_that!(status.code(), some(eq(10)));
+    let waited = machine
+        .spawn_wait(&run_id, &[])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(waited.status.code(), some(eq(10)));
     let transcript =
         std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
     assert_that!(transcript, contains_substring("never started"));
@@ -422,9 +499,10 @@ fn a_dead_supervisor_leaves_its_turn_to_the_next_observer() -> Result<()> {
     assert_that!(machine.marker(&run_id).exists(), eq(false));
 
     machine.release()?;
-    let mut waiter = machine.spawn_wait(&run_id, &[])?;
-    let status = exit_within(&mut waiter, Duration::from_secs(20))?;
-    assert_that!(status.code(), some(eq(0)));
+    let waited = machine
+        .spawn_wait(&run_id, &[])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(waited.status.code(), some(eq(0)));
     assert_that!(machine.marker(&run_id).exists(), eq(true));
     Ok(())
 }

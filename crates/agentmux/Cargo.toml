@@ -49,6 +49,8 @@ nix = { workspace = true, features = ["process", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 win32job.workspace = true
+# Stops this process's own std handles being inherited by the detached children it starts.
+windows-sys = { workspace = true, features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["serde"] }

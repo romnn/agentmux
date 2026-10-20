@@ -1067,6 +1067,9 @@ fn spawn_server(plan: &DriverPlan) -> std::io::Result<Server> {
     if plan.billing == Billing::Subscription {
         scrub_billing_env(&mut env);
     }
+    // The driver's own stdio is the turn's capture files, which the server must not hold beyond
+    // what it is given.
+    crate::launch::keep_std_handles_from_children();
     let spawn = |program: &str| -> std::io::Result<Server> {
         let (input, to_server) = std::io::pipe()?;
         let child = std::process::Command::new(program)

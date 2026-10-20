@@ -41,6 +41,7 @@ dependencies = [
  "tracing",
  "uuid",
  "win32job",
+ "windows-sys",
 ]
 
 [[package]]

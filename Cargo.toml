@@ -141,6 +141,9 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # A kill-on-close job object holds everything a driven Codex turn starts on Windows, where a
 # process's recorded parent cannot be trusted once that parent has exited.
 win32job = "2.0.3"
+# Clears the inherit flag on a process's own standard handles, which `CreateProcess` would
+# otherwise hand to every child however its stdio is redirected. Features are chosen per crate.
+windows-sys = "0.61"
 
 # testing
 # Builds the fake `codex` a test puts on a driver's `PATH`, which is a target `cargo test` builds

@@ -117,4 +117,9 @@ observation of the stream.
 - Settlement is crash-safe in the order it writes files, not durable across power loss: nothing is
   synced.
 - On Windows the supervisor and every delegate are created detached, in a process group of their
-  own; descendants of a directly launched CLI are still not contained.
+  own; descendants of a directly launched CLI are still not contained. `CreateProcess` hands a
+  child every inheritable handle of its parent whatever its stdio, so every spawn first clears the
+  inherit flag on the spawning process's own standard handles
+  (`launch::keep_std_handles_from_children`): otherwise a supervisor started by `agentmux start`
+  under a caller capturing its output, or by an MCP server, would hold the caller's pipes open
+  for the whole turn.
