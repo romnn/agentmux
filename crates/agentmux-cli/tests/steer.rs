@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{
+    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -301,7 +303,10 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
         delegate: Delegate::Codex {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
         },
@@ -405,6 +410,7 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
             "cwd": harness.project_dir.to_string_lossy(),
             "sandbox": "read-only",
             "approvalPolicy": "never",
+            "approvalsReviewer": "user",
             "excludeTurns": true,
         }))]
     );
@@ -468,6 +474,7 @@ async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> 
     std::fs::create_dir_all(&turn).or_fail()?;
     let plan = DriverPlan {
         settings: AppServerSettings {
+            network_access: None,
             program: "codex".to_owned(),
             args: vec!["app-server".to_owned()],
             model: ModelId::parse("gpt-6-astra").or_fail()?,
@@ -519,6 +526,7 @@ fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
         std::fs::create_dir_all(&turn).or_fail()?;
         let plan = DriverPlan {
             settings: AppServerSettings {
+                network_access: None,
                 program: "codex".to_owned(),
                 args: vec!["app-server".to_owned()],
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
@@ -619,6 +627,7 @@ fn drive_fake(
     )?;
     let plan = DriverPlan {
         settings: AppServerSettings {
+            network_access: None,
             program: "codex".to_owned(),
             args: vec!["app-server".to_owned()],
             model: ModelId::parse("gpt-6-astra").or_fail()?,

@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId};
+use agentmux::delegate::{
+    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+};
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::Outcome;
@@ -71,7 +73,10 @@ async fn connected() -> Result<Connected> {
         delegate: Delegate::Codex {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
             isolation: None,
         },

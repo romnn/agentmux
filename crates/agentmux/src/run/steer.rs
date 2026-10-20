@@ -141,9 +141,11 @@ impl RunStore {
             return Err(not_running(NotRunningReason::Ended(outcome.state())).into());
         }
         if folded.launch_mode != LaunchMode::AppServer {
+            // The running turn's own isolation, which a follow-up may have changed.
+            let current = self.current_delegate(&meta, Some(newest.index))?;
             return Err(SteerError::NotSteerable {
                 run_id: run_id.clone(),
-                reason: why_not_steerable(&meta.delegate),
+                reason: why_not_steerable(&current),
             }
             .into());
         }

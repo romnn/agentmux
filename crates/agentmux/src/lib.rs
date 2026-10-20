@@ -32,7 +32,7 @@
 //! # // Uses `no_run` because the example spawns a real delegate CLI and writes a run directory.
 //! use std::sync::Arc;
 //!
-//! use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId};
+//! use agentmux::delegate::{AccountChoice, ClaudePermissions, Delegate, Effort, ModelId};
 //! use agentmux::launch::ProcessLauncher;
 //! use agentmux::run::{Retention, RunStore, StartRequest};
 //!
@@ -50,6 +50,7 @@
 //!         effort: Some(Effort::parse("xhigh")?),
 //!         account: AccountChoice::Default,
 //!         isolation: None,
+//!         permissions: ClaudePermissions::default(),
 //!     },
 //!     question: "Review the merge-base diff for correctness bugs.".to_owned(),
 //!     cwd: std::env::current_dir()?,

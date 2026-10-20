@@ -3,8 +3,11 @@
 //! This module is the enforcement the whole crate exists for.
 //! A caller does not compose a command line; it fills in a [`Delegate`] and the argument vector
 //! follows as a total function over the enum.
-//! There is no path through [`Delegate::invocation`] that omits the streaming flags, the hook
-//! suppression, or the empty MCP config, because none of them is conditional.
+//! There is no path through [`Delegate::invocation`] that omits the streaming flags, the
+//! permission flags or the recursion marker, because none of them is conditional, or that skips
+//! the machine file's limits, because it holds the delegate to them before building anything.
+//! Only the isolation flags depend on a choice, and that choice is recorded with the
+//! consultation.
 //!
 //! Two variants, not a trait: the set is closed at two, and an exhaustive `match` makes the
 //! compiler enumerate every place a third vendor would need handling.
@@ -65,6 +68,23 @@ pub enum DelegateError {
         /// The vendor that was asked for.
         vendor: Vendor,
     },
+
+    /// A request spelled its isolation twice, once as `ignore_user_config` and once as its inverse
+    /// `inherit_settings`, and the two disagree.
+    #[error(
+        "Conflicting settings: ignore_user_config={ignore_user_config} and \
+         inherit_settings={inherit_settings}. Supply only one spelling, or matching inverse values."
+    )]
+    ConflictingSettings {
+        /// What `ignore_user_config` said.
+        ignore_user_config: bool,
+        /// What `inherit_settings` said.
+        inherit_settings: bool,
+    },
+
+    /// The machine file's limits refuse what the consultation asked for.
+    #[error(transparent)]
+    Permission(#[from] crate::config::PermissionRefusal),
 
     /// The requested account alias is not defined by this machine's configuration.
     ///
@@ -166,11 +186,20 @@ fn describe_selection(selected_by: Option<&std::path::Path>) -> String {
 
 /// The isolation a consultation actually runs under.
 ///
-/// An explicit choice wins; otherwise the account decides, because settings live in an account's
-/// own configuration directory and "use my personal account, with its hooks" is one thought rather
-/// than two.
-/// With neither, the answer is isolation: it is the safe default and needs no configuration.
-/// An account a checkout chose does not get to decide; see [`AccountPolicy`].
+/// In order, the first that has an answer decides:
+///
+/// 1. the caller's explicit choice;
+/// 2. an account a checkout chose, which always runs isolated, because a project file switches
+///    nothing on (see [`AccountPolicy`]);
+/// 3. the account's own `inherit_settings`, because settings live in an account's own
+///    configuration directory and "use my personal account, with its hooks" is one thought
+///    rather than two;
+/// 4. the vendor's `ignore_user_config` default in the machine file;
+/// 5. inheriting, unless the vendor's limits rule it out.
+///
+/// The machine file's own preferences cannot contradict its limits — that is refused when the
+/// file is read — so only an explicit choice can be refused; see
+/// [`crate::config::PermissionPolicy::hold_isolation`].
 fn resolve_isolation(
     explicit: Option<Isolation>,
     vendor: Vendor,
@@ -180,23 +209,23 @@ fn resolve_isolation(
     if let Some(isolation) = explicit {
         return isolation;
     }
-    // An account that cannot be resolved is refused by the launch, which says why; until then
-    // it switches nothing on.
-    let inherits = AccountPolicy::resolve(vendor, account, config)
-        .ok()
-        .flatten()
-        .is_some_and(|policy| policy.inherits_settings());
-    if inherits {
-        Isolation::Inherit
-    } else {
-        Isolation::Isolated
+    // An account that cannot be resolved is refused by the launch, which says why.
+    if let Ok(Some(policy)) = AccountPolicy::resolve(vendor, account, config) {
+        if policy.is_project_selected() {
+            return Isolation::Isolated;
+        }
+        if let Some(inherit) = policy.account.inherit_settings {
+            return Isolation::ignoring_user_config(!inherit);
+        }
     }
+    config.permissions(vendor).default_isolation()
 }
 
-/// Name the isolation mode in a summary, but only when it is not the default.
+/// Name the isolation mode in a summary, but only when it loads the user's configuration.
 ///
-/// A line that says `isolated` on every consultation teaches a reader to skip it, and the one
-/// consultation where it matters is the one that inherited.
+/// That is what a consultation gets unless something chose otherwise, and it is still the one
+/// worth naming on every line: a run that inherited is the one whose finished turn a hook can
+/// reopen and whose answer depends on the machine.
 fn describe_isolation(isolation: Option<Isolation>) -> &'static str {
     match isolation {
         Some(Isolation::Inherit) => " settings=inherited",
@@ -397,16 +426,21 @@ string_newtype_conversions!(AccountAlias);
 
 /// Whether a delegate runs isolated, or as the account's own CLI would.
 ///
-/// Isolation is the default and is what makes a consultation a second opinion rather than a second
-/// copy of the caller's own setup: no settings, no hooks, no MCP servers.
+/// Isolation is what makes a consultation a second opinion rather than a second copy of the
+/// caller's own setup: no settings, no hooks, no MCP servers.
 /// It is imposed by argument, not by environment — no variable can switch it on or off.
+/// The public spelling is `ignore_user_config`: `true` is [`Self::Isolated`], `false` is
+/// [`Self::Inherit`].
 ///
-/// `Inherit` exists because the default is sometimes wrong.
-/// A reviewer that is supposed to exercise the project's own tooling needs that tooling, and a
-/// hook the operator wants applied to every model they run is not usefully suppressed here.
+/// `Inherit` is what a consultation gets when nobody chose, because a delegate that runs as the
+/// owner's own CLI runs with the tools, permissions and providers the owner set up for it, and
+/// what it may *do* is held separately, by the permissions every launch passes explicitly.
 /// It costs the three guarantees named on [`Self::Isolated`], and agentmux says so in the
 /// transcript rather than letting a reopened turn look like a model changing its mind.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `codex.defaults.ignore_user_config` and `claude.defaults.ignore_user_config` in the machine
+/// file change what nobody choosing means, and `allow_user_config = false` among a vendor's limits
+/// rules inheriting out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
     /// No user, project or local settings; no hooks; no MCP servers.
@@ -416,7 +450,6 @@ pub enum Isolation {
     /// The delegate cannot re-enter agentmux through a configured MCP server and recurse.
     /// And what the delegate saw does not depend on the caller's machine, so a consultation is
     /// reproducible somewhere else.
-    #[default]
     Isolated,
     /// The account's own settings, hooks and MCP servers, exactly as its CLI would load them.
     Inherit,
@@ -428,23 +461,87 @@ impl Isolation {
     pub fn inherits(self) -> bool {
         matches!(self, Self::Inherit)
     }
+
+    /// The isolation one request spells, from either of its two spellings.
+    ///
+    /// `ignore_user_config` is the canonical spelling and `inherit_settings` its inverse, kept so
+    /// existing callers keep working; a request that gives both must give matching values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::ConflictingSettings`] when the two spellings disagree.
+    pub fn from_spellings(
+        ignore_user_config: Option<bool>,
+        inherit_settings: Option<bool>,
+    ) -> Result<Option<Self>, DelegateError> {
+        match (ignore_user_config, inherit_settings) {
+            (Some(ignore), Some(inherit)) if ignore == inherit => {
+                Err(DelegateError::ConflictingSettings {
+                    ignore_user_config: ignore,
+                    inherit_settings: inherit,
+                })
+            }
+            (Some(ignore), _) => Ok(Some(Self::ignoring_user_config(ignore))),
+            (None, Some(inherit)) => Ok(Some(Self::ignoring_user_config(!inherit))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// The isolation `ignore_user_config = ignore` names.
+    #[must_use]
+    pub fn ignoring_user_config(ignore: bool) -> Self {
+        if ignore {
+            Self::Isolated
+        } else {
+            Self::Inherit
+        }
+    }
+
+    /// Whether the delegate skips the user's own configuration, as `ignore_user_config` says it.
+    #[must_use]
+    pub fn ignores_user_config(self) -> bool {
+        !self.inherits()
+    }
 }
 
-/// How much of the filesystem a Codex delegate may write.
+/// How much of the filesystem a Codex delegate's commands may write.
 ///
+/// These are Codex's own sandbox modes, which govern the commands the delegate runs; they do not
+/// constrain MCP servers or hooks a delegate that loads the user's configuration starts.
 /// A consultation is a second opinion, so `ReadOnly` is the default.
 /// `WorkspaceWrite` exists because a delegate asked to produce a large artefact cannot deliver it
 /// through a read-only sandbox — a read-only delegate told to write its report to a path completes
 /// the work, fails the write, and reports the failure instead of the findings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, VariantArray)]
+/// `DangerFullAccess` lifts the sandbox altogether, network included; a launch may ask for it only
+/// when the machine file raises `codex.limits.max_sandbox` to it.
+///
+/// Ordered from least to most access, which is the order `codex.limits.max_sandbox` compares in.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    VariantArray,
+)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum CodexSandbox {
-    /// The delegate may read the working directory and nothing else.
+    /// Commands may read files and write none; network is off unless
+    /// [`CodexPermissions::network_access`] turns it on.
     #[default]
     ReadOnly,
-    /// The delegate may also write inside its working directory.
+    /// Commands may also write inside the working directory and the roots Codex adds to it, such
+    /// as its temporary directories; network follows Codex's own configuration unless
+    /// [`CodexPermissions::network_access`] decides it.
     WorkspaceWrite,
+    /// No Codex sandbox at all: commands may write anywhere and reach any network.
+    DangerFullAccess,
 }
 
 impl CodexSandbox {
@@ -454,6 +551,302 @@ impl CodexSandbox {
         match self {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    /// The name agentmux's configuration, its MCP tools and its refusals use for this mode.
+    #[must_use]
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::DangerFullAccess => "danger_full_access",
+        }
+    }
+}
+
+/// What a Codex delegate's commands may do: its sandbox mode and whether they reach the network.
+///
+/// Both are optional in a request, where an absent value takes the machine file's default, and
+/// in a record, where an absent `network_access` means nobody chose and Codex's own configuration
+/// decides.
+/// A recorded `sandbox` is always present once a consultation has started; one missing from a
+/// record means the read-only mode every consultation ran under before it was recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexPermissions {
+    /// The sandbox mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<CodexSandbox>,
+    /// Whether commands may reach the network, or `None` to leave it to Codex.
+    ///
+    /// Read-only with network runs under a native permission profile, since Codex's legacy
+    /// read-only mode has no network switch; see `codex_args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
+}
+
+impl CodexPermissions {
+    /// The sandbox mode, read-only when none was recorded.
+    #[must_use]
+    pub fn sandbox(self) -> CodexSandbox {
+        self.sandbox.unwrap_or_default()
+    }
+
+    /// Whether these permissions need Codex's native permission profile under `codex exec`: a
+    /// read-only sandbox whose commands may reach the network.
+    #[must_use]
+    pub fn needs_permission_profile(self) -> bool {
+        self.sandbox() == CodexSandbox::ReadOnly && self.network_access == Some(true)
+    }
+
+    /// How these permissions read in a one-line summary, as `read-only+network`.
+    fn describe(self) -> String {
+        let network = match self.network_access {
+            Some(true) => "+network",
+            Some(false) => "+no-network",
+            None => "",
+        };
+        format!("{}{network}", self.sandbox().as_str())
+    }
+}
+
+/// A Claude permission mode, spelled as `claude --permission-mode` takes it.
+///
+/// These are not a scale of strength: `plan` explores without editing, `acceptEdits` accepts
+/// edits, `dontAsk` denies whatever would need approval, `auto` lets a classifier decide, and
+/// `bypassPermissions` skips every permission check, which a launch may ask for only when the
+/// machine file lists it in `claude.limits.allowed_permission_modes`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    VariantArray,
+)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum ClaudePermissionMode {
+    /// Asks before acting; Claude Code's own default, also spelled `default`.
+    #[serde(rename = "manual", alias = "default")]
+    #[cfg_attr(feature = "clap", value(name = "manual", alias = "default"))]
+    Manual,
+    /// Accepts file edits without asking.
+    #[serde(rename = "acceptEdits")]
+    #[cfg_attr(feature = "clap", value(name = "acceptEdits"))]
+    AcceptEdits,
+    /// Explores and plans without editing: what a second opinion runs under unless configured
+    /// otherwise.
+    #[default]
+    #[serde(rename = "plan")]
+    #[cfg_attr(feature = "clap", value(name = "plan"))]
+    Plan,
+    /// Denies whatever would need approval, rather than asking.
+    #[serde(rename = "dontAsk")]
+    #[cfg_attr(feature = "clap", value(name = "dontAsk"))]
+    DontAsk,
+    /// Lets Claude Code's classifier decide what to approve.
+    #[serde(rename = "auto")]
+    #[cfg_attr(feature = "clap", value(name = "auto"))]
+    Auto,
+    /// Skips every permission check.
+    #[serde(rename = "bypassPermissions")]
+    #[cfg_attr(feature = "clap", value(name = "bypassPermissions"))]
+    BypassPermissions,
+}
+
+impl ClaudePermissionMode {
+    /// The mode as `--permission-mode` and agentmux's configuration spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::DontAsk => "dontAsk",
+            Self::Auto => "auto",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+}
+
+impl std::fmt::Display for ClaudePermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One Claude tool name or permission rule, such as `WebFetch` or `Bash(git diff *)`, passed to
+/// the CLI verbatim.
+///
+/// Opaque for the same reason a model id is: the vocabulary is the CLI's.
+/// A rule is held to what one entry of the CLI's comma-separated lists can carry, so it may hold
+/// spaces and brackets but no comma.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ClaudeTool(String);
+
+impl ClaudeTool {
+    /// Longest rule accepted.
+    pub const MAX_LEN: usize = 256;
+
+    /// Validate one tool name or rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::Argument`] when the rule is empty, over [`ClaudeTool::MAX_LEN`],
+    /// starts with `-`, or holds a comma or a control character.
+    pub fn parse(value: &str) -> Result<Self, DelegateError> {
+        parse_token("tool", value, Self::MAX_LEN, |c| {
+            c != ',' && !c.is_control()
+        })
+        .map(Self)
+    }
+
+    /// Validate every entry of a list, refusing the first that does not parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first entry's [`DelegateError::Argument`].
+    pub fn parse_all<S: AsRef<str>>(values: &[S]) -> Result<Vec<Self>, DelegateError> {
+        values
+            .iter()
+            .map(|value| Self::parse(value.as_ref()))
+            .collect()
+    }
+
+    /// The rule as the CLI will see it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+string_newtype_conversions!(ClaudeTool);
+
+/// What a Claude delegate may do: its permission mode and which tools it is offered.
+///
+/// Every field is optional in a request, where an absent value takes the machine file's default.
+/// A recorded consultation names its permission mode; an absent one, and an absent tool list,
+/// mean what agentmux launches with when nobody chose, which is also what every consultation ran
+/// under before these were recorded: plan mode and a read-only tool list, `Bash`, `Read`, `Grep`,
+/// `Glob`, `WebFetch` and `WebSearch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudePermissions {
+    /// The permission mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<ClaudePermissionMode>,
+    /// The built-in tools the delegate is offered at all, as `--tools`; empty offers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ClaudeTool>>,
+    /// Calls preapproved, as `--allowedTools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<ClaudeTool>>,
+    /// Calls denied, as `--disallowedTools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disallowed_tools: Option<Vec<ClaudeTool>>,
+}
+
+impl ClaudePermissions {
+    /// The permission mode, plan mode when none was recorded.
+    #[must_use]
+    pub fn permission_mode(&self) -> ClaudePermissionMode {
+        self.permission_mode.unwrap_or_default()
+    }
+
+    /// How these permissions read in a one-line summary, naming only what departs from plan mode
+    /// and the read-only tool list.
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        let mode = self.permission_mode();
+        if mode != ClaudePermissionMode::Plan {
+            parts.push(format!(" permission_mode={mode}"));
+        }
+        let lists = [
+            ("tools", &self.tools),
+            ("allowed_tools", &self.allowed_tools),
+            ("disallowed_tools", &self.disallowed_tools),
+        ];
+        for (name, list) in lists {
+            if let Some(list) = list {
+                parts.push(format!(" {name}={}", join_tools(list)));
+            }
+        }
+        parts.concat()
+    }
+}
+
+/// A tool list the way the CLI's flags take it: comma-separated.
+fn join_tools(tools: &[ClaudeTool]) -> String {
+    tools
+        .iter()
+        .map(ClaudeTool::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The permission options a front end presents flat, for either vendor.
+///
+/// What [`Delegate::from_parts`] builds a request from, and what [`Delegate::with_options`]
+/// applies to a recorded consultation as a follow-up's overrides; an absent value takes the
+/// default there, and keeps the recorded choice here.
+/// Each option belongs to one vendor except the isolation, and one given for the other vendor is
+/// refused rather than ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionOptions {
+    /// Whether to skip the user's own configuration; see [`Isolation::from_spellings`].
+    pub isolation: Option<Isolation>,
+    /// The Codex sandbox mode.
+    pub sandbox: Option<CodexSandbox>,
+    /// Whether a Codex delegate's commands may reach the network.
+    pub network_access: Option<bool>,
+    /// The Claude permission mode.
+    pub permission_mode: Option<ClaudePermissionMode>,
+    /// The built-in Claude tools offered.
+    pub tools: Option<Vec<ClaudeTool>>,
+    /// The Claude calls preapproved.
+    pub allowed_tools: Option<Vec<ClaudeTool>>,
+    /// The Claude calls denied.
+    pub disallowed_tools: Option<Vec<ClaudeTool>>,
+}
+
+impl PermissionOptions {
+    /// The first option set that belongs to the other vendor than `vendor`, by the name a caller
+    /// spells it.
+    fn first_foreign(&self, vendor: Vendor) -> Option<(&'static str, Vendor)> {
+        match vendor {
+            Vendor::Claude => [
+                ("sandbox", self.sandbox.is_some()),
+                ("network_access", self.network_access.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(option, set)| set.then_some((option, Vendor::Codex))),
+            Vendor::Codex => [
+                ("permission_mode", self.permission_mode.is_some()),
+                ("tools", self.tools.is_some()),
+                ("allowed_tools", self.allowed_tools.is_some()),
+                ("disallowed_tools", self.disallowed_tools.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(option, set)| set.then_some((option, Vendor::Claude))),
+        }
+    }
+
+    /// Refuse an option that belongs to the other vendor.
+    fn refuse_foreign(&self, vendor: Vendor) -> Result<(), DelegateError> {
+        match self.first_foreign(vendor) {
+            Some((option, owner)) => Err(DelegateError::NotForVendor {
+                option,
+                owner,
+                vendor,
+            }),
+            None => Ok(()),
         }
     }
 }
@@ -690,9 +1083,12 @@ pub enum Delegate {
             with = "stored_account"
         )]
         account: AccountChoice,
-        /// Whether to load the account's own settings, or the account's preference when absent.
+        /// Whether to load the account's own settings, or the configured default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<Isolation>,
+        /// The permission mode and the tools offered.
+        #[serde(flatten)]
+        permissions: ClaudePermissions,
     },
     /// The `OpenAI` CLI.
     Codex {
@@ -701,9 +1097,9 @@ pub enum Delegate {
         /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
-        /// How much the delegate may write.
-        #[serde(default)]
-        sandbox: CodexSandbox,
+        /// How much the delegate's commands may write, and whether they reach the network.
+        #[serde(flatten)]
+        permissions: CodexPermissions,
         /// Which account to authenticate as.
         #[serde(
             default,
@@ -711,7 +1107,7 @@ pub enum Delegate {
             with = "stored_account"
         )]
         account: AccountChoice,
-        /// Whether to load the account's own settings, or the account's preference when absent.
+        /// Whether to load the account's own settings, or the configured default when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<Isolation>,
     },
@@ -722,46 +1118,142 @@ impl Delegate {
     ///
     /// This is the one parse step both front ends share, so they cannot come to accept
     /// different things.
+    /// What `options` leaves out stays unset, for [`crate::run::RunStore::start`] to fill from the
+    /// machine file's defaults once it knows which configuration applies.
     ///
     /// # Errors
     ///
     /// Returns [`DelegateError::Argument`] when the model, effort or alias is not argv-safe, and
-    /// [`DelegateError::NotForVendor`] when `sandbox` is given for a Claude consultation.
+    /// [`DelegateError::NotForVendor`] when `options` sets an option of the other vendor.
     pub fn from_parts(
         vendor: Vendor,
         model: &str,
         effort: Option<&str>,
         account: Option<&str>,
-        isolation: Option<Isolation>,
-        sandbox: Option<CodexSandbox>,
+        options: PermissionOptions,
     ) -> Result<Self, DelegateError> {
         let model = ModelId::parse(model)?;
         let effort = effort.map(Effort::parse).transpose()?;
         let account = AccountChoice::from(account.map(AccountAlias::parse).transpose()?);
-        match vendor {
-            Vendor::Claude => {
-                if sandbox.is_some() {
-                    return Err(DelegateError::NotForVendor {
-                        option: "sandbox",
-                        owner: Vendor::Codex,
-                        vendor,
-                    });
-                }
-                Ok(Self::Claude {
-                    model,
-                    effort,
-                    account,
-                    isolation,
-                })
-            }
-            Vendor::Codex => Ok(Self::Codex {
+        let unset = match vendor {
+            Vendor::Claude => Self::Claude {
                 model,
                 effort,
-                sandbox: sandbox.unwrap_or_default(),
                 account,
+                isolation: None,
+                permissions: ClaudePermissions::default(),
+            },
+            Vendor::Codex => Self::Codex {
+                model,
+                effort,
+                permissions: CodexPermissions::default(),
+                account,
+                isolation: None,
+            },
+        };
+        unset.with_options(options)
+    }
+
+    /// The same delegate, with every option `options` sets in place of the recorded one.
+    ///
+    /// What a follow-up's explicit overrides do: an option left out keeps the consultation's
+    /// recorded choice, and the machine file's defaults are not consulted again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::NotForVendor`] when `options` sets an option of the other vendor.
+    pub fn with_options(mut self, options: PermissionOptions) -> Result<Self, DelegateError> {
+        options.refuse_foreign(self.vendor())?;
+        let PermissionOptions {
+            isolation: requested_isolation,
+            sandbox,
+            network_access,
+            permission_mode,
+            tools,
+            allowed_tools,
+            disallowed_tools,
+        } = options;
+        match &mut self {
+            Self::Claude {
                 isolation,
-            }),
+                permissions,
+                ..
+            } => {
+                *isolation = requested_isolation.or(*isolation);
+                let ClaudePermissions {
+                    permission_mode: recorded_mode,
+                    tools: recorded_tools,
+                    allowed_tools: recorded_allowed,
+                    disallowed_tools: recorded_disallowed,
+                } = permissions;
+                *recorded_mode = permission_mode.or(*recorded_mode);
+                if tools.is_some() {
+                    *recorded_tools = tools;
+                }
+                if allowed_tools.is_some() {
+                    *recorded_allowed = allowed_tools;
+                }
+                if disallowed_tools.is_some() {
+                    *recorded_disallowed = disallowed_tools;
+                }
+            }
+            Self::Codex {
+                isolation,
+                permissions,
+                ..
+            } => {
+                *isolation = requested_isolation.or(*isolation);
+                permissions.sandbox = sandbox.or(permissions.sandbox);
+                permissions.network_access = network_access.or(permissions.network_access);
+            }
         }
+        Ok(self)
+    }
+
+    /// The same delegate, with the isolation and permissions a turn of it ran with.
+    ///
+    /// Only those are taken from `turn`: who is consulted — vendor, model, effort and account —
+    /// is fixed when a consultation starts, so a turn's record cannot move a follow-up onto
+    /// another.
+    /// A record of the other vendor's delegate carries no permissions this one has, and changes
+    /// nothing.
+    #[must_use]
+    pub fn with_settings_of(mut self, turn: &Self) -> Self {
+        match (&mut self, turn) {
+            (
+                Self::Claude {
+                    isolation,
+                    permissions,
+                    ..
+                },
+                Self::Claude {
+                    isolation: ran_isolation,
+                    permissions: ran_permissions,
+                    ..
+                },
+            ) => {
+                *isolation = *ran_isolation;
+                permissions.clone_from(ran_permissions);
+            }
+            (
+                Self::Codex {
+                    isolation,
+                    permissions,
+                    ..
+                },
+                Self::Codex {
+                    isolation: ran_isolation,
+                    permissions: ran_permissions,
+                    ..
+                },
+            ) => {
+                *isolation = *ran_isolation;
+                *permissions = *ran_permissions;
+            }
+            (Self::Claude { .. }, Self::Codex { .. })
+            | (Self::Codex { .. }, Self::Claude { .. }) => {}
+        }
+        self
     }
 
     /// Which CLI this delegate runs.
@@ -783,9 +1275,9 @@ impl Delegate {
 
     /// The same delegate, with its isolation pinned.
     ///
-    /// Recorded for the same reason the account is: an account may ask to inherit, and a run whose
-    /// provenance stops being reproducible is the one run whose provenance most needs writing
-    /// down.
+    /// Recorded for the same reason the account is: whether a run loads the user's configuration
+    /// decides whether it is reproducible, and a run whose provenance stops being reproducible is
+    /// the one run whose provenance most needs writing down.
     #[must_use]
     pub fn with_isolation(mut self, resolved: Isolation) -> Self {
         match &mut self {
@@ -807,6 +1299,73 @@ impl Delegate {
                 account, isolation, ..
             } => resolve_isolation(*isolation, Vendor::Codex, account, config),
         }
+    }
+
+    /// The Codex permissions, for a Codex delegate.
+    #[must_use]
+    pub fn codex_permissions(&self) -> Option<&CodexPermissions> {
+        match self {
+            Self::Codex { permissions, .. } => Some(permissions),
+            Self::Claude { .. } => None,
+        }
+    }
+
+    /// The Claude permissions, for a Claude delegate.
+    #[must_use]
+    pub fn claude_permissions(&self) -> Option<&ClaudePermissions> {
+        match self {
+            Self::Claude { permissions, .. } => Some(permissions),
+            Self::Codex { .. } => None,
+        }
+    }
+
+    /// The same delegate, with every permission the request left unset filled from the machine
+    /// file's defaults, and from agentmux's own where the file names none.
+    ///
+    /// Done once, when a consultation starts, alongside the isolation: a follow-up keeps what was
+    /// filled in here, so a default edited later never changes a consultation already running.
+    #[must_use]
+    pub fn with_default_permissions(mut self, config: &Config) -> Self {
+        match &mut self {
+            Self::Claude { permissions, .. } => {
+                *permissions = config.claude.fill(permissions);
+            }
+            Self::Codex { permissions, .. } => {
+                *permissions = config.codex.fill(*permissions);
+            }
+        }
+        self
+    }
+
+    /// The same delegate, held to the machine file's current limits: what the next turn actually
+    /// launches with.
+    ///
+    /// Checked before every turn, because a limit the owner tightened after a consultation began
+    /// applies to its next turn too.
+    /// Nothing is clamped: a choice beyond a limit is refused, naming the limit and its file.
+    /// The one value filled in is the network of a Codex delegate whose limits forbid network and
+    /// that nobody chose for, which is switched off explicitly rather than left to the user's own
+    /// configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::Permission`] when the isolation or a permission exceeds the
+    /// limits.
+    pub fn held_to_limits(&self, config: &Config) -> Result<Self, DelegateError> {
+        let vendor = self.vendor();
+        config
+            .permissions(vendor)
+            .hold_isolation(self.resolved_isolation(config))?;
+        let mut held = self.clone();
+        match &mut held {
+            Self::Claude { permissions, .. } => {
+                config.claude.hold(permissions, config.source.as_deref())?;
+            }
+            Self::Codex { permissions, .. } => {
+                *permissions = config.codex.hold(*permissions, config.source.as_deref())?;
+            }
+        }
+        Ok(held)
     }
 
     /// The same delegate, with its account pinned to `alias`.
@@ -884,10 +1443,12 @@ impl Delegate {
                 effort,
                 account,
                 isolation,
+                permissions,
             } => {
                 format!(
-                    "claude {model} effort={} account={}{}",
+                    "claude {model} effort={}{} account={}{}",
                     describe_effort(effort.as_ref()),
+                    permissions.describe(),
                     describe_account(account),
                     describe_isolation(*isolation)
                 )
@@ -895,14 +1456,14 @@ impl Delegate {
             Self::Codex {
                 model,
                 effort,
-                sandbox,
+                permissions,
                 account,
                 isolation,
             } => {
                 format!(
                     "codex {model} effort={} sandbox={} account={}{}",
                     describe_effort(effort.as_ref()),
-                    sandbox.as_str(),
+                    permissions.describe(),
                     describe_account(account),
                     describe_isolation(*isolation)
                 )
@@ -1228,7 +1789,8 @@ pub fn scrub_billing_env(env: &mut BTreeMap<String, String>) -> Vec<String> {
 /// consultation can recurse.
 const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 
-/// The built-in tools a Claude delegate may use.
+/// The built-in tools a Claude delegate may use, unless the consultation or the machine file's
+/// `claude.defaults.tools` names others.
 ///
 /// A consultation is a second opinion, not an edit, so `Edit`, `Write` and `NotebookEdit` are not
 /// offered.
@@ -1237,7 +1799,7 @@ const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 /// What actually holds the line is `--permission-mode plan`, which the vendor enforces and reports
 /// in prose rather than structurally.
 /// Treat a Claude delegate as read-only by cooperation, and a Codex delegate under
-/// `CodexSandbox::ReadOnly` as read-only by enforcement.
+/// [`CodexSandbox::ReadOnly`] as read-only by enforcement.
 const CLAUDE_READ_ONLY_TOOLS: &str = "Bash,Read,Grep,Glob,WebFetch,WebSearch";
 
 impl Delegate {
@@ -1272,18 +1834,24 @@ impl Delegate {
             host_env,
             plan.billing,
         )?;
-        let isolation = self.resolved_isolation(config);
+        // Held here, the one step every launch goes through, so no turn runs past a limit the
+        // owner set, however it was reached.
+        let held = self.held_to_limits(config)?;
+        let isolation = held.resolved_isolation(config);
 
-        let args = match self {
-            Self::Claude { model, effort, .. } => {
-                claude_args(model, effort.as_ref(), plan, isolation)
-            }
+        let args = match &held {
+            Self::Claude {
+                model,
+                effort,
+                permissions,
+                ..
+            } => claude_args(model, effort.as_ref(), permissions, plan, isolation),
             Self::Codex {
                 model,
                 effort,
-                sandbox,
+                permissions,
                 ..
-            } => codex_args(model, effort.as_ref(), *sandbox, plan, isolation),
+            } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
         };
 
         let allowed: Vec<&str> = config
@@ -1326,12 +1894,15 @@ impl Delegate {
     /// private `CODEX_HOME` is no way round that is in [`crate::appserver`].
     /// `codex-app-server-codegen refresh` refuses the first codex whose app-server takes the flag,
     /// which is when to pass it here and let isolated delegates through.
+    ///
+    /// The permissions are this delegate's own, so the run store asks a delegate already held to
+    /// the machine file's limits, as [`Delegate::invocation`] holds it.
     #[must_use]
     pub fn app_server_settings(&self, config: &Config) -> Option<AppServerSettings> {
         let Self::Codex {
             model,
             effort,
-            sandbox,
+            permissions,
             ..
         } = self
         else {
@@ -1342,9 +1913,10 @@ impl Delegate {
         }
         Some(AppServerSettings {
             program: Vendor::Codex.program().to_owned(),
-            args: codex_app_server_args(effort.as_ref()),
+            args: codex_app_server_args(effort.as_ref(), *permissions),
             model: model.clone(),
-            sandbox: *sandbox,
+            sandbox: permissions.sandbox(),
+            network_access: permissions.network_access,
         })
     }
 }
@@ -1352,18 +1924,24 @@ impl Delegate {
 /// What a Codex turn driven over `codex app-server` is started with.
 ///
 /// The counterpart of the argument vector `codex_args` builds for `codex exec`, with the same
-/// model, effort and sandbox; the rest of the plan — the working directory, the session to
-/// resume, where the turn's files live — belongs to the run store.
+/// model, effort, sandbox and network; the rest of the plan — the working directory, the session
+/// to resume, where the turn's files live — belongs to the run store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppServerSettings {
     /// The executable, resolved against the child's `PATH`.
     pub program: String,
-    /// The arguments that start the server, effort included.
+    /// The arguments that start the server, effort and a workspace-write network choice included.
     pub args: Vec<String>,
     /// The model the thread runs, pinned on every turn as `exec` pins it.
     pub model: ModelId,
-    /// How much the delegate may write.
+    /// How much the delegate's commands may write, set on the thread at start and resume.
     pub sandbox: CodexSandbox,
+    /// Whether a read-only delegate's commands may reach the network, sent with every
+    /// `turn/start` as its sandbox policy; `None` leaves it to Codex.
+    ///
+    /// Absent from a plan an older agentmux wrote, which ran with Codex's own choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
 }
 
 impl Delegate {
@@ -1617,11 +2195,6 @@ impl<'a> AccountPolicy<'a> {
     /// Whether a checkout's file chose the account.
     fn is_project_selected(&self) -> bool {
         matches!(self.chosen_by, Some(ChosenBy::Project(_)))
-    }
-
-    /// Whether delegates on the account load its own settings, hooks and MCP servers.
-    pub(crate) fn inherits_settings(&self) -> bool {
-        !self.is_project_selected() && self.account.inherit_settings == Some(true)
     }
 
     /// Whether the machine file opted the account into API pricing, and nothing withdrew it.
@@ -1879,19 +2452,25 @@ fn secret_value(
 /// - `--output-format stream-json` with `--verbose`: `text` and `json` return only the *last*
 ///   assistant message, which is not the same thing as the answer; `--verbose` is mandatory
 ///   alongside `stream-json` under `--print` or the CLI rejects it.
-/// - `--setting-sources ""`: loads no user, project or local settings, so no `Stop` hook can
-///   reopen the finished turn.
+/// - `--setting-sources ""`, for an isolated delegate: loads no user, project or local settings,
+///   so no `Stop` hook can reopen the finished turn.
 ///   This is structural — it does not depend on any hook cooperating.
 ///   It does not suppress `CLAUDE.md` discovery, so a delegate still sees the project's own
 ///   instructions.
-/// - `--strict-mcp-config` with an empty config: keeps the delegate from re-entering agentmux.
-/// - `--permission-mode plan` with an edit-free `--tools` list: a second opinion, not an edit.
+/// - `--strict-mcp-config` with an empty config, for an isolated delegate: keeps it from
+///   re-entering agentmux.
+/// - `--permission-mode` and `--tools`, always: plan mode with an edit-free tool list unless the
+///   consultation chose otherwise, passed explicitly so a delegate that loads the user's settings
+///   does not take its permission mode or tools from them.
 ///   See [`CLAUDE_READ_ONLY_TOOLS`] for what that does and does not guarantee.
+/// - `--allowedTools` and `--disallowedTools`, only when the consultation names rules: a
+///   delegate that loads the user's settings otherwise keeps the user's own.
 /// - `--no-session-persistence` is deliberately **absent**.
 ///   It defeats `--resume`, and a consultation must stay open to a follow-up.
 fn claude_args(
     model: &ModelId,
     effort: Option<&Effort>,
+    permissions: &ClaudePermissions,
     plan: &TurnPlan<'_>,
     isolation: Isolation,
 ) -> Vec<String> {
@@ -1910,13 +2489,28 @@ fn claude_args(
         args.push(effort.as_str().to_owned());
     }
     args.push("--permission-mode".to_owned());
-    args.push("plan".to_owned());
+    args.push(permissions.permission_mode().as_str().to_owned());
     args.push("--tools".to_owned());
-    args.push(CLAUDE_READ_ONLY_TOOLS.to_owned());
+    args.push(
+        permissions
+            .tools
+            .as_deref()
+            .map_or_else(|| CLAUDE_READ_ONLY_TOOLS.to_owned(), join_tools),
+    );
+    // Each list goes as one comma-separated value, which a `ClaudeTool` cannot break: it holds no
+    // comma.
+    if let Some(allowed) = &permissions.allowed_tools {
+        args.push("--allowedTools".to_owned());
+        args.push(join_tools(allowed));
+    }
+    if let Some(disallowed) = &permissions.disallowed_tools {
+        args.push("--disallowedTools".to_owned());
+        args.push(join_tools(disallowed));
+    }
     args.push("--output-format".to_owned());
     args.push("stream-json".to_owned());
     args.push("--verbose".to_owned());
-    // Plan mode and the read-only tool list are not part of isolation and stay either way: what
+    // The permission mode and the tool list are not part of isolation and stay either way: what
     // the delegate may *do* is a separate question from whose configuration it loads.
     if !isolation.inherits() {
         args.push("--setting-sources".to_owned());
@@ -1928,23 +2522,53 @@ fn claude_args(
     args
 }
 
+/// A fresh name for the Codex permission profile one read-only turn with network runs under.
+///
+/// Drawn anew for every launch, resumes included, because Codex merges configuration tables
+/// recursively across its layers: a profile of the same name in the user's or a trusted project's
+/// configuration would add its own entries, such as a filesystem write grant, to the one agentmux
+/// defines, and a name a configuration file could know in advance could be defined there.
+fn permission_profile_name() -> String {
+    format!("agentmux_ro_{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Argument vector for the Codex CLI.
 ///
 /// - `--json`: without it stdout carries only the final answer and stays empty until the process
 ///   exits, so there is neither progress nor a recovery path.
-/// - `-c features.hooks=false`: the structural hook defence on this side.
-/// - `--ignore-user-config`: the isolation control.
+/// - `--ignore-user-config` with `-c features.hooks=false`, for an isolated delegate: the
+///   isolation control and the structural hook defence on this side.
 ///   It drops `$CODEX_HOME/config.toml`, and with it the machine's configured MCP servers, so the
 ///   delegate cannot re-enter agentmux or reach any other server the host happens to run.
 ///   Authentication is unaffected, because it comes from `CODEX_HOME` rather than the config
 ///   file.
+///   A delegate that loads the user's configuration gets neither, and runs the user's hooks and
+///   MCP servers.
+/// - The sandbox is always passed, so a delegate that loads the user's configuration does not
+///   take its sandbox from it.
+///   `--sandbox` on a new session and `-c sandbox_mode` on a resume, which **rejects `--sandbox`**
+///   and exits 2; either one selects Codex's legacy sandbox modes, overriding a
+///   `default_permissions` profile the user's configuration selects.
+/// - A workspace-write delegate's network goes as `-c sandbox_workspace_write.network_access`.
+/// - A read-only delegate *with* network has no legacy spelling, so it runs under a native
+///   permission profile of the consultation's own, defined and selected with `-c` on every turn:
+///   `permissions.<name>={extends=":read-only",network={enabled=true}}` and
+///   `default_permissions="<name>"`, with no legacy sandbox selection beside it, because
+///   `--sandbox` would force the legacy modes and drop the profile.
+///   Measured against codex-cli 0.163.0, whose sandbox refused a write and let a request through
+///   under exactly that profile; the run store refuses it on an older codex.
+///   The profile's name is fresh on every launch; see `permission_profile_name`.
+/// - `-c approval_policy="never"` with `-c approvals_reviewer="user"`, on every launch: nobody is
+///   there to approve, and an approval is a way out of the sandbox.
+///   `codex exec` defaults to `never`, but codex 0.162.1's `build_exec_config` drops that default
+///   when the configuration it loaded names the `auto_review` reviewer, which would let the user's
+///   own `approval_policy` have an automatic reviewer approve commands outside the sandbox and
+///   past the machine file's limits.
 /// - `--output-last-message`: written by the codex process rather than by the agent, so a
 ///   read-only sandbox does not block it.
 ///   It is a convenience; the event stream is the truth.
-/// - `resume` **rejects `--sandbox`** and exits 2.
-///   The sandbox goes through `-c sandbox_mode` there instead.
-///   Resume also does not inherit the original model, so model and effort are re-pinned on every
-///   turn.
+/// - Resume does not inherit the original model, so model and effort are re-pinned on every
+///   turn, as is the sandbox.
 /// - `--ephemeral` is deliberately **absent**: it does not persist the session, which would make
 ///   a follow-up impossible.
 /// - `-c mcp_servers={}` is deliberately **absent** because it does not work.
@@ -1956,7 +2580,7 @@ fn claude_args(
 fn codex_args(
     model: &ModelId,
     effort: Option<&Effort>,
-    sandbox: CodexSandbox,
+    permissions: CodexPermissions,
     plan: &TurnPlan<'_>,
     isolation: Isolation,
 ) -> Vec<String> {
@@ -1984,13 +2608,8 @@ fn codex_args(
         args.push("--config".to_owned());
         args.push("features.hooks=false".to_owned());
     }
-    if plan.resume.is_some() {
-        args.push("--config".to_owned());
-        args.push(format!("sandbox_mode=\"{}\"", sandbox.as_str()));
-    } else {
-        args.push("--sandbox".to_owned());
-        args.push(sandbox.as_str().to_owned());
-    }
+    args.extend(codex_sandbox_args(permissions, plan));
+    args.extend(unattended_approval_args());
     args.push("--output-last-message".to_owned());
     args.push(plan.last_message_path.to_string_lossy().into_owned());
     // `-` makes Codex read the prompt from stdin.
@@ -2000,18 +2619,94 @@ fn codex_args(
     args
 }
 
+/// The arguments that give a `codex exec` turn its sandbox and network; see `codex_args`.
+fn codex_sandbox_args(permissions: CodexPermissions, plan: &TurnPlan<'_>) -> Vec<String> {
+    if permissions.needs_permission_profile() {
+        let profile = permission_profile_name();
+        return vec![
+            "--config".to_owned(),
+            format!("permissions.{profile}={{extends=\":read-only\",network={{enabled=true}}}}"),
+            "--config".to_owned(),
+            format!("default_permissions=\"{profile}\""),
+        ];
+    }
+    let sandbox = permissions.sandbox();
+    let mut args = if plan.resume.is_some() {
+        vec![
+            "--config".to_owned(),
+            format!("sandbox_mode=\"{}\"", sandbox.as_str()),
+        ]
+    } else {
+        vec!["--sandbox".to_owned(), sandbox.as_str().to_owned()]
+    };
+    args.extend(workspace_network_args(permissions));
+    args
+}
+
+/// The overrides that keep a `codex exec` turn from being approved past its sandbox.
+fn unattended_approval_args() -> Vec<String> {
+    vec![
+        "--config".to_owned(),
+        "approval_policy=\"never\"".to_owned(),
+        "--config".to_owned(),
+        "approvals_reviewer=\"user\"".to_owned(),
+    ]
+}
+
+/// The override that decides a workspace-write delegate's network, when one was chosen.
+///
+/// Read-only without network needs none, since the legacy read-only mode has none, and the
+/// full-access mode has no network switch at all.
+fn workspace_network_args(permissions: CodexPermissions) -> Vec<String> {
+    match (permissions.sandbox(), permissions.network_access) {
+        (CodexSandbox::WorkspaceWrite, Some(network)) => vec![
+            "--config".to_owned(),
+            format!("sandbox_workspace_write.network_access={network}"),
+        ],
+        (CodexSandbox::WorkspaceWrite, None)
+        | (CodexSandbox::ReadOnly | CodexSandbox::DangerFullAccess, _) => Vec::new(),
+    }
+}
+
 /// Argument vector that starts `codex app-server` for one turn.
 ///
-/// Only the effort travels as an argument, exactly as `exec` passes it, so it applies to every
-/// request the server handles; the model, the sandbox and the approval policy are fields of the
-/// `thread/start` or `thread/resume` request instead.
+/// The effort travels as an argument, exactly as `exec` passes it, so it applies to every request
+/// the server handles, and so does a workspace-write delegate's network choice; the model, the
+/// sandbox mode and the approval policy are fields of the `thread/start` or `thread/resume`
+/// request instead, and a read-only delegate's network is the sandbox policy of its `turn/start`.
 /// There is no isolation flag to pass: see [`Delegate::app_server_settings`] for why only an
 /// inheriting delegate runs this way.
-fn codex_app_server_args(effort: Option<&Effort>) -> Vec<String> {
+fn codex_app_server_args(effort: Option<&Effort>, permissions: CodexPermissions) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
     if let Some(effort) = effort {
         args.push("--config".to_owned());
         args.push(format!("model_reasoning_effort=\"{effort}\""));
     }
+    args.extend(workspace_network_args(permissions));
     args
+}
+
+/// Whether the codex that printed `cli_version` for `--version` is one whose `exec` is verified
+/// to honour a permission profile passed with `-c`, which read-only with network needs.
+///
+/// An unknown version is not verified: a release that ignored the profile's keys would run the
+/// delegate under whatever its configuration selects instead, so the launch is refused rather
+/// than run on a guess.
+#[must_use]
+pub fn codex_supports_permission_profiles(cli_version: Option<&str>) -> bool {
+    cli_version
+        .and_then(release_of)
+        .is_some_and(|release| release >= crate::config::PERMISSION_PROFILE_MIN_CODEX)
+}
+
+/// The `major.minor.patch` release a `--version` line names, as `codex-cli 0.163.0` does.
+fn release_of(version: &str) -> Option<(u64, u64, u64)> {
+    let number = version
+        .split_whitespace()
+        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = number.split('.').map(|part| {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u64>().ok()
+    });
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }

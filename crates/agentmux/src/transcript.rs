@@ -431,6 +431,20 @@ pub struct Turn {
     /// under the question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<crate::delegate::Billing>,
+    /// Whether this turn's delegate loaded the user's configuration, or `None` for a turn
+    /// recorded before agentmux kept it per turn, which ran as the consultation's record says.
+    ///
+    /// A follow-up may change it, so what a hook reopening a turn means is judged by the turn's
+    /// own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::delegate::Isolation>,
+    /// The delegate this turn ran as, when a follow-up changed its isolation or permissions from
+    /// what the transcript header names.
+    ///
+    /// Recorded before the child is spawned, so like [`Self::billing`] it renders under the
+    /// question, and the header above every turn never changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
 }
 
 impl Turn {
@@ -457,6 +471,8 @@ impl Turn {
             recovered: None,
             unsaved_session_store: None,
             billing: None,
+            isolation: None,
+            ran_as: None,
         }
     }
 
@@ -667,6 +683,16 @@ fn render_question(turn: &Turn) -> String {
                 > **This turn may be billed at API prices.** Its account opts into \
                 `billing = \"api\"`, so the key, token or endpoint it names reached the delegate.
             "});
+    }
+    if let Some(ran_as) = &turn.ran_as {
+        let _ = indoc::writedoc!(
+            out,
+            "
+
+            > [!NOTE]
+            > **This turn ran with other settings than the header names:** `{ran_as}`.
+        "
+        );
     }
     out
 }

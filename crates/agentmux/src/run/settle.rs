@@ -58,7 +58,7 @@ use super::records::{
     TurnFiles, read_complete_records, read_if_present, read_json, tail_of_file, write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
-use crate::delegate::{SessionRef, Vendor};
+use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
 use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Transcript, Turn};
@@ -532,8 +532,7 @@ impl LockedRun<'_> {
         // What the launch recorded before the spawn: which session it asked to resume, and
         // whether the child was ever going to be able to save its own.
         let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
-        turn.unsaved_session_store = invocation.unsaved_session_store;
-        turn.billing = invocation.billing;
+        note_launch_record(&mut turn, &invocation, &meta.delegate);
         let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),
@@ -840,6 +839,20 @@ impl RunStore {
         )
         .map(Some)
     }
+}
+
+/// Note on `turn` what its launch record says before the child ran: whether it could save its
+/// session, its pricing, its isolation, and the delegate it ran as when a follow-up changed that
+/// from `header`, the one the transcript header names.
+fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &Delegate) {
+    turn.unsaved_session_store
+        .clone_from(&invocation.unsaved_session_store);
+    turn.billing = invocation.billing;
+    let ran_as = invocation.delegate.as_ref();
+    turn.isolation = ran_as.and_then(Delegate::isolation);
+    turn.ran_as = ran_as
+        .map(Delegate::summary)
+        .filter(|summary| *summary != header.summary());
 }
 
 impl RunStore {

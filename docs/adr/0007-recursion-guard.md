@@ -5,9 +5,10 @@ Status: Accepted
 ## Context
 
 An isolated delegate does not inherit the configured agentmux MCP server
-([0005](0005-isolation-by-argument.md)), but an inheriting one loads the operator's own MCP servers,
-and agentmux may be among them. A delegate that starts another delegate recurses, and every level is
-paid for.
+([0005](0005-isolation-by-argument.md)), but one that loads the user's configuration — which both
+vendors do unless told otherwise ([0026](0026-delegate-permissions.md)) — loads the operator's own
+MCP servers, and agentmux may be among them. A delegate that starts another delegate recurses, and
+every level is paid for.
 
 An environment marker alone does not see every nesting: Codex starts its MCP servers with an
 allowlist environment of its own, in a fresh process group, and that environment drops custom
@@ -35,6 +36,10 @@ guard that read an unreadable record as "no delegate here" would be blind in exa
 exists for.
 
 ## Consequences
+
+- Since a delegate loads the user's configuration by default, a configured agentmux server is
+  routinely started inside one. It refuses to serve, and the delegate reports a server that failed
+  to start; that refusal, not isolation, is what stops the recursion.
 
 - Codex's MCP-server allowlist drops `AGENTMUX_STATE_DIR` too. When a Codex MCP-server process loses
   both variables, it has no marker and may look in the wrong store, so recursion can go undetected

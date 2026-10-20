@@ -15,14 +15,15 @@ isolation, or open the request environment.
 
 **Only a machine file may define anything.** Accounts, `[launch]`, model rewrites
 ([0012](0012-model-rewrites.md)), default efforts ([0013](0013-default-efforts.md)), blocked models
-([0024](0024-blocked-models.md)) and the `retention` window come from a machine file alone. The
+([0024](0024-blocked-models.md)), each vendor's permission defaults and limits
+([0026](0026-delegate-permissions.md)) and the `retention` window come from a machine file alone. The
 window governs one store shared by every project, so a checkout that set it would decide when other
 projects' consultations are deleted. A project `agentmux.toml` is found by walking up from the
 delegate's working directory to the root of its repository (the nearest `.git`); outside a
 repository, discovery runs only within the home directory and excludes home itself. A project file
 may only select an account with `[defaults.<vendor>]`: nonempty understood account definitions,
-launch settings, model rewrites, effort defaults, blocked models and a retention are refused
-(`ConfigError::ProjectFileOversteps`), and unknown keys follow
+launch settings, model rewrites, effort defaults, blocked models, `[codex]` and `[claude]` permission
+tables and a retention are refused (`ConfigError::ProjectFileOversteps`), and unknown keys follow
 [0015](0015-unknown-config-keys-reported.md).
 
 Machine files live under the home directory only: `XDG_CONFIG_HOME` and `APPDATA` count only when
@@ -42,7 +43,9 @@ UTF-8. Other platforms do not currently enforce equivalent ownership or permissi
 
 **A project file's selection switches nothing on.** An account a project file chose runs isolated,
 never on API pricing, and without its own `request_env`, whatever the machine file configures for
-it. Only an explicit `inherit_settings` from the caller overrides the isolation.
+it or the vendor's `ignore_user_config` default says. Only an explicit `ignore_user_config = false`
+(or `inherit_settings = true`) from the caller overrides the isolation, and only within the
+vendor's `allow_user_config` limit.
 `delegate::AccountPolicy` is the one place that is decided, for every reader — isolation, billing,
 request environment.
 

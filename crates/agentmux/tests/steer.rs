@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use agentmux::appserver::mailbox::{Mailbox, SteerReply};
 use agentmux::appserver::{DriverPlan, STOP_BUDGET};
 use agentmux::delegate::{
-    AccountChoice, Billing, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+    AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort,
+    Isolation, ModelId,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
@@ -43,7 +44,10 @@ fn codex(isolation: Isolation) -> Result<Delegate> {
     Ok(Delegate::Codex {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        sandbox: CodexSandbox::WorkspaceWrite,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation: Some(isolation),
     })
@@ -51,6 +55,7 @@ fn codex(isolation: Isolation) -> Result<Delegate> {
 
 fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
@@ -557,7 +562,7 @@ async fn a_turn_that_cannot_be_steered_says_why() -> Result<()> {
     assert_that!(isolated.steerable, eq(false));
     assert_that!(
         harness.store.steer(&isolated.run_id, "x").await,
-        err(displays_as(contains_substring("inherit_settings: true")))
+        err(displays_as(contains_substring("ignore_user_config: false")))
     );
 
     // Claude reads its question once.

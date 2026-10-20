@@ -454,7 +454,7 @@ impl RunStore {
 
         let status = RunStatus {
             run_id: run_id.clone(),
-            delegate: meta.delegate.clone(),
+            delegate: self.current_delegate(&meta, state.newest.map(|newest| newest.index))?,
             cwd: meta.cwd.clone(),
             elapsed: elapsed_since(meta.created_at, &outcome, state.last_activity),
             created_at: meta.created_at,
@@ -467,8 +467,8 @@ impl RunStore {
             unsaved_session_store: state.unsaved_session_store().map(Path::to_path_buf),
             delegate_stderr,
             unrecognised: state.transcript.unrecognised(),
-            hook_reopening: HookReopening::of(
-                state.transcript.was_reopened_by_hook(),
+            hook_reopening: HookReopening::of_turns(
+                &state.transcript.turns,
                 meta.delegate.isolation(),
             ),
             earlier_failure: state.transcript.earlier_failure(),
@@ -545,11 +545,15 @@ impl RunStore {
                 let outcome = newest
                     .as_ref()
                     .map_or(Outcome::Running, |turn| turn.outcome.clone());
-                let billing = newest.and_then(|turn| turn.billing);
+                let billing = newest.as_ref().and_then(|turn| turn.billing);
+                // As the newest turn ran, as `status` describes it.
+                let current = self
+                    .current_delegate(&meta, newest.as_ref().map(|turn| turn.index))
+                    .ok()?;
                 let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
                     .map(|question| first_line(&question, 120))
                     .unwrap_or_default();
-                let mut delegate = describe_delegate(&meta.delegate, meta.rewritten_from.as_ref());
+                let mut delegate = describe_delegate(&current, meta.rewritten_from.as_ref());
                 // Said where every listing shows it, as the status header says it.
                 if billing == Some(Billing::Api) {
                     delegate.push_str(" billing=api");

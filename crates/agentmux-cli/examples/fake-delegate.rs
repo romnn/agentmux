@@ -23,6 +23,10 @@ use serde::Deserialize;
 /// The configuration's file name, beside the executable.
 const FAKE_DELEGATE_CONFIG: &str = "fake-delegate.json";
 
+/// Where each run appends the arguments it was started with, as one JSON array per line, beside
+/// the executable, so a test can check what the delegate actually received.
+const FAKE_DELEGATE_ARGV: &str = "fake-delegate-argv.jsonl";
+
 /// How long the fake waits for its release before it goes on regardless.
 ///
 /// A test that is killed while its fake waits, as nextest kills one that outlives its timeout,
@@ -67,6 +71,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// Append this run's arguments, less the program name, to `path`.
+fn record_argv(path: &std::path::Path) -> Result<(), String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let line = serde_json::to_string(&argv).map_err(|err| format!("cannot encode argv: {err}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
 fn run() -> Result<u8, String> {
     let config_path = std::env::current_exe()
         .map_err(|err| format!("cannot locate itself: {err}"))?
@@ -75,6 +91,7 @@ fn run() -> Result<u8, String> {
         .map_err(|err| format!("cannot read {}: {err}", config_path.display()))?;
     let config: Config = serde_json::from_str(&text)
         .map_err(|err| format!("cannot parse {}: {err}", config_path.display()))?;
+    record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
 
     let mut question = String::new();
     std::io::stdin()

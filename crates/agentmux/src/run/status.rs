@@ -19,7 +19,8 @@ use super::id::RunId;
 pub struct RunStatus {
     /// The consultation's id.
     pub run_id: RunId,
-    /// Who is being consulted.
+    /// Who is being consulted, as its newest turn ran: the isolation and permissions a follow-up
+    /// keeps unless it changes them.
     pub delegate: Delegate,
     /// The directory the delegate is reading the project from.
     ///
@@ -146,7 +147,10 @@ impl RunStatus {
 }
 
 /// What it means that a hook reopened a finished turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// Ordered by how alarming it is, so the most alarming of several turns' readings is their
+/// maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookReopening {
     /// The run inherited the account's settings, so a hook is a documented consequence of what
@@ -158,8 +162,24 @@ pub enum HookReopening {
 }
 
 impl HookReopening {
+    /// What the reopenings in `turns` mean, each judged by its own turn's isolation, or by
+    /// `recorded`, the consultation's, for a turn that predates agentmux keeping it per turn.
+    ///
+    /// One reopening of a turn that loaded no settings is alarming whatever the others were, so
+    /// it decides.
+    pub(super) fn of_turns(
+        turns: &[crate::transcript::Turn],
+        recorded: Option<Isolation>,
+    ) -> Option<Self> {
+        turns
+            .iter()
+            .filter(|turn| turn.was_reopened_by_hook())
+            .filter_map(|turn| Self::of(true, turn.isolation.or(recorded)))
+            .max()
+    }
+
     /// What a reopening means for a run with this isolation, when one happened.
-    pub(super) fn of(reopened: bool, isolation: Option<Isolation>) -> Option<Self> {
+    fn of(reopened: bool, isolation: Option<Isolation>) -> Option<Self> {
         if !reopened {
             return None;
         }

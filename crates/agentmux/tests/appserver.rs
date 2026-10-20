@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use agentmux::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use agentmux::appserver::{DriverOutcome, DriverPlan, DriverTimeouts, drive_with};
 use agentmux::delegate::{
-    AccountChoice, AppServerSettings, Billing, CodexSandbox, ModelId, SessionRef, Vendor,
+    AccountChoice, AppServerSettings, Billing, CodexPermissions, CodexSandbox, ModelId, SessionRef,
+    Vendor,
 };
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
@@ -86,6 +87,7 @@ struct DriverRunResult<W, R> {
 fn plan(dir: &Path, billing: Billing, resume: Option<&str>) -> Result<DriverPlan> {
     Ok(DriverPlan {
         settings: AppServerSettings {
+            network_access: None,
             program: "codex".to_owned(),
             args: vec!["app-server".to_owned()],
             model: ModelId::parse("gpt-6-astra").or_fail()?,
@@ -572,7 +574,8 @@ fn a_cancelled_turn_is_interrupted_over_the_protocol() -> Result<()> {
     Ok(())
 }
 
-/// A follow-up resumes its thread, re-pinning the model, the sandbox and the approval policy.
+/// A follow-up resumes its thread, re-pinning the model, the sandbox, the approval policy and the
+/// reviewer.
 #[gtest]
 fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
@@ -600,6 +603,7 @@ fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
             "cwd": dir.path().to_string_lossy(),
             "sandbox": "read-only",
             "approvalPolicy": "never",
+            "approvalsReviewer": "user",
             "excludeTurns": true,
         })))
     );
@@ -715,8 +719,10 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
             "model": "gpt-6-astra",
             "cwd": dir.path().to_string_lossy(),
             "sandbox": "read-only",
-            // Nobody is there to approve anything, as with `codex exec`.
+            // Nobody is there to approve anything, as with `codex exec`, and no reviewer the loaded
+            // configuration names may approve on the consultation's behalf.
             "approvalPolicy": "never",
+            "approvalsReviewer": "user",
             // Kept, so a follow-up can resume it.
             "ephemeral": false,
         })))
@@ -730,6 +736,92 @@ fn a_new_thread_is_opened_with_the_consultations_settings() -> Result<()> {
             "input": [{"type": "text", "text": QUESTION}],
         })))
     );
+    Ok(())
+}
+
+/// A read-only delegate with network keeps the read-only thread and carries the network on its
+/// turn, as the sandbox policy of `turn/start`, both on a new thread and on a resumed one.
+///
+/// The legacy read-only mode a thread is opened with has no network switch, so the turn is the one
+/// place the protocol takes it, and a resumed thread gets it again rather than relying on what an
+/// earlier turn left.
+#[gtest]
+fn a_read_only_turn_with_network_carries_its_sandbox_policy_every_time() -> Result<()> {
+    for resume in [None, Some(THREAD_ID)] {
+        let dir = tempfile::tempdir().or_fail()?;
+        let mut plan = plan(dir.path(), Billing::Subscription, resume)?;
+        plan.settings.network_access = Some(true);
+
+        let run = run(
+            &plan,
+            |peer| {
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
+                complete_turn_with_reply(peer, "ok")
+            },
+            |_| {},
+        )?;
+
+        assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
+        let opened = if resume.is_some() {
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+        // The thread stays read-only and unattended.
+        let thread = client_messages_for_method(&run, opened)
+            .first()
+            .and_then(|message| message.get("params").cloned())
+            .or_fail()?;
+        assert_that!(thread.get("sandbox"), some(eq(&json!("read-only"))));
+        assert_that!(thread.get("approvalPolicy"), some(eq(&json!("never"))));
+        // The turn says the network is on, within that read-only sandbox.
+        assert_that!(
+            client_messages_for_method(&run, "turn/start")
+                .first()
+                .and_then(|message| message.get("params"))
+                .and_then(|params| params.get("sandboxPolicy")),
+            some(eq(&json!({"type": "readOnly", "networkAccess": true}))),
+            "{opened}"
+        );
+    }
+    Ok(())
+}
+
+/// A delegate whose network nobody chose, or that runs a sandbox with its own network switch,
+/// sends no sandbox policy, leaving the thread's sandbox as it was opened.
+#[gtest]
+fn other_sandboxes_send_no_turn_sandbox_policy() -> Result<()> {
+    let cases = [
+        (CodexSandbox::ReadOnly, None),
+        (CodexSandbox::ReadOnly, Some(false)),
+        (CodexSandbox::WorkspaceWrite, Some(true)),
+    ];
+    for (sandbox, network_access) in cases {
+        let dir = tempfile::tempdir().or_fail()?;
+        let mut plan = plan(dir.path(), Billing::Subscription, None)?;
+        plan.settings.sandbox = sandbox;
+        plan.settings.network_access = network_access;
+
+        let run = run(
+            &plan,
+            |peer| {
+                peer.open_thread(THREAD_ID)?;
+                peer.start_turn(THREAD_ID, TURN_ID)?;
+                complete_turn_with_reply(peer, "ok")
+            },
+            |_| {},
+        )?;
+
+        assert_that!(
+            client_messages_for_method(&run, "turn/start")
+                .first()
+                .and_then(|message| message.get("params"))
+                .and_then(|params| params.get("sandboxPolicy")),
+            none(),
+            "{sandbox:?} {network_access:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1428,7 +1520,10 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
             delegate: agentmux::delegate::Delegate::Codex {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: None,
-                sandbox: CodexSandbox::ReadOnly,
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
                 account: AccountChoice::Default,
                 isolation: None,
             },

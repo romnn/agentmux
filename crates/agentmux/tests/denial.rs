@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{AccountChoice, CodexSandbox, Delegate, Effort, ModelId, Vendor};
+use agentmux::delegate::{
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+    Vendor,
+};
 use agentmux::run::{Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use googletest::prelude::*;
@@ -26,6 +29,7 @@ fn env() -> BTreeMap<String, String> {
 
 fn claude() -> Result<Delegate> {
     Ok(Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
@@ -37,7 +41,10 @@ fn codex() -> Result<Delegate> {
     Ok(Delegate::Codex {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation: None,
     })

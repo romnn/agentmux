@@ -567,3 +567,106 @@ fn a_dead_supervisor_leaves_its_turn_to_the_next_observer() -> Result<()> {
     assert_that!(machine.marker(&run_id).exists(), eq(true));
     Ok(())
 }
+
+/// The supervisor starts the delegate with exactly the argument vector the launch recorded, so a
+/// Codex turn's permissions — its sandbox, network, unattended approval and the permission
+/// profile named for that one launch — reach the CLI it runs, on the first turn and on a
+/// follow-up, which names a profile of its own.
+#[gtest]
+fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: fixtures::CODEX_HAPPY,
+        stderr: "",
+        exit_code: 0,
+    })?;
+    // The fake answers `--version` with a release past the one permission profiles need.
+    std::fs::copy(
+        fake_delegate()?,
+        machine
+            .bin
+            .join(format!("codex{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .or_fail()?;
+    let started = run_in_background(machine.agentmux(&[
+        "--codex-launch",
+        "exec",
+        "start",
+        "--json",
+        "--delegate",
+        "codex",
+        "--model",
+        "sol",
+        "--network-access",
+        "Review it.",
+    ]))?
+    .finish(COMMAND_LIMIT)?;
+    let run_id = started_run(&started)?;
+    machine.release()?;
+    assert_that!(
+        until_exists(&machine.marker(&run_id), Duration::from_secs(10)),
+        eq(true)
+    );
+
+    // The follow-up resumes the session, its fake released already.
+    let followed = run_in_background(machine.agentmux(&[
+        "--codex-launch",
+        "exec",
+        "follow-up",
+        &run_id,
+        "--json",
+        "--wait",
+        "30",
+        "And again.",
+    ]))?
+    .finish(COMMAND_LIMIT)?;
+    if !followed.status.success() {
+        fail!("follow-up failed: {}", followed.stderr)?;
+    }
+
+    // What each run of the fake was started with, in order.
+    let received: Vec<Vec<String>> =
+        std::fs::read_to_string(machine.bin.join("fake-delegate-argv.jsonl"))
+            .or_fail()?
+            .lines()
+            .map(|line| serde_json::from_str(line).or_fail())
+            .collect::<Result<_>>()?;
+    let mut profiles = Vec::new();
+    for (index, turn) in ["0000", "0001"].into_iter().enumerate() {
+        let recorded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                machine
+                    .run_dir(&run_id)
+                    .join("turns")
+                    .join(turn)
+                    .join("invocation.json"),
+            )
+            .or_fail()?,
+        )
+        .or_fail()?;
+        let recorded: Vec<String> =
+            serde_json::from_value(recorded.get("args").or_fail()?.clone()).or_fail()?;
+        // The delegate received exactly what the launch recorded.
+        assert_that!(received.get(index), some(eq(&recorded)), "turn {turn}");
+        assert_that!(
+            recorded,
+            contains(eq("approval_policy=\"never\"")),
+            "turn {turn}"
+        );
+        assert_that!(
+            recorded,
+            contains(eq("approvals_reviewer=\"user\"")),
+            "turn {turn}"
+        );
+        assert_that!(recorded, not(contains(eq("--sandbox"))), "turn {turn}");
+        let profile = recorded
+            .iter()
+            .find(|arg| arg.starts_with("default_permissions=\"agentmux_ro_"))
+            .cloned()
+            .or_fail()?;
+        profiles.push(profile);
+    }
+    assert_that!(received.get(1), some(contains(eq("resume"))));
+    // A resume names a profile of its own rather than reusing the first turn's.
+    assert_that!(profiles.first(), not(eq(profiles.get(1))));
+    Ok(())
+}

@@ -9,8 +9,8 @@ use std::path::Path;
 
 use agentmux::config::{Account, Config, Defaults, Secret};
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, Billing, CodexSandbox, Delegate, DelegateError, Effort,
-    Invocation, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
+    AccountAlias, AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox,
+    Delegate, DelegateError, Effort, Invocation, Isolation, ModelId, SessionRef, TurnPlan, Vendor,
 };
 use googletest::prelude::*;
 
@@ -23,33 +23,43 @@ fn effort(level: &str) -> Result<Effort> {
 }
 
 /// Every variant of the closed set, so a third vendor cannot be added without extending this.
+///
+/// Each is pinned isolated, which is what the flags these tests check depend on.
 fn every_delegate() -> Result<Vec<Delegate>> {
     Ok(vec![
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
-            isolation: None,
+            isolation: Some(Isolation::Isolated),
         },
         Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-fable-5-1")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
-            isolation: None,
+            isolation: Some(Isolation::Isolated),
         },
         Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: Some(effort("high")?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: AccountChoice::Default,
-            isolation: None,
+            isolation: Some(Isolation::Isolated),
         },
         Delegate::Codex {
             model: model("gpt-5.6-sol")?,
             effort: Some(effort("xhigh")?),
-            sandbox: CodexSandbox::WorkspaceWrite,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::WorkspaceWrite),
+                network_access: None,
+            },
             account: AccountChoice::Default,
-            isolation: None,
+            isolation: Some(Isolation::Isolated),
         },
     ])
 }
@@ -308,6 +318,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
 
     let personal = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -325,6 +336,7 @@ fn a_named_account_authenticates_as_itself() -> Result<()> {
 
     let default = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
@@ -358,6 +370,7 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
     };
 
     let error = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Named(AccountAlias::parse("work").or_fail()?),
@@ -400,6 +413,7 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
     };
 
     let error = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Named(AccountAlias::parse("work").or_fail()?),
@@ -433,6 +447,7 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
     };
 
     let error = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -481,7 +496,10 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
     let invocation = Delegate::Codex {
         model: model("qwen3-coder")?,
         effort: Some(effort("high")?),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Named(AccountAlias::parse("local").or_fail()?),
         isolation: None,
     }
@@ -510,7 +528,10 @@ fn a_codex_resume_passes_its_sandbox_as_config_not_as_a_flag() -> Result<()> {
     let delegate = Delegate::Codex {
         model: model("gpt-6-astra")?,
         effort: Some(effort("high")?),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation: None,
     };
@@ -536,6 +557,7 @@ fn a_claude_resume_reopens_the_delegates_session() -> Result<()> {
     let session = SessionRef::parse("85ff2d6a-ec24-47cf-a4f8-486a5bb06814").or_fail()?;
     let resumed = build(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
@@ -656,6 +678,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             billing: None,
         };
         let result = Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
@@ -692,6 +715,7 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
     };
 
     let invocation = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Default,
@@ -727,6 +751,7 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
     };
 
     let error = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Default,
@@ -759,6 +784,7 @@ fn an_account_withholds_a_credential_the_machine_layer_forwarded() -> Result<()>
 
     let invocation = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -821,6 +847,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
     };
 
     let invocation = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -863,6 +890,7 @@ fn a_configured_default_applies_when_the_caller_names_none() -> Result<()> {
 
     let invocation = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
@@ -911,6 +939,7 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
     };
 
     let error = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Default,
@@ -927,14 +956,15 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
 
 /// Inheriting drops exactly the flags that impose isolation, and nothing else.
 ///
-/// The opt-out exists because the default is sometimes wrong: a reviewer meant to exercise the
-/// project's own tooling needs that tooling loaded.
+/// Inheriting is what a delegate gets when nobody chooses, so the owner's own tooling is loaded.
 /// What it must not do is quietly widen what the delegate may change: plan mode and the
-/// read-only tool list are a different question from whose configuration is loaded.
+/// read-only tool list are a different question from whose configuration is loaded, and are
+/// passed explicitly so the user's settings cannot replace them.
 #[gtest]
 fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
     let inherited = build(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
@@ -958,12 +988,29 @@ fn inheriting_settings_drops_only_the_isolation_flags() -> Result<()> {
     );
     assert_that!(inherited.args().contains(&"--tools".to_owned()), eq(true));
 
-    let isolated = build(
+    // Nobody choosing is inheriting.
+    let defaulted = build(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Default,
             isolation: None,
+        },
+        None,
+    )?;
+    assert_that!(
+        defaulted.args().contains(&"--setting-sources".to_owned()),
+        eq(false)
+    );
+
+    let isolated = build(
+        &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
+            model: model("claude-opus-5")?,
+            effort: Some(effort("xhigh")?),
+            account: AccountChoice::Default,
+            isolation: Some(Isolation::Isolated),
         },
         None,
     )?;
@@ -985,7 +1032,10 @@ fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
     let delegate = |isolation| Delegate::Codex {
         model: model.clone(),
         effort: Some(effort.clone()),
-        sandbox: CodexSandbox::ReadOnly,
+        permissions: CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        },
         account: AccountChoice::Default,
         isolation,
     };
@@ -1004,7 +1054,16 @@ fn a_codex_delegate_can_inherit_its_account_configuration() -> Result<()> {
         eq(false)
     );
 
-    let isolated = build(&delegate(None), None)?;
+    // Nobody choosing loads the user's configuration too.
+    let defaulted = build(&delegate(None), None)?;
+    assert_that!(
+        defaulted
+            .args()
+            .contains(&"--ignore-user-config".to_owned()),
+        eq(false)
+    );
+
+    let isolated = build(&delegate(Some(Isolation::Isolated)), None)?;
     assert_that!(
         isolated.args().contains(&"--ignore-user-config".to_owned()),
         eq(true)
@@ -1028,6 +1087,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
 
     let invocation = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -1045,6 +1105,7 @@ fn an_account_can_ask_for_its_own_settings() -> Result<()> {
     // An explicit request still overrides the account's preference, in both directions.
     let forced = build_with(
         &Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
@@ -1120,6 +1181,7 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
         billing: None,
     };
     let delegate = Delegate::Claude {
+        permissions: ClaudePermissions::default(),
         model: model("claude-opus-5")?,
         effort: Some(effort("xhigh")?),
         account: AccountChoice::Default,
@@ -1178,6 +1240,7 @@ fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
     let account = AccountChoice::Named(AccountAlias::parse(alias).or_fail()?);
     Ok(match vendor {
         Vendor::Claude => Delegate::Claude {
+            permissions: ClaudePermissions::default(),
             model: model("claude-opus-5")?,
             effort: Some(effort("xhigh")?),
             account,
@@ -1186,7 +1249,10 @@ fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
         Vendor::Codex => Delegate::Codex {
             model: model("gpt-6-astra")?,
             effort: Some(effort("high")?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account,
             isolation: None,
         },

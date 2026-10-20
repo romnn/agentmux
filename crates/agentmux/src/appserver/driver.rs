@@ -717,6 +717,7 @@ impl TurnDriver<'_> {
         let cwd = self.plan.cwd.to_string_lossy().into_owned();
         let model = settings.model.as_str().to_owned();
         let sandbox = settings.sandbox;
+        let turn_policy = protocol::turn_sandbox_policy(sandbox, settings.network_access);
         let (method, thread_id_response) = if let Some(session) = &self.plan.resume_thread_id {
             let params = protocol::thread_resume_params(session, &model, &cwd, sandbox);
             let thread_resume_response = self.call::<methods::ThreadResume>(&params)?;
@@ -744,7 +745,7 @@ impl TurnDriver<'_> {
         let announced = self.translator.thread_began(&thread_id);
         self.record(&[announced]).map_err(SetupExit::Failed)?;
 
-        let start = protocol::turn_start_params(&thread_id, question);
+        let start = protocol::turn_start_params(&thread_id, question, turn_policy);
         let turn_start_response = match self.call::<methods::TurnStart>(&start) {
             Ok(response) => response,
             Err(SetupExit::TurnObserved) => return Ok(thread_id),

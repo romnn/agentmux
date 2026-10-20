@@ -91,8 +91,10 @@ any later one is looked at. The bounded
 observation of the stream.
 
 - The MCP `wait` tool returns only a settled turn and its transcript, through `transcript_end`,
-  with no deadline of its own, under a header built from the settlement and the consultation's
-  creation-time record, so a later turn neither delays nor fails it. It sends `notifications/progress` every 30 seconds to a request that
+  with no deadline of its own, under a header built from the settlement, the consultation's
+  creation-time record and the waited turn's own launch record, whose delegate line names what
+  that turn ran with ([0026](0026-delegate-permissions.md)), so a later turn neither delays nor
+  fails it. It sends `notifications/progress` every 30 seconds to a request that
   carries a progress token, which keeps Claude Code's idle timer from ending the call; a host that
   bounds tool calls regardless, as Codex does with `tool_timeout_sec`, still ends it. Cancelling
   the request ends the wait, never the consultation.

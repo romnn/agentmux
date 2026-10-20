@@ -136,13 +136,18 @@ agentmux tail <run-id> --follow
 agentmux wait <run-id>    # exits 0 completed, 10 failed, 11 cancelled
 
 # A correction while the turn is still running, from another terminal. Only a Codex turn that
-# inherits its account's settings runs over `codex app-server`, which is what can take one.
-agentmux start --delegate codex --model sol --effort high --inherit-settings \
+# loads its account's configuration, which is the default, runs over `codex app-server`, which is
+# what can take one.
+agentmux start --delegate codex --model sol --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
 # One more question, in the delegate's own session.
 agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
+
+# Read-only, but with network, for a question that needs `cargo` or `gh` to answer.
+agentmux ask --delegate codex --model sol --effort high --network-access \
+  'Does the latest tokio release still support our MSRV?'
 
 agentmux list
 agentmux prune            # drop consultations past their retention
@@ -179,7 +184,8 @@ account = "personal"
 [accounts.claude.personal]
 config_dir = "~/.claude-personal"
 description = "Personal Max subscription"
-# Run this account's delegates with its own settings, hooks and MCP servers.
+# Run this account's delegates with its own settings, hooks and MCP servers, whatever the vendor's
+# `ignore_user_config` default says; `false` runs them isolated.
 inherit_settings = true
 
 # A key kept out of the file, read from the environment at launch.
@@ -216,7 +222,8 @@ directory instead.
 
 **Two files, two jobs.** A *machine* file — `$AGENTMUX_CONFIG`, `~/.config/agentmux/agentmux.toml`,
 `~/agentmux.toml`, or the platform config directory when it lies under your home — may define
-accounts, model rewrites, default efforts and the retention window. `AGENTMUX_CONFIG` must be
+accounts, model rewrites, default efforts, the retention window, and what a delegate loads and may
+do. `AGENTMUX_CONFIG` must be
 absolute and is the one way to keep the file anywhere else; `XDG_CONFIG_HOME` and `APPDATA` count
 only when they point under your home, so a container that points them at a workspace cannot turn a
 checkout into a machine file. A *project* file, found by walking up from the delegate's working
@@ -230,7 +237,8 @@ account = "clientx"
 ```
 
 A project file that tries to define an account, a `[launch]` table, a `[models]` rewrite, an
-`[efforts]` default, a `[blocked]` model or a `retention` is refused by name. It has to be, because
+`[efforts]` default, a `[blocked]` model, a `retention`, or a `[codex]` or `[claude]` permission
+table is refused by name. It has to be, because
 such a file arrives with a `git clone`: were it able to name a `base_url` and an `api_key_env`,
 cloning a repository and asking for one second opinion would send your key to whoever wrote it. For
 the same reason a project file may choose *which* of your accounts pays but nothing more: an account
@@ -477,41 +485,122 @@ added to its table in the machine file, or its launches are refused naming the f
 reaches no delegate any more; to keep using it, give it to an account with `api_key_env` and
 `billing = "api"`. Nothing else in the file changes.
 
-### Isolation, and opting out of it
+### Permissions: what a delegate loads and may do
 
-By default a delegate loads **no** user, project or local settings, no hooks and no MCP servers.
-Three things follow. A blocking `Stop` hook cannot reopen the finished turn and blank its result.
-The delegate cannot re-enter `agentmux` through a configured MCP server and recurse. And what the
-delegate saw does not depend on the machine it ran on.
+Every launch passes each CLI's own controls explicitly, so a delegate never takes its sandbox or
+permission mode from the user's configuration. The machine file sets what a consultation gets when
+the caller names nothing, and the most a caller may ask for:
 
-That default is sometimes wrong. A reviewer meant to exercise the project's own tooling needs that
-tooling, and a hook you want applied to every model you run is not usefully suppressed here. So it
-can be turned off, per account or per consultation:
+```toml
+# ~/.config/agentmux/agentmux.toml
+[codex.defaults]
+ignore_user_config = false   # load ~/.codex/config.toml: providers, MCP servers, hooks
+sandbox = "read_only"        # or "workspace_write", "danger_full_access"
+network_access = true        # unset: Codex's own configuration decides
+
+[codex.limits]
+allow_user_config = true
+max_sandbox = "workspace_write"
+allow_network = true
+
+[claude.defaults]
+ignore_user_config = true    # load no settings, hooks or MCP servers
+permission_mode = "plan"
+tools = ["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"]
+disallowed_tools = ["Bash(git push *)"]
+
+[claude.limits]
+allowed_permission_modes = ["plan", "default", "acceptEdits", "dontAsk", "auto"]
+```
+
+Callers choose within those limits: `ignore_user_config`, `sandbox` and `network_access` for
+Codex, and `ignore_user_config`, `permission_mode`, `tools`, `allowed_tools` and
+`disallowed_tools` for Claude, as MCP parameters on `start` and `ask` or as `--ignore-user-config`,
+`--sandbox`, `--network-access`, `--permission-mode`, `--tools`, `--allowed-tools` and
+`--disallowed-tools`. A request beyond a limit is refused before anything is launched, naming the
+limit and the file, and never lowered to fit:
+
+```text
+Cannot launch codex: sandbox="danger_full_access" exceeds codex.limits.max_sandbox="workspace_write"
+in /home/you/.config/agentmux/agentmux.toml. Request sandbox="workspace_write" or "read_only". Only
+the owner can raise this limit.
+```
+
+With no file, both vendors load the user's configuration, Codex runs read-only with its network
+left to Codex's own configuration, and Claude runs in plan mode with the read-only tool list.
+`danger_full_access` and `bypassPermissions` can be asked for only when the machine file allows
+them, and a default its own limits refuse fails the load. `allow_network = false` also switches the
+network off for a consultation that did not choose, so the user's configuration cannot switch it
+on. Every limit is the machine file's alone; `agentmux accounts`, `quota` and the MCP server's
+instructions list each vendor's defaults and limits.
+
+The transcript header names what a consultation started with, as `sandbox=read-only+network`, and
+never changes. `status` and `list` name what its newest turn ran with, and `wait` what the turn it
+returns ran with. A follow-up keeps that
+unless it passes the same parameters or flags to change them, and a turn that ran with other
+settings than the header names says so under its question. The current limits
+are checked again before every turn, so a limit tightened since refuses the next turn until it asks
+for less.
+
+**How each choice reaches the CLI.** Codex's sandbox goes as `--sandbox` (as `-c sandbox_mode=…`
+on a resume, which rejects `--sandbox`), and a workspace-write delegate's network as
+`-c sandbox_workspace_write.network_access=…`. Codex's legacy read-only mode has no network switch,
+so read-only *with* network runs under a native permission profile defined and selected with `-c`
+on every turn: `extends = ":read-only"` with `network.enabled = true`, under a random name drawn
+afresh for each launch so no configuration file can extend it. Every `codex exec` turn also pins
+`approval_policy="never"` and `approvals_reviewer="user"`, so an `auto_review` reviewer in your
+configuration cannot approve a command out of the sandbox; app-server threads get the same.
+That was measured against codex-cli 0.163.0, and agentmux refuses it on a codex older than 0.162.1
+when it runs over `codex exec`; a turn driven over `codex app-server` sends the same policy as the
+`sandboxPolicy` of every `turn/start` instead. Claude gets `--permission-mode`, `--tools` and, when
+chosen, `--allowedTools` and `--disallowedTools`. Codex's sandbox governs the commands the delegate
+runs, not the MCP servers or hooks a delegate that loads the user's configuration starts.
+
+**A limit is a ceiling on what agentmux requests, not on what your own Codex rules allow.** An
+allow-rule in your `.rules` files, or a trusted project's, runs the commands it matches outside the
+sandbox, as in your own sessions. `ignore_user_config: true` does not drop the rules in
+`$CODEX_HOME/rules`; it drops a project's only when your configuration was what trusted it.
+
+### Loading the user's configuration, or not
+
+`ignore_user_config` decides whether a delegate loads the user's own CLI configuration: settings,
+hooks and MCP servers. Both vendors load it unless the machine file or the call says otherwise,
+because a delegate that runs as your own CLI runs with the providers, tools and rules you set up
+for it, while what it may *do* is held separately by the permissions above. The older spellings
+still work: `inherit_settings: true` on the MCP tools, `--inherit-settings` and `--isolated` on the
+command line, and `inherit_settings` on an account, which wins over the vendor's default; a call
+that spells the choice twice must agree with itself.
+
+Skipping it is what makes a consultation a second opinion rather than a second copy of your setup.
+An isolated delegate — `ignore_user_config: true` — has three guarantees a loading one does not. A
+blocking `Stop` hook cannot reopen the finished turn and blank its result; with your configuration
+loaded one can, and the transcript marks the reopened turn so the answer above it is still found.
+The delegate cannot re-enter `agentmux` through a configured MCP server. And what it saw depends
+far less on the machine it ran on, though an isolated Codex delegate still applies your own
+exec-policy rules (see [Permissions](#permissions-what-a-delegate-loads-and-may-do)).
 
 ```bash
 agentmux ask --delegate claude --model opus --effort xhigh \
-  --inherit-settings "Run the project's own checks and tell me what fails."
+  --ignore-user-config "Review the diff against main for correctness bugs."
 
-agentmux ask ... --isolated      # override an account that asks to inherit
+agentmux ask ... --ignore-user-config=false   # load it, even where the machine's default skips it
 ```
 
-The MCP tools take `inherit_settings: true` for the same thing. Isolation is imposed by
-*argument*, not by environment — no variable switches it on or off — so this is the only way to
-change it.
-
-What inheriting does **not** change is what the delegate may do: plan mode and the read-only tool
-list stay, because whose configuration is loaded is a different question from what may be edited.
+Isolation is imposed by *argument*, not by environment — no variable switches it on or off. An
+account a checkout's own `agentmux.toml` selects runs isolated unless the call explicitly asks to
+load the configuration.
 
 Every delegate is launched with `AGENTMUX_DELEGATE=1`, and `agentmux` refuses to launch a
 delegate — or to serve as an MCP server at all — when it finds itself inside one. An isolated
-delegate could never reach `agentmux` anyway; an inheriting one loads your own MCP servers, and
-`agentmux` may be among them. The variable is not the only witness, because Codex starts its MCP
+delegate could never reach `agentmux` anyway; one that loads your configuration loads your own MCP
+servers, and `agentmux` may be among them: that server then refuses to start, which the delegate
+reports as a server that failed. The variable is not the only witness, because Codex starts its MCP
 servers with an environment of its own choosing that does not carry it: `agentmux` also walks its
 own ancestry and refuses when any ancestor — however many shells or version-manager shims sit in
 between — is a delegate it launched that is still running. That second witness needs both
 processes to open the same state directory, which Codex's own allowlist cannot tell the nested
 one about; with `AGENTMUX_STATE_DIR` or `XDG_STATE_HOME` set to something other than the
-platform default, a Codex delegate that inherits an MCP configuration naming `agentmux` is
+platform default, a Codex delegate that loads an MCP configuration naming `agentmux` is
 guarded by the variable alone.
 
 ### What the delegate does and does not see
@@ -522,19 +611,23 @@ reads, less the API keys [Billing safety](#billing-safety) removes — and nothi
 launching agent's session identity reaches it
 ([ADR 0022](docs/adr/0022-delegate-env-from-allowlist.md)).
 
-A Claude delegate runs with `--setting-sources ""`, so no user, project or local settings load and
-no hook can reopen its finished turn, and with `--strict-mcp-config` and an empty MCP config so it
-cannot re-enter `agentmux`. It runs in plan mode and is offered no editing tools.
+What it loads besides depends on `ignore_user_config`. By default both vendors load the user's own
+configuration, so its settings, hooks and MCP servers are part of the run. An isolated Claude
+delegate runs with `--setting-sources ""`, so no user, project or local settings load and no hook
+can reopen its finished turn, and with `--strict-mcp-config` and an empty MCP config so it cannot
+re-enter `agentmux`. An isolated Codex delegate runs with `--ignore-user-config`, which is what
+actually detaches the machine's configured MCP servers — `-c mcp_servers={}` looks like it should
+and does not. Measured against codex-cli 0.153.4, a delegate launched with that override still
+called a configured server's tool, so a machine with `agentmux` in its own Codex config could have
+had a delegate call `agentmux` and recurse. It also runs with `features.hooks=false`. It still
+loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions.
 
-A Codex delegate runs with `--ignore-user-config`, which is what actually detaches the machine's
-configured MCP servers — `-c mcp_servers={}` looks like it should and does not. Measured against
-codex-cli 0.153.4, a delegate launched with that override still called a configured server's tool,
-so a machine with `agentmux` in its own Codex config could have had a delegate call `agentmux` and
-recurse. It also runs with `features.hooks=false` and a read-only sandbox by default.
+Either way, a Claude delegate runs in plan mode and is offered no editing tools, and a Codex
+delegate runs read-only, unless the consultation's permissions say otherwise.
 
-One thing does still reach a Claude delegate: `--setting-sources ""` does **not** suppress
-`CLAUDE.md` discovery, so a project's own instruction file is part of the delegate's prompt.
-`agentmux` says so in the result rather than hiding it.
+One thing reaches a Claude delegate even when isolated: `--setting-sources ""` does **not**
+suppress `CLAUDE.md` discovery, so a project's own instruction file is part of the delegate's
+prompt. `agentmux` says so in the result rather than hiding it.
 
 ### Steering a running turn
 
@@ -548,16 +641,16 @@ agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 ```
 
 `status` says `steerable: yes` while a turn can take one. Today that is a **Codex delegate that
-inherits its account's settings**, because only `codex app-server` accepts input for a running
-turn and only an inheriting delegate can run over it:
+loads its account's configuration**, which is the default, because only `codex app-server` accepts
+input for a running turn and only such a delegate can run over it:
 
 - `codex exec`, which reads its prompt once, is what an isolated Codex delegate needs: the
   app-server has no equivalent of `--ignore-user-config` (codex-cli 0.159.3), and a private
   `CODEX_HOME` holding only the login cannot stand in for it — a keyring login is filed under the
   directory's path, a copied login's token refresh would log your own codex out, and sessions
   would land where your codex cannot find them. So isolation is never traded for steering
-  silently: start the consultation with `inherit_settings: true` (`--inherit-settings`) if it
-  should be steerable. The codex release whose app-server takes the flag lifts this.
+  silently: a consultation with `ignore_user_config: true` runs over `codex exec` and cannot be
+  steered. The codex release whose app-server takes the flag lifts this.
 - A Claude delegate runs as `claude --print`, which reads its question once and offers no channel
   into a turn that has started.
 
@@ -571,7 +664,7 @@ that was sent but never answered — the turn or the server ended first, or no a
 30 seconds — is reported as unconfirmed rather than refused, because codex may have taken it; read
 the transcript before sending it again.
 
-**How an inheriting Codex turn runs.** `agentmux` itself, run as a detached child exactly where
+**How a driven Codex turn runs.** `agentmux` itself, run as a detached child exactly where
 `codex exec` would be, starts `codex app-server`, runs the one turn with `approvalPolicy: never`,
 writes what the server reports in the event format `codex exec --json` writes, and exits. So
 `status`, `tail`, `result` and the files on disk read the same in either mode, and the turn survives

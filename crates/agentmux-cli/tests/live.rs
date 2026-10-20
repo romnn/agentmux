@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{AccountAlias, CodexSandbox, Delegate, Effort, Isolation, ModelId};
+use agentmux::delegate::{
+    AccountAlias, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -51,7 +53,10 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         delegate: Delegate::Codex {
             model: ModelId::parse(MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            sandbox: CodexSandbox::ReadOnly,
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
             account: account.into(),
             isolation: Some(Isolation::Inherit),
         },
