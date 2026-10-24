@@ -4,10 +4,16 @@ commit = true
 tag = true
 pre_commit_hooks = [
   # Refresh workspace package versions without updating dependencies.
-  "cargo metadata --offline --format-version 1 >/dev/null"
+  "cargo metadata --offline --format-version 1 >/dev/null",
+  # The oracle is a workspace of its own whose lockfile records agentmux's path crates, and its
+  # check runs `--locked`.
+  # Not offline, because its graph is codex's, which a checkout that never built it lacks.
+  # Locked pins hold either way.
+  "cargo metadata --format-version 1 --manifest-path crates/codex-app-server-codegen/oracle/Cargo.toml >/dev/null"
 ]
 additional_files = [
-  "Cargo.lock"
+  "Cargo.lock",
+  "crates/codex-app-server-codegen/oracle/Cargo.lock"
 ]
 
 [[tool.bumpversion.files]]
