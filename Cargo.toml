@@ -90,12 +90,12 @@ serde = { version = "1", features = ["derive"] }
 # `float_roundtrip` is what the tests' `jsonschema` turns on, so it is on everywhere: a feature
 # unified into test builds alone would test a float parser the release never links.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-toml = "0.9"
+toml = "1.1.8"
 # Reads the `retention` duration in `agentmux.toml` (`7d`, `1w`, `36h`).
 humantime = "2"
 # Lists an enum's variants, so a front end offers every value the core accepts without a copy of
 # the enum to keep in step.
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 # `schemars` derives the JSON Schema for every MCP tool's input; `rmcp`'s `schemars`
 # feature must stay on the same major.
 schemars = "1"
