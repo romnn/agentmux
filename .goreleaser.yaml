@@ -8,8 +8,25 @@ homebrew_casks:
     ids:
       - *agentmux
     description: "agentmux delegates a question to another vendor's coding agent and captures the whole transcript"
+    # The macOS binaries are unsigned, so Homebrew stages them with a quarantine attribute that
+    # Gatekeeper then refuses; the postflight step strips it on macOS hosts only.
+    # It is a `postflight_steps` block in `custom_block` because goreleaser's `hooks.post.install`
+    # renders a `postflight` stanza, which Homebrew 7 warns is deprecated on every `brew` call that
+    # touches the tap.
+    # goreleaser renders the cask as a Go template first, so `staged_path` is escaped as a raw
+    # string.
     custom_block: |
       os macos: "darwin", linux: "linux"
+
+      postflight_steps do
+        on_macos do
+          if_path_exists "/usr/bin/xattr" do
+            run "/usr/bin/xattr",
+                args:         ["-dr", "com.apple.quarantine", "{{ `{{staged_path}}` }}/agentmux"],
+                must_succeed: false
+          end
+        end
+      end
     directory: Casks
     commit_author:
       name: romnn
@@ -21,14 +38,6 @@ homebrew_casks:
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
       pull_request:
         enabled: false
-    hooks:
-      post:
-        # The macOS binaries are unsigned, so Homebrew stages them with a quarantine
-        # attribute that Gatekeeper then refuses. Strip it on macOS hosts only.
-        install: |
-          if OS.mac? && File.exist?("/usr/bin/xattr")
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/agentmux"]
-          end
 
 builds:
   - id: *agentmux
