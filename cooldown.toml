@@ -1,1 +1,6 @@
 min-age = "14d"
+
+[global]
+# The oracle's lockfile is seeded from codex's own at the pinned tag and resolves only with those
+# pins, so it changes when the pin moves (skill `codex-protocol-codegen`), never by re-locking.
+exclude-folders = ["/crates/codex-app-server-codegen/oracle"]
