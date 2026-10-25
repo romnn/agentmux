@@ -10,12 +10,14 @@
 //!                              submitted, a cancellation is marked or recorded, or the run is
 //!                              removed
 //! runs/<run_id>/
-//!   meta.json                  delegate, question, cwd, retention, created_at
+//!   meta.json                  delegate, cwd, retention, created_at, and the label `start` was
+//!                              given
 //!   transcript.md              the rendered transcript, a cache of the fold below
 //!   turns/0001/                one directory per turn, numbered from 1 as the transcript's
 //!                              headings number turns
 //!     question.md              what was asked; also the child's stdin
-//!     invocation.json          what was run, written before the spawn
+//!     invocation.json          what was run, and the label the turn carries, written before the
+//!                              spawn
 //!     events.jsonl             the delegate's raw event stream, exactly as emitted
 //!     stderr.log               the delegate's stderr
 //!     last-message.md          Codex's closing message, written by the CLI itself
@@ -80,6 +82,7 @@ mod auto_resume;
 mod cancel;
 mod error;
 mod id;
+mod label;
 pub(crate) mod layout;
 mod lock;
 mod migrate_zero_based_turn_dirs;
@@ -99,6 +102,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Utc};
+
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
 use crate::transcript::{Outcome, Transcript};
@@ -113,11 +118,14 @@ use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, last_page_of, page_o
 pub use auto_resume::{AutoResume, AutoResumePolicy, CONTINUE as AUTO_RESUME_QUESTION};
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
+pub use label::{RunLabel, RunLabelError};
 pub use quota::QuotaReport;
 pub use records::{LaunchMode, Meta, SettledTurn};
 pub use retention::Retention;
 pub use spawn::StartRequest;
-pub use status::{HookReopening, RunStatus, RunSummary, TranscriptPage, describe_delegate};
+pub use status::{
+    HookReopening, ListFilter, RunStatus, RunSummary, TranscriptPage, describe_delegate,
+};
 pub use supervise::{SUBCOMMAND as SUPERVISE_SUBCOMMAND, supervise};
 pub use wait::{TurnRef, WaitFor, Waited};
 
@@ -502,9 +510,11 @@ impl RunStore {
             _ => None,
         };
 
+        let newest_index = state.newest.as_ref().map(|newest| newest.index);
         let status = RunStatus {
             run_id: run_id.clone(),
-            delegate: self.current_delegate(&meta, state.newest.map(|newest| newest.index))?,
+            label: self.current_label(&meta, newest_index)?,
+            delegate: self.current_delegate(&meta, newest_index)?,
             cwd: meta.cwd.clone(),
             elapsed: elapsed_since(meta.created_at, &outcome, state.last_activity),
             created_at: meta.created_at,
@@ -562,12 +572,12 @@ impl RunStore {
         Ok((status, full))
     }
 
-    /// Recent consultations, newest first.
+    /// Recent consultations that `filter` admits, newest first, at most `limit` of them.
     ///
     /// # Errors
     ///
     /// Returns [`RunError::Io`] when the run directory cannot be listed.
-    pub fn list(&self, limit: usize) -> Result<Vec<RunSummary>, RunError> {
+    pub fn list(&self, limit: usize, filter: &ListFilter) -> Result<Vec<RunSummary>, RunError> {
         // Ordered by the recorded creation time, not by the id.
         // Ids lead with a second-precision timestamp, so two consultations started in the same
         // second — the common case, since fanning one question out across both vendors starts them
@@ -584,47 +594,71 @@ impl RunStore {
                 .cmp(&a.created_at)
                 .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        metas.truncate(limit);
 
+        // Summarised lazily, newest first, so a listing folds only as many runs as it needs to
+        // fill `limit` with ones the filter admits.
         Ok(metas
             .into_iter()
             .filter_map(|meta| {
-                // The outcome and the pricing are the newest turn's, as `status` reports them, and
-                // the question is the first turn's own file; none needs the whole consultation
-                // folded.
-                let newest = self
-                    .lock(&meta.run_id)
-                    .and_then(|run| run.fold_newest_turn(&meta))
-                    .ok()?;
-                let outcome = newest
-                    .as_ref()
-                    .map_or(Outcome::Running, |turn| turn.outcome.clone());
-                let billing = newest.as_ref().and_then(|turn| turn.billing);
-                // As the newest turn ran, as `status` describes it.
-                let current = self
-                    .current_delegate(&meta, newest.as_ref().map(|turn| turn.index))
-                    .ok()?;
-                let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
-                    .map(|question| first_line(&question, 120))
-                    .unwrap_or_default();
-                let mut delegate = describe_delegate(&current, meta.rewritten_from.as_ref());
-                // Said where every listing shows it, as the status header says it.
-                if billing == Some(Billing::Api) {
-                    delegate.push_str(" billing=api");
-                }
-                Some(RunSummary {
-                    run_id: meta.run_id,
-                    delegate,
-                    outcome,
-                    turns: newest
-                        .as_ref()
-                        .map_or(0, |turn| turn.index.saturating_add(1)),
-                    created_at: meta.created_at,
-                    question,
-                    billing,
-                })
+                let started_as = meta.label.clone();
+                let summary = self.summary(meta)?;
+                let labelled = filter.label.as_deref().is_none_or(|needle| {
+                    [started_as.as_ref(), summary.label.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|label| label.matches(needle))
+                });
+                let in_state = filter
+                    .state
+                    .is_none_or(|state| summary.outcome.state() == state);
+                (labelled && in_state).then_some(summary)
             })
+            .take(limit)
             .collect())
+    }
+
+    /// One consultation's line in `list`, or `None` for one whose records cannot be read.
+    fn summary(&self, meta: Meta) -> Option<RunSummary> {
+        // The outcome and the pricing are the newest turn's, as `status` reports them, and the
+        // question is the first turn's own file; none needs the whole consultation folded.
+        let newest = self
+            .lock(&meta.run_id)
+            .and_then(|run| run.fold_newest_turn(&meta))
+            .ok()?;
+        let newest_index = newest.as_ref().map(|folded| folded.turn.index);
+        let outcome = newest
+            .as_ref()
+            .map_or(Outcome::Running, |folded| folded.turn.outcome.clone());
+        let billing = newest.as_ref().and_then(|folded| folded.turn.billing);
+        // As the newest turn ran, as `status` describes it.
+        let current = self.current_delegate(&meta, newest_index).ok()?;
+        let label = self.current_label(&meta, newest_index).ok()?;
+        let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
+            .map(|question| first_line(&question, 120))
+            .unwrap_or_default();
+        let mut delegate = describe_delegate(&current, meta.rewritten_from.as_ref());
+        // Said where every listing shows it, as the status header says it.
+        if billing == Some(Billing::Api) {
+            delegate.push_str(" billing=api");
+        }
+        Some(RunSummary {
+            run_id: meta.run_id,
+            label,
+            delegate,
+            vendor: current.vendor(),
+            model: current.model().clone(),
+            effort: current.effort().cloned(),
+            cwd: meta.cwd,
+            outcome,
+            last_activity: newest
+                .as_ref()
+                .and_then(|folded| folded.last_activity)
+                .map(DateTime::<Utc>::from),
+            turns: newest_index.map_or(0, |index| index.saturating_add(1)),
+            created_at: meta.created_at,
+            question,
+            billing,
+        })
     }
 
     /// What agentmux recorded when the consultation began.

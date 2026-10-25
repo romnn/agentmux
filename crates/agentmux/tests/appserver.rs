@@ -1533,6 +1533,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
             env: std::collections::BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
     let turn = state

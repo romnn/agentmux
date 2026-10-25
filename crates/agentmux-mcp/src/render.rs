@@ -29,7 +29,7 @@ use agentmux::report::{
     quota_block, quota_report, summarise,
 };
 use agentmux::run::{
-    AutoResume, HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn,
+    AutoResume, HookReopening, Meta, QuotaReport, RunLabel, RunStatus, RunSummary, SettledTurn,
     TranscriptPage, describe_delegate,
 };
 use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
@@ -56,6 +56,9 @@ pub enum Caller {
 pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "run_id:     {}", status.run_id);
+    if let Some(label) = &status.label {
+        let _ = writeln!(out, "label:      {label}");
+    }
     let _ = writeln!(out, "state:      {}", outcome_line(&status.outcome));
     if !status.earlier_failures.is_empty() {
         // On a line of its own, beside the state rather than inside it: the state reports the
@@ -543,7 +546,8 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
 }
 
 /// What `wait` returns: a settled turn's transcript, under a header built from the settlement,
-/// from what the consultation recorded when it began, and from `delegate`, who that turn ran as.
+/// from what the consultation recorded when it began, and from `delegate` and `label`, who that
+/// turn ran as and what it was for.
 ///
 /// Nothing in it depends on a later turn, so a follow-up that is running, or one whose records
 /// cannot be read, neither delays nor fails a wait for a turn that has settled; `newest` is the
@@ -554,15 +558,17 @@ pub fn settled(
     settled: &SettledTurn,
     meta: &Meta,
     delegate: &Delegate,
+    label: Option<&RunLabel>,
     newest: Option<u32>,
     auto_resume: Option<&AutoResume>,
     page: &TranscriptPage,
 ) -> String {
     let id = settled.run_id();
     let turn = settled.turn_number();
+    let label = label.map_or_else(String::new, |label| format!("label:      {label}\n"));
     let mut out = indoc::formatdoc! {"
         run_id:     {id}
-        state:      {state}
+        {label}state:      {state}
         delegate:   {delegate}
         reading:    {cwd}
         settled:    turn {turn} is final; its record is {marker}
@@ -649,9 +655,13 @@ pub fn list(runs: &[RunSummary]) -> String {
     }
     let mut out = String::new();
     for run in runs {
+        let label = run
+            .label
+            .as_ref()
+            .map_or_else(String::new, |label| format!("    label: {label}\n"));
         out.push_str(&indoc::formatdoc! {"
             {run_id}  {state:<9}  {turns} turn(s)  {created_at}
-                {delegate}
+            {label}    {delegate}
                 {question}
             ",
             run_id = run.run_id,

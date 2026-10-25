@@ -18,7 +18,8 @@ use agentmux::delegate::{
     Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, Isolation,
     PermissionOptions, Vendor,
 };
-use agentmux::run::{Retention, RunId};
+use agentmux::run::{Retention, RunId, RunLabel};
+use agentmux::transcript::TurnState;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
@@ -388,6 +389,11 @@ pub struct QuestionArgs {
     /// `retention` the machine's `agentmux.toml` sets.
     #[arg(long)]
     pub keep: bool,
+
+    /// A short purpose for the consultation, such as `"REVIEW CRD G1"`, which `status`, `list`
+    /// and `wait` show and `list --label` finds it by.
+    #[arg(long, value_parser = RunLabel::parse)]
+    pub label: Option<RunLabel>,
 }
 
 impl QuestionArgs {
@@ -580,6 +586,11 @@ pub struct FollowUpArgs {
     #[arg(long, default_value_t = 600)]
     pub wait: u64,
 
+    /// A new short purpose for this turn and the ones after it; omitted, the turn keeps the
+    /// consultation's current label.
+    #[arg(long, value_parser = RunLabel::parse)]
+    pub label: Option<RunLabel>,
+
     /// Changes to the consultation's isolation or permissions for this turn and the ones after
     /// it; whatever is omitted keeps what the newest turn ran with.
     #[command(flatten)]
@@ -649,12 +660,21 @@ pub struct WaitArgs {
     pub timeout: Option<std::time::Duration>,
 }
 
-/// Arguments for `agentmux list`: how many consultations to show.
+/// Arguments for `agentmux list`: how many consultations to show, and which.
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Most consultations to list.
     #[arg(long, short = 'n', default_value_t = 20)]
     pub limit: usize,
+
+    /// Only consultations whose label holds this text, ignoring case: the label `start` gave it,
+    /// or the one its newest turn has.
+    #[arg(long, value_name = "TEXT")]
+    pub label: Option<String>,
+
+    /// Only consultations whose newest turn stands so.
+    #[arg(long, value_enum)]
+    pub state: Option<TurnState>,
 }
 
 /// Arguments for `agentmux prune`: one consultation to delete, or none to sweep.

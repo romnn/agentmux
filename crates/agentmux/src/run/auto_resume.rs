@@ -330,11 +330,13 @@ impl RunStore {
         if delegate.isolation().is_none() {
             delegate = delegate.with_isolation(Isolation::Isolated);
         }
+        let label = self.current_label(&meta, Some(plan.turn_index))?;
         let next = NextTurn {
             delegate: &delegate,
             index: next_index,
             question: CONTINUE,
             resume: Some(&session),
+            label: label.as_ref(),
         };
         run.launch_turn(
             &meta,

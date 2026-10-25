@@ -128,7 +128,7 @@ impl RunStore {
                 continue;
             }
             let finished = match run.fold_newest_turn(&meta) {
-                Ok(turn) => turn.is_none_or(|turn| turn.outcome.is_terminal()),
+                Ok(folded) => folded.is_none_or(|folded| folded.turn.outcome.is_terminal()),
                 Err(_) => continue,
             };
             if !finished || self.a_child_is_alive(&run_id).unwrap_or(true) {
@@ -157,7 +157,7 @@ impl RunStore {
         let meta = self.meta(run_id)?;
         if run
             .fold_newest_turn(&meta)?
-            .is_some_and(|turn| !turn.outcome.is_terminal())
+            .is_some_and(|folded| !folded.turn.outcome.is_terminal())
             || self.a_child_is_alive(run_id)?
         {
             return Err(RunError::StillRunning {

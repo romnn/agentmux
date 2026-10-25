@@ -51,6 +51,7 @@ async fn connected() -> Result<Connected> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 

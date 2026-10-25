@@ -64,6 +64,7 @@ fn request(question: &str) -> Result<StartRequest> {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })
 }
 

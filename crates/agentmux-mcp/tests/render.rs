@@ -78,6 +78,7 @@ fn consult_with(
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
     Ok((store, status, dir))
@@ -269,6 +270,7 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 
@@ -345,6 +347,7 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 
@@ -529,6 +532,7 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 
@@ -610,6 +614,7 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 
@@ -700,6 +705,7 @@ fn earlier_failures_do_not_read_as_the_newest_turns_state() -> Result<()> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
     store.follow_up(&started.run_id, "try again").or_fail()?;

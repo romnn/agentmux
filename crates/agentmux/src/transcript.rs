@@ -349,7 +349,11 @@ impl Outcome {
 ///
 /// Displayed as the one word the serialised outcome's `state` tag holds, stable enough for a
 /// caller to branch on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::VariantArray,
+)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum TurnState {
     /// See [`Outcome::Running`].

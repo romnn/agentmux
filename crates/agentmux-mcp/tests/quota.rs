@@ -48,6 +48,7 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
     Ok((store, status, dir))

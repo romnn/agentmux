@@ -417,12 +417,12 @@ impl LockedRun<'_> {
     /// A run's outcome is its newest turn's, and a turn folds from its own files alone, so the
     /// callers that only need to know whether a consultation is over — the poll loop, `list`,
     /// the sweep — do not re-read every settled turn's capture to find out.
-    pub(super) fn fold_newest_turn(&self, meta: &Meta) -> Result<Option<Turn>, RunError> {
+    pub(super) fn fold_newest_turn(&self, meta: &Meta) -> Result<Option<FoldedTurn>, RunError> {
         let turns = self.store.turn_files(&self.run_id)?;
         let Some(newest) = turns.last() else {
             return Ok(None);
         };
-        Ok(Some(self.fold_turn(meta, newest)?.turn))
+        Ok(Some(self.fold_turn(meta, newest)?))
     }
 
     /// Whether a folded turn's delegate has gone, asked once per fold.

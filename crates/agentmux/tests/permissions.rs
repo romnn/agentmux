@@ -15,7 +15,7 @@ use agentmux::delegate::{
     CodexPermissions, CodexSandbox, Delegate, DelegateError, Effort, Invocation, Isolation,
     ModelId, PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
-use agentmux::run::{Retention, RunError, RunStore, StartRequest};
+use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use googletest::prelude::*;
 
@@ -947,6 +947,7 @@ impl Machine {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         }
     }
 
@@ -1034,6 +1035,7 @@ fn a_follow_up_override_becomes_the_recorded_choice() -> Result<()> {
             isolation: Some(Isolation::Isolated),
             ..PermissionOptions::default()
         },
+        None,
     )?;
     machine.store.follow_up(&started.run_id, "and again")?;
 
@@ -1104,6 +1106,7 @@ fn a_tightened_limit_refuses_the_next_turn() -> Result<()> {
             network_access: Some(false),
             ..PermissionOptions::default()
         },
+        None,
     )?;
     assert_that!(
         has_pair(&machine.args(1)?, "--config", "sandbox_mode=\"read-only\""),
@@ -1128,7 +1131,7 @@ fn a_refused_start_leaves_no_run() -> Result<()> {
             PermissionRefusal::SandboxBeyondLimit { .. }
         ))
     );
-    assert_that!(machine.store.list(10)?, is_empty());
+    assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
     assert_that!(machine.launcher.launches(), is_empty());
     Ok(())
 }
@@ -1156,7 +1159,7 @@ fn an_unverified_codex_cannot_run_read_only_with_network_over_exec() -> Result<(
         )
     );
     assert_that!(refused.to_string(), contains_substring("codex-cli 0.150.0"));
-    assert_that!(machine.store.list(10)?, is_empty());
+    assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
     assert_that!(machine.launcher.launches(), is_empty());
     Ok(())
 }
@@ -1246,6 +1249,7 @@ fn a_permission_change_leaves_the_rendered_transcript_in_place() -> Result<()> {
             sandbox: Some(CodexSandbox::ReadOnly),
             ..PermissionOptions::default()
         },
+        None,
     )?;
 
     let after = machine.store.page(&started.run_id, 0, usize::MAX)?;
@@ -1294,6 +1298,7 @@ fn a_reopened_turn_is_judged_by_its_own_isolation() -> Result<()> {
             isolation: Some(Isolation::Isolated),
             ..PermissionOptions::default()
         },
+        None,
     )?;
 
     let status = machine.store.status(&started.run_id)?;
@@ -1325,10 +1330,11 @@ fn list_and_status_agree_after_an_override() -> Result<()> {
             network_access: Some(false),
             ..PermissionOptions::default()
         },
+        None,
     )?;
 
     let status = machine.store.status(&started.run_id)?;
-    let listed = machine.store.list(10)?;
+    let listed = machine.store.list(10, &ListFilter::default())?;
     let summary = status.delegate.summary();
     assert_that!(summary, contains_substring("sandbox=read-only+no-network"));
     assert_that!(
@@ -1360,6 +1366,7 @@ async fn a_steer_refusal_names_the_running_turns_isolation() -> Result<()> {
             isolation: Some(Isolation::Isolated),
             ..PermissionOptions::default()
         },
+        None,
     )?;
 
     let refused = machine.store.steer(&started.run_id, "x").await;

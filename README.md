@@ -117,7 +117,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 | `steer`     | Add an instruction to a turn that is still running, read before its next model call |
 | `wait`      | Block until a turn has settled, then return it — never earlier, with no time limit   |
 | `cancel`    | Stop a running consultation or a pending automatic resume, keeping what was collected |
-| `list`      | Recent consultations with their ids, so an id can be recovered                       |
+| `list`      | Recent consultations with their ids and labels, filtered by `label` or `state`       |
 | `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
 
 ### Use from the command line
@@ -130,7 +130,7 @@ agentmux ask --delegate codex --model astra --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 
 # A long review, watched as it arrives, then collected once it has settled.
-agentmux start --delegate claude --model opus --effort xhigh --keep \
+agentmux start --delegate claude --model opus --effort xhigh --keep --label 'REVIEW CRD G1' \
   --file review/brief.md
 agentmux tail <run-id> --follow
 agentmux tail <run-id> --from-end --max-bytes 2000    # just the latest output
@@ -143,14 +143,18 @@ agentmux start --delegate codex --model sol --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
-# One more question, in the delegate's own session.
+# One more question, in the delegate's own session. A `--label` labels this turn and the ones
+# after it; without one the turn keeps the consultation's label.
 agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
+agentmux follow-up <run-id> --label 'RE-REVIEW after rework' 'The fix is in; review it again.'
 
 # Read-only, but with network, for a question that needs `cargo` or `gh` to answer.
 agentmux ask --delegate codex --model sol --effort high --network-access \
   'Does the latest tokio release still support our MSRV?'
 
 agentmux list
+# A heartbeat in one call: label, cwd, model, effort, newest outcome and last activity per run.
+agentmux list --label review --state failed --json
 agentmux prune            # drop consultations past their retention
 
 # Every command takes --json; a consultation's state is always under `outcome`.

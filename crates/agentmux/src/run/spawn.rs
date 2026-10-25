@@ -16,6 +16,7 @@ use crate::transcript::{Outcome, ResumeAttempt};
 use super::auto_resume::AutoResumePlan;
 use super::error::{NotResumable, RunError};
 use super::id::RunId;
+use super::label::RunLabel;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
@@ -53,6 +54,9 @@ pub struct StartRequest {
     /// For a codex whose app-server protocol no longer matches this agentmux; such a turn cannot
     /// be steered.
     pub force_codex_exec: bool,
+    /// What the consultation is for, which `status`, `list` and `wait` show and `list` filters
+    /// on.
+    pub label: Option<RunLabel>,
 }
 
 /// One turn to launch: as which delegate, at which index, asking what, continuing which session.
@@ -66,6 +70,8 @@ pub(super) struct NextTurn<'a> {
     pub(super) question: &'a str,
     /// The delegate's own session to continue, for a follow-up.
     pub(super) resume: Option<&'a SessionRef>,
+    /// What the turn is for, recorded with it.
+    pub(super) label: Option<&'a RunLabel>,
 }
 
 /// How a turn's child process is built.
@@ -248,6 +254,7 @@ impl RunStore {
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
+            label: request.label.clone(),
         };
         let started = write_json(&dir.join("meta.json"), &meta)
             .and_then(|()| self.lock(&run_id))
@@ -257,6 +264,7 @@ impl RunStore {
                     index: 0,
                     question: &request.question,
                     resume: None,
+                    label: meta.label.as_ref(),
                 };
                 run.launch_turn(&meta, &first, Resolution::Configured(&config))
             });
@@ -380,11 +388,11 @@ impl RunStore {
     /// [`RunError::NotResumable`] when the previous turn is still running, was cancelled, never
     /// announced a session id, or ended without the delegate saying anything.
     pub fn follow_up(&self, run_id: &RunId, question: &str) -> Result<RunStatus, RunError> {
-        self.follow_up_with(run_id, question, PermissionOptions::default())
+        self.follow_up_with(run_id, question, PermissionOptions::default(), None)
     }
 
     /// Continue a consultation, with the isolation or permissions `overrides` names in place of
-    /// the ones its newest turn ran with.
+    /// the ones its newest turn ran with, and `label` in place of its newest turn's label.
     ///
     /// What `overrides` leaves out keeps what the newest turn ran with, or what `start` recorded
     /// for a turn launched before agentmux kept that; the machine file's defaults are not
@@ -393,6 +401,7 @@ impl RunStore {
     /// began refuses this turn rather than letting it run past the owner's new ceiling.
     /// What the turn runs with is recorded with the turn, and the next follow-up starts from it;
     /// the consultation's own record, and the transcript header rendered from it, never change.
+    /// So is the label, which the turns after it keep until another follow-up names one.
     ///
     /// # Errors
     ///
@@ -405,6 +414,7 @@ impl RunStore {
         run_id: &RunId,
         question: &str,
         overrides: PermissionOptions,
+        label: Option<RunLabel>,
     ) -> Result<RunStatus, RunError> {
         // Asked before the lock, which would otherwise leave a lock file for a run that is not
         // there.
@@ -431,12 +441,17 @@ impl RunStore {
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
             let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
+            let label = match label {
+                Some(label) => Some(label),
+                None => self.current_label(&meta, state.newest.map(|newest| newest.index))?,
+            };
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
                 delegate: &delegate,
                 index,
                 question,
                 resume: Some(&session),
+                label: label.as_ref(),
             };
             run.launch_turn(&meta, &next, Resolution::Configured(&config))?;
         }
@@ -468,6 +483,42 @@ impl RunStore {
             Some(ran_as) => meta.delegate.clone().with_settings_of(&ran_as),
             None => meta.delegate.clone(),
         })
+    }
+
+    /// What a consultation's turn at `newest` is for: the label its record holds, or the one
+    /// `start` was given for a run with no turn yet or a turn recorded before agentmux kept one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
+    /// cannot be read.
+    pub(super) fn current_label(
+        &self,
+        meta: &Meta,
+        newest: Option<u32>,
+    ) -> Result<Option<RunLabel>, RunError> {
+        let Some(index) = newest else {
+            return Ok(meta.label.clone());
+        };
+        let recorded =
+            read_json::<InvocationRecord>(&self.turn_dir(&meta.run_id, index).invocation())?
+                .and_then(|record| record.label);
+        Ok(recorded.or_else(|| meta.label.clone()))
+    }
+
+    /// What a settled turn is for: what `status` and `list` say of the newest turn, said of any
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
+    /// cannot be read.
+    pub fn turn_label(
+        &self,
+        meta: &Meta,
+        settled: &SettledTurn,
+    ) -> Result<Option<RunLabel>, RunError> {
+        self.current_label(meta, Some(settled.turn_index()))
     }
 
     /// Who a settled turn ran as: what `status` and `list` say of the newest turn, said of any
@@ -665,6 +716,7 @@ impl RunStore {
             index,
             question,
             resume,
+            label,
         } = *next;
         std::fs::write(turn.question(), question)
             .map_err(RunError::io(format!("writing turn {index} question")))?;
@@ -734,6 +786,7 @@ impl RunStore {
                 agentmux_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 delegate: Some(delegate.clone()),
                 auto_resume,
+                label: label.cloned(),
             },
         )?;
 

@@ -86,6 +86,7 @@ async fn connected() -> Result<Connected> {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })?;
 
     let (server_end, client_end) = tokio::io::duplex(64 * 1024);

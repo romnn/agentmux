@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use agentmux::delegate::{AccountAlias, Billing, ClaudePermissions, Delegate, Effort, ModelId};
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
+use agentmux::run::{ListFilter, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::fixtures;
 use googletest::prelude::*;
 
@@ -172,6 +172,7 @@ impl BillingTestEnvironment {
             env: BTreeMap::new(),
             billing,
             force_codex_exec: false,
+            label: None,
         })?;
         store
             .wait_until_terminal(&started.run_id, Duration::from_secs(20))
@@ -237,7 +238,7 @@ async fn an_account_opted_into_api_pricing_passes_its_key_and_says_so() -> Resul
         contains_substring("This turn may be billed at API prices.")
     );
     // And so does every listing of it.
-    let listed = test_environment.store()?.list(10)?;
+    let listed = test_environment.store()?.list(10, &ListFilter::default())?;
     let summary = listed.first().or_fail()?;
     assert_that!(summary.billing, some(eq(Billing::Api)));
     assert_that!(summary.delegate, ends_with("billing=api"));
