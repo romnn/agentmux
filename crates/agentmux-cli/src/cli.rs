@@ -391,7 +391,7 @@ pub struct QuestionArgs {
     pub keep: bool,
 
     /// A short purpose for the consultation, such as `"REVIEW CRD G1"`, which `status`, `list`
-    /// and `wait` show and `list --label` finds it by.
+    /// and `wait` show and `list --label` finds it by: one line of up to 120 characters.
     #[arg(long, value_parser = RunLabel::parse)]
     pub label: Option<RunLabel>,
 }
@@ -586,8 +586,8 @@ pub struct FollowUpArgs {
     #[arg(long, default_value_t = 600)]
     pub wait: u64,
 
-    /// A new short purpose for this turn and the ones after it; omitted, the turn keeps the
-    /// consultation's current label.
+    /// A new short purpose for this turn and the ones after it, one line of up to 120
+    /// characters; omitted, the turn keeps the consultation's current label.
     #[arg(long, value_parser = RunLabel::parse)]
     pub label: Option<RunLabel>,
 
@@ -667,8 +667,7 @@ pub struct ListArgs {
     #[arg(long, short = 'n', default_value_t = 20)]
     pub limit: usize,
 
-    /// Only consultations whose label holds this text, ignoring case: the label `start` gave it,
-    /// or the one its newest turn has.
+    /// Only consultations whose current label holds this text, ignoring case.
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
 

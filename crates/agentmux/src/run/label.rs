@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
     "invalid label {value:?}: a label is one line of 1-{max} characters with no control \
-     characters, such as \"REVIEW CRD G1\"",
+     characters or line breaks, such as \"REVIEW CRD G1\"",
     max = RunLabel::MAX_CHARS
 )]
 pub struct RunLabelError {
@@ -32,12 +32,16 @@ impl RunLabel {
     /// # Errors
     ///
     /// Returns [`RunLabelError`] for a label that is empty once trimmed, longer than
-    /// [`RunLabel::MAX_CHARS`], or holds a control character, a newline included.
+    /// [`RunLabel::MAX_CHARS`], or holds a control character or a line break of any kind.
     pub fn parse(value: &str) -> Result<Self, RunLabelError> {
         let trimmed = value.trim();
         let ok = !trimmed.is_empty()
             && trimmed.chars().count() <= Self::MAX_CHARS
-            && !trimmed.chars().any(char::is_control);
+            // Unicode's line and paragraph separators are not control characters, and would
+            // break a listing's line as a newline does.
+            && !trimmed
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'));
         if ok {
             Ok(Self(trimmed.to_owned()))
         } else {
@@ -92,7 +96,14 @@ mod tests {
             RunLabel::parse("  REVIEW CRD G1 ").map(String::from),
             ok(eq("REVIEW CRD G1"))
         );
-        for refused in ["", "   ", "two\nlines", "tab\there", &"x".repeat(121)] {
+        for refused in [
+            "",
+            "   ",
+            "two\nlines",
+            "tab\there",
+            "two\u{2028}lines",
+            &"x".repeat(121),
+        ] {
             assert_that!(RunLabel::parse(refused), err(anything()), "{refused:?}");
         }
         assert_that!(RunLabel::parse(&"é".repeat(120)), ok(anything()));

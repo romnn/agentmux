@@ -37,11 +37,6 @@ impl RunStore {
             meta.cwd.display(),
             meta.created_at.to_rfc3339(),
         );
-        // Written only for a labelled consultation, so a transcript rendered before labels
-        // existed renders byte for byte as it did.
-        if let Some(label) = &meta.label {
-            let _ = writeln!(text, "- label: {label}");
-        }
         let offset = |text: &str| u64::try_from(text.len()).unwrap_or(u64::MAX);
         let mut spans = Vec::with_capacity(state.transcript.turns.len());
         for turn in &state.transcript.turns {

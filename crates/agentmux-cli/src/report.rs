@@ -342,10 +342,9 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
     for settled in &waited.settled {
         let offset = settled.section_offset();
         let page = settled.page(offset, usize::MAX)?;
-        let meta = store.meta(settled.run_id())?;
         reports.push(SettledJson {
             settled,
-            label: store.turn_label(&meta, settled)?,
+            label: store.turn_label(settled),
             // Decided before the settlement was committed, so it is there for a turn that has one.
             auto_resume: store.auto_resume(settled.run_id(), settled.turn_number())?,
             text_offset: offset,
@@ -395,13 +394,13 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
 /// Returns an error when the lines cannot be formatted.
 fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
     let settled = settled_report.settled;
+    // Its own line under the heading, ending in a newline, or nothing.
+    let mut label = String::new();
+    if let Some(turn_label) = &settled_report.label {
+        writeln!(label, "  label       {turn_label}")?;
+    }
     // Its own lines under the state, ending in a newline each, or nothing.
     let mut resume = String::new();
-    // Its own line under the heading, ending in a newline, or nothing.
-    let label = settled_report
-        .label
-        .as_ref()
-        .map_or_else(String::new, |label| format!("  label       {label}\n"));
     if let Some(auto_resume) = &settled_report.auto_resume {
         writeln!(
             resume,
@@ -465,40 +464,37 @@ struct WaitJson<'a> {
     pending: &'a [TurnRef],
 }
 
-/// Print recent consultations.
+/// Print recent consultations, as `filtered` by `--label` or `--state` or not.
 ///
 /// # Errors
 ///
 /// Returns an error when the JSON form cannot be serialised.
-pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
+pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(runs)?);
         return Ok(());
     }
     if runs.is_empty() {
-        println!("no consultations yet");
+        if filtered {
+            println!("no consultations match --label and --state");
+        } else {
+            println!("no consultations yet");
+        }
         return Ok(());
     }
     for run in runs {
-        let label = run
-            .label
-            .as_ref()
-            .map_or_else(String::new, |label| format!("    label: {label}\n"));
-        print!(
-            "{}",
-            indoc::formatdoc! {"
-                {run_id}  {state:<9}  {turns} turn(s)  {created_at}
-                {label}    {delegate}
-                    {question}
-                ",
-                run_id = run.run_id,
-                state = run.outcome.state(),
-                turns = run.turns,
-                created_at = run.created_at.to_rfc3339(),
-                delegate = run.delegate,
-                question = run.question,
-            }
+        println!(
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
+            run_id = run.run_id,
+            state = run.outcome.state(),
+            turns = run.turns,
+            created_at = run.created_at.to_rfc3339(),
         );
+        if let Some(label) = &run.label {
+            println!("    label: {label}");
+        }
+        println!("    {}", run.delegate);
+        println!("    {}", run.question);
     }
     Ok(())
 }

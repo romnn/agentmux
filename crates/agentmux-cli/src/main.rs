@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
                 args.run_id.id(),
                 &args.text()?,
                 args.permissions.options()?,
-                args.label.clone(),
+                args.label.as_ref(),
             )?;
             store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
@@ -132,11 +132,12 @@ async fn main() -> Result<()> {
         }
         Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
         Command::List(args) => {
+            let filtered = args.label.is_some() || args.state.is_some();
             let filter = ListFilter {
                 label: args.label,
                 state: args.state,
             };
-            report::list(&store.list(args.limit, &filter)?, cli.json)
+            report::list(&store.list(args.limit, &filter)?, filtered, cli.json)
         }
         // Dispatched before the store was opened.
         Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
