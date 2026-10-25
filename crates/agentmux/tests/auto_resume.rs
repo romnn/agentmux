@@ -231,7 +231,7 @@ fn a_follow_up_takes_the_place_of_a_pending_resume() -> Result<()> {
         &std::fs::read(harness.turn_dir(&run_id, 2).join("invocation.json")).or_fail()?,
     )
     .or_fail()?;
-    assert_that!(invocation.get("auto_resume_attempt"), none());
+    assert_that!(invocation.get("auto_resume"), none());
     Ok(())
 }
 
@@ -246,10 +246,10 @@ fn the_last_allowed_resume_failing_overloaded_ends_the_run() -> Result<()> {
     let invocation_path = harness.turn_dir(&run_id, 1).join("invocation.json");
     let mut invocation: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&invocation_path).or_fail()?).or_fail()?;
-    invocation
-        .as_object_mut()
-        .or_fail()?
-        .insert("auto_resume_attempt".to_owned(), serde_json::json!(12));
+    invocation.as_object_mut().or_fail()?.insert(
+        "auto_resume".to_owned(),
+        serde_json::json!({ "attempt": 12, "attempts": 12 }),
+    );
     std::fs::write(&invocation_path, invocation.to_string()).or_fail()?;
     harness.admit(&run_id, 1, 1)?;
 

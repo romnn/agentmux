@@ -779,12 +779,20 @@ fn an_overloaded_turn_is_resumed_automatically() -> Result<()> {
     assert_that!(second.status.code(), some(eq(0)));
     assert_that!(second.stdout, contains_substring("FIXTURE_OK"));
 
-    // Turn 2 is recorded as agentmux's own, asked "continue", resuming the same thread.
+    // Turn 2 is recorded as agentmux's own, asked "continue", resuming the same thread, and
+    // the transcript says so under its question.
     let invocation = turn_record(&machine, &run_id, "0002", "invocation.json")?;
     assert_that!(
-        invocation.get("auto_resume_attempt"),
-        some(eq(&serde_json::json!(1)))
+        invocation.get("auto_resume"),
+        some(eq(&serde_json::json!({ "attempt": 1, "attempts": 12 })))
     );
+    let transcript =
+        std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
+    assert_that!(
+        transcript,
+        contains_substring("agentmux sent this question itself")
+    );
+    assert_that!(transcript, contains_substring("automatic resume 1 of 12"));
     assert_that!(
         invocation.get("resumed_from"),
         some(eq(&serde_json::json!(

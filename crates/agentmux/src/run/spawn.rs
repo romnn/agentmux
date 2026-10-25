@@ -11,7 +11,7 @@ use crate::delegate::{
     PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
 use crate::launch::{LaunchSpec, Liveness};
-use crate::transcript::Outcome;
+use crate::transcript::{Outcome, ResumeAttempt};
 
 use super::auto_resume::AutoResumePlan;
 use super::error::{NotResumable, RunError};
@@ -96,13 +96,13 @@ impl Resolution<'_> {
             Self::Configured(config) => Resolved {
                 invocation: delegate.invocation(plan, host_env, config)?,
                 app_server_settings: delegate.app_server_settings(config),
-                auto_resume_attempt: None,
+                auto_resume: None,
             },
             Self::Inherited(Inherited { billing, attempt }) => Resolved {
                 invocation: delegate.continuation(plan, host_env.clone(), billing),
                 app_server_settings: delegate
                     .app_server_settings_under(delegate.isolation().unwrap_or(Isolation::Isolated)),
-                auto_resume_attempt: Some(attempt),
+                auto_resume: Some(attempt),
             },
         })
     }
@@ -114,7 +114,7 @@ struct Resolved {
     /// How it runs over `codex app-server`, when it can.
     app_server_settings: Option<AppServerSettings>,
     /// Which automatic resume it is, when it is one.
-    auto_resume_attempt: Option<u32>,
+    auto_resume: Option<ResumeAttempt>,
 }
 
 /// What an automatic resume carries over from the turn it continues.
@@ -122,8 +122,8 @@ struct Resolved {
 pub(super) struct Inherited {
     /// The pricing the environment was resolved for.
     pub(super) billing: Billing,
-    /// Which automatic resume in a row this is, counted from 1.
-    pub(super) attempt: u32,
+    /// Which automatic resume in a row this is.
+    pub(super) attempt: ResumeAttempt,
 }
 
 /// What the machine's configuration decided about a requested delegate.
@@ -680,7 +680,7 @@ impl RunStore {
         let Resolved {
             mut invocation,
             app_server_settings,
-            auto_resume_attempt,
+            auto_resume,
         } = resolution.resolve(delegate, &plan, &self.host_env)?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
@@ -733,7 +733,7 @@ impl RunStore {
                 cli_version,
                 agentmux_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 delegate: Some(delegate.clone()),
-                auto_resume_attempt,
+                auto_resume,
             },
         )?;
 
@@ -747,7 +747,7 @@ impl RunStore {
             args = ?invocation.args(),
             cwd = %meta.cwd.display(),
             resumed = resume.is_some(),
-            automatic = auto_resume_attempt.is_some(),
+            automatic = auto_resume.is_some(),
             mode = ?launch_mode,
             billing = %invocation.billing(),
             "launching delegate",

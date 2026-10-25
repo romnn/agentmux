@@ -45,7 +45,7 @@ one place to change these; the hidden `--auto-resume-delay` flag shortens the fi
    (`LockedRun::schedule_auto_resume`). A reader that finds the settlement — a `wait` above all —
    therefore finds the decision. The turn qualifies when it failed overloaded, nobody asked to
    cancel it, and its `supervisor-plan.json` carries an `auto_resume` plan. Its own
-   `invocation.json` says how many automatic resumes preceded it (`auto_resume_attempt`); one past
+   `invocation.json` says how many automatic resumes preceded it (`auto_resume`); one past
    the policy's attempts is recorded `exhausted`. Otherwise the resume is recorded `scheduled`, with
    its attempt and due time, only while the turn's supervisor is alive and the consultation passes
    `resumable_session` ([0023](0023-resume-after-delegate-exit.md)).
@@ -82,9 +82,12 @@ is the one that launch set for its delegate; refusing on it would refuse the sup
 handiwork. No caller can reach that path: it needs a plan an admitted launch wrote, read by the
 supervisor that plan's record names.
 
-**The automatic turn says it is automatic.** Its `invocation.json` records `auto_resume_attempt`,
-its `question.md` is `continue`, and the failed turn keeps `auto-resume.json`. Existing bytes are
-never rewritten ([0009](0009-append-only-transcript.md)).
+**The automatic turn says it is automatic.** Its `invocation.json` records `auto_resume` (the
+attempt and how many are allowed) before it is launched, the fold carries it into the turn
+(`Turn::auto_resume`), and the transcript renders a note under that turn's question saying
+agentmux sent it, with the attempt. Its `question.md` is `continue`, and the failed turn keeps
+`auto-resume.json`. The note is known before the turn's first byte is rendered, so it adds only
+new bytes ([0009](0009-append-only-transcript.md)).
 
 **What callers are told.** `RunStore::auto_resume` reads the decision together with what happened
 since, and `RunStatus::auto_resume` reports it for the newest turn: `scheduled` (turn, attempt,

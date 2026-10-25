@@ -509,6 +509,23 @@ pub struct Turn {
     /// question, and the header above every turn never changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ran_as: Option<String>,
+    /// Which automatic resume this turn is, when agentmux rather than the caller asked its
+    /// question, after the model was overloaded.
+    ///
+    /// Recorded before the child is spawned, so like [`Self::billing`] it renders under the
+    /// question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<ResumeAttempt>,
+}
+
+/// Which automatic resume a turn is, in an unbroken run of turns that failed because the model
+/// was overloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeAttempt {
+    /// Which automatic resume in a row it is, counted from 1.
+    pub attempt: u32,
+    /// How many agentmux makes in a row before it stops.
+    pub attempts: u32,
 }
 
 impl Turn {
@@ -537,6 +554,7 @@ impl Turn {
             billing: None,
             isolation: None,
             ran_as: None,
+            auto_resume: None,
         }
     }
 
@@ -732,6 +750,17 @@ fn render_question(turn: &Turn) -> String {
         turn.index.saturating_add(1),
         turn.question.trim_end()
     );
+    if let Some(ResumeAttempt { attempt, attempts }) = turn.auto_resume {
+        let _ = indoc::writedoc!(
+            out,
+            "
+
+            > [!NOTE]
+            > **agentmux sent this question itself** after the model was overloaded, not the \
+            caller: automatic resume {attempt} of {attempts}.
+        "
+        );
+    }
     if let Some(store) = &turn.unsaved_session_store {
         let _ = indoc::writedoc!(
             out,

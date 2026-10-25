@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Billing, Delegate, ModelId, SessionRef};
 use crate::launch::{ExitStatus, Launched};
-use crate::transcript::{Outcome, turn_index_of_number, turn_number};
+use crate::transcript::{Outcome, ResumeAttempt, turn_index_of_number, turn_number};
 
 use super::SettledBy;
 use super::auto_resume::AutoResumePlan;
@@ -482,10 +482,10 @@ pub(super) struct InvocationRecord {
     /// consultation's record says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) delegate: Option<Delegate>,
-    /// Which automatic resume this turn is, counted from 1 along an unbroken run of turns that
-    /// failed overloaded, when agentmux rather than a caller sent it.
+    /// Which automatic resume this turn is, along an unbroken run of turns that failed
+    /// overloaded, when agentmux rather than a caller sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) auto_resume_attempt: Option<u32>,
+    pub(super) auto_resume: Option<ResumeAttempt>,
 }
 
 /// Write a record, replacing any there before, so that a reader never sees a partial one.

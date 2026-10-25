@@ -28,7 +28,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::delegate::Isolation;
-use crate::transcript::{FailureKind, Outcome};
+use crate::transcript::{FailureKind, Outcome, ResumeAttempt};
 
 use super::error::RunError;
 use super::id::RunId;
@@ -227,7 +227,7 @@ impl RunStore {
         let next = self.turn_dir(run_id, next_index);
         if next.holds_a_record() {
             let automatic = read_json::<InvocationRecord>(&next.invocation())?
-                .is_some_and(|record| record.auto_resume_attempt.is_some());
+                .is_some_and(|record| record.auto_resume.is_some());
             return Ok(automatic.then_some(AutoResume::Resumed {
                 turn,
                 attempt,
@@ -274,7 +274,9 @@ impl RunStore {
         let dir = self.turn_dir(&plan.run_id, plan.turn_index);
         let next_index = plan.turn_index.saturating_add(1);
         let Some(AutoResumeRecord::Scheduled {
-            attempt, due_at, ..
+            attempt,
+            attempts,
+            due_at,
         }) = read_json::<AutoResumeRecord>(&dir.auto_resume())?
         else {
             return Ok(Resumption::NotScheduled);
@@ -323,7 +325,7 @@ impl RunStore {
             &next,
             Resolution::Inherited(Inherited {
                 billing: plan.producer.billing,
-                attempt,
+                attempt: ResumeAttempt { attempt, attempts },
             }),
         )?;
         Ok(Resumption::Resumed)
@@ -370,8 +372,8 @@ impl LockedRun<'_> {
             return Ok(());
         };
         let before = read_json::<InvocationRecord>(&dir.invocation())?
-            .and_then(|record| record.auto_resume_attempt)
-            .unwrap_or(0);
+            .and_then(|record| record.auto_resume)
+            .map_or(0, |resume| resume.attempt);
         let attempt = before.saturating_add(1);
         if attempt > plan.policy.attempts {
             write_json_once(

@@ -862,6 +862,7 @@ fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &D
     turn.unsaved_session_store
         .clone_from(&invocation.unsaved_session_store);
     turn.billing = invocation.billing;
+    turn.auto_resume = invocation.auto_resume;
     let ran_as = invocation.delegate.as_ref();
     turn.isolation = ran_as.and_then(Delegate::isolation);
     turn.ran_as = ran_as

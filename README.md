@@ -421,9 +421,9 @@ your own, ends the run.
 While a resume is pending, `status` and a `wait` on the failed turn say when it is due and which
 turn it starts (`agentmux resumes this automatically at … as turn 2, sending "continue" (attempt 1
 of 12)`), and the
-turn to wait for next can be waited for once that time has passed. The automatic turn's
-`invocation.json` records `auto_resume_attempt`, so the transcript's `continue` is visibly
-agentmux's, not the caller's. `cancel` stops a pending resume and leaves the turn failed. Why it
+turn to wait for next can be waited for once that time has passed. The transcript notes under the
+automatic turn's `continue` that agentmux sent it, and with which attempt, and its
+`invocation.json` records the same as `auto_resume`. `cancel` stops a pending resume and leaves the turn failed. Why it
 works this way is in [ADR 0027](docs/adr/0027-automatic-resume-after-overload.md).
 
 ### Environment
