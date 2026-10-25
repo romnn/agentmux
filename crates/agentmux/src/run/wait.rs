@@ -40,13 +40,13 @@ impl TurnRef {
         &self.run_id
     }
 
-    /// The turn's zero-based index.
+    /// The turn's zero-based position among the consultation's turns.
     #[must_use]
-    pub fn turn_index(&self) -> u32 {
+    pub(crate) fn turn_index(&self) -> u32 {
         self.turn_index
     }
 
-    /// The turn's one-based number, as the transcript's headings show it.
+    /// The turn's one-based number, as the transcript's headings and its directory show it.
     #[must_use]
     pub fn turn_number(&self) -> u32 {
         self.turn_index.saturating_add(1)

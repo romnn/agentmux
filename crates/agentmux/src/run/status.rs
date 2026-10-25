@@ -201,8 +201,10 @@ pub struct RunSummary {
     pub run_id: RunId,
     /// A one-line description of the delegate.
     pub delegate: String,
-    /// How the consultation stands.
+    /// How the consultation stands: the newest turn's outcome.
     pub outcome: Outcome,
+    /// How many turns the consultation has, which is also the newest turn's number.
+    pub turns: u32,
     /// When `start` was called.
     pub created_at: DateTime<Utc>,
     /// The first line of the question, truncated.

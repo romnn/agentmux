@@ -473,7 +473,7 @@ impl AgentMux {
         // As the settled turn ran, which `status` and `list` say of it while it is the newest.
         let delegate = self
             .store
-            .turn_delegate(&meta, settled.turn_index())
+            .turn_delegate(&meta, &settled)
             .map_err(|error| run_error(&error))?;
         let newest = self
             .store
@@ -713,6 +713,7 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         // caller can do next.
         | RunError::Steer(_)
         | RunError::TurnAlreadyClaimed { .. }
+        | RunError::LegacyRunStillRunning { .. }
         | RunError::StillRunning { .. }
         | RunError::NoSuchTurn { .. }
         | RunError::Delegate(_)

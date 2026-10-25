@@ -276,6 +276,16 @@ pub(crate) fn turn_number<S: serde::Serializer>(
     serializer.serialize_u32(index.saturating_add(1))
 }
 
+/// A one-based turn number as it is written, read back as the zero-based turn index.
+pub(crate) fn turn_index_of_number<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let number = u32::deserialize(deserializer)?;
+    number
+        .checked_sub(1)
+        .ok_or_else(|| serde::de::Error::custom("turns are numbered from 1"))
+}
+
 /// How a turn ended.
 ///
 /// `Failed` carries only the reason.

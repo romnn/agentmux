@@ -91,8 +91,8 @@ fn build(
 ) -> std::result::Result<Invocation, DelegateError> {
     let extra_env = BTreeMap::new();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume,
         extra_env: &extra_env,
         billing: None,
@@ -1194,7 +1194,7 @@ fn a_record_without_the_new_fields_follows_up_as_it_ran() -> Result<()> {
     std::fs::write(&meta_path, serde_json::to_string(&meta).or_fail()?).or_fail()?;
     let invocation_path = meta_path
         .with_file_name("turns")
-        .join("0000")
+        .join("0001")
         .join("invocation.json");
     let mut invocation: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&invocation_path).or_fail()?).or_fail()?;

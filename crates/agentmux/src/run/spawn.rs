@@ -18,8 +18,8 @@ use super::id::RunId;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SupervisorPhase,
-    SupervisorPlan, SupervisorRecord, read_json, write_json,
+    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SettledTurn,
+    SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
 use super::status::RunStatus;
@@ -411,8 +411,8 @@ impl RunStore {
         })
     }
 
-    /// Who a consultation's turn `turn_index` ran as: what `status` and `list` say of its newest
-    /// turn, said of any one.
+    /// Who a settled turn ran as: what `status` and `list` say of the newest turn, said of any
+    /// one.
     ///
     /// Read from that turn's own launch record and the consultation's, so a later turn neither
     /// changes nor fails the answer, which is what a wait pinned to an earlier turn reports.
@@ -421,8 +421,8 @@ impl RunStore {
     ///
     /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
     /// cannot be read.
-    pub fn turn_delegate(&self, meta: &Meta, turn_index: u32) -> Result<Delegate, RunError> {
-        self.current_delegate(meta, Some(turn_index))
+    pub fn turn_delegate(&self, meta: &Meta, settled: &SettledTurn) -> Result<Delegate, RunError> {
+        self.current_delegate(meta, Some(settled.turn_index()))
     }
 
     /// The session a follow-up would continue, or why there is none.
@@ -828,7 +828,7 @@ pub(super) fn claim_turn(turn: &TurnDir, index: u32, run_id: &RunId) -> Result<(
             if recorded {
                 return Err(RunError::TurnAlreadyClaimed {
                     run_id: run_id.clone(),
-                    index,
+                    turn: index.saturating_add(1),
                 });
             }
             // Set aside rather than deleted: the caller that died may have spawned its child

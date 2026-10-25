@@ -53,12 +53,12 @@ delegate left, even one whose stream ended before the delegate could be stopped.
 for both — the turn settled and its delegate gone, from the one observation the fold made — so a
 cancellation the delegate survived is settled but not continued.
 
-**`settled.json` version 1** is written last, whole, under the lock, and never rewritten:
+**`settled.json` version 2** is written last, whole, under the lock, and never rewritten:
 
 ```json
 {
-  "version": 1,
-  "turn_index": 0,
+  "version": 2,
+  "turn": 1,
   "outcome": { "state": "completed", "usage": {} },
   "settled_by": "terminal_event",
   "events_len": 5641,
@@ -68,7 +68,8 @@ cancellation the delegate survived is settled but not continued.
 }
 ```
 
-`outcome` is the serialized `Outcome`, never `running`; `settled_by` is `terminal_event` or
+`turn` is the turn's number, counted from 1 as its directory `turns/0001` and the transcript's
+headings count it; `outcome` is the serialized `Outcome`, never `running`; `settled_by` is `terminal_event` or
 `exit_record`; `events_len` and `recovered_bytes` are the capture prefix and recovered reply the
 turn was folded from, and from then on its frozen input
 ([0009](0009-append-only-transcript.md)); `transcript_start` and `transcript_end` bound the turn's

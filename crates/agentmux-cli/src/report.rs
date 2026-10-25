@@ -412,13 +412,20 @@ pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
         return Ok(());
     }
     for run in runs {
-        println!(
-            "{}  {:<9}  {}\n    {}\n    {}",
-            run.run_id,
-            run.outcome.state(),
-            run.created_at.to_rfc3339(),
-            run.delegate,
-            run.question
+        print!(
+            "{}",
+            indoc::formatdoc! {"
+                {run_id}  {state:<9}  {turns} turn(s)  {created_at}
+                    {delegate}
+                    {question}
+                ",
+                run_id = run.run_id,
+                state = run.outcome.state(),
+                turns = run.turns,
+                created_at = run.created_at.to_rfc3339(),
+                delegate = run.delegate,
+                question = run.question,
+            }
         );
     }
     Ok(())

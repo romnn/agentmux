@@ -321,7 +321,7 @@ fn a_turn_records_the_versions_that_wrote_it() -> Result<()> {
             .root()
             .join("runs")
             .join(started.run_id.as_str())
-            .join("turns/0000/invocation.json"),
+            .join("turns/0001/invocation.json"),
     )?;
     let record = serde_json::from_str::<serde_json::Value>(&record)?;
 
@@ -526,7 +526,7 @@ fn age_run(store: &RunStore, run_id: &RunId, days: u64, captures: bool) -> Resul
         for capture in ["events.jsonl", "stderr.log"] {
             std::fs::File::options()
                 .write(true)
-                .open(run.join("turns/0000").join(capture))
+                .open(run.join("turns/0001").join(capture))
                 .or_fail()?
                 .set_modified(long_ago)
                 .or_fail()?;
@@ -688,7 +688,7 @@ fn a_report_missing_from_the_stream_is_recovered_from_the_last_message_file() ->
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/last-message.md");
+        .join("turns/0001/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
 
     let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
@@ -768,7 +768,7 @@ fn the_rendered_transcript_only_grows_at_its_end() -> Result<()> {
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/events.jsonl");
+        .join("turns/0001/events.jsonl");
 
     // Grow the stream the way a live child would, one event at a time.
     for extra in [
@@ -816,7 +816,7 @@ fn a_capture_file_ending_mid_character_keeps_everything_before_it() -> Result<()
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/events.jsonl");
+        .join("turns/0001/events.jsonl");
     let mut bytes = std::fs::read(&events)?;
     bytes.extend_from_slice(br#"{"type":"item.completed","item":{"text":"celebra"#);
     bytes.extend_from_slice(&"🎉".as_bytes()[..2]);
@@ -935,8 +935,8 @@ fn every_turn_owns_its_own_capture_files() -> Result<()> {
         .join("runs")
         .join(started.run_id.as_str())
         .join("turns");
-    let questions: Vec<String> = (0..3)
-        .map(|index| std::fs::read_to_string(turns.join(format!("{index:04}/question.md"))))
+    let questions: Vec<String> = (1..=3)
+        .map(|number| std::fs::read_to_string(turns.join(format!("{number:04}/question.md"))))
         .collect::<std::result::Result<_, _>>()?;
     assert_that!(
         questions,
@@ -1050,7 +1050,7 @@ async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/events.jsonl");
+        .join("turns/0001/events.jsonl");
     let mut stream = std::fs::read_to_string(&events)?;
     stream.push_str(indoc::indoc! {r#"
         {"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"from beyond"}}
@@ -1207,7 +1207,7 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
             .root()
             .join("runs")
             .join(started.run_id.as_str())
-            .join("turns/0000/last-message.md"),
+            .join("turns/0001/last-message.md"),
         "too late",
     )?;
     let after_settlement = harness_gone.store.page(&started.run_id, 0, 1_000_000)?;
@@ -1226,7 +1226,7 @@ fn a_turn_that_said_nothing_is_not_resumable_until_it_has() -> Result<()> {
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/last-message.md");
+        .join("turns/0001/last-message.md");
     std::fs::write(&last, "the findings, in full")?;
     harness
         .launcher
@@ -1695,7 +1695,7 @@ fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0001");
+        .join("turns/0002");
     std::fs::create_dir_all(&abandoned)?;
     std::fs::write(abandoned.join("question.md"), "never launched")?;
 
@@ -1716,7 +1716,7 @@ fn an_abandoned_turn_claim_is_taken_over() -> Result<()> {
     let set_aside = std::fs::read_dir(abandoned.parent().or_fail()?)?
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find(|name| name.starts_with("0001.abandoned."))
+        .find(|name| name.starts_with("0002.abandoned."))
         .or_fail()?;
     assert_that!(
         std::fs::read_to_string(
@@ -1745,7 +1745,7 @@ async fn cancelling_a_consultation_with_no_recorded_turn_returns() -> Result<()>
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000");
+        .join("turns/0001");
     std::fs::remove_dir_all(&turn)?;
 
     let cancelled = tokio::time::timeout(
@@ -1876,7 +1876,7 @@ fn a_settled_failure_does_not_move_with_its_stderr() -> Result<()> {
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000/stderr.log");
+        .join("turns/0001/stderr.log");
     let mut text = std::fs::read_to_string(&stderr)?;
     text.push_str("and a second word, from beyond\n");
     std::fs::write(&stderr, text)?;
@@ -1916,7 +1916,7 @@ fn a_reply_landing_after_a_later_turn_is_not_recovered_into_the_earlier_one() ->
         .root()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0001");
+        .join("turns/0002");
     std::fs::write(earlier.join("last-message.md"), "late findings")?;
 
     let page = harness.store.page(&started.run_id, 0, 1_000_000)?;

@@ -107,8 +107,8 @@ fn build_with(
     config: &Config,
 ) -> Result<Invocation> {
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -362,8 +362,8 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
     let config = config_with_personal(dir.path())?;
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -405,8 +405,8 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
     );
     config.source = Some(dir.path().join("agentmux.toml"));
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -439,8 +439,8 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
     let missing = dir.path().join("never-created");
     let config = config_with_personal(&missing)?;
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -484,8 +484,8 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
     );
 
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -671,8 +671,8 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             .into_iter()
             .collect();
         let plan = TurnPlan {
-            question_path: Path::new("/runs/r/turns/0000/question.md"),
-            last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+            question_path: Path::new("/runs/r/turns/0001/question.md"),
+            last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
             resume: None,
             extra_env: &requested,
             billing: None,
@@ -707,8 +707,8 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
         .into_iter()
         .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -743,8 +743,8 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
         .into_iter()
         .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -839,8 +839,8 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         .into_iter()
         .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -931,8 +931,8 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
         },
     );
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
@@ -1174,8 +1174,8 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
         .into_iter()
         .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -1214,8 +1214,8 @@ fn build_invocation_with_request_env(
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -1394,8 +1394,8 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
     .into_iter()
     .collect();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing: None,
@@ -1528,8 +1528,8 @@ fn build_invocation_with_billing(
 ) -> std::result::Result<Invocation, DelegateError> {
     let requested = BTreeMap::new();
     let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0000/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0000/last-message.md"),
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
         resume: None,
         extra_env: &requested,
         billing,

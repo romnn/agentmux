@@ -12,7 +12,8 @@
 //! runs/<run_id>/
 //!   meta.json                  delegate, question, cwd, retention, created_at
 //!   transcript.md              the rendered transcript, a cache of the fold below
-//!   turns/0000/
+//!   turns/0001/                one directory per turn, numbered from 1 as the transcript's
+//!                              headings number turns
 //!     question.md              what was asked; also the child's stdin
 //!     invocation.json          what was run, written before the spawn
 //!     events.jsonl             the delegate's raw event stream, exactly as emitted
@@ -74,6 +75,7 @@ mod error;
 mod id;
 pub(crate) mod layout;
 mod lock;
+mod migrate_zero_based_turn_dirs;
 mod publish;
 mod quota;
 mod records;
@@ -152,7 +154,8 @@ impl RunStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Io`] when the directory cannot be created.
+    /// Returns [`RunError::Io`] when the directory cannot be created, or a run still in the
+    /// zero-based turn layout cannot be renumbered.
     pub fn open(
         root: impl Into<PathBuf>,
         launcher: Arc<dyn Launcher>,
@@ -163,7 +166,7 @@ impl RunStore {
         let root = std::path::absolute(root.into())
             .map_err(RunError::io("resolving the state directory"))?;
         create_private_dir(&root)?;
-        Ok(Self {
+        let store = Self {
             root,
             launcher,
             // Asking nothing by default, so embedding this library never spawns a process the
@@ -178,7 +181,9 @@ impl RunStore {
             codex_driver: None,
             // Unsupervised for the same reason.
             supervisor: None,
-        })
+        };
+        store.migrate_zero_based_turn_dirs()?;
+        Ok(store)
     }
 
     /// Launch every turn under a supervisor, `<supervisor> supervise <plan>`, which starts the
@@ -581,6 +586,9 @@ impl RunStore {
                     run_id: meta.run_id,
                     delegate,
                     outcome,
+                    turns: newest
+                        .as_ref()
+                        .map_or(0, |turn| turn.index.saturating_add(1)),
                     created_at: meta.created_at,
                     question,
                     billing,

@@ -146,7 +146,7 @@ impl Machine {
     fn marker(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id)
             .join("turns")
-            .join("0000")
+            .join("0001")
             .join("settled.json")
     }
 
@@ -323,7 +323,9 @@ fn a_turn_settles_with_nothing_asking() -> Result<()> {
         serde_json::from_slice(&std::fs::read(&marker).or_fail()?).or_fail()?;
     let transcript =
         std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
-    assert_that!(settled.get("version"), some(eq(&serde_json::json!(1))));
+    assert_that!(settled.get("version"), some(eq(&serde_json::json!(2))));
+    // Numbered as its directory, `turns/0001`, is.
+    assert_that!(settled.get("turn"), some(eq(&serde_json::json!(1))));
     assert_that!(
         settled.pointer("/outcome/state"),
         some(eq(&serde_json::json!("completed")))
@@ -503,7 +505,7 @@ fn a_delegate_that_cannot_start_is_a_failed_turn() -> Result<()> {
 
 /// The supervisor's pid, from the record its caller wrote.
 fn supervisor_pid(machine: &Machine, run_id: &str) -> Result<u32> {
-    let path = machine.run_dir(run_id).join("turns/0000/supervisor.json");
+    let path = machine.run_dir(run_id).join("turns/0001/supervisor.json");
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).or_fail()?).or_fail()?;
     record
@@ -538,7 +540,7 @@ fn a_dead_supervisor_leaves_its_turn_to_the_next_observer() -> Result<()> {
     })?;
     let run_id = machine.start()?;
     // Recorded by the supervisor once it has started the delegate.
-    let launch = machine.run_dir(&run_id).join("turns/0000/launch.json");
+    let launch = machine.run_dir(&run_id).join("turns/0001/launch.json");
     assert_that!(until_exists(&launch, Duration::from_secs(10)), eq(true));
 
     let supervisor = supervisor_pid(&machine, &run_id)?;
@@ -631,7 +633,7 @@ fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
             .map(|line| serde_json::from_str(line).or_fail())
             .collect::<Result<_>>()?;
     let mut profiles = Vec::new();
-    for (index, turn) in ["0000", "0001"].into_iter().enumerate() {
+    for (index, turn) in ["0001", "0002"].into_iter().enumerate() {
         let recorded: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
                 machine

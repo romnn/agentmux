@@ -1539,7 +1539,7 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
         .path()
         .join("runs")
         .join(started.run_id.as_str())
-        .join("turns/0000");
+        .join("turns/0001");
     std::fs::copy(plan.last_message_path(), turn.join("last-message.md")).or_fail()?;
 
     let (_, first) = store.view(&started.run_id, 0, 1_000_000).or_fail()?;

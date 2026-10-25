@@ -335,16 +335,16 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
     );
     // The supervisor settles the turn once the driver has cleaned up and gone, with nothing
     // asking: its marker appears on its own.
-    let turn_dir = |index: u32| {
+    let turn_dir = |number: u32| {
         harness
             .state_dir
             .join("runs")
             .join(id.as_str())
             .join("turns")
-            .join(format!("{index:04}"))
+            .join(format!("{number:04}"))
     };
     assert_that!(
-        until_exists(&turn_dir(0).join("settled.json")).await,
+        until_exists(&turn_dir(1).join("settled.json")).await,
         eq(true)
     );
     harness

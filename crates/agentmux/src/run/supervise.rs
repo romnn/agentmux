@@ -237,9 +237,11 @@ impl RunStore {
     /// cancellation is committed whether or not the delegate left: either way one finalization
     /// settles it.
     fn settle_supervised(&self, plan: &SupervisorPlan) -> Result<Supervised, RunError> {
-        Ok(match self.finalize_turn(&plan.run_id, plan.turn_index)? {
-            Some(_) => Supervised::Settled,
-            None => Supervised::Unsettled,
-        })
+        Ok(
+            match self.finalize_turn_index(&plan.run_id, plan.turn_index)? {
+                Some(_) => Supervised::Settled,
+                None => Supervised::Unsettled,
+            },
+        )
     }
 }
