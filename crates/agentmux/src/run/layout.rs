@@ -54,8 +54,8 @@ impl TurnDir {
     ///
     /// Cached because finding it means searching the vendor's session tree, and a fold runs on
     /// every `status` and every page of a `tail`.
-    pub(super) fn rate_limit(&self) -> PathBuf {
-        self.root.join("rate-limit.json")
+    pub(super) fn usage_window(&self) -> PathBuf {
+        self.root.join("usage-window.json")
     }
     pub(super) fn exit(&self) -> PathBuf {
         self.root.join("exit.json")

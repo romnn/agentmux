@@ -309,7 +309,7 @@ impl RunStore {
                 lookup.thread_id.as_str(),
             );
             let found = if found.is_some() || lookup.delegate_has_exited {
-                write_json_once(&lookup.turn_dir.rate_limit(), &found).unwrap_or_else(|err| {
+                write_json_once(&lookup.turn_dir.usage_window(), &found).unwrap_or_else(|err| {
                     tracing::debug!(?err, "not remembering a turn's usage window");
                     found
                 })
@@ -708,7 +708,7 @@ fn cached_rate_limit_or_lookup(
 ) -> Option<RateLimitLookup> {
     let thread_id =
         thread_id.filter(|_| turn.usage_window.is_none() && turn.outcome.is_terminal())?;
-    match read_json::<Option<UsageWindow>>(&files.dir.rate_limit()) {
+    match read_json::<Option<UsageWindow>>(&files.dir.usage_window()) {
         Ok(Some(remembered)) => {
             turn.usage_window = remembered;
             None
