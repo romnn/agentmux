@@ -592,7 +592,9 @@ fn earlier_failures_do_not_read_as_the_newest_turns_state() -> Result<()> {
         Arc::new(ScriptedLauncher::new([
             Script::completed(flagged),
             Script::completed(flagged),
-            Script::running("{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n"),
+            Script::running(indoc::indoc! {r#"
+                {"type":"thread.started","thread_id":"01a0"}
+            "#}),
         ])),
         env,
     )

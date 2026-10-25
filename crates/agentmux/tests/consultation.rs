@@ -1072,6 +1072,52 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     Ok(())
 }
 
+/// Only turns before the newest that failed are earlier failures.
+///
+/// The newest turn's own failure is the outcome, so listing it again would report it twice; a
+/// completed turn between two failures is not one; and a single turn has no earlier turns at all.
+#[gtest]
+fn earlier_failures_are_the_failed_turns_before_the_newest() -> Result<()> {
+    let flagged = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"findings"}}
+        {"type":"turn.failed","error":{"message":"ERROR: This content was flagged for possible cybersecurity risk"}}
+    "#};
+    let harness = harness([
+        Script::completed(flagged),
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(flagged),
+    ])?;
+
+    // One turn, failed: that is the outcome, and nothing came before it.
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    assert_that!(started.outcome, matches_pattern!(Outcome::Failed { .. }));
+    assert_that!(started.earlier_failures, is_empty());
+
+    // A completed turn after it: turn one is now an earlier failure.
+    let completed = harness.store.follow_up(&started.run_id, "again")?;
+    assert_that!(
+        completed.earlier_failures,
+        elements_are![predicate(
+            |failure: &agentmux::transcript::EarlierFailure| {
+                failure.turn_number() == 1 && failure.kind() == FailureKind::ContentFlagged
+            }
+        )]
+    );
+
+    // A failed newest turn is the outcome, not an earlier failure, and the completed turn between
+    // is skipped.
+    let failed = harness.store.follow_up(&started.run_id, "once more")?;
+    assert_that!(failed.outcome, matches_pattern!(Outcome::Failed { .. }));
+    let turns: Vec<u32> = failed
+        .earlier_failures
+        .iter()
+        .map(|failure| failure.turn_number())
+        .collect();
+    assert_that!(turns, elements_are![eq(&1)]);
+    Ok(())
+}
+
 /// A follow-up that is refused after claiming its turn gives the claim back.
 ///
 /// Otherwise the transcript gains a phantom turn that folds to a launch failure, the consultation

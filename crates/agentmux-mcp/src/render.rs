@@ -67,17 +67,16 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
             earlier_failures_line(&status.earlier_failures),
         );
     }
-    let _ = write!(
-        out,
-        "delegate:   {}\n\
-         reading:    {}\n\
-         progress:   {} elapsed · {} turn(s) · {} message(s)",
-        delegate_line(status),
-        status.cwd.display(),
-        duration(status.elapsed),
-        status.turns,
-        status.message_count,
-    );
+    out.push_str(&indoc::formatdoc! {"
+        delegate:   {delegate}
+        reading:    {reading}
+        progress:   {elapsed} elapsed · {turns} turn(s) · {messages} message(s)",
+        delegate = delegate_line(status),
+        reading = status.cwd.display(),
+        elapsed = duration(status.elapsed),
+        turns = status.turns,
+        messages = status.message_count,
+    });
     if let Some(input) = status.usage.input_tokens {
         let _ = write!(
             out,
