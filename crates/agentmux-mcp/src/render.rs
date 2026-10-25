@@ -32,7 +32,7 @@ use agentmux::run::{
     HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn, TranscriptPage,
     describe_delegate,
 };
-use agentmux::transcript::{FailureKind, RateLimit, describe_unsaved_session_store};
+use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
 use chrono::Utc;
 
 use crate::tools::MAX_WAIT_SECONDS;
@@ -149,9 +149,7 @@ pub fn warnings(status: &RunStatus) -> String {
                     status.message_count,
                     recovery_advice(
                         kind,
-                        // Only an exhausted window refused the turn; one with room left resets
-                        // on its own schedule, and timing a retry by it would wait for nothing.
-                        status.rate_limit.as_ref().filter(|limit| limit.exhausted),
+                        status.exhausted_window(),
                         &status.quota,
                         status.delegate.vendor(),
                         status.delegate.account().alias()
@@ -245,7 +243,7 @@ pub fn warnings(status: &RunStatus) -> String {
 /// block.
 fn recovery_advice(
     kind: FailureKind,
-    rate_limit: Option<&RateLimit>,
+    exhausted_window: Option<&UsageWindow>,
     quota: &[AccountQuota],
     vendor: agentmux::delegate::Vendor,
     consultation_account: Option<&agentmux::delegate::AccountAlias>,
@@ -256,8 +254,8 @@ fn recovery_advice(
         // A window that has already reopened, or reopens within the longest wait one call can
         // block for, beats every other remedy: switching accounts spends a different
         // subscription to solve a problem that is about to solve itself, or has already.
-        if let Some(limit) = rate_limit
-            && limit.reopens_in(Utc::now()).is_none_or(|remaining| {
+        if let Some(limit) = exhausted_window
+            && limit.resets_in(Utc::now()).is_none_or(|remaining| {
                 remaining <= std::time::Duration::from_secs(MAX_WAIT_SECONDS)
             })
         {
@@ -281,7 +279,7 @@ fn recovery_advice(
         if !alternatives.is_empty() {
             // Said only when a window was recovered: without one, "too far off" would be a
             // claim about a number nobody has.
-            let window = rate_limit.map_or(
+            let window = exhausted_window.map_or(
                 "and no reopening time was reported",
                 |_| "and the window is too far off to wait for",
             );
@@ -306,7 +304,7 @@ fn recovery_advice(
                  question against the other vendor."
             ));
         }
-        if let Some(limit) = rate_limit {
+        if let Some(limit) = exhausted_window {
             return Cow::Owned(rate_limit_advice(limit));
         }
     }
@@ -321,13 +319,13 @@ fn recovery_advice(
 /// the caller for longer than it would spend asking elsewhere.
 /// The advice is to wait and then retry, never to retry with a wait: a retry before the window
 /// reopens fails the same way at once, whatever it waits for afterwards.
-fn rate_limit_advice(limit: &RateLimit) -> String {
+fn rate_limit_advice(limit: &UsageWindow) -> String {
     let window = limit
         .window
         .as_deref()
         .map_or_else(String::new, |name| format!(" ({name})"));
 
-    let Some(remaining) = limit.reopens_in(Utc::now()) else {
+    let Some(remaining) = limit.resets_in(Utc::now()) else {
         return format!(
             "The usage window{window} has already reopened, so this failure is stale — `start` \
              the same question again."

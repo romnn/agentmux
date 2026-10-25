@@ -13,7 +13,7 @@ use agentmux::delegate::{
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
-use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use agentmux::transcript::{FailureKind, Outcome, UsageWindow};
 use chrono::Utc;
 use googletest::prelude::*;
 
@@ -126,7 +126,7 @@ fn a_rate_limit_with_another_account_available_names_that_account() -> Result<()
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
         exhausted: true,
@@ -157,7 +157,7 @@ fn a_rate_limit_with_no_alternative_still_advises_from_the_window() -> Result<()
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
         exhausted: true,
@@ -205,7 +205,7 @@ fn a_reopened_window_is_retried_rather_than_routed_elsewhere() -> Result<()> {
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() - chrono::Duration::minutes(5),
         window: Some("five_hour".to_owned()),
         exhausted: true,
@@ -232,7 +232,7 @@ fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::minutes(3),
         window: Some("five_hour".to_owned()),
         exhausted: true,
@@ -291,7 +291,7 @@ fn the_advice_never_names_an_account_of_the_other_vendor() -> Result<()> {
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
         exhausted: true,

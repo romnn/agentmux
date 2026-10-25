@@ -50,9 +50,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     if let Some(cost) = status.cost_usd {
         println!("  cost        ${cost:.4}");
     }
-    if let Some(limit) = &status.rate_limit {
+    if let Some(limit) = &status.usage_window {
         // Printed for a healthy run too: the point is to see the window closing before it closes.
-        println!("  window      {}", report::rate_limit_line(limit));
+        println!("  window      {}", report::usage_window_line(limit));
     }
     // Only a rate limit populates this, and the human reading it is the only party who can go
     // and log another account in.

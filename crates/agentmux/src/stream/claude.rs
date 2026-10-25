@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines};
-use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Role, Turn, Usage};
+use crate::transcript::{FailureKind, Message, Outcome, Role, Turn, Usage, UsageWindow};
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
 ///
@@ -365,12 +365,12 @@ enum RateLimitStatus {
 ///
 /// The window is kept whatever the status says, because a run that succeeded against a nearly
 /// closed window still tells the caller what to expect from the next question.
-/// Only a refusal earns a line in the transcript.
+/// Only a status other than `allowed` earns a line in the transcript.
 fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
     let info = event.rate_limit_info;
 
     if let Some(resets_at) = info.resets_at.and_then(DateTime::from_timestamp_secs) {
-        turn.rate_limit = Some(RateLimit {
+        turn.usage_window = Some(UsageWindow {
             resets_at,
             window: info.rate_limit_type.clone(),
             exhausted: matches!(info.status, Some(RateLimitStatus::Rejected)),
@@ -385,13 +385,15 @@ fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
     };
     if let Some(status) = status {
         let mut note = format!("delegate rate limit status: {status}");
-        if let Some(limit) = &turn.rate_limit {
+        if let Some(limit) = &turn.usage_window {
+            // Only a refused window is closed until then; a warning's window merely resets.
+            let when = if limit.exhausted { "reopens" } else { "resets" };
             match &limit.window {
                 Some(window) => {
-                    let _ = write!(note, "; the {window} window reopens at ");
+                    let _ = write!(note, "; the {window} window {when} at ");
                 }
                 None => {
-                    let _ = write!(note, "; the window reopens at ");
+                    let _ = write!(note, "; the window {when} at ");
                 }
             }
             let _ = write!(note, "{}", limit.resets_at.to_rfc3339());

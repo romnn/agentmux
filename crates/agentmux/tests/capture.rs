@@ -291,7 +291,7 @@ fn a_rate_limited_run_keeps_the_window_reopening_time() {
     let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_RATE_LIMITED);
 
     let limit = turn
-        .rate_limit
+        .usage_window
         .clone()
         .expect("the recorded stream carries one");
     assert_that!(limit.resets_at.timestamp(), eq(1_788_768_000));
@@ -866,4 +866,26 @@ fn a_capture_an_older_agentmux_wrote_folds_as_it_did() {
             ..
         })
     );
+}
+
+/// A warning that the window is nearly used is not a refusal: the window is open, and the
+/// transcript says when it resets rather than when it reopens.
+#[gtest]
+fn a_rate_limit_warning_leaves_the_window_open() {
+    let events = indoc::indoc! {r#"
+        {"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1788727800,"rateLimitType":"five_hour"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", events);
+
+    let window = turn.usage_window.clone();
+    assert_that!(
+        window,
+        some(field!(
+            agentmux::transcript::UsageWindow.exhausted,
+            eq(&false)
+        ))
+    );
+    let rendered = agentmux::transcript::render_turn(&turn);
+    assert_that!(rendered, contains_substring("five_hour window resets at"));
+    assert_that!(rendered, not(contains_substring("reopens")));
 }

@@ -494,12 +494,12 @@ impl RunStore {
             quota,
             // The newest window wins: an earlier turn's reading is stale the moment another
             // arrives, and a caller acting on it would wait against a window that already moved.
-            rate_limit: state
+            usage_window: state
                 .transcript
                 .turns
                 .iter()
                 .rev()
-                .find_map(|turn| turn.rate_limit.clone()),
+                .find_map(|turn| turn.usage_window.clone()),
             broke_continuity: state
                 .transcript
                 .turns

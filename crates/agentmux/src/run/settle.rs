@@ -61,7 +61,7 @@ use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
-use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Transcript, Turn};
+use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
 /// How many bytes of a departed child's stderr are kept with its exit record.
 const STDERR_TAIL: usize = 2000;
@@ -322,7 +322,7 @@ impl RunStore {
                 .iter_mut()
                 .find(|turn| turn.index == lookup.turn_index)
             {
-                turn.rate_limit = found;
+                turn.usage_window = found;
             }
         }
     }
@@ -336,7 +336,7 @@ impl RunStore {
         meta: &Meta,
         codex_home: Option<&Path>,
         thread_id: &str,
-    ) -> Option<RateLimit> {
+    ) -> Option<UsageWindow> {
         let codex_home = if let Some(recorded) = codex_home {
             recorded.to_path_buf()
         } else {
@@ -351,7 +351,7 @@ impl RunStore {
         let resets_at = selected
             .resets_at
             .and_then(chrono::DateTime::from_timestamp_secs)?;
-        Some(RateLimit {
+        Some(UsageWindow {
             resets_at,
             exhausted: selected.exhausted(),
             used_percent: Some(selected.used_percent),
@@ -707,10 +707,10 @@ fn cached_rate_limit_or_lookup(
     delegate_gone: bool,
 ) -> Option<RateLimitLookup> {
     let thread_id =
-        thread_id.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
-    match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
+        thread_id.filter(|_| turn.usage_window.is_none() && turn.outcome.is_terminal())?;
+    match read_json::<Option<UsageWindow>>(&files.dir.rate_limit()) {
         Ok(Some(remembered)) => {
-            turn.rate_limit = remembered;
+            turn.usage_window = remembered;
             None
         }
         Ok(None) | Err(_) => Some(RateLimitLookup {
