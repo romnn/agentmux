@@ -816,6 +816,27 @@ fn an_overloaded_turn_is_resumed_automatically() -> Result<()> {
         some(eq(&serde_json::json!("overloaded")))
     );
     assert_that!(status.get("auto_resume"), none());
+
+    // Damage to the later turn's records leaves a wait on the failed turn whole: it still
+    // returns that turn, and says only that what followed cannot be read.
+    std::fs::write(
+        machine.run_dir(&run_id).join("turns/0002/invocation.json"),
+        "{ not json",
+    )
+    .or_fail()?;
+    let again = machine
+        .spawn_wait(&run_id, &["--turn", "1", "--json"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(again.status.code(), some(eq(10)));
+    let again: serde_json::Value = serde_json::from_str(&again.stdout).or_fail()?;
+    assert_that!(
+        again.pointer("/settled/0/auto_resume/state"),
+        some(eq(&serde_json::json!("unknown")))
+    );
+    assert_that!(
+        again.pointer("/settled/0/auto_resume/turn"),
+        some(eq(&serde_json::json!(2)))
+    );
     Ok(())
 }
 

@@ -182,6 +182,10 @@ pub fn auto_resume_line(resume: &AutoResume) -> String {
             "agentmux resumed this automatically as turn {turn}, sending \
              \"{AUTO_RESUME_QUESTION}\" (attempt {attempt} of {attempts})"
         ),
+        AutoResume::Unknown { turn, reason } => format!(
+            "turn {turn} has begun since, but whether agentmux sent it as an automatic resume \
+             cannot be read: {reason}"
+        ),
         AutoResume::Cancelled { attempt, attempts } => format!(
             "the automatic resume (attempt {attempt} of {attempts}) was cancelled, so nothing more \
              runs unless you follow up"

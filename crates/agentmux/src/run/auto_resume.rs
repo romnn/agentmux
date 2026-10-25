@@ -147,6 +147,14 @@ pub enum AutoResume {
         /// How many agentmux makes in a row before it stops.
         attempts: u32,
     },
+    /// Turn `turn` has begun since, but its records could not be read to say whether agentmux
+    /// started it.
+    Unknown {
+        /// The turn that has begun.
+        turn: u32,
+        /// Why its records could not be read.
+        reason: String,
+    },
     /// A `cancel` stopped the resume before it started.
     Cancelled {
         /// Which automatic resume in a row it would have been.
@@ -190,11 +198,13 @@ impl RunStore {
     /// since: the next turn, a `cancel`, and whether the supervisor that was to resume is still
     /// there.
     /// A follow-up a caller started in the resume's place leaves nothing to say here.
+    /// A later turn whose records cannot be read is [`AutoResume::Unknown`] rather than an error,
+    /// so damage to a later turn never fails a report about this one.
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when a record there cannot be
-    /// read.
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when this turn's own records
+    /// cannot be read.
     pub fn auto_resume(&self, run_id: &RunId, turn: u32) -> Result<Option<AutoResume>, RunError> {
         let Some(turn_index) = turn.checked_sub(1) else {
             return Ok(None);
@@ -226,13 +236,19 @@ impl RunStore {
         let turn = next_index.saturating_add(1);
         let next = self.turn_dir(run_id, next_index);
         if next.holds_a_record() {
-            let automatic = read_json::<InvocationRecord>(&next.invocation())?
-                .is_some_and(|record| record.auto_resume.is_some());
-            return Ok(automatic.then_some(AutoResume::Resumed {
-                turn,
-                attempt,
-                attempts,
-            }));
+            return Ok(match read_json::<InvocationRecord>(&next.invocation()) {
+                Ok(record) => record
+                    .is_some_and(|record| record.auto_resume.is_some())
+                    .then_some(AutoResume::Resumed {
+                        turn,
+                        attempt,
+                        attempts,
+                    }),
+                Err(err) => Some(AutoResume::Unknown {
+                    turn,
+                    reason: err.to_string(),
+                }),
+            });
         }
         if dir.auto_resume_cancelled().exists() {
             return Ok(Some(AutoResume::Cancelled { attempt, attempts }));

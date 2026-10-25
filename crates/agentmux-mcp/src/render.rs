@@ -333,7 +333,9 @@ fn auto_resume_advice(resume: &AutoResume) -> String {
         AutoResume::Scheduled { turn, .. } => format!(
             "{line}. Nothing to do but wait: once that time has passed, wait for turn {turn}."
         ),
-        AutoResume::Resumed { turn, .. } => format!("{line}; wait for turn {turn}."),
+        AutoResume::Resumed { turn, .. } | AutoResume::Unknown { turn, .. } => {
+            format!("{line}; wait for turn {turn}.")
+        }
         AutoResume::Cancelled { .. }
         | AutoResume::Abandoned { .. }
         | AutoResume::Exhausted { .. } => {

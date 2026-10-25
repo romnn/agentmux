@@ -92,7 +92,9 @@ new bytes ([0009](0009-append-only-transcript.md)).
 **What callers are told.** `RunStore::auto_resume` reads the decision together with what happened
 since, and `RunStatus::auto_resume` reports it for the newest turn: `scheduled` (turn, attempt,
 attempts, due time), `resumed`, `cancelled`, `abandoned` (the supervisor went without resuming;
-its log is named) or `exhausted`. Both front ends print one line for it
+its log is named) or `exhausted`. A later turn whose records cannot be read is `unknown`, never an
+error, so damage to a later turn cannot fail a report about this one
+([0025](0025-eager-settlement-and-terminal-waiting.md)). Both front ends print one line for it
 (`report::auto_resume_line`). The MCP failure advice says what agentmux is doing in place of what
 the caller should do, and `next` offers `wait` for the turn the resume starts, once it has begun,
 and `cancel`, rather than a `follow_up` that would take the resume's place. `wait` on the failed

@@ -385,7 +385,10 @@ fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
             "  resume      {}",
             report::auto_resume_line(auto_resume)
         )?;
-        if let AutoResume::Scheduled { turn, .. } | AutoResume::Resumed { turn, .. } = auto_resume {
+        if let AutoResume::Scheduled { turn, .. }
+        | AutoResume::Resumed { turn, .. }
+        | AutoResume::Unknown { turn, .. } = auto_resume
+        {
             writeln!(
                 resume,
                 "  next        agentmux wait {} --turn {turn}, once it has begun",
