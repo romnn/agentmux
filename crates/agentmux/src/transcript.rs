@@ -214,6 +214,11 @@ pub enum FailureKind {
     RateLimited,
     /// The account is out of credit or over a spend cap.
     BudgetExceeded,
+    /// The vendor's model is at capacity or overloaded for everyone, for the moment.
+    ///
+    /// Transient and nothing to do with the account: the session is intact, and the same model
+    /// usually answers again within seconds.
+    Overloaded,
     /// The delegate hit its own maximum number of turns.
     TurnLimit,
     /// The child process could not be started, or died before saying anything.
@@ -232,6 +237,7 @@ impl FailureKind {
             Self::ContentFlagged => "content flagged",
             Self::RateLimited => "rate limited",
             Self::BudgetExceeded => "budget exceeded",
+            Self::Overloaded => "model overloaded",
             Self::TurnLimit => "turn limit",
             Self::LaunchFailed => "launch failed",
             Self::Unclassified => "error",

@@ -16,7 +16,7 @@ use chrono::Utc;
 
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
-use crate::run::{HookReopening, RunStatus, describe_delegate};
+use crate::run::{AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, describe_delegate};
 use crate::transcript::{EarlierFailure, FailureKind, Outcome, UsageWindow};
 
 /// Something a reader must be told about a consultation, because it changes how the transcript
@@ -151,6 +151,55 @@ pub fn earlier_failures_line(failures: &[EarlierFailure]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What agentmux does, or did, about a turn that failed because the model was overloaded, in one
+/// line both front ends print verbatim.
+#[must_use]
+pub fn auto_resume_line(resume: &AutoResume) -> String {
+    match resume {
+        AutoResume::Scheduled {
+            turn,
+            attempt,
+            attempts,
+            due_at,
+        } => {
+            let remaining = (*due_at - Utc::now()).to_std().map_or_else(
+                |_| "now".to_owned(),
+                |remaining| format!("in {}", duration(remaining)),
+            );
+            format!(
+                "agentmux resumes this automatically at {} ({remaining}) as turn {turn}, sending \
+                 \"{AUTO_RESUME_QUESTION}\" (attempt {attempt} of {attempts}); `cancel` stops it",
+                due_at.to_rfc3339()
+            )
+        }
+        AutoResume::Resumed {
+            turn,
+            attempt,
+            attempts,
+        } => format!(
+            "agentmux resumed this automatically as turn {turn}, sending \
+             \"{AUTO_RESUME_QUESTION}\" (attempt {attempt} of {attempts})"
+        ),
+        AutoResume::Cancelled { attempt, attempts } => format!(
+            "the automatic resume (attempt {attempt} of {attempts}) was cancelled, so nothing more \
+             runs unless you follow up"
+        ),
+        AutoResume::Abandoned {
+            due_at,
+            supervisor_log,
+        } => format!(
+            "the automatic resume due at {} did not happen: the agentmux supervisor that was to \
+             send it has gone; its log is {}",
+            due_at.to_rfc3339(),
+            supervisor_log.display()
+        ),
+        AutoResume::Exhausted { attempts } => format!(
+            "agentmux resumed this automatically {attempts} times in a row and the model was \
+             overloaded every time, so it has stopped resuming"
+        ),
+    }
 }
 
 /// Collapse whitespace and clip, so a value stays on one line.

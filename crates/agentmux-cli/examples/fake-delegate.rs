@@ -11,6 +11,7 @@
 //! Otherwise it reads its question from stdin, writes the configured stream and stderr, waits
 //! until the configured release file exists, its directory has gone or [`LONGEST_WAIT`] has
 //! passed, writes what it was told to write last, and exits with the configured status.
+//! A configuration can give later runs, such as a resumed turn, something else to do.
 //! It is portable, so the same scenario runs on every platform agentmux supports.
 
 use std::io::{Read as _, Write as _};
@@ -37,9 +38,30 @@ const FAKE_DELEGATE_ARGV: &str = "fake-delegate-argv.jsonl";
 /// It is longer than nextest lets any of these tests run.
 const LONGEST_WAIT: Duration = Duration::from_secs(300);
 
-/// What one run of the fake does.
+/// What the fake does: on its first run, and on each later one.
 #[derive(Debug, Deserialize)]
 struct Config {
+    /// The first run.
+    #[serde(flatten)]
+    first: Run,
+    /// The second run, the third and so on; a run past the end of these repeats the last.
+    #[serde(default)]
+    later: Vec<Run>,
+}
+
+impl Config {
+    /// What run `number`, counted from 1, does.
+    fn run(&self, number: usize) -> &Run {
+        number
+            .checked_sub(2)
+            .and_then(|index| self.later.get(index).or(self.later.last()))
+            .unwrap_or(&self.first)
+    }
+}
+
+/// What one run of the fake does.
+#[derive(Debug, Deserialize)]
+struct Run {
     /// Written to stdout as soon as the question has been read.
     #[serde(default)]
     stdout: String,
@@ -71,8 +93,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Append this run's arguments, less the program name, to `path`.
-fn record_argv(path: &std::path::Path) -> Result<(), String> {
+/// Append this run's arguments, less the program name, to `path`, and say which run this is,
+/// counted from 1.
+fn record_argv(path: &std::path::Path) -> Result<usize, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let line = serde_json::to_string(&argv).map_err(|err| format!("cannot encode argv: {err}"))?;
     let mut file = std::fs::OpenOptions::new()
@@ -80,7 +103,10 @@ fn record_argv(path: &std::path::Path) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
-    writeln!(file, "{line}").map_err(|err| format!("cannot write {}: {err}", path.display()))
+    writeln!(file, "{line}").map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    let recorded = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    Ok(recorded.lines().count())
 }
 
 fn run() -> Result<u8, String> {
@@ -91,7 +117,8 @@ fn run() -> Result<u8, String> {
         .map_err(|err| format!("cannot read {}: {err}", config_path.display()))?;
     let config: Config = serde_json::from_str(&text)
         .map_err(|err| format!("cannot parse {}: {err}", config_path.display()))?;
-    record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
+    let number = record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
+    let config = config.run(number);
 
     let mut question = String::new();
     std::io::stdin()

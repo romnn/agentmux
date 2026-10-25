@@ -13,7 +13,7 @@ use agentmux::delegate::{
     AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
     ModelId,
 };
-use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
+use agentmux::run::{AutoResume, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, UsageWindow};
 use chrono::Utc;
@@ -127,6 +127,72 @@ fn an_unavailable_model_is_told_to_fix_the_model_not_to_wait() -> Result<()> {
     // And it must not be advertised as resumable, or the caller pays for a turn that cannot work.
     assert_that!(status.resumable, eq(false));
     assert_that!(rendered, not(contains_substring("follow_up")));
+    Ok(())
+}
+
+/// A Codex turn that said something and then failed because the model was at capacity.
+const OVERLOADED: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"01a0"}
+    {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"halfway through"}}
+    {"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}
+"#};
+
+/// An overloaded model with nothing resuming it is a pause the caller ends: nothing to fix, and a
+/// `follow_up` that continues the session.
+#[gtest]
+fn an_overloaded_model_is_told_to_continue_the_session() -> Result<()> {
+    let (_store, status, _dir) = consult(OVERLOADED)?;
+    let rendered = agentmux_mcp::render::status(&status);
+
+    assert_that!(rendered, contains_substring("failed (model overloaded)"));
+    assert_that!(
+        rendered,
+        contains_substring("a `follow_up` asking it to continue")
+    );
+    assert_that!(rendered, contains_substring("follow_up {"));
+    Ok(())
+}
+
+/// While agentmux is about to resume the consultation itself, the caller is told when and which
+/// turn to wait for, and how to stop it, and is not offered a follow-up that would take the
+/// resume's place.
+#[gtest]
+fn a_pending_automatic_resume_replaces_the_advice_to_follow_up() -> Result<()> {
+    let (_store, mut status, _dir) = consult(OVERLOADED)?;
+    status.auto_resume = Some(AutoResume::Scheduled {
+        turn: 2,
+        attempt: 3,
+        attempts: 12,
+        due_at: Utc::now() + chrono::TimeDelta::minutes(2),
+    });
+    let rendered = agentmux_mcp::render::status(&status);
+
+    assert_that!(
+        rendered,
+        contains_substring("agentmux resumes this automatically at")
+    );
+    assert_that!(rendered, contains_substring("as turn 2"));
+    assert_that!(rendered, contains_substring("(attempt 3 of 12)"));
+    let wait = format!("wait {{\"run_id\": \"{}\", \"turn\": 2}}", status.run_id);
+    assert_that!(rendered, contains_substring(wait.as_str()));
+    assert_that!(rendered, contains_substring("cancel {"));
+    assert_that!(rendered, not(contains_substring("follow_up {")));
+    Ok(())
+}
+
+/// Once agentmux has stopped resuming, the caller is told so, and the advice for the failure
+/// itself applies again.
+#[gtest]
+fn an_exhausted_automatic_resume_hands_the_consultation_back() -> Result<()> {
+    let (_store, mut status, _dir) = consult(OVERLOADED)?;
+    status.auto_resume = Some(AutoResume::Exhausted { attempts: 12 });
+    let rendered = agentmux_mcp::render::status(&status);
+
+    assert_that!(
+        rendered,
+        contains_substring("12 times in a row and the model was overloaded every time")
+    );
+    assert_that!(rendered, contains_substring("follow_up {"));
     Ok(())
 }
 

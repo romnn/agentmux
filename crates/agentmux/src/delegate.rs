@@ -1538,9 +1538,9 @@ string_newtype_conversions!(SessionRef);
 
 /// A fully prepared child process: what to run, with which arguments, in which environment.
 ///
-/// Produced only by [`Delegate::invocation`], and its fields are private, so the flags that make
-/// capture correct, the recursion marker and the environment allowlist cannot be left out at a
-/// call site.
+/// Produced by [`Delegate::invocation`], or by [`Delegate::continuation`] in the environment an
+/// earlier one built, and its fields are private, so the flags that make capture correct, the
+/// recursion marker and the environment allowlist cannot be left out at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     program: String,
@@ -1883,6 +1883,48 @@ impl Delegate {
         })
     }
 
+    /// Build the child process for a turn that continues one this delegate already ran, in
+    /// `env`, the environment that turn ran in, unchanged.
+    ///
+    /// For agentmux's own automatic resume, whose supervisor holds the previous turn's resolved
+    /// environment but neither the host environment nor the machine's configuration it was
+    /// resolved from.
+    /// Nothing is resolved again: the identity, the request's environment, the billing scrub and
+    /// the recursion marker are already in `env`, and `billing` is the pricing it was resolved
+    /// for.
+    /// The arguments are this delegate's own, held to the limits the turn it continues was
+    /// admitted under, with its pinned isolation, or isolated for a record from before isolation
+    /// was pinned.
+    #[must_use]
+    pub fn continuation(
+        &self,
+        plan: &TurnPlan<'_>,
+        env: BTreeMap<String, String>,
+        billing: Billing,
+    ) -> Invocation {
+        let isolation = self.isolation().unwrap_or(Isolation::Isolated);
+        let args = match self {
+            Self::Claude {
+                model,
+                effort,
+                permissions,
+                ..
+            } => claude_args(model, effort.as_ref(), permissions, plan, isolation),
+            Self::Codex {
+                model,
+                effort,
+                permissions,
+                ..
+            } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
+        };
+        Invocation {
+            program: self.vendor().program().to_owned(),
+            args,
+            env,
+            billing,
+        }
+    }
+
     /// How this delegate's turns run over `codex app-server`, or `None` when they cannot.
     ///
     /// Only a Codex delegate that inherits its account's settings qualifies.
@@ -1899,6 +1941,16 @@ impl Delegate {
     /// the machine file's limits, as [`Delegate::invocation`] holds it.
     #[must_use]
     pub fn app_server_settings(&self, config: &Config) -> Option<AppServerSettings> {
+        self.app_server_settings_under(self.resolved_isolation(config))
+    }
+
+    /// How this delegate's turns run over `codex app-server` under `isolation`, or `None` when
+    /// they cannot.
+    ///
+    /// [`Delegate::app_server_settings`] with the isolation already resolved, for a turn that
+    /// continues one whose isolation was pinned when it was admitted.
+    #[must_use]
+    pub fn app_server_settings_under(&self, isolation: Isolation) -> Option<AppServerSettings> {
         let Self::Codex {
             model,
             effort,
@@ -1908,7 +1960,7 @@ impl Delegate {
         else {
             return None;
         };
-        if !self.resolved_isolation(config).inherits() {
+        if !isolation.inherits() {
             return None;
         }
         Some(AppServerSettings {

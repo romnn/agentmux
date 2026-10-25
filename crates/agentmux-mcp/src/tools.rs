@@ -480,8 +480,18 @@ impl AgentMux {
             .pin_turn(&id, None)
             .ok()
             .map(|newest| newest.turn_number());
+        // Decided before the settlement was committed, so it is there for a turn that has one.
+        let auto_resume = self
+            .store
+            .auto_resume(&id, settled.turn_index())
+            .map_err(|error| run_error(&error))?;
         Ok(text(render::settled(
-            &settled, &meta, &delegate, newest, &page,
+            &settled,
+            &meta,
+            &delegate,
+            newest,
+            auto_resume.as_ref(),
+            &page,
         )))
     }
 
@@ -557,8 +567,10 @@ impl AgentMux {
                        is kept and still readable with `result`. Returns once the delegate has \
                        actually stopped: a few seconds, or up to about twenty for a turn driven \
                        over Codex's app-server, which is first interrupted over its protocol. \
-                       Calling it on a consultation that has already finished changes nothing and \
-                       simply reports its state."
+                       On a consultation whose last turn failed because the model was overloaded, \
+                       it stops the automatic resume agentmux has scheduled, and the turn stays \
+                       failed. Calling it on a consultation that has otherwise finished changes \
+                       nothing and simply reports its state."
     )]
     async fn cancel(
         &self,
@@ -991,6 +1003,11 @@ instruction to a turn that is still running, which the delegate sees before its 
 only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`
 consultation that inherits its account's settings, because only those are launched over Codex's
 app-server.
+
+A turn that fails because the vendor's model is overloaded is resumed by agentmux itself: after a
+short wait it sends "continue" in the same session as the next turn, waiting longer each time the
+model is still overloaded, and gives up after a dozen tries. The failed turn says when, and which
+turn to wait for next; `cancel` stops it.
 
 The transcript is the deliverable and the last message is not the answer. No tool returns "the
 answer", deliberately: a delegate's report is routinely followed by wrap-up, a warning, or a turn

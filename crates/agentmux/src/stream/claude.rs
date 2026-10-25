@@ -648,6 +648,7 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
         (_, Some(404)) => FailureKind::ModelUnavailable,
         (_, Some(429)) => FailureKind::RateLimited,
         (_, Some(402)) => FailureKind::BudgetExceeded,
+        (_, Some(529)) => FailureKind::Overloaded,
         (Some(TerminalReason::MaxTurns | TerminalReason::TurnLimit), _) => FailureKind::TurnLimit,
         (Some(TerminalReason::Refusal), _) => FailureKind::ContentFlagged,
         (None, _) => classify(&detail),

@@ -104,6 +104,11 @@ pub(crate) fn classify(detail: &str) -> crate::transcript::FailureKind {
         && (has("not found") || has("not supported") || has("does not exist") || has("unsupported"))
     {
         FailureKind::ModelUnavailable
+    } else if word("overloaded") || (has("at capacity") && word("model")) {
+        // Claude's `overloaded_error` and an OpenAI `server_is_overloaded` hold it as a whole
+        // word, and Codex says the selected model is at capacity; capacity alone is a disk's as
+        // often as a model's.
+        FailureKind::Overloaded
     } else if has("max turns") || has("max_turns") || has("turn limit") {
         FailureKind::TurnLimit
     } else {
@@ -120,4 +125,49 @@ fn has_word(text: &str, needle: &str) -> bool {
             .and_then(|s| s.chars().next());
         !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::classify;
+    use crate::transcript::FailureKind;
+
+    /// A vendor that is out of capacity for the moment is told apart from every other failure,
+    /// in each vendor's own words, and stderr that mentions capacity, or an overload inside a
+    /// longer word, is not.
+    #[gtest]
+    fn an_overloaded_model_is_classified_narrowly() {
+        let cases = [
+            // Codex, verbatim, after a long turn
+            (
+                "Selected model is at capacity. Please try a different model.",
+                FailureKind::Overloaded,
+            ),
+            // Claude's API error, as its CLI quotes it
+            (
+                r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                FailureKind::Overloaded,
+            ),
+            // OpenAI's error code
+            (
+                "stream error: server_is_overloaded",
+                FailureKind::Overloaded,
+            ),
+            // A full disk is at capacity too, but no model is
+            (
+                "the codex CLI exited with status 1: write failed, volume at capacity",
+                FailureKind::Unclassified,
+            ),
+            // An overload inside a longer identifier is not one
+            (
+                "the codex CLI exited with status 1: OverloadedMethodError in plugin",
+                FailureKind::Unclassified,
+            ),
+        ];
+        for (detail, expected) in cases {
+            expect_that!(classify(detail), eq(expected), "{detail}");
+        }
+    }
 }

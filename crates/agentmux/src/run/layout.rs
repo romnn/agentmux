@@ -85,6 +85,15 @@ impl TurnDir {
     pub(super) fn supervisor_log(&self) -> PathBuf {
         self.root.join("supervisor.log")
     }
+    /// Whether agentmux resumes the consultation automatically after this turn, decided as the
+    /// turn's settlement is committed, and written before it.
+    pub(super) fn auto_resume(&self) -> PathBuf {
+        self.root.join("auto-resume.json")
+    }
+    /// Present once a `cancel` stopped the automatic resume of this turn.
+    pub(super) fn auto_resume_cancelled(&self) -> PathBuf {
+        self.root.join("auto-resume-cancelled")
+    }
     /// The commitment that the turn's transcript is published and final, written last.
     pub(super) fn settled(&self) -> PathBuf {
         self.root.join("settled.json")

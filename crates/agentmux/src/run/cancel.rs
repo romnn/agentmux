@@ -4,6 +4,7 @@ use std::fs::File;
 use std::time::Duration;
 
 use crate::launch::{Launched, Liveness};
+use crate::transcript::{FailureKind, Outcome};
 
 use super::RunStore;
 use super::error::RunError;
@@ -49,6 +50,10 @@ impl RunStore {
     /// A child that survives both signals is still stopped by the next `cancel`, which stops
     /// whatever is still running whether or not the turn is already recorded.
     ///
+    /// A consultation whose newest turn failed because the model was overloaded is not running,
+    /// but agentmux may be about to resume it; cancelling it stops that resume, which then never
+    /// starts, and the turn stays failed.
+    ///
     /// # Errors
     ///
     /// Returns [`RunError::NotFound`] when there is no such consultation,
@@ -74,11 +79,31 @@ impl RunStore {
                     });
                 }
                 Some(newest) => {
-                    let cancelling = !run.fold_turn(&meta, &newest)?.turn.outcome.is_terminal();
+                    let outcome = run.fold_turn(&meta, &newest)?.turn.outcome;
+                    let cancelling = !outcome.is_terminal();
                     if cancelling {
                         File::create(newest.dir.cancelling()).map_err(|source| RunError::Io {
                             context: format!("marking turn {} as cancelling", newest.index),
                             source,
+                        })?;
+                    } else if matches!(
+                        outcome,
+                        Outcome::Failed {
+                            kind: FailureKind::Overloaded,
+                            ..
+                        }
+                    ) {
+                        // Its supervisor may be waiting to resume it, and claims the resume under
+                        // this lock only while this marker is absent; marked whether or not the
+                        // resume is decided yet, so one decided after this still never starts.
+                        File::create(newest.dir.auto_resume_cancelled()).map_err(|source| {
+                            RunError::Io {
+                                context: format!(
+                                    "stopping the automatic resume after turn {}",
+                                    newest.index
+                                ),
+                                source,
+                            }
                         })?;
                     }
                     Some((newest, cancelling))

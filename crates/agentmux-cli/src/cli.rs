@@ -51,6 +51,13 @@ pub struct Cli {
     )]
     pub codex_launch: CodexLaunchArg,
 
+    /// How long a turn's supervisor waits before it first resumes a consultation whose model
+    /// was overloaded; later resumes in a row double it, up to fifteen minutes.
+    ///
+    /// Hidden, because thirty seconds is the delay to use; the tests shorten it.
+    #[arg(long, global = true, hide = true, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub auto_resume_delay: Option<std::time::Duration>,
+
     #[command(subcommand)]
     pub command: Command,
 }
