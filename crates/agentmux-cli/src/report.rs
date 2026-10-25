@@ -34,9 +34,6 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     println!("{}  {}", status.run_id, report::delegate_line(status));
     println!("  state       {}", report::outcome_line(&status.outcome));
-    if let Some(resume) = &status.auto_resume {
-        println!("  resume      {}", report::auto_resume_line(resume));
-    }
     // Above the facts, as every front end puts them: each changes how what follows is read.
     for warning in status.warnings() {
         for line in warning_lines(&warning) {
@@ -93,6 +90,12 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
                 format!("  stderr      {last_stderr_line}")
             })
             .collect(),
+        Warning::AutoResume(resume) => {
+            vec![format!(
+                "  resume      {}",
+                report::auto_resume_line(resume)
+            )]
+        }
         Warning::EarlierFailures(failures) => vec![format!(
             "  EARLIER     {} — see the transcript",
             report::earlier_failures_line(failures)
@@ -221,6 +224,7 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
             let report = TailJson {
                 run_id: &status.run_id,
                 outcome: &status.outcome,
+                auto_resume: status.auto_resume.as_ref(),
                 text: &page.text,
                 next_cursor: page.next_offset,
                 at_end: page.at_end,
@@ -228,6 +232,15 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
             println!("{}", serde_json::to_string(&report)?);
         } else {
             print!("{}", page.text);
+            // Once the end of a finished consultation is reached, what `result` says beside it,
+            // on stderr so stdout stays the transcript.
+            if status.is_terminal() && page.at_end {
+                for warning in status.warnings() {
+                    for line in warning_lines(&warning) {
+                        eprintln!("{line}");
+                    }
+                }
+            }
         }
 
         if !args.follow {
@@ -745,6 +758,9 @@ struct TranscriptJson<'a> {
 struct TailJson<'a> {
     run_id: &'a RunId,
     outcome: &'a Outcome,
+    /// What agentmux does about the newest turn having failed because the model was overloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_resume: Option<&'a AutoResume>,
     text: &'a str,
     next_cursor: u64,
     at_end: bool,

@@ -855,6 +855,24 @@ fn cancel_stops_a_pending_automatic_resume() -> Result<()> {
         contains_substring("resumes this automatically")
     );
 
+    // Every other reading of the consultation says so too: the status, `result` and `tail`
+    // beside the transcript, and `tail --json`.
+    for args in [["status", &run_id], ["result", &run_id], ["tail", &run_id]] {
+        let read = run_in_background(machine.agentmux(&args))?.finish(COMMAND_LIMIT)?;
+        assert_that!(
+            format!("{}{}", read.stdout, read.stderr),
+            contains_substring("resumes this automatically"),
+            "{args:?}"
+        );
+    }
+    let tailed =
+        run_in_background(machine.agentmux(&["tail", &run_id, "--json"]))?.finish(COMMAND_LIMIT)?;
+    let tailed: serde_json::Value = serde_json::from_str(&tailed.stdout).or_fail()?;
+    assert_that!(
+        tailed.pointer("/auto_resume/state"),
+        some(eq(&serde_json::json!("scheduled")))
+    );
+
     let cancelled = run_in_background(machine.agentmux(&["cancel", &run_id, "--json"]))?
         .finish(COMMAND_LIMIT)?;
     assert_that!(cancelled.status.success(), eq(true));

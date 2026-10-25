@@ -163,6 +163,8 @@ pub fn warnings(status: &RunStatus) -> String {
                     let _ = writeln!(out, "\x20           {line}");
                 }
             }
+            // Said as the failure's advice above, in the place of what the caller should do.
+            Warning::AutoResume(_) => {}
             // Said on the header's own `earlier:` line, beside the state it must not be read as.
             Warning::EarlierFailures(_) => {}
             Warning::SessionNotSaved { store: session_store_path } => {
@@ -430,6 +432,25 @@ fn follow_up_step(status: &RunStatus, lead: &str) -> String {
     "#}
 }
 
+/// The calls that follow an automatic resume agentmux is about to send, under whichever lead-in
+/// the caller needs, or `None` when none is pending.
+///
+/// A follow-up would take the resume's place, so these are offered instead of one: the turn the
+/// resume starts, and the way to stop it.
+fn pending_resume_steps(status: &RunStatus, lead: &str) -> Option<String> {
+    let Some(AutoResume::Scheduled { turn, due_at, .. }) = &status.auto_resume else {
+        return None;
+    };
+    let id = &status.run_id;
+    Some(indoc::formatdoc! {r#"
+        {lead}wait {{"run_id": "{id}", "turn": {turn}}} — after {due}, once agentmux
+                    has resumed it
+                    cancel {{"run_id": "{id}"}} — stop the automatic resume
+    "#,
+        due = due_at.to_rfc3339(),
+    })
+}
+
 /// What to call next, with the arguments filled in.
 #[must_use]
 pub fn next_steps(status: &RunStatus) -> String {
@@ -439,16 +460,8 @@ pub fn next_steps(status: &RunStatus) -> String {
 
             next:       result {{"run_id": "{id}"}}
         "#};
-        // A follow-up would take the place of the resume agentmux is about to send, so the turn
-        // that resume starts is offered instead, and the way to stop it.
-        if let Some(AutoResume::Scheduled { turn, due_at, .. }) = &status.auto_resume {
-            next_steps_text.push_str(&indoc::formatdoc! {r#"
-                            wait {{"run_id": "{id}", "turn": {turn}}} — after {due}, once agentmux
-                            has resumed it
-                            cancel {{"run_id": "{id}"}} — stop the automatic resume
-            "#,
-                due = due_at.to_rfc3339(),
-            });
+        if let Some(steps) = pending_resume_steps(status, "            ") {
+            next_steps_text.push_str(&steps);
         } else if status.resumable {
             next_steps_text.push_str(&follow_up_step(status, "            "));
         }
@@ -518,7 +531,9 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
     // A finished consultation's one remaining move is the follow-up, and a running one still needs
     // the whole watch loop, so neither is left for a caller holding the answer to reconstruct.
     if status.is_terminal() {
-        if status.resumable {
+        if let Some(steps) = pending_resume_steps(status, "\nnext:       ") {
+            out.push_str(&steps);
+        } else if status.resumable {
             out.push_str(&follow_up_step(status, "\nnext:       "));
         }
     } else {

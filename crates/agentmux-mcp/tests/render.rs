@@ -158,7 +158,7 @@ fn an_overloaded_model_is_told_to_continue_the_session() -> Result<()> {
 /// resume's place.
 #[gtest]
 fn a_pending_automatic_resume_replaces_the_advice_to_follow_up() -> Result<()> {
-    let (_store, mut status, _dir) = consult(OVERLOADED)?;
+    let (store, mut status, _dir) = consult(OVERLOADED)?;
     status.auto_resume = Some(AutoResume::Scheduled {
         turn: 2,
         attempt: 3,
@@ -177,6 +177,19 @@ fn a_pending_automatic_resume_replaces_the_advice_to_follow_up() -> Result<()> {
     assert_that!(rendered, contains_substring(wait.as_str()));
     assert_that!(rendered, contains_substring("cancel {"));
     assert_that!(rendered, not(contains_substring("follow_up {")));
+
+    // Every result that carries the warnings carries the resume: `result` and `tail` too.
+    let page = store.page(&status.run_id, 0, 100_000).or_fail()?;
+    for rendered in [
+        agentmux_mcp::render::transcript(&status, &page),
+        agentmux_mcp::render::tail(&status, &page),
+    ] {
+        assert_that!(
+            rendered,
+            contains_substring("agentmux resumes this automatically at")
+        );
+        assert_that!(rendered, not(contains_substring("follow_up {")));
+    }
     Ok(())
 }
 

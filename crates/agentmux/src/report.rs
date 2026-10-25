@@ -32,6 +32,9 @@ pub enum Warning<'a> {
         /// What its CLI wrote to stderr, when the failure detail does not already quote it.
         stderr: Option<&'a str>,
     },
+    /// What agentmux does, or did, about the newest turn having failed because the model was
+    /// overloaded: resume it automatically, or why it no longer will.
+    AutoResume(&'a AutoResume),
     /// Turns before the newest failed, whatever the newest is doing.
     EarlierFailures(&'a [EarlierFailure]),
     /// The delegate could not save its session, so no follow-up can resume it.
@@ -75,6 +78,9 @@ impl RunStatus {
                 detail,
                 stderr: self.delegate_stderr.as_deref(),
             });
+        }
+        if let Some(resume) = &self.auto_resume {
+            warnings.push(Warning::AutoResume(resume));
         }
         if !self.earlier_failures.is_empty() {
             warnings.push(Warning::EarlierFailures(&self.earlier_failures));
