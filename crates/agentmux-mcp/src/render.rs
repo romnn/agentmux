@@ -163,10 +163,10 @@ pub fn warnings(status: &RunStatus) -> String {
                     let _ = writeln!(out, "\x20           {line}");
                 }
             }
-            // Said as the failure's advice above, in the place of what the caller should do.
-            Warning::AutoResume(_) => {}
-            // Said on the header's own `earlier:` line, beside the state it must not be read as.
-            Warning::EarlierFailures(_) => {}
+            // Both said elsewhere: an automatic resume as the failure's advice above, in the place
+            // of what the caller should do, and earlier failures on the header's own `earlier:`
+            // line, beside the state they must not be read as.
+            Warning::AutoResume(_) | Warning::EarlierFailures(_) => {}
             Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
                     warning:    this consultation cannot be followed up: {fact}.

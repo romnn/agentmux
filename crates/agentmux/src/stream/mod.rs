@@ -118,8 +118,8 @@ pub(crate) fn classify(detail: &str) -> crate::transcript::FailureKind {
 ///
 /// An overload is the one failure agentmux acts on by itself, resuming the consultation at a
 /// cost, so it is read only from the vendor's own report, and only in the vendor's own phrasing:
-/// Codex's "Selected model is at capacity", Claude's `overloaded_error`, an OpenAI
-/// `server_is_overloaded`, a model said to be overloaded.
+/// Codex's "Selected model is at capacity", Claude's `overloaded_error`, the
+/// `server_is_overloaded` error code, or a model said to be overloaded.
 /// Stderr, which [`classify`] also reads, is full of other things that are overloaded.
 /// Every other failure is classified as [`classify`] does, and wins over an overload it mentions.
 pub(crate) fn classify_reported(detail: &str) -> crate::transcript::FailureKind {
