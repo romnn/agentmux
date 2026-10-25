@@ -25,7 +25,8 @@ use agentmux::config::ModelRules;
 use agentmux::delegate::Delegate;
 use agentmux::quota::{AccountQuota, Observation};
 use agentmux::report::{
-    Warning, delegate_line, duration, outcome_line, quota_block, quota_report, summarise,
+    Warning, delegate_line, duration, earlier_failures_line, outcome_line, quota_block,
+    quota_report, summarise,
 };
 use agentmux::run::{
     HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn, TranscriptPage,
@@ -54,32 +55,28 @@ pub enum Caller {
 #[must_use]
 pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>) -> String {
     let mut out = String::new();
-    let mut state = outcome_line(&status.outcome);
-    if let Some((turn, kind)) = status.earlier_failure {
-        // The state line reports the newest turn, so without this a follow-up onto a failed turn
-        // would present the consultation as completed and leave the failure buried in the body.
-        let _ = write!(
-            state,
-            " (turn {} failed: {} — see the transcript)",
-            turn.saturating_add(1),
-            kind.label(),
+    let _ = writeln!(out, "run_id:     {}", status.run_id);
+    let _ = writeln!(out, "state:      {}", outcome_line(&status.outcome));
+    if !status.earlier_failures.is_empty() {
+        // On a line of its own, beside the state rather than inside it: the state reports the
+        // newest turn, and without this a follow-up onto a failed turn would present the
+        // consultation as completed and leave the failure buried in the body.
+        let _ = writeln!(
+            out,
+            "earlier:    {} — see the transcript",
+            earlier_failures_line(&status.earlier_failures),
         );
     }
-    let _ = write!(
-        out,
-        "run_id:     {}\n\
-         state:      {}\n\
-         delegate:   {}\n\
-         reading:    {}\n\
-         progress:   {} elapsed · {} turn(s) · {} message(s)",
-        status.run_id,
-        state,
-        delegate_line(status),
-        status.cwd.display(),
-        duration(status.elapsed),
-        status.turns,
-        status.message_count,
-    );
+    out.push_str(&indoc::formatdoc! {"
+        delegate:   {delegate}
+        reading:    {reading}
+        progress:   {elapsed} elapsed · {turns} turn(s) · {messages} message(s)",
+        delegate = delegate_line(status),
+        reading = status.cwd.display(),
+        elapsed = duration(status.elapsed),
+        turns = status.turns,
+        messages = status.message_count,
+    });
     if let Some(input) = status.usage.input_tokens {
         let _ = write!(
             out,
@@ -172,9 +169,8 @@ pub fn warnings(status: &RunStatus) -> String {
                     let _ = writeln!(out, "\x20           {line}");
                 }
             }
-            // Said in the header's state line, which reports the newest turn and would otherwise
-            // present the consultation as completed.
-            Warning::EarlierFailure { .. } => {}
+            // Said on the header's own `earlier:` line, beside the state it must not be read as.
+            Warning::EarlierFailures(_) => {}
             Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
                     warning:    this consultation cannot be followed up: {fact}.

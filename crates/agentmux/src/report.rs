@@ -17,7 +17,7 @@ use chrono::Utc;
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
 use crate::run::{HookReopening, RunStatus, describe_delegate};
-use crate::transcript::{FailureKind, Outcome, RateLimit};
+use crate::transcript::{EarlierFailure, FailureKind, Outcome, RateLimit};
 
 /// Something a reader must be told about a consultation, because it changes how the transcript
 /// reads.
@@ -32,13 +32,8 @@ pub enum Warning<'a> {
         /// What its CLI wrote to stderr, when the failure detail does not already quote it.
         stderr: Option<&'a str>,
     },
-    /// An earlier turn failed, although the newest did not.
-    EarlierFailure {
-        /// The turn, counting from zero.
-        turn_index: u32,
-        /// What kind of failure.
-        kind: FailureKind,
-    },
+    /// Turns before the newest failed, whatever the newest is doing.
+    EarlierFailures(&'a [EarlierFailure]),
     /// The delegate could not save its session, so no follow-up can resume it.
     SessionNotSaved {
         /// Where it would have been saved.
@@ -81,8 +76,8 @@ impl RunStatus {
                 stderr: self.delegate_stderr.as_deref(),
             });
         }
-        if let Some((turn_index, kind)) = self.earlier_failure {
-            warnings.push(Warning::EarlierFailure { turn_index, kind });
+        if !self.earlier_failures.is_empty() {
+            warnings.push(Warning::EarlierFailures(&self.earlier_failures));
         }
         if let Some(store) = &self.unsaved_session_store {
             warnings.push(Warning::SessionNotSaved { store });
@@ -126,6 +121,26 @@ pub fn outcome_line(outcome: &Outcome) -> String {
         }
         other => other.state().to_string(),
     }
+}
+
+/// The turns before the newest that failed, in one line, such as
+/// `turn 2 failed (content flagged), turn 3 failed (rate limited)`.
+///
+/// Phrased to stand beside [`outcome_line`] rather than inside it: the state reports the newest
+/// turn, and an earlier failure written into it reads as the state of the turn running now.
+#[must_use]
+pub fn earlier_failures_line(failures: &[EarlierFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "turn {} failed ({})",
+                failure.turn_number(),
+                failure.kind().label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Collapse whitespace and clip, so a value stays on one line.

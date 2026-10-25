@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Billing, Delegate, ModelId, SessionRef};
 use crate::launch::{ExitStatus, Launched};
-use crate::transcript::Outcome;
+use crate::transcript::{Outcome, turn_number};
 
 use super::SettledBy;
 use super::error::RunError;
@@ -273,18 +273,6 @@ pub struct SettledTurn {
     transcript_path: PathBuf,
     #[serde(rename = "settled_path")]
     marker_path: PathBuf,
-}
-
-/// A zero-based turn index, written as the one-based number the transcript's headings show.
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde's `serialize_with` hands the field over by reference"
-)]
-pub(super) fn turn_number<S: serde::Serializer>(
-    index: &u32,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.serialize_u32(index.saturating_add(1))
 }
 
 impl SettledTurn {

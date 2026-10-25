@@ -86,10 +86,9 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
                 format!("  stderr      {last_stderr_line}")
             })
             .collect(),
-        Warning::EarlierFailure { turn_index, kind } => vec![format!(
-            "  EARLIER     turn {} failed: {} — see the transcript",
-            turn_index.saturating_add(1),
-            kind.label()
+        Warning::EarlierFailures(failures) => vec![format!(
+            "  EARLIER     {} — see the transcript",
+            report::earlier_failures_line(failures)
         )],
         Warning::SessionNotSaved {
             store: session_store_path,

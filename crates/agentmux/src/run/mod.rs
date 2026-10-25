@@ -471,7 +471,7 @@ impl RunStore {
                 &state.transcript.turns,
                 meta.delegate.isolation(),
             ),
-            earlier_failure: state.transcript.earlier_failure(),
+            earlier_failures: state.transcript.earlier_failures(),
             quota,
             // The newest window wins: an earlier turn's reading is stale the moment another
             // arrives, and a caller acting on it would wait against a window that already moved.
