@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::delegate::SessionRef;
-use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines};
+use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
 use crate::transcript::{Message, Outcome, Role, Turn, Usage};
 
 /// One line of a Codex capture: an event `codex exec --json` writes, or one agentmux adds.
@@ -248,7 +248,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     .and_then(|error| error.message)
                     .unwrap_or_else(|| "delegate reported an error".to_owned());
                 turn.outcome = Outcome::Failed {
-                    kind: classify(&message),
+                    kind: classify_reported(&message),
                     detail: message,
                 };
                 break;

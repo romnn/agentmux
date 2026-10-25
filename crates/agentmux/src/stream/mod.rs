@@ -83,6 +83,8 @@ pub(crate) fn complete_lines(events: &str) -> impl Iterator<Item = &str> {
 /// Each phrase is a whole word or a specific pairing, because the text this sees is also the tail
 /// of a CLI's stderr: `ECONNREFUSED` is not a refusal and a request id containing `429` is not a
 /// rate limit, and a caller told either would go and fix the wrong thing.
+/// It never reads an overload, which only the vendor's own stream may report: see
+/// [`classify_reported`].
 pub(crate) fn classify(detail: &str) -> crate::transcript::FailureKind {
     use crate::transcript::FailureKind;
 
@@ -104,15 +106,42 @@ pub(crate) fn classify(detail: &str) -> crate::transcript::FailureKind {
         && (has("not found") || has("not supported") || has("does not exist") || has("unsupported"))
     {
         FailureKind::ModelUnavailable
-    } else if word("overloaded") || (has("at capacity") && word("model")) {
-        // Claude's `overloaded_error` and an OpenAI `server_is_overloaded` hold it as a whole
-        // word, and Codex says the selected model is at capacity; capacity alone is a disk's as
-        // often as a model's.
-        FailureKind::Overloaded
     } else if has("max turns") || has("max_turns") || has("turn limit") {
         FailureKind::TurnLimit
     } else {
         FailureKind::Unclassified
+    }
+}
+
+/// Classify the error a delegate reported in its own event stream, which alone may say that the
+/// vendor's model is overloaded.
+///
+/// An overload is the one failure agentmux acts on by itself, resuming the consultation at a
+/// cost, so it is read only from the vendor's own report, and only in the vendor's own phrasing:
+/// Codex's "Selected model is at capacity", Claude's `overloaded_error`, an OpenAI
+/// `server_is_overloaded`, a model said to be overloaded.
+/// Stderr, which [`classify`] also reads, is full of other things that are overloaded.
+/// Every other failure is classified as [`classify`] does, and wins over an overload it mentions.
+pub(crate) fn classify_reported(detail: &str) -> crate::transcript::FailureKind {
+    use crate::transcript::FailureKind;
+
+    const OVERLOAD: &[&str] = &[
+        "model is at capacity",
+        "overloaded_error",
+        "server_is_overloaded",
+        "model is overloaded",
+        "model is currently overloaded",
+    ];
+    match classify(detail) {
+        FailureKind::Unclassified => {
+            let text = detail.to_ascii_lowercase();
+            if OVERLOAD.iter().any(|phrase| text.contains(phrase)) {
+                FailureKind::Overloaded
+            } else {
+                FailureKind::Unclassified
+            }
+        }
+        kind => kind,
     }
 }
 
@@ -131,12 +160,12 @@ fn has_word(text: &str, needle: &str) -> bool {
 mod tests {
     use googletest::prelude::*;
 
-    use super::classify;
+    use super::{classify, classify_reported};
     use crate::transcript::FailureKind;
 
     /// A vendor that is out of capacity for the moment is told apart from every other failure,
-    /// in each vendor's own words, and stderr that mentions capacity, or an overload inside a
-    /// longer word, is not.
+    /// in each vendor's own words, and text that mentions capacity or an overload otherwise is
+    /// not.
     #[gtest]
     fn an_overloaded_model_is_classified_narrowly() {
         let cases = [
@@ -165,9 +194,32 @@ mod tests {
                 "the codex CLI exited with status 1: OverloadedMethodError in plugin",
                 FailureKind::Unclassified,
             ),
+            // Something else that is overloaded is not the vendor's model
+            (
+                "MCP server overloaded; fatal: permission denied",
+                FailureKind::Unclassified,
+            ),
+            // A rate limit that mentions load is still a rate limit
+            (
+                "rate limit reached; the model is overloaded",
+                FailureKind::RateLimited,
+            ),
         ];
         for (detail, expected) in cases {
-            expect_that!(classify(detail), eq(expected), "{detail}");
+            expect_that!(classify_reported(detail), eq(expected), "{detail}");
+        }
+    }
+
+    /// Text that did not come from the vendor's own stream, such as a CLI's stderr explaining a
+    /// missing terminal event, is never read as an overload, whatever it says.
+    #[gtest]
+    fn stderr_never_reads_as_an_overload() {
+        for detail in [
+            "the codex CLI exited with status 1: Selected model is at capacity.",
+            r#"the claude CLI exited with status 1: {"type":"overloaded_error"}"#,
+            "the codex CLI exited with status 1: MCP server overloaded; fatal: permission denied",
+        ] {
+            expect_that!(classify(detail), eq(FailureKind::Unclassified), "{detail}");
         }
     }
 }
