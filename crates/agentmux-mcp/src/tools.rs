@@ -120,7 +120,8 @@ pub struct TailParams {
     pub run_id: String,
 
     /// Byte offset to read from.
-    /// Pass `0` the first time, then the `next_cursor` of the previous call.
+    /// Pass `0` to start at the beginning, or omit it with `from_end`; after that, pass the
+    /// `next_cursor` of the previous call.
     /// Cursors only move forward, so a stale one is safe.
     #[serde(default)]
     #[schemars(with = "u64")]

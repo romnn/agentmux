@@ -759,4 +759,32 @@ mod tests {
         assert_that!(claude.disallowed_tools.map(|list| list.len()), some(eq(2)));
         Ok(())
     }
+
+    /// `--from-end` reads the latest output with `--follow`, but a cursor names another start,
+    /// so the two together are refused, an explicit `--cursor 0` included.
+    #[gtest]
+    fn from_end_parses_and_conflicts_with_a_cursor() -> Result<()> {
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(
+                ["agentmux", "tail", "20261020T005204-388ea0d8"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+        };
+        let cli = parse(&["--from-end", "--max-bytes", "2000", "--follow"]).or_fail()?;
+        let tail = match cli.command {
+            Command::Tail(tail) => Some(tail),
+            _ => None,
+        }
+        .or_fail()?;
+        assert_that!(tail.from_end, eq(true));
+        assert_that!(tail.max_bytes, eq(2000));
+        assert_that!(tail.follow, eq(true));
+
+        assert_that!(
+            parse(&["--from-end", "--cursor", "0"]).map(|_| ()),
+            err(anything())
+        );
+        Ok(())
+    }
 }
