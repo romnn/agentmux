@@ -229,13 +229,14 @@ impl FailureKind {
 }
 
 /// A turn before the newest that failed.
+///
+/// The turn is read only as the one-based number its heading shows, so no reader can print the
+/// zero-based index by mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct EarlierFailure {
-    /// The turn, counting from zero; serialised as the one-based number its heading shows.
     #[serde(rename = "turn", serialize_with = "turn_number")]
-    pub turn_index: u32,
-    /// What kind of failure.
-    pub kind: FailureKind,
+    turn_index: u32,
+    kind: FailureKind,
 }
 
 impl EarlierFailure {
@@ -243,6 +244,12 @@ impl EarlierFailure {
     #[must_use]
     pub fn turn_number(self) -> u32 {
         self.turn_index.saturating_add(1)
+    }
+
+    /// What kind of failure.
+    #[must_use]
+    pub fn kind(self) -> FailureKind {
+        self.kind
     }
 }
 

@@ -136,7 +136,7 @@ pub fn earlier_failures_line(failures: &[EarlierFailure]) -> String {
             format!(
                 "turn {} failed ({})",
                 failure.turn_number(),
-                failure.kind.label()
+                failure.kind().label()
             )
         })
         .collect::<Vec<_>>()
