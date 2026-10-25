@@ -497,21 +497,32 @@ impl RunStore {
     /// What a consultation's turn at `index` is for: the label it was given, or else the one the
     /// latest turn before it was given, or `None` when no turn up to it was given one.
     ///
-    /// A turn whose record cannot be read is read as given none, so a damaged record never fails
-    /// a `status` or a `list`.
-    pub(super) fn label_of_turn(&self, run_id: &RunId, index: u32) -> Option<RunLabel> {
-        (0..=index).rev().find_map(|index| {
-            read_json::<InvocationRecord>(&self.turn_dir(run_id, index).invocation())
-                .ok()
-                .flatten()
-                .and_then(|record| record.label)
-        })
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when a launch record it reads
+    /// cannot be read.
+    pub(super) fn label_of_turn(
+        &self,
+        run_id: &RunId,
+        index: u32,
+    ) -> Result<Option<RunLabel>, RunError> {
+        for index in (0..=index).rev() {
+            let record = read_json::<InvocationRecord>(&self.turn_dir(run_id, index).invocation())?;
+            if let Some(label) = record.and_then(|record| record.label) {
+                return Ok(Some(label));
+            }
+        }
+        Ok(None)
     }
 
     /// What a settled turn is for: what `status` and `list` say of the newest turn, said of any
     /// one.
-    #[must_use]
-    pub fn turn_label(&self, settled: &SettledTurn) -> Option<RunLabel> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when a launch record it reads
+    /// cannot be read.
+    pub fn turn_label(&self, settled: &SettledTurn) -> Result<Option<RunLabel>, RunError> {
         self.label_of_turn(settled.run_id(), settled.turn_index())
     }
 

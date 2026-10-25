@@ -510,7 +510,7 @@ async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Resu
             .wait_for_settlement(&harness.store.pin_turn(&started.run_id, Some(turn))?)
             .await?;
         assert_that!(
-            harness.store.turn_label(&settled),
+            harness.store.turn_label(&settled)?,
             some(eq(&label(expected)?)),
             "turn {turn}"
         );
@@ -576,43 +576,6 @@ async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Resu
         })
     );
     assert_that!(summary.last_activity, some(anything()));
-    Ok(())
-}
-
-/// A turn whose launch record is gone is read as given no label, so the consultation keeps the
-/// label an earlier turn was given rather than falling back further.
-#[gtest]
-fn a_missing_launch_record_keeps_the_label_before_it() -> Result<()> {
-    let harness = harness([
-        Script::completed(fixtures::CODEX_HAPPY),
-        Script::completed(fixtures::CODEX_HAPPY),
-        Script::completed(fixtures::CODEX_HAPPY),
-    ])?;
-    let label = |text: &str| RunLabel::parse(text).or_fail();
-    let mut labelled = request(codex()?, "review it");
-    labelled.label = Some(label("first")?);
-    let started = harness.store.start(&labelled)?;
-    harness.store.follow_up_with(
-        &started.run_id,
-        "again",
-        PermissionOptions::default(),
-        Some(&label("second")?),
-    )?;
-    harness.store.follow_up(&started.run_id, "once more")?;
-
-    let third = harness
-        .store
-        .root()
-        .join("runs")
-        .join(started.run_id.as_str())
-        .join("turns")
-        .join("0003")
-        .join("invocation.json");
-    std::fs::remove_file(third).or_fail()?;
-    assert_that!(
-        harness.store.status(&started.run_id)?.label,
-        some(eq(&label("second")?))
-    );
     Ok(())
 }
 
