@@ -151,14 +151,14 @@ pub enum RunError {
     Steer(#[from] SteerError),
     /// Another caller claimed this turn first.
     #[error(
-        "consultation {run_id} already has a turn {index}, started by another caller. Only one \
+        "consultation {run_id} already has a turn {turn}, started by another caller. Only one \
          follow-up can be outstanding at a time; read the consultation again with `result`."
     )]
     TurnAlreadyClaimed {
         /// Which consultation.
         run_id: RunId,
-        /// The turn index that was already claimed.
-        index: u32,
+        /// The one-based number of the turn that was already claimed.
+        turn: u32,
     },
     /// The operation needs the consultation finished, and it is not.
     #[error(

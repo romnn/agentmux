@@ -154,7 +154,8 @@ impl RunStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Io`] when the directory cannot be created.
+    /// Returns [`RunError::Io`] when the directory cannot be created, or a run still in the
+    /// zero-based turn layout cannot be renumbered.
     pub fn open(
         root: impl Into<PathBuf>,
         launcher: Arc<dyn Launcher>,
@@ -181,7 +182,7 @@ impl RunStore {
             // Unsupervised for the same reason.
             supervisor: None,
         };
-        store.migrate_zero_based_turn_dirs();
+        store.migrate_zero_based_turn_dirs()?;
         Ok(store)
     }
 

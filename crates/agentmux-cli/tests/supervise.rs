@@ -323,7 +323,9 @@ fn a_turn_settles_with_nothing_asking() -> Result<()> {
         serde_json::from_slice(&std::fs::read(&marker).or_fail()?).or_fail()?;
     let transcript =
         std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
-    assert_that!(settled.get("version"), some(eq(&serde_json::json!(1))));
+    assert_that!(settled.get("version"), some(eq(&serde_json::json!(2))));
+    // Numbered as its directory, `turns/0001`, is.
+    assert_that!(settled.get("turn"), some(eq(&serde_json::json!(1))));
     assert_that!(
         settled.pointer("/outcome/state"),
         some(eq(&serde_json::json!("completed")))

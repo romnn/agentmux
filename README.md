@@ -691,10 +691,10 @@ A turn **settles** once its delegate has gone, or once a cancellation has frozen
 delegate could not be made to stop: its transcript through that turn is published and will never
 change, and `turns/<n>/settled.json` beside it says so, with the turn's outcome and where its
 section of `transcript.md` ends. Turn directories are numbered from 1, as `wait --turn` and the
-transcript's headings number turns: turn 2 is `turns/0002`. Every turn runs under a supervisor — the hidden
-`agentmux supervise`, which starts the delegate itself and settles the turn the moment it leaves —
-so the settlement is on disk within moments whether or not anything is asking, and a file watch on
-`settled.json` sees it.
+transcript's headings number turns: turn 2 is `turns/0002`. Every turn runs under a supervisor —
+the hidden `agentmux supervise`, which starts the delegate itself and settles the turn the moment it
+leaves — so the settlement is on disk within moments whether or not anything is asking, and a file
+watch on `settled.json` sees it.
 
 Two waits return exactly then, never earlier, and have no deadline of their own:
 

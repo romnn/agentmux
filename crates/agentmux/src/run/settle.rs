@@ -761,10 +761,21 @@ impl RunStore {
     /// # Errors
     ///
     /// Returns [`RunError::NotFound`] when there is no such consultation,
-    /// [`RunError::NoSuchTurn`] when it has no turn `turn_index`, [`RunError::UncertainStart`]
-    /// when the turn's supervisor left while starting its delegate without recording one, and
-    /// [`RunError::InvalidSettlement`] when a marker on disk does not hold.
+    /// [`RunError::NoSuchTurn`] when it has no turn `turn`, counted from 1,
+    /// [`RunError::UncertainStart`] when the turn's supervisor left while starting its delegate
+    /// without recording one, and [`RunError::InvalidSettlement`] when a marker on disk does not
+    /// hold.
     pub fn finalize_turn(
+        &self,
+        run_id: &RunId,
+        turn: u32,
+    ) -> Result<Option<SettledTurn>, RunError> {
+        let target = self.pin_turn(run_id, Some(turn))?;
+        self.finalize_turn_index(run_id, target.turn_index())
+    }
+
+    /// [`RunStore::finalize_turn`] of the turn with zero-based `turn_index`.
+    pub(super) fn finalize_turn_index(
         &self,
         run_id: &RunId,
         turn_index: u32,

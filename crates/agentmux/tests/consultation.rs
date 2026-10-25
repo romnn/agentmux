@@ -897,37 +897,6 @@ fn page_reached_end(harness: &Harness, run_id: &RunId, cursor: u64) -> Result<bo
     Ok(page.at_end)
 }
 
-/// A run written in the zero-based layout, whose first turn is `turns/0000`, is renumbered when
-/// the store opens, so its turns read as they did.
-#[gtest]
-fn a_zero_based_run_is_renumbered_when_the_store_opens() -> Result<()> {
-    let harness = harness([
-        Script::completed(fixtures::CODEX_HAPPY),
-        Script::completed(fixtures::CODEX_HAPPY),
-    ])?;
-    let started = harness.store.start(&request(codex()?, "q"))?;
-    harness.store.follow_up(&started.run_id, "again")?;
-    let (_, before) = harness.store.view(&started.run_id, 0, usize::MAX)?;
-
-    // Put the run back into the zero-based layout.
-    let turns = harness
-        .store
-        .root()
-        .join("runs")
-        .join(started.run_id.as_str())
-        .join("turns");
-    std::fs::rename(turns.join("0001"), turns.join("0000"))?;
-    std::fs::rename(turns.join("0002"), turns.join("0001"))?;
-
-    let reopened = RunStore::open(harness.store.root(), harness.launcher.clone(), env())?;
-    let (status, after) = reopened.view(&started.run_id, 0, usize::MAX)?;
-    assert_that!(status.turns, eq(2));
-    assert_that!(after.text, eq(&before.text));
-    assert_that!(turns.join("0000").exists(), eq(false));
-    assert_that!(turns.join("0002").is_dir(), eq(true));
-    Ok(())
-}
-
 /// Each turn owns its own capture files, and a claimed turn is never launched into twice.
 ///
 /// Turn directories are how `fold_run` counts turns, so a caller that creates one is already

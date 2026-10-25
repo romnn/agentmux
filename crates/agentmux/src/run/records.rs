@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Billing, Delegate, ModelId, SessionRef};
 use crate::launch::{ExitStatus, Launched};
-use crate::transcript::{Outcome, turn_number};
+use crate::transcript::{Outcome, turn_index_of_number, turn_number};
 
 use super::SettledBy;
 use super::error::RunError;
@@ -130,7 +130,12 @@ pub(super) struct SupervisorPlan {
     pub(super) store_root: PathBuf,
     /// The consultation.
     pub(super) run_id: RunId,
-    /// The turn's zero-based index.
+    /// The turn's zero-based position, written as the one-based number its directory shows.
+    #[serde(
+        rename = "turn",
+        serialize_with = "turn_number",
+        deserialize_with = "turn_index_of_number"
+    )]
     pub(super) turn_index: u32,
     /// The launch this plan belongs to, which the [`SupervisorRecord`] must name.
     pub(super) launch_id: String,
@@ -236,6 +241,12 @@ impl TurnFiles {
 pub(super) struct SettledRecord {
     /// Exactly [`SettledRecord::VERSION`].
     pub(super) version: u32,
+    /// The turn's zero-based position, written as the one-based number its directory shows.
+    #[serde(
+        rename = "turn",
+        serialize_with = "turn_number",
+        deserialize_with = "turn_index_of_number"
+    )]
     pub(super) turn_index: u32,
     pub(super) outcome: Outcome,
     pub(super) settled_by: SettledBy,
@@ -251,7 +262,7 @@ pub(super) struct SettledRecord {
 
 impl SettledRecord {
     /// The one schema version this agentmux reads and writes.
-    pub(super) const VERSION: u32 = 1;
+    pub(super) const VERSION: u32 = 2;
 }
 
 /// A turn whose end is committed: its transcript is published through
@@ -351,13 +362,14 @@ impl SettledTurn {
         &self.run_id
     }
 
-    /// The turn's zero-based index, as its directory is named.
+    /// The turn's zero-based position among the consultation's turns.
     #[must_use]
-    pub fn turn_index(&self) -> u32 {
+    pub(crate) fn turn_index(&self) -> u32 {
         self.turn_index
     }
 
-    /// The turn's one-based number, as the transcript's headings and every front end show it.
+    /// The turn's one-based number, as the transcript's headings, its directory and every front
+    /// end show it.
     #[must_use]
     pub fn turn_number(&self) -> u32 {
         self.turn_index.saturating_add(1)

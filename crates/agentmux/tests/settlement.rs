@@ -101,13 +101,13 @@ fn a_turn_settles_once_its_delegate_has_gone() -> Result<()> {
     // The stream says completed, but the delegate is still there.
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(started.settled, eq(false));
-    assert_that!(harness.store.finalize_turn(&started.run_id, 0)?, none());
+    assert_that!(harness.store.finalize_turn(&started.run_id, 1)?, none());
     assert_that!(marker.exists(), eq(false));
 
     harness
         .launcher
         .mark_process_gone(harness.launcher.launch_handle(0));
-    let settled = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
+    let settled = harness.store.finalize_turn(&started.run_id, 1)?.or_fail()?;
 
     // The marker vouches for the transcript as published: the turn's section ends where the file
     // does, and starts after the header.
@@ -142,12 +142,12 @@ fn a_settlement_is_committed_once_and_rewritten_the_same() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request("q")?)?;
     let marker = harness.turn_dir(&started.run_id, 1).join("settled.json");
-    let first = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
+    let first = harness.store.finalize_turn(&started.run_id, 1)?.or_fail()?;
     let committed = std::fs::read(&marker).or_fail()?;
     let transcript = harness.transcript(&started.run_id)?;
 
     // Adopted, not rewritten.
-    let again = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
+    let again = harness.store.finalize_turn(&started.run_id, 1)?.or_fail()?;
     harness.store.status(&started.run_id)?;
     assert_that!(again, eq(&first));
     assert_that!(std::fs::read(&marker).or_fail()?, eq(&committed));
@@ -173,7 +173,7 @@ fn a_turn_its_exit_record_settles_commits_the_failure() -> Result<()> {
     )])?;
     let started = harness.store.start(&request("q")?)?;
 
-    let settled = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
+    let settled = harness.store.finalize_turn(&started.run_id, 1)?.or_fail()?;
     assert_that!(settled.settled_by(), eq(SettledBy::ExitRecord));
     assert_that!(
         settled.outcome(),
@@ -213,7 +213,7 @@ async fn a_pinned_wait_returns_its_own_turn_across_a_follow_up() -> Result<()> {
     );
 
     let settled = harness.store.wait_for_settlement(&pinned).await?;
-    assert_that!(settled.turn_index(), eq(0));
+    assert_that!(settled.turn_number(), eq(1));
     let page = settled.page(0, usize::MAX)?;
     assert_that!(page.text, contains_substring("_Turn 1 completed"));
     assert_that!(page.text, not(contains_substring("## Turn 2")));
@@ -286,13 +286,13 @@ fn a_settlement_that_does_not_hold_is_refused() -> Result<()> {
 
     // Unsupported version, running outcome, reversed range, bytes the transcript does not have
     for broken in [
-        with("version", serde_json::json!(2)),
+        with("version", serde_json::json!(3)),
         with("outcome", serde_json::json!({"state": "running"})),
         with("transcript_start", serde_json::json!(1_000_000)),
     ] {
         std::fs::write(&marker, broken.to_string()).or_fail()?;
         assert_that!(
-            harness.store.finalize_turn(&started.run_id, 0),
+            harness.store.finalize_turn(&started.run_id, 1),
             err(matches_pattern!(RunError::InvalidSettlement { .. })),
             "{broken}"
         );
@@ -305,7 +305,7 @@ fn a_settlement_that_does_not_hold_is_refused() -> Result<()> {
         with("transcript_end", serde_json::json!(1_000_000)).to_string(),
     )
     .or_fail()?;
-    let settled = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
+    let settled = harness.store.finalize_turn(&started.run_id, 1)?.or_fail()?;
     assert_that!(
         settled.page(0, usize::MAX),
         err(matches_pattern!(RunError::InvalidSettlement { .. }))
@@ -314,7 +314,7 @@ fn a_settlement_that_does_not_hold_is_refused() -> Result<()> {
     // Not a record at all
     std::fs::write(&marker, "{\"version\":").or_fail()?;
     assert_that!(
-        harness.store.finalize_turn(&started.run_id, 0),
+        harness.store.finalize_turn(&started.run_id, 1),
         err(matches_pattern!(RunError::CorruptRecord { .. }))
     );
     Ok(())
@@ -447,7 +447,7 @@ async fn a_dead_supervisor_leaves_a_failed_start_or_an_uncertain_one() -> Result
     let spawning = harness.store.start(&request("q")?)?;
     leave_a_dead_supervisor(&harness, &spawning.run_id, "spawning")?;
     assert_that!(
-        harness.store.finalize_turn(&spawning.run_id, 0),
+        harness.store.finalize_turn(&spawning.run_id, 1),
         err(matches_pattern!(RunError::UncertainStart { .. }))
     );
     assert_that!(
@@ -565,7 +565,7 @@ fn every_reader_refuses_a_settlement_that_does_not_hold() -> Result<()> {
 
     // Unsupported version, running outcome, reversed range, a recovered reply that is not there
     for broken in [
-        with("version", serde_json::json!(2)),
+        with("version", serde_json::json!(3)),
         with("outcome", serde_json::json!({"state": "running"})),
         with("transcript_start", serde_json::json!(1_000_000)),
         with("recovered_bytes", serde_json::json!(10)),
@@ -737,7 +737,7 @@ async fn a_cancellation_the_delegate_survives_still_settles_the_turn() -> Result
     );
     assert_that!(cancelled.settled, eq(true));
     assert_that!(
-        harness.store.finalize_turn(&started.run_id, 0)?,
+        harness.store.finalize_turn(&started.run_id, 1)?,
         some(anything())
     );
     assert_that!(
