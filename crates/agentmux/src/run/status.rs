@@ -289,6 +289,13 @@ pub(super) fn page_of(full: &str, offset: u64, max_bytes: usize) -> TranscriptPa
     }
 }
 
+/// The last `max_bytes` of a render, never starting inside a character.
+pub(super) fn last_page_of(full: &str, max_bytes: usize) -> TranscriptPage {
+    // Rounded forward rather than back, so the page never holds more than `max_bytes`.
+    let start = full.ceil_char_boundary(full.len().saturating_sub(max_bytes));
+    page_of(full, u64::try_from(start).unwrap_or(u64::MAX), max_bytes)
+}
+
 /// How long a consultation has been going, or how long it took.
 ///
 /// A finished consultation's clock stops at the last write to a capture file rather than at now,

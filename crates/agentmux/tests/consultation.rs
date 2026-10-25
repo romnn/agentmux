@@ -865,6 +865,33 @@ fn a_page_smaller_than_one_character_still_makes_progress() -> Result<()> {
     Ok(())
 }
 
+/// A page read from the end is the transcript's last bytes, ends at its end and never holds more
+/// than was asked for.
+///
+/// Every turn heading contains an em dash, so most window sizes land inside a character at least
+/// once; the page then starts at the next one rather than growing past `max_bytes`.
+#[gtest]
+fn a_page_from_the_end_is_the_newest_bytes_and_never_more() -> Result<()> {
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request(codex()?, "q"))?;
+    let (_, whole) = harness.store.view(&started.run_id, 0, usize::MAX)?;
+
+    for max_bytes in 1..=whole.text.len() + 2 {
+        let (_, page) = harness.store.view_end(&started.run_id, max_bytes)?;
+        assert_that!(page.text.len(), le(max_bytes), "max_bytes {max_bytes}");
+        assert_that!(
+            whole.text,
+            ends_with(page.text.as_str()),
+            "max_bytes {max_bytes}"
+        );
+        // Within one character of the window, and its cursor follows on from the end.
+        assert_that!(page.text.len() + 3, ge(max_bytes.min(whole.text.len())));
+        assert_that!(page.next_offset, eq(whole.total_bytes));
+        assert_that!(page.at_end, eq(true));
+    }
+    Ok(())
+}
+
 fn page_reached_end(harness: &Harness, run_id: &RunId, cursor: u64) -> Result<bool> {
     let page = harness.store.page(run_id, cursor, 1)?;
     Ok(page.at_end)

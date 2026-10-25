@@ -126,6 +126,12 @@ pub struct TailParams {
     #[schemars(with = "u64")]
     pub cursor: Option<u64>,
 
+    /// Set to `true` to read the last `max_bytes` of the transcript instead of from a cursor:
+    /// what the delegate wrote most recently, however long it has been running.
+    /// Its `next_cursor` follows on from there; pass `cursor` or `from_end`, not both.
+    #[serde(default)]
+    pub from_end: bool,
+
     /// Most bytes to return.
     /// Defaults to 4000, which is deliberately small: this is for watching, not for reading.
     #[serde(default)]
@@ -373,23 +379,30 @@ impl AgentMux {
         description = "Show the transcript written since a cursor, so you can see what the \
                        delegate is actually doing while it works. Prefer `status` for a polling \
                        loop — it is cheaper and carries no transcript text; reach for `tail` when \
-                       you want to see the work rather than the state. This shows a slice from \
-                       your cursor, and the findings are usually not in it: once the state is \
-                       terminal, read `result` from the top."
+                       you want to see the work rather than the state; `from_end` shows the \
+                       latest output without paging there. This shows a slice, and the findings \
+                       are usually not in it: once the state is terminal, read `result` from the \
+                       top."
     )]
     fn tail(
         &self,
         Parameters(params): Parameters<TailParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let id = run_id(&params.run_id)?;
-        let (status, page) = self
-            .store
-            .view(
-                &id,
-                params.cursor.unwrap_or(0),
-                slice(params.max_bytes, DEFAULT_TAIL_BYTES),
-            )
-            .map_err(|error| run_error(&error))?;
+        let max_bytes = slice(params.max_bytes, DEFAULT_TAIL_BYTES);
+        let (status, page) = match (params.from_end, params.cursor) {
+            (true, Some(_)) => {
+                return Err(ErrorData::invalid_params(
+                    "pass `cursor` or `from_end`, not both: `from_end` reads the last `max_bytes` \
+                     of the transcript, and a cursor reads on from where an earlier call ended."
+                        .to_owned(),
+                    None,
+                ));
+            }
+            (true, None) => self.store.view_end(&id, max_bytes),
+            (false, cursor) => self.store.view(&id, cursor.unwrap_or(0), max_bytes),
+        }
+        .map_err(|error| run_error(&error))?;
         Ok(text(render::tail(&status, &page)))
     }
 
@@ -968,9 +981,9 @@ waits return exactly then, never earlier, and have no time limit of their own:
 A bounded wait that comes back "still running" — `result` with `wait_seconds`, or `ask` — has
 observed the consultation, not seen it finish. It has lost nothing; wait for the turn instead of
 calling again. Use `status` for a cheap look that carries no transcript text, `tail` when you want
-to see what the delegate is actually doing, `result` to page the transcript, and `cancel` to stop
-one while keeping what it collected. `ask` is `start` plus a 45-second wait, for a question you
-expect answered quickly; a review is not that. `list` recovers an id you did not keep.
+to see what the delegate is actually doing — with `from_end` for its latest output — `result` to
+page the transcript, and `cancel` to stop one while keeping what it collected. `ask` is `start`
+plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep.
 `follow_up` continues the delegate's own session, so ask only the new thing. `steer` adds an
 instruction to a turn that is still running, which the delegate sees before its next model call;
 only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`

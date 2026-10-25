@@ -99,7 +99,7 @@ use records::{
     ExitRecord, LaunchRecord, SettledRecord, SupervisorRecord, TurnFiles, read_if_present,
     read_json, tail_of_file,
 };
-use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, page_of};
+use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, last_page_of, page_of};
 
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
@@ -393,6 +393,25 @@ impl RunStore {
     ) -> Result<(RunStatus, TranscriptPage), RunError> {
         let (status, full) = self.snapshot(run_id)?;
         Ok((status, page_of(&full, offset, max_bytes)))
+    }
+
+    /// The state of a consultation and the last `max_bytes` of its transcript, from one reading of
+    /// the files.
+    ///
+    /// For a caller that wants what the delegate is doing now without paging there from a cursor.
+    /// The page's [`TranscriptPage::next_offset`] is the end of the transcript, so a caller
+    /// follows on from it with [`RunStore::view`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotFound`] when there is no such consultation.
+    pub fn view_end(
+        &self,
+        run_id: &RunId,
+        max_bytes: usize,
+    ) -> Result<(RunStatus, TranscriptPage), RunError> {
+        let (status, full) = self.snapshot(run_id)?;
+        Ok((status, last_page_of(&full, max_bytes)))
     }
 
     /// One page of the rendered transcript, from the same single fold as [`RunStore::view`].

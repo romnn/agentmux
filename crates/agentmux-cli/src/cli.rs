@@ -517,6 +517,11 @@ pub struct TailArgs {
     #[arg(long, default_value_t = 0)]
     pub cursor: u64,
 
+    /// Start with the last `--max-bytes` of the transcript, what the delegate wrote most recently,
+    /// rather than from a cursor.
+    #[arg(long, conflicts_with = "cursor")]
+    pub from_end: bool,
+
     /// Most bytes to print.
     #[arg(long, default_value_t = 64_000)]
     pub max_bytes: usize,
