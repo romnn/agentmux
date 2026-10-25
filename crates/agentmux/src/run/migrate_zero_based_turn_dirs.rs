@@ -2,27 +2,31 @@
 //! `turns/0000` and whose version 1 `settled.json` names a zero-based `turn_index`, to the one-based
 //! one, whose first turn is `turns/0001` and whose version 2 `settled.json` names its `turn`.
 //!
-//! Delete this file and its two calls, in [`RunStore::open`] and [`RunStore::sweep`], once state
-//! directories written before the change have been opened by a release that runs it.
+//! Delete this file, its two calls in [`RunStore::open`] and [`RunStore::sweep`], and
+//! [`RunError::LegacyRunStillRunning`] once state directories written before the change have been
+//! opened by a release that runs it.
 
 use std::path::Path;
 
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
+use super::layout::TurnDir;
+use super::records::{TurnFiles, read_json};
 
 impl RunStore {
-    /// Renumber every run still in the zero-based layout whose turns have all ended.
+    /// Renumber every run still in the zero-based layout.
     ///
-    /// A run with a turn still running is left for an open after that turn ends, because its
-    /// supervisor and driver hold the directory's old name and would write into another turn's.
-    /// A run whose lock another process holds is left for a later open too, so opening the store
-    /// never waits.
+    /// A run whose delegates and supervisors cannot all be shown gone refuses the whole store
+    /// instead, by the rule that keeps the retention sweep from deleting it: they hold its
+    /// directories' old names, and after a renumbering would write into another turn's.
+    /// The store is refused rather than the run skipped, because a skipped run would be read
+    /// under the wrong numbers by every other call.
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Io`] when the runs directory cannot be listed or a run cannot be
-    /// renumbered.
+    /// Returns [`RunError::LegacyRunStillRunning`] for such a run, and [`RunError::Io`] when the
+    /// runs directory cannot be listed or a run cannot be renumbered.
     pub(super) fn migrate_zero_based_turn_dirs(&self) -> Result<(), RunError> {
         let runs = self.runs_dir();
         let entries = match std::fs::read_dir(&runs) {
@@ -43,10 +47,21 @@ impl RunStore {
             if !pending(&run_dir) {
                 continue;
             }
-            let Some(locked) = self.try_lock(&run_id)? else {
-                continue;
-            };
+            let locked = self.lock(&run_id)?;
             let turns = run_dir.join("turns");
+            for (index, dir) in legacy_turns(&turns).into_iter().enumerate() {
+                let files = TurnFiles {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    launch: read_json(&dir.launch())?,
+                    exit: read_json(&dir.exit())?,
+                    supervisor: read_json(&dir.supervisor())?,
+                    settled: None,
+                    dir,
+                };
+                if self.turn_may_be_alive(&files) {
+                    return Err(RunError::LegacyRunStillRunning { run_id });
+                }
+            }
             renumber(&turns).map_err(RunError::io(format!("renumbering {}", turns.display())))?;
             drop(locked);
         }
@@ -62,28 +77,28 @@ pub(super) fn pending(run_dir: &Path) -> bool {
     run_dir.join("turns").join("0000").is_dir()
 }
 
+/// The turn directories still named zero-based: the contiguous run from `0000`.
+///
+/// A renumbering cut short leaves the ones above the gap already moved, and they are not moved
+/// again.
+fn legacy_turns(turns: &Path) -> Vec<TurnDir> {
+    (0..u32::MAX)
+        .map(|index| TurnDir {
+            root: turns.join(format!("{index:04}")),
+        })
+        .take_while(|dir| dir.root.is_dir())
+        .collect()
+}
+
 /// Move each zero-based `turns/<n>` to `turns/<n + 1>`, highest first so no rename lands on
 /// another, rewriting its `settled.json` before it moves.
-///
-/// The zero-based turns are the contiguous run from `0000`: a renumbering cut short leaves the
-/// ones above the gap already moved, and the next one finishes it without moving them again.
 fn renumber(turns: &Path) -> std::io::Result<()> {
-    let dir = |index: u32| turns.join(format!("{index:04}"));
-    let count = (0..u32::MAX)
-        .take_while(|index| dir(*index).is_dir())
-        .count();
-    let count = u32::try_from(count).unwrap_or(u32::MAX);
-    // A turn with neither record may still be running.
-    let all_ended = (0..count).all(|index| {
-        let turn = dir(index);
-        turn.join("settled.json").is_file() || turn.join("exit.json").is_file()
-    });
-    if !all_ended {
-        return Ok(());
-    }
-    for index in (0..count).rev() {
-        rewrite_settled(&dir(index).join("settled.json"))?;
-        std::fs::rename(dir(index), dir(index.saturating_add(1)))?;
+    for (index, dir) in legacy_turns(turns).iter().enumerate().rev() {
+        rewrite_settled(&dir.settled())?;
+        std::fs::rename(
+            &dir.root,
+            turns.join(format!("{:04}", index.saturating_add(1))),
+        )?;
     }
     Ok(())
 }
@@ -110,11 +125,15 @@ fn rewrite_settled(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::Arc;
 
     use googletest::prelude::*;
 
     use super::renumber;
+    use crate::run::{RunError, RunStore};
+    use crate::testing::ScriptedLauncher;
 
     /// A zero-based turn directory holding a settlement, as the zero-based layout wrote it.
     fn legacy_turn(turns: &Path, index: u32) -> Result<()> {
@@ -181,17 +200,40 @@ mod tests {
         Ok(())
     }
 
-    /// A turn with no record of its end may still be running, so the run is left as it is.
+    /// A run that may still be running refuses the store and is left as it is.
+    ///
+    /// Its supervisor recorded that it was spawning a delegate and never recorded one, so a
+    /// delegate may be running that holds the directory's old name: the rule the retention sweep
+    /// keeps, which needs no live process to show here.
     #[gtest]
-    fn a_run_with_a_turn_still_running_is_left_alone() -> Result<()> {
-        let dir = tempfile::tempdir().or_fail()?;
-        let turns = dir.path().join("turns");
-        legacy_turn(&turns, 0)?;
-        std::fs::create_dir_all(turns.join("0001")).or_fail()?;
+    fn a_run_that_may_still_be_running_refuses_the_store() -> Result<()> {
+        let state = tempfile::tempdir().or_fail()?;
+        let run_id = "20261025T120000-0a1b2c3d";
+        let turn = state.path().join("runs").join(run_id).join("turns/0000");
+        std::fs::create_dir_all(&turn).or_fail()?;
+        std::fs::write(
+            turn.join("supervisor.json"),
+            serde_json::json!({
+                "launch_id": "launch",
+                "launched": {"pid": 1, "started": 1},
+                "started_at": "2026-10-25T12:00:00Z",
+                "phase": "spawning",
+            })
+            .to_string(),
+        )
+        .or_fail()?;
 
-        renumber(&turns).or_fail()?;
+        let opened = RunStore::open(
+            state.path(),
+            Arc::new(ScriptedLauncher::new([])),
+            BTreeMap::new(),
+        );
 
-        assert_that!(names(&turns)?, elements_are![eq("0000"), eq("0001")]);
+        assert_that!(
+            opened.map(|_| ()),
+            err(matches_pattern!(RunError::LegacyRunStillRunning { .. }))
+        );
+        assert_that!(turn.is_dir(), eq(true));
         Ok(())
     }
 }

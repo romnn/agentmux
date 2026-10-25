@@ -713,6 +713,7 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
         // caller can do next.
         | RunError::Steer(_)
         | RunError::TurnAlreadyClaimed { .. }
+        | RunError::LegacyRunStillRunning { .. }
         | RunError::StillRunning { .. }
         | RunError::NoSuchTurn { .. }
         | RunError::Delegate(_)

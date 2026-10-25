@@ -313,8 +313,9 @@ impl SettledTurn {
         }
         if record.turn_index != index {
             return Err(invalid(format!(
-                "it names turn index {}, but it is in the directory of turn index {index}",
-                record.turn_index
+                "it names turn {}, but it is in the directory of turn {}",
+                record.turn_index.saturating_add(1),
+                index.saturating_add(1)
             )));
         }
         if !record.outcome.is_terminal() {

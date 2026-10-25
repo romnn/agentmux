@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
-use super::records::{ExitRecord, Meta};
+use super::records::{ExitRecord, Meta, TurnFiles};
 use super::settle;
 
 /// How long a finished consultation is kept.
@@ -48,21 +48,28 @@ impl RunStore {
     /// finished publishing; and a supervisor that left while spawning its delegate, recording
     /// none, may have left one running that nothing can name.
     pub(super) fn a_child_is_alive(&self, run_id: &RunId) -> Result<bool, RunError> {
-        Ok(self.turn_files(run_id)?.into_iter().any(|turn| {
-            let delegate_may_run = match &turn.exit {
-                None | Some(ExitRecord::Cancelled { .. }) => turn
-                    .launch
-                    .as_ref()
-                    .is_some_and(|record| !self.child_has_gone(record.launched)),
-                Some(ExitRecord::Exited { .. } | ExitRecord::NotStarted { .. }) => false,
-            };
-            let unrecorded_start = turn.start_is_uncertain();
-            let supervisor_runs = turn
-                .supervisor
+        Ok(self
+            .turn_files(run_id)?
+            .iter()
+            .any(|turn| self.turn_may_be_alive(turn)))
+    }
+
+    /// Whether one turn's delegate or supervisor may still be running, by the rule
+    /// [`RunStore::a_child_is_alive`] states.
+    pub(super) fn turn_may_be_alive(&self, turn: &TurnFiles) -> bool {
+        let delegate_may_run = match &turn.exit {
+            None | Some(ExitRecord::Cancelled { .. }) => turn
+                .launch
                 .as_ref()
-                .is_some_and(|supervisor| !self.child_has_gone(supervisor.launched));
-            delegate_may_run || unrecorded_start || supervisor_runs
-        }))
+                .is_some_and(|record| !self.child_has_gone(record.launched)),
+            Some(ExitRecord::Exited { .. } | ExitRecord::NotStarted { .. }) => false,
+        };
+        let unrecorded_start = turn.start_is_uncertain();
+        let supervisor_runs = turn
+            .supervisor
+            .as_ref()
+            .is_some_and(|supervisor| !self.child_has_gone(supervisor.launched));
+        delegate_may_run || unrecorded_start || supervisor_runs
     }
 
     /// Delete consultations whose delegate last wrote anything more than `after` ago.

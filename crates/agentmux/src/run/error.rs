@@ -149,6 +149,18 @@ pub enum RunError {
     /// A steer was refused, or could not be confirmed.
     #[error("{0}")]
     Steer(#[from] SteerError),
+    /// MIGRATION, temporary: a consultation in the zero-based turn layout may still be running,
+    /// so its turn directories cannot be renumbered yet; delete with
+    /// `run/migrate_zero_based_turn_dirs.rs`.
+    #[error(
+        "consultation {run_id} may still be running under an earlier agentmux, which numbered its \
+         turn directories from 0, so they cannot be renumbered yet. Let it finish, or stop it with \
+         the agentmux that started it, then run this agentmux again."
+    )]
+    LegacyRunStillRunning {
+        /// Which consultation.
+        run_id: RunId,
+    },
     /// Another caller claimed this turn first.
     #[error(
         "consultation {run_id} already has a turn {turn}, started by another caller. Only one \
