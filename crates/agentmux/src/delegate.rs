@@ -1538,8 +1538,8 @@ string_newtype_conversions!(SessionRef);
 
 /// A fully prepared child process: what to run, with which arguments, in which environment.
 ///
-/// Produced by [`Delegate::invocation`], or by [`Delegate::continuation`] in the environment an
-/// earlier one built, and its fields are private, so the flags that make capture correct, the
+/// Produced by [`Delegate::invocation`], or by the run store's automatic resume in the environment
+/// an earlier one built, and its fields are private, so the flags that make capture correct, the
 /// recursion marker and the environment allowlist cannot be left out at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -1834,8 +1834,9 @@ impl Delegate {
             host_env,
             plan.billing,
         )?;
-        // Held here, the one step every launch goes through, so no turn runs past a limit the
-        // owner set, however it was reached.
+        // Held here, the one step every launch a caller asks for goes through, so no turn runs
+        // past a limit the owner set, however it was reached; an automatic resume continues a
+        // turn that was held here, in the environment built here.
         let held = self.held_to_limits(config)?;
         let isolation = held.resolved_isolation(config);
 
@@ -1895,8 +1896,11 @@ impl Delegate {
     /// The arguments are this delegate's own, held to the limits the turn it continues was
     /// admitted under, with its pinned isolation, or isolated for a record from before isolation
     /// was pinned.
+    ///
+    /// Crate-private, because only the run store holds an environment this method may be given:
+    /// one [`Delegate::invocation`] built, which carries the allowlist and the recursion marker.
     #[must_use]
-    pub fn continuation(
+    pub(crate) fn continuation(
         &self,
         plan: &TurnPlan<'_>,
         env: BTreeMap<String, String>,
@@ -1950,7 +1954,10 @@ impl Delegate {
     /// [`Delegate::app_server_settings`] with the isolation already resolved, for a turn that
     /// continues one whose isolation was pinned when it was admitted.
     #[must_use]
-    pub fn app_server_settings_under(&self, isolation: Isolation) -> Option<AppServerSettings> {
+    pub(crate) fn app_server_settings_under(
+        &self,
+        isolation: Isolation,
+    ) -> Option<AppServerSettings> {
         let Self::Codex {
             model,
             effort,
