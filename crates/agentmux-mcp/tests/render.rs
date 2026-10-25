@@ -316,6 +316,8 @@ fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()>
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::minutes(4),
         window: Some("five_hour".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
 
     let warnings = agentmux_mcp::render::warnings(&status);
@@ -344,6 +346,8 @@ fn a_window_hours_away_advises_switching_rather_than_waiting() -> Result<()> {
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day_overage_included".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
 
     let warnings = agentmux_mcp::render::warnings(&status);

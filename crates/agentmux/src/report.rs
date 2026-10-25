@@ -194,13 +194,27 @@ pub fn duration(duration: std::time::Duration) -> String {
 #[must_use]
 pub fn rate_limit_line(limit: &RateLimit) -> String {
     let window = limit.window.as_deref().unwrap_or("usage");
-    match limit.reopens_in(Utc::now()) {
-        Some(remaining) => format!(
-            "{window} window reopens in {} ({})",
+    let remaining = limit.reopens_in(Utc::now());
+    // Only an exhausted window is closed until it resets; saying "reopens" of any other reads as
+    // a block on an account that can still answer.
+    match (limit.exhausted, remaining) {
+        (true, Some(remaining)) => format!(
+            "{window} window exhausted, reopens in {} ({})",
             duration(remaining),
             limit.resets_at.to_rfc3339()
         ),
-        None => format!("{window} window has reopened"),
+        (true, None) => format!("{window} window has reopened"),
+        (false, Some(remaining)) => {
+            let used = limit
+                .used_percent
+                .map_or_else(String::new, |percent| format!(" {percent:.0}% used,"));
+            format!(
+                "{window} window{used} resets in {} ({})",
+                duration(remaining),
+                limit.resets_at.to_rfc3339()
+            )
+        }
+        (false, None) => format!("{window} window has reset"),
     }
 }
 

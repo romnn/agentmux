@@ -52,7 +52,7 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     if let Some(limit) = &status.rate_limit {
         // Printed for a healthy run too: the point is to see the window closing before it closes.
-        println!("  rate limit  {}", report::rate_limit_line(limit));
+        println!("  window      {}", report::rate_limit_line(limit));
     }
     // Only a rate limit populates this, and the human reading it is the only party who can go
     // and log another account in.

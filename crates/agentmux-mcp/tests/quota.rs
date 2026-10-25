@@ -129,6 +129,8 @@ fn a_rate_limit_with_another_account_available_names_that_account() -> Result<()
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
     status.quota = vec![
         reported(Vendor::Codex, "personal", 11)?,
@@ -158,6 +160,8 @@ fn a_rate_limit_with_no_alternative_still_advises_from_the_window() -> Result<()
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
 
     let warnings = agentmux_mcp::render::warnings(&status);
@@ -204,6 +208,8 @@ fn a_reopened_window_is_retried_rather_than_routed_elsewhere() -> Result<()> {
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() - chrono::Duration::minutes(5),
         window: Some("five_hour".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
     status.quota = vec![reported(Vendor::Codex, "personal", 11)?];
 
@@ -229,6 +235,8 @@ fn a_window_reopening_soon_outranks_switching_account() -> Result<()> {
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::minutes(3),
         window: Some("five_hour".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
     status.quota = vec![reported(Vendor::Codex, "personal", 11)?];
 
@@ -286,6 +294,8 @@ fn the_advice_never_names_an_account_of_the_other_vendor() -> Result<()> {
     status.rate_limit = Some(RateLimit {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
     // The consultation ran on Codex; this account belongs to Claude.
     status.quota = vec![reported(Vendor::Claude, "other-vendor-account", 3)?];

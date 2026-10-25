@@ -299,6 +299,8 @@ fn a_rate_limited_run_keeps_the_window_reopening_time() {
         limit.window.as_deref(),
         some(eq("seven_day_overage_included"))
     );
+    // The stream said `rejected`, so the window is closed until it reopens.
+    assert_that!(limit.exhausted, eq(true));
 
     // The transcript states it too, so a reader of the rendered text is not worse off than a
     // caller reading the struct.

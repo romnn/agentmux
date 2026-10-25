@@ -149,7 +149,9 @@ pub fn warnings(status: &RunStatus) -> String {
                     status.message_count,
                     recovery_advice(
                         kind,
-                        status.rate_limit.as_ref(),
+                        // Only an exhausted window refused the turn; one with room left resets
+                        // on its own schedule, and timing a retry by it would wait for nothing.
+                        status.rate_limit.as_ref().filter(|limit| limit.exhausted),
                         &status.quota,
                         status.delegate.vendor(),
                         status.delegate.account().alias()

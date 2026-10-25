@@ -354,8 +354,11 @@ struct RateLimitInfo {
 #[serde(rename_all = "snake_case")]
 enum RateLimitStatus {
     Allowed,
+    /// The account is refused until the window reopens.
+    Rejected,
+    /// A status this parser does not name, such as a warning that the window is nearly used.
     #[serde(untagged)]
-    NotAllowed(String),
+    Other(String),
 }
 
 /// Record what a `rate_limit_event` says about the account's usage window.
@@ -370,10 +373,17 @@ fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
         turn.rate_limit = Some(RateLimit {
             resets_at,
             window: info.rate_limit_type.clone(),
+            exhausted: matches!(info.status, Some(RateLimitStatus::Rejected)),
+            used_percent: None,
         });
     }
 
-    if let Some(RateLimitStatus::NotAllowed(status)) = info.status {
+    let status = match info.status {
+        None | Some(RateLimitStatus::Allowed) => None,
+        Some(RateLimitStatus::Rejected) => Some("rejected".to_owned()),
+        Some(RateLimitStatus::Other(status)) => Some(status),
+    };
+    if let Some(status) = status {
         let mut note = format!("delegate rate limit status: {status}");
         if let Some(limit) = &turn.rate_limit {
             match &limit.window {

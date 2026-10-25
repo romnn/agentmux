@@ -25,9 +25,12 @@ use serde::{Deserialize, Serialize};
 /// hours is not.
 /// Both vendors report the reopening time in the stream and neither puts it in the error message,
 /// so it is captured here rather than left for a caller to parse back out of prose.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// It is carried for a run that was never refused too, because a window nearly used up tells the
+/// caller what to expect from the next question; [`RateLimit::exhausted`] says which it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateLimit {
-    /// When the window reopens.
+    /// When the window resets, which for an exhausted window is when it reopens.
     pub resets_at: DateTime<Utc>,
     /// The vendor's own name for the window, such as `seven_day_overage_included`.
     ///
@@ -35,10 +38,18 @@ pub struct RateLimit {
     /// ones appear without notice, and the name is only ever shown to a reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
+    /// Whether the window was refusing requests when the vendor reported it.
+    ///
+    /// Only then is it closed until [`RateLimit::resets_at`]; otherwise it merely resets then.
+    #[serde(default)]
+    pub exhausted: bool,
+    /// How much of the window had been used, from 0 to 100, where the vendor reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
 }
 
 impl RateLimit {
-    /// How long until the window reopens, or `None` once it already has.
+    /// How long until the window resets, or `None` once it already has.
     #[must_use]
     pub fn reopens_in(&self, now: DateTime<Utc>) -> Option<std::time::Duration> {
         (self.resets_at - now).to_std().ok()

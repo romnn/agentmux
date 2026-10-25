@@ -347,12 +347,15 @@ impl RunStore {
 
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
         let snapshot = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
-        let resets_at = select_rate_limit_window(&snapshot)?
+        let selected = select_rate_limit_window(&snapshot)?;
+        let resets_at = selected
             .resets_at
             .and_then(chrono::DateTime::from_timestamp_secs)?;
         Some(RateLimit {
             resets_at,
-            window: snapshot.limit_id,
+            exhausted: selected.exhausted(),
+            used_percent: Some(selected.used_percent),
+            window: snapshot.limit_id.clone(),
         })
     }
 }
