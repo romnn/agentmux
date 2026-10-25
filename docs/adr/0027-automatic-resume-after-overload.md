@@ -18,12 +18,15 @@ that environment was resolved from ([0022](0022-delegate-env-from-allowlist.md))
 
 ## Decision
 
-**Overload is a failure kind of its own.** `stream::classify` reads `FailureKind::Overloaded`
-(label "model overloaded") from `overloaded` as a whole word, which covers Claude's
-`overloaded_error` and an OpenAI `server_is_overloaded`, or from "at capacity" together with the
-whole word "model"; Claude's `api_error_status` 529 says the same structurally. Capacity alone is
-not enough, because the text classified includes a CLI's stderr, where a full disk is at capacity
-too.
+**Overload is a failure kind of its own, read only from the vendor's own report.**
+`FailureKind::Overloaded` (label "model overloaded") is the one failure agentmux acts on at a cost,
+so `stream::classify_reported` reads it only from the error a delegate's event stream reports, and
+only in a vendor's specific phrasing: "model is at capacity" (Codex's `Selected model is at
+capacity`), `overloaded_error`, `server_is_overloaded`, or a model said to be overloaded. Claude's
+`api_error_status` 529 says the same structurally. Every other failure kind wins over an overload
+the same text mentions. `stream::classify`, which also reads a CLI's stderr when a delegate left
+without a terminal event, never reads an overload: stderr is full of other things that are
+overloaded or at capacity.
 
 **The turn's supervisor resumes the consultation, with "continue", in the same session.** The model
 is never changed. The policy, `AutoResumePolicy` in `crates/agentmux/src/run/auto_resume.rs`, is:
@@ -37,8 +40,9 @@ is never changed. The policy, `AutoResumePolicy` in `crates/agentmux/src/run/aut
 
 A run is an unbroken sequence of turns that failed overloaded; a turn that ends any other way,
 including a caller's own follow-up, ends it, and the next overload starts again at thirty seconds.
-Twelve resumes wait about an hour and forty-five minutes in all. `AutoResumePolicy::DEFAULT` is the
-one place to change these; the hidden `--auto-resume-delay` flag shortens the first delay for tests.
+Twelve resumes wait 7,230 seconds in all, two hours and thirty seconds: 30, 60, 120, 240 and 480
+seconds, then 900 seven times. `AutoResumePolicy::DEFAULT` is the one place to change these; the
+hidden `--auto-resume-delay` flag shortens the first delay for tests.
 
 1. **Deciding.** Whoever commits the newest turn's settlement decides, from that turn's records,
    and writes `auto-resume.json` just before `settled.json`, under the same hold of the lock
@@ -110,8 +114,9 @@ stays failed.
 
 - An overloaded consultation continues overnight with nobody asking, and the transcript shows each
   automatic turn as a `continue` agentmux sent.
-- A turn that fails overloaded before the delegate said anything, or without a session, is not
-  resumable and is not resumed; it is reported as an ordinary failure.
+- A consultation in which the delegate has said nothing yet, in any turn, or that has no session,
+  is not resumable, so a turn of it that fails overloaded is not resumed; it is reported as an
+  ordinary failure. `resumable_session` asks this of the whole transcript, not of the turn.
 - A store opened without a supervisor never resumes anything, and neither does a turn whose
   supervisor died before its settlement was committed.
 - A supervisor that dies while waiting leaves the decision on disk; readers report the resume as
