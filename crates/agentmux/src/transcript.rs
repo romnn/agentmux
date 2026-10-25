@@ -228,6 +228,36 @@ impl FailureKind {
     }
 }
 
+/// A turn before the newest that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EarlierFailure {
+    /// The turn, counting from zero; serialised as the one-based number its heading shows.
+    #[serde(rename = "turn", serialize_with = "turn_number")]
+    pub turn_index: u32,
+    /// What kind of failure.
+    pub kind: FailureKind,
+}
+
+impl EarlierFailure {
+    /// The turn, counted from 1 as the transcript's turn headings count.
+    #[must_use]
+    pub fn turn_number(self) -> u32 {
+        self.turn_index.saturating_add(1)
+    }
+}
+
+/// A zero-based turn index, written as the one-based number the transcript's headings show.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` hands the field over by reference"
+)]
+pub(crate) fn turn_number<S: serde::Serializer>(
+    index: &u32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u32(index.saturating_add(1))
+}
+
 /// How a turn ended.
 ///
 /// `Failed` carries only the reason.
@@ -519,23 +549,28 @@ impl Transcript {
         })
     }
 
-    /// The first turn that failed, when it is not the turn that decides [`Self::outcome`].
+    /// Every turn before the newest that failed, oldest first.
     ///
     /// [`Self::outcome`] reports the newest turn, which is what a caller polling for "is it done"
     /// needs.
     /// On its own that lets a follow-up hide a failure: turn one is refused, turn two succeeds,
     /// and the consultation reports `completed` with the refusal buried in the body.
-    /// Callers report this alongside the outcome so the earlier failure stays visible.
+    /// Callers report these beside the outcome, never inside it, so the earlier failures stay
+    /// visible without reading as the state of the turn that is running now.
     #[must_use]
-    pub fn earlier_failure(&self) -> Option<(u32, FailureKind)> {
+    pub fn earlier_failures(&self) -> Vec<EarlierFailure> {
         let last = self.turns.len().saturating_sub(1);
         self.turns
             .iter()
             .take(last)
-            .find_map(|turn| match &turn.outcome {
-                Outcome::Failed { kind, .. } => Some((turn.index, *kind)),
+            .filter_map(|turn| match &turn.outcome {
+                Outcome::Failed { kind, .. } => Some(EarlierFailure {
+                    turn_index: turn.index,
+                    kind: *kind,
+                }),
                 _ => None,
             })
+            .collect()
     }
 
     /// Whether the delegate ever said anything, across every turn.

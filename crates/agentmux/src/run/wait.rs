@@ -14,10 +14,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::transcript::turn_number;
+
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
-use super::records::{SettledTurn, turn_number};
+use super::records::SettledTurn;
 use super::status::{TranscriptPage, page_of};
 
 /// One turn of one consultation, chosen once.

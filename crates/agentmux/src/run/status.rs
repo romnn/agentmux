@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::delegate::{Billing, Delegate, Isolation, ModelId};
-use crate::transcript::{FailureKind, Outcome, RateLimit, UnrecognisedEvents, Usage};
+use crate::transcript::{EarlierFailure, Outcome, RateLimit, UnrecognisedEvents, Usage};
 
 use super::id::RunId;
 
@@ -84,11 +84,12 @@ pub struct RunStatus {
     /// Decided here rather than by each front end, because the same event means opposite things
     /// depending on what the run loaded and every reader has to say the same thing about it.
     pub hook_reopening: Option<HookReopening>,
-    /// An earlier turn that failed, when the newest turn is not the one that failed.
+    /// Every turn before the newest that failed, oldest first.
     ///
     /// Without this a follow-up onto a failed turn would report the consultation as `completed`
     /// and leave the failure visible only deep inside the transcript body.
-    pub earlier_failure: Option<(u32, FailureKind)>,
+    /// Kept apart from [`RunStatus::outcome`], which describes the newest turn alone.
+    pub earlier_failures: Vec<EarlierFailure>,
     /// What each account of this vendor had left, when the consultation was rate limited.
     ///
     /// Empty for every other outcome: probing costs a process, and the answer is only actionable

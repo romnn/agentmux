@@ -1097,7 +1097,7 @@ fn a_refused_follow_up_leaves_no_phantom_turn() -> Result<()> {
     let status = harness.store.status(&started.run_id)?;
     assert_that!(status.turns, eq(1));
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
-    assert_that!(status.earlier_failure, none());
+    assert_that!(status.earlier_failures, is_empty());
     Ok(())
 }
 

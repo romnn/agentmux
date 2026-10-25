@@ -569,3 +569,78 @@ fn protocol_drift_points_at_codex_exec() -> Result<()> {
     );
     Ok(())
 }
+
+/// Earlier failures sit beside the newest turn's state, never inside it.
+///
+/// Written into the state line, a failure from turn one reads as the state of the turn running
+/// now: `running (turn 1 failed …)` looks like the current turn failed.
+/// Every earlier failure is listed, not only the first, so a later one is not hidden either.
+#[gtest]
+fn earlier_failures_do_not_read_as_the_newest_turns_state() -> Result<()> {
+    let flagged = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"findings"}}
+        {"type":"turn.failed","error":{"message":"ERROR: This content was flagged for possible cybersecurity risk"}}
+    "#};
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([
+            Script::completed(flagged),
+            Script::completed(flagged),
+            Script::running("{\"type\":\"thread.started\",\"thread_id\":\"01a0\"}\n"),
+        ])),
+        env,
+    )
+    .or_fail()?;
+    let started = store
+        .start(&StartRequest {
+            delegate: Delegate::Codex {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
+                account: AccountChoice::Default,
+                isolation: None,
+            },
+            question: "Review the diff for correctness bugs.".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+        })
+        .or_fail()?;
+    store.follow_up(&started.run_id, "try again").or_fail()?;
+    let status = store.follow_up(&started.run_id, "and again").or_fail()?;
+
+    let rendered = agentmux_mcp::render::status(&status);
+    let state_line = rendered
+        .lines()
+        .find(|line| line.starts_with("state:"))
+        .or_fail()?;
+    // The state is the third turn's alone, and both failed turns are named on their own line.
+    assert_that!(state_line, eq("state:      running"));
+    assert_that!(
+        rendered,
+        contains_substring(
+            "earlier:    turn 1 failed (content flagged), turn 2 failed (content flagged)"
+        )
+    );
+    // The machine-readable form numbers the turns as the transcript's headings do.
+    let json = serde_json::to_value(&status).or_fail()?;
+    assert_that!(
+        json["earlier_failures"],
+        eq(&serde_json::json!([
+            {"turn": 1, "kind": "content_flagged"},
+            {"turn": 2, "kind": "content_flagged"},
+        ]))
+    );
+    Ok(())
+}
