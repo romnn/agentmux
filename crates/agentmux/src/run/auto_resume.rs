@@ -183,8 +183,8 @@ pub(super) enum Resumption {
 }
 
 impl RunStore {
-    /// What agentmux does, or did, about the turn with zero-based `turn_index` failing because
-    /// the model was overloaded, or `None` when it does nothing.
+    /// What agentmux does, or did, about turn `turn`, counted from 1, failing because the model
+    /// was overloaded, or `None` when it does nothing.
     ///
     /// Read from the decision recorded as the turn settled, and from what happened around it
     /// since: the next turn, a `cancel`, and whether the supervisor that was to resume is still
@@ -195,7 +195,15 @@ impl RunStore {
     ///
     /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when a record there cannot be
     /// read.
-    pub fn auto_resume(
+    pub fn auto_resume(&self, run_id: &RunId, turn: u32) -> Result<Option<AutoResume>, RunError> {
+        let Some(turn_index) = turn.checked_sub(1) else {
+            return Ok(None);
+        };
+        self.auto_resume_at_index(run_id, turn_index)
+    }
+
+    /// [`RunStore::auto_resume`] of the turn with zero-based `turn_index`.
+    pub(super) fn auto_resume_at_index(
         &self,
         run_id: &RunId,
         turn_index: u32,

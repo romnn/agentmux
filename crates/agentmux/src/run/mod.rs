@@ -554,7 +554,7 @@ impl RunStore {
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
             auto_resume: match &state.newest {
-                Some(newest) => self.auto_resume(run_id, newest.index)?,
+                Some(newest) => self.auto_resume_at_index(run_id, newest.index)?,
                 None => None,
             },
             outcome,

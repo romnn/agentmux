@@ -483,7 +483,7 @@ impl AgentMux {
         // Decided before the settlement was committed, so it is there for a turn that has one.
         let auto_resume = self
             .store
-            .auto_resume(&id, settled.turn_index())
+            .auto_resume(&id, settled.turn_number())
             .map_err(|error| run_error(&error))?;
         Ok(text(render::settled(
             &settled,

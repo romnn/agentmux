@@ -225,7 +225,7 @@ fn a_follow_up_takes_the_place_of_a_pending_resume() -> Result<()> {
 
     let followed = harness.store.follow_up(&run_id, "go on").or_fail()?;
     assert_that!(followed.turns, eq(2));
-    assert_that!(harness.store.auto_resume(&run_id, 0).or_fail()?, none());
+    assert_that!(harness.store.auto_resume(&run_id, 1).or_fail()?, none());
     // The follow-up is the caller's, and nothing about it is automatic.
     let invocation: serde_json::Value = serde_json::from_slice(
         &std::fs::read(harness.turn_dir(&run_id, 2).join("invocation.json")).or_fail()?,
