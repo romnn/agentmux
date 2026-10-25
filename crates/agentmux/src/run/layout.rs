@@ -138,6 +138,10 @@ impl RunStore {
         self.run_dir(run_id).join("transcript.md")
     }
 
+    pub(super) fn continued_by_path(&self, run_id: &RunId) -> PathBuf {
+        self.run_dir(run_id).join("continued-by.json")
+    }
+
     /// Every turn directory of a run, in order, ending at the first index that has none.
     pub(super) fn turn_dirs(&self, run_id: &RunId) -> impl Iterator<Item = (u32, TurnDir)> {
         (0..u32::MAX)

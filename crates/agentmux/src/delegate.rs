@@ -29,7 +29,7 @@
 //! the CLI's own default runs.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
@@ -1496,6 +1496,11 @@ pub struct TurnPlan<'a> {
     /// [`Billing::Api`] is honoured only for an account the machine's configuration opts in;
     /// [`Billing::Subscription`] always is.
     pub billing: Option<Billing>,
+    /// Directories outside the working directory the delegate must be able to read.
+    ///
+    /// Claude reads only its working directory unless granted more, so each is passed as
+    /// `--add-dir`; Codex's sandboxes read everywhere and need nothing.
+    pub read_dirs: &'a [PathBuf],
 }
 
 /// The delegate CLI's own handle on a conversation, so a later turn can continue it.
@@ -2524,6 +2529,8 @@ fn secret_value(
 ///   See [`CLAUDE_READ_ONLY_TOOLS`] for what that does and does not guarantee.
 /// - `--allowedTools` and `--disallowedTools`, only when the consultation names rules: a
 ///   delegate that loads the user's settings otherwise keeps the user's own.
+/// - `--add-dir`, once for each directory the turn must read outside its working directory: the
+///   consultation a fresh one continues, whose transcript its first question points at.
 /// - `--no-session-persistence` is deliberately **absent**.
 ///   It defeats `--resume`, and a consultation must stay open to a follow-up.
 fn claude_args(
@@ -2565,6 +2572,10 @@ fn claude_args(
     if let Some(disallowed) = &permissions.disallowed_tools {
         args.push("--disallowedTools".to_owned());
         args.push(join_tools(disallowed));
+    }
+    for dir in plan.read_dirs {
+        args.push("--add-dir".to_owned());
+        args.push(dir.to_string_lossy().into_owned());
     }
     args.push("--output-format".to_owned());
     args.push("stream-json".to_owned());

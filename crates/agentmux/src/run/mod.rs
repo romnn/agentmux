@@ -10,8 +10,9 @@
 //!                              submitted, a cancellation is marked or recorded, or the run is
 //!                              removed
 //! runs/<run_id>/
-//!   meta.json                  delegate, cwd, retention, created_at, and the label `start` was
-//!                              given
+//!   meta.json                  delegate, cwd, retention, created_at, the label `start` was
+//!                              given, and the consultation this one continues
+//!   continued-by.json          the consultation that continued this one in a fresh session
 //!   transcript.md              the rendered transcript, a cache of the fold below
 //!   turns/0001/                one directory per turn, numbered from 1 as the transcript's
 //!                              headings number turns
@@ -80,6 +81,7 @@
 
 mod auto_resume;
 mod cancel;
+mod continue_fresh;
 mod error;
 mod id;
 mod label;
@@ -106,16 +108,17 @@ use chrono::{DateTime, Utc};
 
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
-use crate::transcript::{Outcome, Transcript};
+use crate::transcript::{FailureKind, Outcome, Transcript};
 
 use layout::create_private_dir;
 use records::{
-    ExitRecord, LaunchRecord, SettledRecord, SupervisorRecord, TurnFiles, read_if_present,
-    read_json, tail_of_file,
+    ContinuedBy, ExitRecord, LaunchRecord, SettledRecord, SupervisorRecord, TurnFiles,
+    read_if_present, read_json, tail_of_file,
 };
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, last_page_of, page_of};
 
 pub use auto_resume::{AutoResume, AutoResumePolicy, CONTINUE as AUTO_RESUME_QUESTION};
+pub use continue_fresh::CONTENT_FLAGGED_STREAK;
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
 pub use label::{RunLabel, RunLabelError};
@@ -567,6 +570,27 @@ impl RunStore {
                 Some(newest) => self.auto_resume_at_index(run_id, newest.index)?,
                 None => None,
             },
+            content_flagged_in_a_row: u32::try_from(
+                state
+                    .transcript
+                    .turns
+                    .iter()
+                    .rev()
+                    .take_while(|turn| {
+                        matches!(
+                            turn.outcome,
+                            Outcome::Failed {
+                                kind: FailureKind::ContentFlagged,
+                                ..
+                            }
+                        )
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+            continues: meta.continues.clone(),
+            continued_by: read_json::<ContinuedBy>(&self.continued_by_path(run_id))?
+                .map(|record| record.run_id),
             outcome,
         };
         Ok((status, full))

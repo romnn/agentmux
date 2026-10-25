@@ -96,6 +96,7 @@ fn build(
         resume,
         extra_env: &extra_env,
         billing: None,
+        read_dirs: &[],
     };
     delegate.invocation(&plan, &host_env(), config)
 }

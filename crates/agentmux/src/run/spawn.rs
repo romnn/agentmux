@@ -225,6 +225,19 @@ impl RunStore {
     /// Under a supervisor, a delegate that then cannot be started is a failed turn, kept with the
     /// reason.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
+        self.start_continuing(request, None)
+    }
+
+    /// Begin a consultation, recorded as continuing `continues` when it names one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`RunStore::start`].
+    pub(super) fn start_continuing(
+        &self,
+        request: &StartRequest,
+        continues: Option<&RunId>,
+    ) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
         // refused request leaves no half-made consultation for `list` to report as running.
         self.refuse_to_spawn(request.delegate.vendor())?;
@@ -255,6 +268,7 @@ impl RunStore {
             retention: request.retention,
             created_at: Utc::now(),
             label: request.label.clone(),
+            continues: continues.cloned(),
         };
         let started = write_json(&dir.join("meta.json"), &meta)
             .and_then(|()| self.lock(&run_id))
@@ -722,12 +736,15 @@ impl RunStore {
             .map_err(RunError::io(format!("writing turn {index} question")))?;
 
         let last_message = turn.last_message();
+        // The consultation this one continues holds the transcript its first question points at.
+        let read_dirs: Vec<PathBuf> = meta.continues.iter().map(|id| self.run_dir(id)).collect();
         let plan = TurnPlan {
             question_path: &turn.question(),
             last_message_path: &last_message,
             resume,
             extra_env: &meta.env,
             billing: meta.billing,
+            read_dirs: &read_dirs,
         };
         let Resolved {
             mut invocation,

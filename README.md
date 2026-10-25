@@ -122,7 +122,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 
 ### Use from the command line
 
-The same eleven verbs are available directly, as a unified CLI over both vendors:
+The same twelve verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.

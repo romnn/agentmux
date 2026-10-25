@@ -141,6 +141,19 @@ pub struct RunStatus {
     /// when it does anything: resume it automatically, or say why it no longer will.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<super::AutoResume>,
+    /// How many of the newest turns in a row a content filter refused.
+    ///
+    /// From [`super::CONTENT_FLAGGED_STREAK`] on, the session's own context is what trips the
+    /// filter, and the way forward is [`super::RunStore::continue_fresh`] rather than a rephrased
+    /// follow-up.
+    pub content_flagged_in_a_row: u32,
+    /// The consultation this one continues in a fresh session, when it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continues: Option<RunId>,
+    /// The consultation that continued this one in a fresh session, the most recent when there
+    /// were several.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_by: Option<RunId>,
 }
 
 pub(super) fn whole_seconds<S: serde::Serializer>(
@@ -155,6 +168,16 @@ impl RunStatus {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.outcome.is_terminal()
+    }
+
+    /// Whether the way forward is a fresh session: the newest turn has settled, nothing has
+    /// continued the consultation yet, and a content filter refused enough turns in a row that
+    /// the session's own context is what it refuses.
+    #[must_use]
+    pub fn suggests_continue_fresh(&self) -> bool {
+        self.settled
+            && self.continued_by.is_none()
+            && self.content_flagged_in_a_row >= super::CONTENT_FLAGGED_STREAK
     }
 }
 

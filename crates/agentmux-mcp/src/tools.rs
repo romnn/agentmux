@@ -1,4 +1,4 @@
-//! The eleven tools.
+//! The twelve tools.
 //!
 //! Changes when the tool API changes.
 
@@ -214,6 +214,21 @@ pub struct FollowUpParams {
     #[serde(flatten)]
     #[schemars(flatten)]
     pub permissions: PermissionParams,
+}
+
+/// Arguments for `continue_fresh`: which consultation to continue, and what to ask.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContinueFreshParams {
+    /// The consultation id to continue, from `ask`, `start` or `list`.
+    /// Its newest turn must have settled.
+    pub run_id: String,
+
+    /// What the new session should do, after it has read the old transcript and the working
+    /// tree.
+    /// Omitted, it carries on with the work the old consultation was doing.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub question: Option<String>,
 }
 
 /// Arguments for `wait`: which turn to wait for, and which page of the transcript to return.
@@ -543,6 +558,28 @@ impl AgentMux {
             params.offset.unwrap_or(before),
             slice(params.max_bytes, DEFAULT_RESULT_BYTES),
         )
+    }
+
+    #[tool(
+        description = "Continue a consultation in a new one when its own session cannot go on — \
+                       typically when a content filter refused two or more turns in a row, which \
+                       means the session's context, not your wording, is what it refuses. Starts \
+                       a new consultation with the same delegate, model, effort, permissions, \
+                       working directory and label, whose first question gives the old \
+                       transcript's path, says the working tree may hold the old consultation's \
+                       uncommitted work, and then asks `question`. Each consultation's `status` \
+                       names the other. Returns the new consultation's id immediately, like \
+                       `start`; collect it with `wait`."
+    )]
+    fn continue_fresh(
+        &self,
+        Parameters(params): Parameters<ContinueFreshParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let status = self
+            .store
+            .continue_fresh(&run_id(&params.run_id)?, params.question.as_deref())
+            .map_err(|error| run_error(&error))?;
+        Ok(text(render::status(&status)))
     }
 
     #[tool(

@@ -2,7 +2,7 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same eleven verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! The same twelve verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
 //! Two more are hidden: `supervise`, the process the run store launches for every turn to start
 //! its delegate and settle it, and `codex-app-server`, the driver it launches as the delegate of a

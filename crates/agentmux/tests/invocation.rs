@@ -112,6 +112,7 @@ fn build_with(
         resume,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
     delegate
         .invocation(&plan, &host_session_env(), config)
@@ -367,6 +368,7 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
 
     let error = Delegate::Claude {
@@ -410,6 +412,7 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
 
     let error = Delegate::Claude {
@@ -444,6 +447,7 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
 
     let error = Delegate::Claude {
@@ -489,6 +493,7 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
     let mut host = host_session_env();
     host.insert("LOCAL_TOKEN".to_owned(), "not-a-real-key".to_owned());
@@ -676,6 +681,7 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             resume: None,
             extra_env: &requested,
             billing: None,
+            read_dirs: &[],
         };
         let result = Delegate::Claude {
             permissions: ClaudePermissions::default(),
@@ -712,6 +718,7 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
 
     let invocation = Delegate::Claude {
@@ -748,6 +755,7 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
 
     let error = Delegate::Claude {
@@ -844,6 +852,7 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
 
     let invocation = Delegate::Claude {
@@ -936,6 +945,7 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
         resume: None,
         extra_env: &BTreeMap::new(),
         billing: None,
+        read_dirs: &[],
     };
 
     let error = Delegate::Claude {
@@ -1179,6 +1189,7 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
     let delegate = Delegate::Claude {
         permissions: ClaudePermissions::default(),
@@ -1219,6 +1230,7 @@ fn build_invocation_with_request_env(
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
@@ -1399,6 +1411,7 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         resume: None,
         extra_env: &requested,
         billing: None,
+        read_dirs: &[],
     };
     let api_invocation = delegate_on_account(Vendor::Codex, "metered")?
         .invocation(&plan, &host, &config)
@@ -1533,6 +1546,7 @@ fn build_invocation_with_billing(
         resume: None,
         extra_env: &requested,
         billing,
+        read_dirs: &[],
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
