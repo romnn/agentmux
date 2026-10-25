@@ -1587,12 +1587,17 @@ fn a_rollout_is_found_where_the_requests_environment_sent_the_child() -> Result<
         .collect();
     let started = store.start(&start).or_fail()?;
 
-    // The window came from the rollout under the request's `CODEX_HOME`.
+    // The window came from the rollout under the request's `CODEX_HOME`, half used and open.
     let status = store.status(&started.run_id).or_fail()?;
-    assert_that!(
-        status.rate_limit.map(|limit| limit.window),
-        some(some(eq("codex")))
-    );
+    let window = status.usage_window.or_fail()?;
+    assert_that!(window.window.as_deref(), some(eq("codex")));
+    assert_that!(window.used_percent, some(eq(53.0)));
+    assert_that!(window.exhausted, eq(false));
+
+    // It was cached as it was found: with the rollout gone, the next read still has it.
+    std::fs::remove_dir_all(&codex_home)?;
+    let again = store.status(&started.run_id).or_fail()?;
+    assert_that!(again.usage_window, some(eq(&window)));
     Ok(())
 }
 
@@ -1623,7 +1628,10 @@ fn a_rollout_missed_while_the_delegate_saves_is_searched_again() -> Result<()> {
     let started = store.start(&request(codex()?, "q")).or_fail()?;
 
     // Nothing written yet, so nothing found.
-    assert_that!(store.status(&started.run_id).or_fail()?.rate_limit, none());
+    assert_that!(
+        store.status(&started.run_id).or_fail()?.usage_window,
+        none()
+    );
 
     // The CLI writes its rollout on the way out.
     let day = codex_home.join("sessions/2026/09/07");
@@ -1641,7 +1649,7 @@ fn a_rollout_missed_while_the_delegate_saves_is_searched_again() -> Result<()> {
         store
             .status(&started.run_id)
             .or_fail()?
-            .rate_limit
+            .usage_window
             .map(|limit| limit.window),
         some(some(eq("codex")))
     );

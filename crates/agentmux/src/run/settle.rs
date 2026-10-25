@@ -61,7 +61,7 @@ use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::stream::{self, Fold};
-use crate::transcript::{FailureKind, Message, Outcome, RateLimit, Transcript, Turn};
+use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
 /// How many bytes of a departed child's stderr are kept with its exit record.
 const STDERR_TAIL: usize = 2000;
@@ -309,7 +309,7 @@ impl RunStore {
                 lookup.thread_id.as_str(),
             );
             let found = if found.is_some() || lookup.delegate_has_exited {
-                write_json_once(&lookup.turn_dir.rate_limit(), &found).unwrap_or_else(|err| {
+                write_json_once(&lookup.turn_dir.usage_window(), &found).unwrap_or_else(|err| {
                     tracing::debug!(?err, "not remembering a turn's usage window");
                     found
                 })
@@ -322,7 +322,7 @@ impl RunStore {
                 .iter_mut()
                 .find(|turn| turn.index == lookup.turn_index)
             {
-                turn.rate_limit = found;
+                turn.usage_window = found;
             }
         }
     }
@@ -336,7 +336,7 @@ impl RunStore {
         meta: &Meta,
         codex_home: Option<&Path>,
         thread_id: &str,
-    ) -> Option<RateLimit> {
+    ) -> Option<UsageWindow> {
         let codex_home = if let Some(recorded) = codex_home {
             recorded.to_path_buf()
         } else {
@@ -347,12 +347,15 @@ impl RunStore {
 
         // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
         let snapshot = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
-        let resets_at = select_rate_limit_window(&snapshot)?
+        let selected = select_rate_limit_window(&snapshot)?;
+        let resets_at = selected
             .resets_at
             .and_then(chrono::DateTime::from_timestamp_secs)?;
-        Some(RateLimit {
+        Some(UsageWindow {
             resets_at,
-            window: snapshot.limit_id,
+            exhausted: selected.exhausted(),
+            used_percent: Some(selected.used_percent),
+            window: snapshot.limit_id.clone(),
         })
     }
 }
@@ -704,10 +707,10 @@ fn cached_rate_limit_or_lookup(
     delegate_gone: bool,
 ) -> Option<RateLimitLookup> {
     let thread_id =
-        thread_id.filter(|_| turn.rate_limit.is_none() && turn.outcome.is_terminal())?;
-    match read_json::<Option<RateLimit>>(&files.dir.rate_limit()) {
+        thread_id.filter(|_| turn.usage_window.is_none() && turn.outcome.is_terminal())?;
+    match read_json::<Option<UsageWindow>>(&files.dir.usage_window()) {
         Ok(Some(remembered)) => {
-            turn.rate_limit = remembered;
+            turn.usage_window = remembered;
             None
         }
         Ok(None) | Err(_) => Some(RateLimitLookup {

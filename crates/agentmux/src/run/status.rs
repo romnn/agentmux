@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::delegate::{Billing, Delegate, Isolation, ModelId};
-use crate::transcript::{EarlierFailure, Outcome, RateLimit, UnrecognisedEvents, Usage};
+use crate::transcript::{EarlierFailure, Outcome, UnrecognisedEvents, Usage, UsageWindow};
 
 use super::id::RunId;
 
@@ -100,7 +100,7 @@ pub struct RunStatus {
     /// Carried out of the transcript because the right response to a rate limit depends on how
     /// long the window has left, and a caller should not have to read the transcript body to find
     /// a timestamp the stream already gave up.
-    pub rate_limit: Option<RateLimit>,
+    pub usage_window: Option<UsageWindow>,
     /// Whether any turn asked to continue a session and silently opened a new one instead.
     pub broke_continuity: bool,
     /// Whether codex sent app-server messages the generated protocol could not read, which

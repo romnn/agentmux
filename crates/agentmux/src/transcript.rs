@@ -18,16 +18,20 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// What the vendor said about the usage window the delegate was refused against.
+/// What the vendor reported about the account's usage window as a turn ran.
 ///
 /// A rate limit is the one failure whose right response depends on a number the failure itself does
 /// not contain: a window reopening in ten minutes is worth waiting for, and one reopening in nine
 /// hours is not.
-/// Both vendors report the reopening time in the stream and neither puts it in the error message,
-/// so it is captured here rather than left for a caller to parse back out of prose.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RateLimit {
-    /// When the window reopens.
+/// Claude reports the window in its stream and Codex in the session rollout it writes, and neither
+/// puts it in the error message, so it is captured here rather than left for a caller to parse back
+/// out of prose.
+///
+/// It is carried for a turn that was never refused too, because a window nearly used up tells the
+/// caller what to expect from the next question; [`UsageWindow::exhausted`] says which it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    /// When the window resets, which for an exhausted window is when it reopens.
     pub resets_at: DateTime<Utc>,
     /// The vendor's own name for the window, such as `seven_day_overage_included`.
     ///
@@ -35,12 +39,19 @@ pub struct RateLimit {
     /// ones appear without notice, and the name is only ever shown to a reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
+    /// Whether the window was refusing requests when the vendor reported it.
+    ///
+    /// Only then is it closed until [`UsageWindow::resets_at`]; otherwise it merely resets then.
+    pub exhausted: bool,
+    /// How much of the window had been used, from 0 to 100, where the vendor reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
 }
 
-impl RateLimit {
-    /// How long until the window reopens, or `None` once it already has.
+impl UsageWindow {
+    /// How long until the window resets, or `None` once it already has.
     #[must_use]
-    pub fn reopens_in(&self, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    pub fn resets_in(&self, now: DateTime<Utc>) -> Option<std::time::Duration> {
         (self.resets_at - now).to_std().ok()
     }
 }
@@ -424,7 +435,7 @@ pub struct Turn {
     /// that succeeded against a nearly exhausted window is worth knowing about before the next
     /// question is asked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_limit: Option<RateLimit>,
+    pub usage_window: Option<UsageWindow>,
     /// The model identifier the vendor itself reported using, when it reported one.
     ///
     /// A requested identifier can be an alias the vendor expands — `sonnet` arrives as
@@ -502,7 +513,7 @@ impl Turn {
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
             has_undecoded_app_server_messages: false,
-            rate_limit: None,
+            usage_window: None,
             resolved_model: None,
             broke_continuity: false,
             recovered: None,

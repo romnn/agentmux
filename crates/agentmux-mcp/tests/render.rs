@@ -15,7 +15,7 @@ use agentmux::delegate::{
 };
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
-use agentmux::transcript::{FailureKind, Outcome, RateLimit};
+use agentmux::transcript::{FailureKind, Outcome, UsageWindow};
 use chrono::Utc;
 use googletest::prelude::*;
 
@@ -313,9 +313,11 @@ fn a_window_reopening_soon_advises_waiting_rather_than_switching() -> Result<()>
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::minutes(4),
         window: Some("five_hour".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
 
     let warnings = agentmux_mcp::render::warnings(&status);
@@ -341,9 +343,11 @@ fn a_window_hours_away_advises_switching_rather_than_waiting() -> Result<()> {
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = Some(RateLimit {
+    status.usage_window = Some(UsageWindow {
         resets_at: Utc::now() + chrono::Duration::hours(9),
         window: Some("seven_day_overage_included".to_owned()),
+        exhausted: true,
+        used_percent: None,
     });
 
     let warnings = agentmux_mcp::render::warnings(&status);
@@ -368,7 +372,7 @@ fn a_rate_limit_without_a_window_still_advises_something_actionable() -> Result<
         kind: FailureKind::RateLimited,
         detail: "rate limit reached".to_owned(),
     };
-    status.rate_limit = None;
+    status.usage_window = None;
 
     let warnings = agentmux_mcp::render::warnings(&status);
 
@@ -644,5 +648,33 @@ fn earlier_failures_do_not_read_as_the_newest_turns_state() -> Result<()> {
             {"turn": 2, "kind": "content_flagged"},
         ]))
     );
+    Ok(())
+}
+
+/// A rate-limited failure whose recorded window still has room is not timed by that window.
+///
+/// The window did not refuse the turn, so it says nothing about when a retry would succeed, and
+/// advising to wait for its reset would park the caller for a week on a window that is open.
+#[gtest]
+fn a_window_with_room_left_does_not_time_the_retry() -> Result<()> {
+    let (_store, mut status, _dir) = consult(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.failed","error":{"message":"rate limit reached"}}
+    "#})?;
+    status.outcome = Outcome::Failed {
+        kind: FailureKind::RateLimited,
+        detail: "rate limit reached".to_owned(),
+    };
+    status.usage_window = Some(UsageWindow {
+        resets_at: Utc::now() + chrono::Duration::minutes(4),
+        window: Some("codex".to_owned()),
+        exhausted: false,
+        used_percent: Some(28.0),
+    });
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+
+    assert_that!(warnings, not(contains_substring("wait that long")));
+    assert_that!(warnings, not(contains_substring("reopen")));
     Ok(())
 }

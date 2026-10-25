@@ -17,7 +17,7 @@ use chrono::Utc;
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
 use crate::run::{HookReopening, RunStatus, describe_delegate};
-use crate::transcript::{EarlierFailure, FailureKind, Outcome, RateLimit};
+use crate::transcript::{EarlierFailure, FailureKind, Outcome, UsageWindow};
 
 /// Something a reader must be told about a consultation, because it changes how the transcript
 /// reads.
@@ -107,6 +107,16 @@ impl RunStatus {
         }
         warnings
     }
+
+    /// The usage window that is refusing requests, which is the one a retry after a rate limit
+    /// can be timed by.
+    ///
+    /// A window with room left resets on its own schedule, and timing a retry by it would wait
+    /// for nothing.
+    #[must_use]
+    pub fn exhausted_window(&self) -> Option<&UsageWindow> {
+        self.usage_window.as_ref().filter(|window| window.exhausted)
+    }
 }
 
 /// A one-line state, with the failure reason inline when there is one.
@@ -192,15 +202,29 @@ pub fn duration(duration: std::time::Duration) -> String {
 
 /// Where an account's usage window stands.
 #[must_use]
-pub fn rate_limit_line(limit: &RateLimit) -> String {
+pub fn usage_window_line(limit: &UsageWindow) -> String {
     let window = limit.window.as_deref().unwrap_or("usage");
-    match limit.reopens_in(Utc::now()) {
-        Some(remaining) => format!(
-            "{window} window reopens in {} ({})",
+    let remaining = limit.resets_in(Utc::now());
+    // Only an exhausted window is closed until it resets; saying "reopens" of any other reads as
+    // a block on an account that can still answer.
+    match (limit.exhausted, remaining) {
+        (true, Some(remaining)) => format!(
+            "{window} window exhausted, reopens in {} ({})",
             duration(remaining),
             limit.resets_at.to_rfc3339()
         ),
-        None => format!("{window} window has reopened"),
+        (true, None) => format!("{window} window has reopened"),
+        (false, Some(remaining)) => {
+            let used = limit
+                .used_percent
+                .map_or_else(String::new, |percent| format!(" {percent:.0}% used,"));
+            format!(
+                "{window} window{used} resets in {} ({})",
+                duration(remaining),
+                limit.resets_at.to_rfc3339()
+            )
+        }
+        (false, None) => format!("{window} window has reset"),
     }
 }
 

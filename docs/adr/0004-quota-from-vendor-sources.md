@@ -23,7 +23,7 @@ over JSON-RPC for `account/rateLimits/read`. The server interleaves unsolicited 
 replies, so the response is matched on its request id rather than read as the next line.
 
 **A Codex turn's own window** is recovered after the turn from the session rollout and cached per
-turn in `rate-limit.json`, because that search would otherwise run on every `status` and every page
+turn in `usage-window.json`, because that search would otherwise run on every `status` and every page
 of a `tail`. The window recorded (`select_rate_limit_window` in `crates/agentmux/src/run/settle.rs`)
 is an exhausted one if any, the one reopening last if several are, and otherwise the fullest. A plan
 with a five-hour and a weekly window is refused against whichever is used up, and advice to wait for
