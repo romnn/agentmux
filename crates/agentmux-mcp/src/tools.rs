@@ -1044,8 +1044,11 @@ observed the consultation, not seen it finish. It has lost nothing; wait for the
 calling again. Use `status` for a cheap look that carries no transcript text, `tail` when you want
 to see what the delegate is actually doing — with `from_end` for its latest output — `result` to
 page the transcript, and `cancel` to stop one while keeping what it collected. `ask` is `start`
-plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep.
-`follow_up` continues the delegate's own session, so ask only the new thing. `steer` adds an
+plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep,
+and with `label` and `state` finds the consultations you gave a `label` on `start` or `follow_up`.
+`follow_up` continues the delegate's own session, so ask only the new thing. When that session
+itself cannot go on — a content filter refusing turn after turn however you rephrase —
+`continue_fresh` starts a new consultation that reads the old transcript and working tree. `steer` adds an
 instruction to a turn that is still running, which the delegate sees before its next model call;
 only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`
 consultation that inherits its account's settings, because only those are launched over Codex's
