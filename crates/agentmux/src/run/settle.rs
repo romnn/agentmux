@@ -856,13 +856,14 @@ impl RunStore {
 }
 
 /// Note on `turn` what its launch record says before the child ran: whether it could save its
-/// session, its pricing, its isolation, and the delegate it ran as when a follow-up changed that
-/// from `header`, the one the transcript header names.
+/// session, its pricing, its isolation, its label, and the delegate it ran as when a follow-up
+/// changed that from `header`, the one the transcript header names.
 fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &Delegate) {
     turn.unsaved_session_store
         .clone_from(&invocation.unsaved_session_store);
     turn.billing = invocation.billing;
     turn.auto_resume = invocation.auto_resume;
+    turn.label.clone_from(&invocation.label);
     let ran_as = invocation.delegate.as_ref();
     turn.isolation = ran_as.and_then(Delegate::isolation);
     turn.ran_as = ran_as

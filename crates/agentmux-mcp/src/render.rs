@@ -600,10 +600,14 @@ pub fn settled(
 ) -> String {
     let id = settled.run_id();
     let turn = settled.turn_number();
-    let label = label.map_or_else(String::new, |label| format!("label:      {label}\n"));
+    // Its own line under the id, ending in a newline, or nothing.
+    let mut label_line = String::new();
+    if let Some(label) = label {
+        let _ = writeln!(label_line, "label:      {label}");
+    }
     let mut out = indoc::formatdoc! {"
         run_id:     {id}
-        {label}state:      {state}
+        {label_line}state:      {state}
         delegate:   {delegate}
         reading:    {cwd}
         settled:    turn {turn} is final; its record is {marker}
@@ -680,32 +684,35 @@ pub fn tail(status: &RunStatus, page: &TranscriptPage) -> String {
     out
 }
 
-/// Recent consultations.
+/// Recent consultations, as `filtered` by the caller's `label` or `state` or not.
 #[must_use]
-pub fn list(runs: &[RunSummary]) -> String {
+pub fn list(runs: &[RunSummary], filtered: bool) -> String {
     if runs.is_empty() {
-        return "no consultations yet. Start one with `ask`, or with `start` if it will take \
-                minutes."
-            .to_owned();
+        // A caller that filtered may well have consultations, and starting another would only
+        // duplicate one it could not find.
+        return if filtered {
+            "no consultations match the `label` and `state` you passed. Call `list` without them \
+             to see every recent one."
+        } else {
+            "no consultations yet. Start one with `ask`, or with `start` if it will take minutes."
+        }
+        .to_owned();
     }
     let mut out = String::new();
     for run in runs {
-        let label = run
-            .label
-            .as_ref()
-            .map_or_else(String::new, |label| format!("    label: {label}\n"));
-        out.push_str(&indoc::formatdoc! {"
-            {run_id}  {state:<9}  {turns} turn(s)  {created_at}
-            {label}    {delegate}
-                {question}
-            ",
+        let _ = writeln!(
+            out,
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
             run_id = run.run_id,
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
-            delegate = run.delegate,
-            question = run.question,
-        });
+        );
+        if let Some(label) = &run.label {
+            let _ = writeln!(out, "    label: {label}");
+        }
+        let _ = writeln!(out, "    {}", run.delegate);
+        let _ = writeln!(out, "    {}", run.question);
     }
     out
 }

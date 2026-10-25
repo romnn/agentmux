@@ -22,8 +22,8 @@ use super::label::RunLabel;
 pub struct RunStatus {
     /// The consultation's id.
     pub run_id: RunId,
-    /// What the consultation is for, as its newest turn was labelled: by the follow-up that
-    /// began it, or else as the turn before it was.
+    /// What the consultation is for now: the label its newest turn was given, or else the latest
+    /// one an earlier turn was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<RunLabel>,
     /// Who is being consulted, as its newest turn ran: the isolation and permissions a follow-up
@@ -236,7 +236,7 @@ impl HookReopening {
 pub struct RunSummary {
     /// The consultation's id.
     pub run_id: RunId,
-    /// What the consultation is for, as its newest turn was labelled.
+    /// What the consultation is for now, as [`RunStatus::label`] says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<RunLabel>,
     /// A one-line description of the delegate.
@@ -273,8 +273,7 @@ pub struct RunSummary {
 /// The default shows every one.
 #[derive(Debug, Clone, Default)]
 pub struct ListFilter {
-    /// Only consultations whose label holds this text, ignoring case: the label `start` gave it
-    /// or the one its newest turn has.
+    /// Only consultations whose current label holds this text, ignoring case.
     pub label: Option<String>,
     /// Only consultations whose newest turn stands so.
     pub state: Option<TurnState>,

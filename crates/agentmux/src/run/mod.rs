@@ -10,14 +10,14 @@
 //!                              submitted, a cancellation is marked or recorded, or the run is
 //!                              removed
 //! runs/<run_id>/
-//!   meta.json                  delegate, cwd, retention, created_at, the label `start` was
-//!                              given, and the consultation this one continues
+//!   meta.json                  delegate, cwd, retention, created_at, and the consultation this
+//!                              one continues
 //!   continued-by.json          the consultation that continued this one in a fresh session
 //!   transcript.md              the rendered transcript, a cache of the fold below
 //!   turns/0001/                one directory per turn, numbered from 1 as the transcript's
 //!                              headings number turns
 //!     question.md              what was asked; also the child's stdin
-//!     invocation.json          what was run, and the label the turn carries, written before the
+//!     invocation.json          what was run, and the label the turn was given, written before the
 //!                              spawn
 //!     events.jsonl             the delegate's raw event stream, exactly as emitted
 //!     stderr.log               the delegate's stderr
@@ -516,7 +516,7 @@ impl RunStore {
         let newest_index = state.newest.as_ref().map(|newest| newest.index);
         let status = RunStatus {
             run_id: run_id.clone(),
-            label: self.current_label(&meta, newest_index)?,
+            label: newest_index.and_then(|index| self.label_of_turn(run_id, index)),
             delegate: self.current_delegate(&meta, newest_index)?,
             cwd: meta.cwd.clone(),
             elapsed: elapsed_since(meta.created_at, &outcome, state.last_activity),
@@ -624,13 +624,12 @@ impl RunStore {
         Ok(metas
             .into_iter()
             .filter_map(|meta| {
-                let started_as = meta.label.clone();
                 let summary = self.summary(meta)?;
                 let labelled = filter.label.as_deref().is_none_or(|needle| {
-                    [started_as.as_ref(), summary.label.as_ref()]
-                        .into_iter()
-                        .flatten()
-                        .any(|label| label.matches(needle))
+                    summary
+                        .label
+                        .as_ref()
+                        .is_some_and(|label| label.matches(needle))
                 });
                 let in_state = filter
                     .state
@@ -656,7 +655,7 @@ impl RunStore {
         let billing = newest.as_ref().and_then(|folded| folded.turn.billing);
         // As the newest turn ran, as `status` describes it.
         let current = self.current_delegate(&meta, newest_index).ok()?;
-        let label = self.current_label(&meta, newest_index).ok()?;
+        let label = newest_index.and_then(|index| self.label_of_turn(&meta.run_id, index));
         let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
             .map(|question| first_line(&question, 120))
             .unwrap_or_default();

@@ -55,7 +55,7 @@ pub struct StartRequest {
     /// be steered.
     pub force_codex_exec: bool,
     /// What the consultation is for, which `status`, `list` and `wait` show and `list` filters
-    /// on.
+    /// on, until a follow-up gives another.
     pub label: Option<RunLabel>,
 }
 
@@ -70,7 +70,7 @@ pub(super) struct NextTurn<'a> {
     pub(super) question: &'a str,
     /// The delegate's own session to continue, for a follow-up.
     pub(super) resume: Option<&'a SessionRef>,
-    /// What the turn is for, recorded with it.
+    /// The label the caller gave the turn, when it gave one.
     pub(super) label: Option<&'a RunLabel>,
 }
 
@@ -267,7 +267,6 @@ impl RunStore {
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
-            label: request.label.clone(),
             continues: continues.cloned(),
         };
         let started = write_json(&dir.join("meta.json"), &meta)
@@ -278,7 +277,7 @@ impl RunStore {
                     index: 0,
                     question: &request.question,
                     resume: None,
-                    label: meta.label.as_ref(),
+                    label: request.label.as_ref(),
                 };
                 run.launch_turn(&meta, &first, Resolution::Configured(&config))
             });
@@ -428,7 +427,7 @@ impl RunStore {
         run_id: &RunId,
         question: &str,
         overrides: PermissionOptions,
-        label: Option<RunLabel>,
+        label: Option<&RunLabel>,
     ) -> Result<RunStatus, RunError> {
         // Asked before the lock, which would otherwise leave a lock file for a run that is not
         // there.
@@ -455,17 +454,13 @@ impl RunStore {
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
             let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
-            let label = match label {
-                Some(label) => Some(label),
-                None => self.current_label(&meta, state.newest.map(|newest| newest.index))?,
-            };
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
                 delegate: &delegate,
                 index,
                 question,
                 resume: Some(&session),
-                label: label.as_ref(),
+                label,
             };
             run.launch_turn(&meta, &next, Resolution::Configured(&config))?;
         }
@@ -499,40 +494,25 @@ impl RunStore {
         })
     }
 
-    /// What a consultation's turn at `newest` is for: the label its record holds, or the one
-    /// `start` was given for a run with no turn yet or a turn recorded before agentmux kept one.
+    /// What a consultation's turn at `index` is for: the label it was given, or else the one the
+    /// latest turn before it was given, or `None` when no turn up to it was given one.
     ///
-    /// # Errors
-    ///
-    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
-    /// cannot be read.
-    pub(super) fn current_label(
-        &self,
-        meta: &Meta,
-        newest: Option<u32>,
-    ) -> Result<Option<RunLabel>, RunError> {
-        let Some(index) = newest else {
-            return Ok(meta.label.clone());
-        };
-        let recorded =
-            read_json::<InvocationRecord>(&self.turn_dir(&meta.run_id, index).invocation())?
-                .and_then(|record| record.label);
-        Ok(recorded.or_else(|| meta.label.clone()))
+    /// A turn whose record cannot be read is read as given none, so a damaged record never fails
+    /// a `status` or a `list`.
+    pub(super) fn label_of_turn(&self, run_id: &RunId, index: u32) -> Option<RunLabel> {
+        (0..=index).rev().find_map(|index| {
+            read_json::<InvocationRecord>(&self.turn_dir(run_id, index).invocation())
+                .ok()
+                .flatten()
+                .and_then(|record| record.label)
+        })
     }
 
     /// What a settled turn is for: what `status` and `list` say of the newest turn, said of any
     /// one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RunError::Io`] or [`RunError::CorruptRecord`] when that turn's launch record
-    /// cannot be read.
-    pub fn turn_label(
-        &self,
-        meta: &Meta,
-        settled: &SettledTurn,
-    ) -> Result<Option<RunLabel>, RunError> {
-        self.current_label(meta, Some(settled.turn_index()))
+    #[must_use]
+    pub fn turn_label(&self, settled: &SettledTurn) -> Option<RunLabel> {
+        self.label_of_turn(settled.run_id(), settled.turn_index())
     }
 
     /// Who a settled turn ran as: what `status` and `list` say of the newest turn, said of any

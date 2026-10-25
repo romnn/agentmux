@@ -465,8 +465,7 @@ pub struct ListParams {
     #[schemars(with = "usize")]
     pub limit: Option<usize>,
 
-    /// Only consultations whose label holds this text, ignoring case: the label `start` gave it,
-    /// or the one its newest turn has.
+    /// Only consultations whose current label holds this text, ignoring case.
     #[serde(default)]
     #[schemars(with = "String")]
     pub label: Option<String>,

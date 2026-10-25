@@ -37,11 +37,8 @@ impl RunStore {
             meta.cwd.display(),
             meta.created_at.to_rfc3339(),
         );
-        // Each written only when there is one, so a transcript rendered before either existed
-        // renders byte for byte as it did.
-        if let Some(label) = &meta.label {
-            let _ = writeln!(text, "- label: {label}");
-        }
+        // Written only when there is one, so a transcript rendered before it existed renders
+        // byte for byte as it did.
         if let Some(continues) = &meta.continues {
             let _ = writeln!(text, "- continues: {continues}");
         }

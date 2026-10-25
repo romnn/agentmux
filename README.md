@@ -143,8 +143,8 @@ agentmux start --delegate codex --model sol --effort high \
   'Review the diff against main for correctness bugs. Cite file:line.'
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 
-# One more question, in the delegate's own session. A `--label` labels this turn and the ones
-# after it; without one the turn keeps the consultation's label.
+# One more question, in the delegate's own session.
+# A `--label` labels this turn and the ones after it; without one the turn keeps the current one.
 agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
 agentmux follow-up <run-id> --label 'RE-REVIEW after rework' 'The fix is in; review it again.'
 

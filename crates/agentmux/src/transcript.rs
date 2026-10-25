@@ -520,6 +520,12 @@ pub struct Turn {
     /// question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<ResumeAttempt>,
+    /// The label the caller gave this turn, when it gave one.
+    ///
+    /// Recorded before the child is spawned, so like [`Self::billing`] it renders under the
+    /// question, which makes the transcript say where a consultation's purpose changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<crate::run::RunLabel>,
 }
 
 /// Which automatic resume a turn is, in an unbroken run of turns that failed because the model
@@ -559,6 +565,7 @@ impl Turn {
             isolation: None,
             ran_as: None,
             auto_resume: None,
+            label: None,
         }
     }
 
@@ -754,6 +761,15 @@ fn render_question(turn: &Turn) -> String {
         turn.index.saturating_add(1),
         turn.question.trim_end()
     );
+    if let Some(label) = &turn.label {
+        let _ = indoc::writedoc!(
+            out,
+            "
+
+            > **Label:** {label}
+        "
+        );
+    }
     if let Some(ResumeAttempt { attempt, attempts }) = turn.auto_resume {
         let _ = indoc::writedoc!(
             out,

@@ -204,7 +204,8 @@ pub struct FollowUpParams {
     pub max_bytes: Option<usize>,
 
     /// A new short purpose for this turn and the ones after it, such as
-    /// `"RE-REVIEW after rework"`; omitted, the turn keeps the consultation's current label.
+    /// `"RE-REVIEW after rework"`: one line of up to 120 characters.
+    /// Omitted, the turn keeps the consultation's current label.
     #[serde(default)]
     #[schemars(with = "String")]
     pub label: Option<String>,
@@ -489,10 +490,7 @@ impl AgentMux {
             .store
             .turn_delegate(&meta, &settled)
             .map_err(|error| run_error(&error))?;
-        let turn_label = self
-            .store
-            .turn_label(&meta, &settled)
-            .map_err(|error| run_error(&error))?;
+        let turn_label = self.store.turn_label(&settled);
         let newest = self
             .store
             .pin_turn(&id, None)
@@ -544,7 +542,7 @@ impl AgentMux {
             .transcript_bytes;
         let status = self
             .store
-            .follow_up_with(&id, &params.question, overrides, label)
+            .follow_up_with(&id, &params.question, overrides, label.as_ref())
             .map_err(|error| run_error(&error))?;
         self.store
             .wait_until_terminal(
@@ -636,6 +634,7 @@ impl AgentMux {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let filtered = params.label.is_some() || params.state.is_some();
         let filter = ListFilter {
             label: params.label,
             state: params.state,
@@ -644,7 +643,7 @@ impl AgentMux {
             .store
             .list(params.limit.unwrap_or(20).clamp(1, 200), &filter)
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::list(&runs)))
+        Ok(text(render::list(&runs, filtered)))
     }
 
     #[tool(
@@ -1454,7 +1453,7 @@ mod tests {
         };
 
         let started = result_text(&start(Some(" REVIEW CRD G1 "))?.or_fail()?)?;
-        assert_that!(started, contains_substring("\nlabel:      REVIEW CRD G1\n"));
+        assert_that!(started, contains_substring("label:      REVIEW CRD G1"));
         start(None)?.or_fail()?;
         let refusal = start(Some("two\nlines"))?.err().or_fail()?;
         assert_that!(refusal.code, eq(ErrorCode::INVALID_PARAMS));
@@ -1465,10 +1464,10 @@ mod tests {
             result_text(&server.list(Parameters(params)).or_fail()?)
         };
         let found = list(serde_json::json!({ "label": "crd", "state": "completed" }))?;
-        assert_that!(found, contains_substring("    label: REVIEW CRD G1\n"));
+        assert_that!(found, contains_substring("    label: REVIEW CRD G1"));
         assert_that!(found.matches(" turn(s) ").count(), eq(1));
         let none = list(serde_json::json!({ "state": "running" }))?;
-        assert_that!(none, starts_with("no consultations"));
+        assert_that!(none, starts_with("no consultations match"));
         Ok(())
     }
 
