@@ -68,12 +68,13 @@ fn request(question: &str) -> Result<StartRequest> {
 }
 
 impl Harness {
-    fn turn_dir(&self, run_id: &RunId, index: u32) -> PathBuf {
+    /// The directory of turn `number`, counted from 1 as the directories are named.
+    fn turn_dir(&self, run_id: &RunId, number: u32) -> PathBuf {
         self.store
             .root()
             .join("runs")
             .join(run_id.as_str())
-            .join(format!("turns/{index:04}"))
+            .join(format!("turns/{number:04}"))
     }
 
     fn transcript(&self, run_id: &RunId) -> Result<String> {
@@ -95,7 +96,7 @@ impl Harness {
 fn a_turn_settles_once_its_delegate_has_gone() -> Result<()> {
     let harness = harness([Script::running(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request("q")?)?;
-    let marker = harness.turn_dir(&started.run_id, 0).join("settled.json");
+    let marker = harness.turn_dir(&started.run_id, 1).join("settled.json");
 
     // The stream says completed, but the delegate is still there.
     assert_that!(started.outcome, matches_pattern!(Outcome::Completed { .. }));
@@ -140,7 +141,7 @@ fn a_turn_settles_once_its_delegate_has_gone() -> Result<()> {
 fn a_settlement_is_committed_once_and_rewritten_the_same() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request("q")?)?;
-    let marker = harness.turn_dir(&started.run_id, 0).join("settled.json");
+    let marker = harness.turn_dir(&started.run_id, 1).join("settled.json");
     let first = harness.store.finalize_turn(&started.run_id, 0)?.or_fail()?;
     let committed = std::fs::read(&marker).or_fail()?;
     let transcript = harness.transcript(&started.run_id)?;
@@ -205,7 +206,7 @@ async fn a_pinned_wait_returns_its_own_turn_across_a_follow_up() -> Result<()> {
     // Committed before the follow-up was claimed.
     assert_that!(
         harness
-            .turn_dir(&started.run_id, 0)
+            .turn_dir(&started.run_id, 1)
             .join("settled.json")
             .exists(),
         eq(true)
@@ -272,7 +273,7 @@ async fn a_cancelled_turn_settles_cancelled() -> Result<()> {
 fn a_settlement_that_does_not_hold_is_refused() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request("q")?)?;
-    let marker = harness.turn_dir(&started.run_id, 0).join("settled.json");
+    let marker = harness.turn_dir(&started.run_id, 1).join("settled.json");
     let committed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&marker).or_fail()?).or_fail()?;
     let with = |field: &str, value: serde_json::Value| {
@@ -404,7 +405,7 @@ async fn a_wait_returns_within_its_polling_ceiling() -> Result<()> {
 ///
 /// The pid is one no scripted launcher hands out, which the launcher reports gone.
 fn leave_a_dead_supervisor(harness: &Harness, run_id: &RunId, phase: &str) -> Result<()> {
-    let turn = harness.turn_dir(run_id, 0);
+    let turn = harness.turn_dir(run_id, 1);
     std::fs::remove_file(turn.join("launch.json")).or_fail()?;
     let record = serde_json::json!({
         "launch_id": "0123456789abcdef0123456789abcdef",
@@ -428,7 +429,7 @@ async fn a_dead_supervisor_leaves_a_failed_start_or_an_uncertain_one() -> Result
     let prepared = harness.store.start(&request("q")?)?;
     leave_a_dead_supervisor(&harness, &prepared.run_id, "prepared")?;
     std::fs::write(
-        harness.turn_dir(&prepared.run_id, 0).join("supervisor.log"),
+        harness.turn_dir(&prepared.run_id, 1).join("supervisor.log"),
         "agentmux: out of file descriptors",
     )
     .or_fail()?;
@@ -550,7 +551,7 @@ fn a_follow_up_waits_for_the_turn_it_continues_to_be_committed() -> Result<()> {
 fn every_reader_refuses_a_settlement_that_does_not_hold() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request("q")?)?;
-    let turn = harness.turn_dir(&started.run_id, 0);
+    let turn = harness.turn_dir(&started.run_id, 1);
     let marker = turn.join("settled.json");
     let committed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&marker).or_fail()?).or_fail()?;
@@ -608,7 +609,7 @@ async fn a_wait_writes_a_lost_transcript_again() -> Result<()> {
         .join("runs")
         .join(started.run_id.as_str())
         .join("transcript.md");
-    let marker = harness.turn_dir(&started.run_id, 0).join("settled.json");
+    let marker = harness.turn_dir(&started.run_id, 1).join("settled.json");
     let transcript = harness.transcript(&started.run_id)?;
     let committed = std::fs::read(&marker).or_fail()?;
 
@@ -642,9 +643,9 @@ async fn damage_elsewhere_does_not_stop_a_wait() -> Result<()> {
     let good = harness.store.start(&request("good")?)?;
     harness.store.follow_up(&good.run_id, "again")?;
     let bad = harness.store.start(&request("bad")?)?;
-    for (run_id, index) in [(&good.run_id, 1), (&bad.run_id, 0)] {
+    for (run_id, number) in [(&good.run_id, 2), (&bad.run_id, 1)] {
         std::fs::write(
-            harness.turn_dir(run_id, index).join("settled.json"),
+            harness.turn_dir(run_id, number).join("settled.json"),
             "{\"version\":",
         )
         .or_fail()?;

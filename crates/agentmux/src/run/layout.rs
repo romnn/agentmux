@@ -114,12 +114,14 @@ impl RunStore {
         self.runs_dir().join(run_id.as_str())
     }
 
+    /// The directory of the turn with zero-based `index`, named by its one-based number, as the
+    /// transcript's headings and every front end count turns.
     pub(super) fn turn_dir(&self, run_id: &RunId, index: u32) -> TurnDir {
         TurnDir {
             root: self
                 .run_dir(run_id)
                 .join("turns")
-                .join(format!("{index:04}")),
+                .join(format!("{:04}", index.saturating_add(1))),
         }
     }
 
