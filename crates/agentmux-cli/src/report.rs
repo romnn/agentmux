@@ -199,10 +199,14 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
     /// Slow enough not to spin, fast enough that a terminal feels live.
     const POLL: Duration = Duration::from_millis(700);
 
-    let mut cursor = args.cursor;
+    // Only the first read can start from the end; every later one follows on from its cursor.
+    let mut cursor = (!args.from_end).then_some(args.cursor);
     loop {
-        let (status, page) = store.view(args.run_id.id(), cursor, args.max_bytes)?;
-        cursor = page.next_offset;
+        let (status, page) = match cursor {
+            Some(cursor) => store.view(args.run_id.id(), cursor, args.max_bytes)?,
+            None => store.view_end(args.run_id.id(), args.max_bytes)?,
+        };
+        cursor = Some(page.next_offset);
 
         if json {
             // The same shape every other `--json` form uses for the outcome, so one reader
@@ -221,7 +225,7 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
 
         if !args.follow {
             if !json && !page.at_end {
-                eprintln!("\n[next cursor: {cursor}]");
+                eprintln!("\n[next cursor: {}]", page.next_offset);
             }
             return Ok(());
         }

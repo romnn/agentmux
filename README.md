@@ -111,7 +111,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 | `ask`       | Start a consultation and wait up to `wait_seconds` for it — the one-call path       |
 | `start`     | Start one and return the id immediately, for work that will take minutes            |
 | `status`    | State, elapsed time, message count, token usage, and anything that needs a warning  |
-| `tail`      | The transcript written since a cursor, plus the next cursor — call it on a loop     |
+| `tail`      | The transcript since a cursor, or its newest bytes, plus the next cursor           |
 | `result`    | The complete transcript, paged, optionally after blocking for the consultation      |
 | `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
 | `steer`     | Add an instruction to a turn that is still running, read before its next model call |
@@ -133,6 +133,7 @@ agentmux ask --delegate codex --model astra --effort high \
 agentmux start --delegate claude --model opus --effort xhigh --keep \
   --file review/brief.md
 agentmux tail <run-id> --follow
+agentmux tail <run-id> --from-end --max-bytes 2000    # just the latest output
 agentmux wait <run-id>    # exits 0 completed, 10 failed, 11 cancelled
 
 # A correction while the turn is still running, from another terminal. Only a Codex turn that
