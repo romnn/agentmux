@@ -344,7 +344,7 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
         let page = settled.page(offset, usize::MAX)?;
         reports.push(SettledJson {
             settled,
-            label: store.turn_label(settled),
+            label: store.turn_label(settled)?,
             // Decided before the settlement was committed, so it is there for a turn that has one.
             auto_resume: store.auto_resume(settled.run_id(), settled.turn_number())?,
             text_offset: offset,

@@ -99,7 +99,9 @@ mod tests {
         for refused in [
             "",
             "   ",
-            "two\nlines",
+            indoc::indoc! {"
+                two
+                lines"},
             "tab\there",
             "two\u{2028}lines",
             &"x".repeat(121),

@@ -475,7 +475,10 @@ impl AgentMux {
             .store
             .turn_delegate(&meta, &settled)
             .map_err(|error| run_error(&error))?;
-        let turn_label = self.store.turn_label(&settled);
+        let turn_label = self
+            .store
+            .turn_label(&settled)
+            .map_err(|error| run_error(&error))?;
         let newest = self
             .store
             .pin_turn(&id, None)
@@ -1418,7 +1421,11 @@ mod tests {
         let started = result_text(&start(Some(" REVIEW CRD G1 "))?.or_fail()?)?;
         assert_that!(started, contains_substring("label:      REVIEW CRD G1"));
         start(None)?.or_fail()?;
-        let refusal = start(Some("two\nlines"))?.err().or_fail()?;
+        let refusal = start(Some(indoc::indoc! {"
+            two
+            lines"}))?
+        .err()
+        .or_fail()?;
         assert_that!(refusal.code, eq(ErrorCode::INVALID_PARAMS));
         assert_that!(launcher.launches().len(), eq(2));
 

@@ -512,7 +512,10 @@ impl RunStore {
         let newest_index = state.newest.as_ref().map(|newest| newest.index);
         let status = RunStatus {
             run_id: run_id.clone(),
-            label: newest_index.and_then(|index| self.label_of_turn(run_id, index)),
+            label: match newest_index {
+                Some(index) => self.label_of_turn(run_id, index)?,
+                None => None,
+            },
             delegate: self.current_delegate(&meta, newest_index)?,
             cwd: meta.cwd.clone(),
             elapsed: elapsed_since(meta.created_at, &outcome, state.last_activity),
@@ -630,7 +633,10 @@ impl RunStore {
         let billing = newest.as_ref().and_then(|folded| folded.turn.billing);
         // As the newest turn ran, as `status` describes it.
         let current = self.current_delegate(&meta, newest_index).ok()?;
-        let label = newest_index.and_then(|index| self.label_of_turn(&meta.run_id, index));
+        let label = match newest_index {
+            Some(index) => self.label_of_turn(&meta.run_id, index).ok()?,
+            None => None,
+        };
         let question = std::fs::read_to_string(self.turn_dir(&meta.run_id, 0).question())
             .map(|question| first_line(&question, 120))
             .unwrap_or_default();
