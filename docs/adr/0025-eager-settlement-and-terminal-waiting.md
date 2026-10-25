@@ -40,6 +40,9 @@ names no supervisor launches delegates directly, and their turns settle on read.
   supervisor gone never means a turn done.
 - A delegate the supervisor cannot start is a failed turn (`ExitRecord::NotStarted`), kept with
   the reason. A start that fails before the turn is recorded still leaves no run behind.
+- A turn that failed because the model was overloaded is not the end of its supervisor: it waits
+  and resumes the consultation as the next turn, which its plan's `auto_resume` says how to run
+  ([0027](0027-automatic-resume-after-overload.md)).
 
 **One step settles a turn.** `RunStore::finalize_turn` (`crates/agentmux/src/run/settle.rs`)
 takes the run lock, adopts a `settled.json` already there, or folds the consultation from its

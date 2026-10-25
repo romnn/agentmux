@@ -30,6 +30,11 @@ The store names its own resolved root to every delegate as `AGENTMUX_STATE_DIR`
 (`RunStore::STATE_DIR_ENV`), so a nested agentmux looks in the same store whatever the platform
 default would have been.
 
+The one launch the guard does not check is an automatic resume after an overloaded model
+([0027](0027-automatic-resume-after-overload.md)): the supervisor of an admitted turn continues that
+turn's consultation, and the marker in its environment is the one that admission set for its
+delegate. Only that supervisor, from the plan its admitted launch wrote, can make one.
+
 A successful check is cached for the lifetime of that `RunStore` instance. Errors listing the runs
 directory or reading discovered records abort the check rather than answer "not inside", because a
 guard that read an unreadable record as "no delegate here" would be blind in exactly the case it

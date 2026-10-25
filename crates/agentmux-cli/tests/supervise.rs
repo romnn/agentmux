@@ -672,3 +672,231 @@ fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
     assert_that!(profiles.first(), not(eq(profiles.get(1))));
     Ok(())
 }
+
+/// A Codex turn that fails with the vendor's "at capacity" error, after saying something in a
+/// session it announced.
+const CODEX_OVERLOADED: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Halfway through the review."}}
+    {"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}
+"#};
+
+/// A machine whose `codex` is the fake: its first run fails overloaded, every later one answers
+/// in the same thread, and none waits for a release.
+fn overloaded_codex_machine() -> Result<Machine> {
+    let machine = machine(&FakeRun {
+        stdout: "",
+        stderr: "",
+        exit_code: 0,
+    })?;
+    std::fs::copy(
+        fake_delegate()?,
+        machine
+            .bin
+            .join(format!("codex{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .or_fail()?;
+    let config = serde_json::json!({
+        "stdout": CODEX_OVERLOADED,
+        "exit_code": 1,
+        "later": [{ "stdout": fixtures::CODEX_HAPPY, "exit_code": 0 }],
+    });
+    std::fs::write(machine.bin.join("fake-delegate.json"), config.to_string()).or_fail()?;
+    Ok(machine)
+}
+
+/// Start a Codex consultation over `codex exec`, whose supervisor waits `delay` before resuming
+/// it automatically.
+fn start_codex(machine: &Machine, delay: &str) -> Result<String> {
+    let started = run_in_background(machine.agentmux(&[
+        "--codex-launch",
+        "exec",
+        "--auto-resume-delay",
+        delay,
+        "start",
+        "--json",
+        "--delegate",
+        "codex",
+        "--model",
+        "sol",
+        "Review it.",
+    ]))?
+    .finish(COMMAND_LIMIT)?;
+    started_run(&started)
+}
+
+/// A JSON record agentmux wrote into the turn directory `turn` of a consultation.
+fn turn_record(
+    machine: &Machine,
+    run_id: &str,
+    turn: &str,
+    name: &str,
+) -> Result<serde_json::Value> {
+    let path = machine.run_dir(run_id).join("turns").join(turn).join(name);
+    serde_json::from_slice(&std::fs::read(path).or_fail()?).or_fail()
+}
+
+/// A turn that fails because the model is at capacity is resumed by its own supervisor, with
+/// nothing asking: it waits, sends "continue" in the same session as the next turn, and that turn
+/// completes.
+/// A wait on the failed turn says so and names the turn to wait for next.
+#[gtest]
+fn an_overloaded_turn_is_resumed_automatically() -> Result<()> {
+    let machine = overloaded_codex_machine()?;
+    let run_id = start_codex(&machine, "200ms")?;
+
+    // The failed turn is a failure to `wait`, which names the resume and the turn it starts.
+    let first = machine
+        .spawn_wait(&run_id, &["--turn", "1"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(first.status.code(), some(eq(10)));
+    assert_that!(first.stdout, contains_substring("model overloaded"));
+    assert_that!(
+        first.stdout,
+        contains_substring("resumes this automatically")
+            .or(contains_substring("resumed this automatically"))
+    );
+    assert_that!(first.stdout, contains_substring("--turn 2"));
+    let decided = turn_record(&machine, &run_id, "0001", "auto-resume.json")?;
+    assert_that!(
+        decided.get("state"),
+        some(eq(&serde_json::json!("scheduled")))
+    );
+    assert_that!(decided.get("attempt"), some(eq(&serde_json::json!(1))));
+
+    // The supervisor started turn 2 itself, and it settles as completed.
+    assert_that!(
+        until_exists(
+            &machine.run_dir(&run_id).join("turns/0002/settled.json"),
+            Duration::from_secs(20)
+        ),
+        eq(true)
+    );
+    let second = machine
+        .spawn_wait(&run_id, &["--turn", "2"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(second.status.code(), some(eq(0)));
+    assert_that!(second.stdout, contains_substring("FIXTURE_OK"));
+
+    // Turn 2 is recorded as agentmux's own, asked "continue", resuming the same thread, and
+    // the transcript says so under its question.
+    let invocation = turn_record(&machine, &run_id, "0002", "invocation.json")?;
+    assert_that!(
+        invocation.get("auto_resume"),
+        some(eq(&serde_json::json!({ "attempt": 1, "attempts": 12 })))
+    );
+    let transcript =
+        std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
+    assert_that!(
+        transcript,
+        contains_substring("agentmux sent this question itself")
+    );
+    assert_that!(transcript, contains_substring("automatic resume 1 of 12"));
+    assert_that!(
+        invocation.get("resumed_from"),
+        some(eq(&serde_json::json!(
+            "01a0784a-915b-7d92-a381-b53d765296c4"
+        )))
+    );
+    let question = std::fs::read_to_string(machine.run_dir(&run_id).join("turns/0002/question.md"))
+        .or_fail()?;
+    assert_that!(question, eq("continue"));
+
+    // The consultation reads as completed, with the overload as an earlier failure.
+    let status = run_in_background(machine.agentmux(&["status", &run_id, "--json"]))?
+        .finish(COMMAND_LIMIT)?;
+    let status: serde_json::Value = serde_json::from_str(&status.stdout).or_fail()?;
+    assert_that!(
+        status.pointer("/outcome/state"),
+        some(eq(&serde_json::json!("completed")))
+    );
+    assert_that!(
+        status.pointer("/earlier_failures/0/kind"),
+        some(eq(&serde_json::json!("overloaded")))
+    );
+    assert_that!(status.get("auto_resume"), none());
+
+    // Damage to the later turn's records leaves a wait on the failed turn whole: it still
+    // returns that turn, and says only that what followed cannot be read.
+    std::fs::write(
+        machine.run_dir(&run_id).join("turns/0002/invocation.json"),
+        "{ not json",
+    )
+    .or_fail()?;
+    let again = machine
+        .spawn_wait(&run_id, &["--turn", "1", "--json"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(again.status.code(), some(eq(10)));
+    let again: serde_json::Value = serde_json::from_str(&again.stdout).or_fail()?;
+    assert_that!(
+        again.pointer("/settled/0/auto_resume/state"),
+        some(eq(&serde_json::json!("unknown")))
+    );
+    assert_that!(
+        again.pointer("/settled/0/auto_resume/turn"),
+        some(eq(&serde_json::json!(2)))
+    );
+    Ok(())
+}
+
+/// `cancel` on a consultation whose resume is still pending stops the resume: the supervisor
+/// leaves without starting another turn, and the failed turn says the resume was cancelled.
+#[gtest]
+fn cancel_stops_a_pending_automatic_resume() -> Result<()> {
+    let machine = overloaded_codex_machine()?;
+    let run_id = start_codex(&machine, "1h")?;
+    let first = machine
+        .spawn_wait(&run_id, &["--turn", "1"])?
+        .finish(Duration::from_secs(20))?;
+    assert_that!(first.status.code(), some(eq(10)));
+    assert_that!(
+        first.stdout,
+        contains_substring("resumes this automatically")
+    );
+
+    // Every other reading of the consultation says so too: the status, `result` and `tail`
+    // beside the transcript, and `tail --json`.
+    for args in [["status", &run_id], ["result", &run_id], ["tail", &run_id]] {
+        let read = run_in_background(machine.agentmux(&args))?.finish(COMMAND_LIMIT)?;
+        assert_that!(
+            format!("{}{}", read.stdout, read.stderr),
+            contains_substring("resumes this automatically"),
+            "{args:?}"
+        );
+    }
+    let tailed =
+        run_in_background(machine.agentmux(&["tail", &run_id, "--json"]))?.finish(COMMAND_LIMIT)?;
+    let tailed: serde_json::Value = serde_json::from_str(&tailed.stdout).or_fail()?;
+    assert_that!(
+        tailed.pointer("/auto_resume/state"),
+        some(eq(&serde_json::json!("scheduled")))
+    );
+
+    let cancelled = run_in_background(machine.agentmux(&["cancel", &run_id, "--json"]))?
+        .finish(COMMAND_LIMIT)?;
+    assert_that!(cancelled.status.success(), eq(true));
+    let status: serde_json::Value = serde_json::from_str(&cancelled.stdout).or_fail()?;
+    assert_that!(
+        status.pointer("/auto_resume/state"),
+        some(eq(&serde_json::json!("cancelled")))
+    );
+    assert_that!(
+        status.pointer("/outcome/state"),
+        some(eq(&serde_json::json!("failed")))
+    );
+
+    // The supervisor sees the cancellation within a second or so and leaves, having started
+    // nothing.
+    let supervisor = supervisor_pid(&machine, &run_id)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while is_running(supervisor) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_that!(is_running(supervisor), eq(false));
+    assert_that!(
+        machine.run_dir(&run_id).join("turns/0002").exists(),
+        eq(false)
+    );
+    Ok(())
+}

@@ -105,6 +105,8 @@ impl LockedRun<'_> {
     /// A crash between the two leaves the transcript published and no marker, and the next fold
     /// renders the same frozen input and writes it.
     /// A marker is never rewritten.
+    /// The newest turn's `auto-resume.json`, when it gets one, is written just before its
+    /// marker.
     pub(super) fn fold_and_publish(&self, meta: &Meta) -> Result<Published, RunError> {
         let state = self.fold_run(meta)?;
         let rendered = RunStore::render(meta, &state);
@@ -125,6 +127,14 @@ impl LockedRun<'_> {
             // and the write.
             if marker.exists() {
                 continue;
+            }
+            // Decided before the marker is written, so a reader that finds the settlement finds
+            // whether agentmux resumes the consultation after it too.
+            if state
+                .newest
+                .is_some_and(|newest| newest.index == span.index)
+            {
+                self.schedule_auto_resume(&state, span.index, &turn.outcome)?;
             }
             let record = SettledRecord {
                 version: SettledRecord::VERSION,

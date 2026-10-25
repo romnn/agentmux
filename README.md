@@ -116,7 +116,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 | `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
 | `steer`     | Add an instruction to a turn that is still running, read before its next model call |
 | `wait`      | Block until a turn has settled, then return it — never earlier, with no time limit   |
-| `cancel`    | Stop a running consultation, keeping everything collected so far; returns once it has  |
+| `cancel`    | Stop a running consultation or a pending automatic resume, keeping what was collected |
 | `list`      | Recent consultations with their ids, so an id can be recovered                       |
 | `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
 
@@ -407,6 +407,24 @@ null on a subscription — and because a per-model window like `Fable` is report
 while agentmux only ever sees an opaque model id. An account that could not be asked is reported
 as **unavailable, not idle**; an unauthenticated configuration directory answers "0% used"
 cheerfully, and anything ranking on "least used" would route straight to the broken one.
+
+### Overloaded models
+
+A long turn can fail because the vendor's model is at capacity for the moment — Codex's `Selected
+model is at capacity`, Claude's `overloaded_error` — and `status` reports it as `failed (model
+overloaded)`. The session is intact, so agentmux resumes it itself: the turn's supervisor waits 30
+seconds and sends `continue` in the same session, with the same model, as the next turn. Each
+further overload in a row doubles the wait, up to 15 minutes, and after 12 automatic resumes that
+all failed this way agentmux stops and says so. A turn that ends any other way, or a follow-up of
+your own, ends the run.
+
+While a resume is pending, `status` and a `wait` on the failed turn say when it is due and which
+turn it starts (`agentmux resumes this automatically at … as turn 2, sending "continue" (attempt 1
+of 12)`), and the
+turn to wait for next can be waited for once that time has passed. The transcript notes under the
+automatic turn's `continue` that agentmux sent it, and with which attempt, and its
+`invocation.json` records the same as `auto_resume`. `cancel` stops a pending resume and leaves the turn failed. Why it
+works this way is in [ADR 0027](docs/adr/0027-automatic-resume-after-overload.md).
 
 ### Environment
 
@@ -732,7 +750,8 @@ that had already finished its turn when the signal landed is reported as having 
 does not prove the child left: one that somehow survives both signals is stopped again by the next
 `cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose process
 is still there — because deleting its record would leave the child running, billing, and
-unreachable.
+unreachable. On a consultation whose last turn failed because the model was overloaded, `cancel`
+stops the automatic resume agentmux scheduled, before it starts.
 
 A delegate that exits without a closing event is recorded once, with its exit status and the tail
 of its stderr, and the transcript is rendered from that record from then on — never from files a

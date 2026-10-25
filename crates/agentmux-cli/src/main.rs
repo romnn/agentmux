@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{RunStore, StartRequest};
+use agentmux::run::{AutoResumePolicy, RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
@@ -65,21 +65,7 @@ async fn main() -> Result<()> {
         std::process::exit(agentmux::run::supervise(&args.plan_path, agentmux::host_env()).await);
     }
 
-    let host_env = agentmux::host_env();
-    let root = match &cli.state_dir {
-        Some(dir) => dir.clone(),
-        None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
-    };
-    // This executable is the supervisor of every turn and the driver of a driven one, so a turn
-    // it starts is run and settled by the same build that will read it back.
-    let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
-    let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
-        .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
-        .with_supervisor(&executable);
-    if cli.codex_launch == CodexLaunchArg::AppServer {
-        store = store.with_codex_app_server(executable);
-    }
-
+    let store = open_store(&cli)?;
     match cli.command {
         Command::Accounts => {
             // Resolved from the current directory, so the answer is the one a consultation started
@@ -156,6 +142,36 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The store every front-end command works on, as the global arguments configure it.
+///
+/// # Errors
+///
+/// Returns an error when the state directory or this executable cannot be located, or the store
+/// cannot be opened.
+fn open_store(cli: &Cli) -> Result<RunStore> {
+    let host_env = agentmux::host_env();
+    let root = match &cli.state_dir {
+        Some(dir) => dir.clone(),
+        None => RunStore::default_root(&host_env).wrap_err("locating the state directory")?,
+    };
+    // This executable is the supervisor of every turn and the driver of a driven one, so a turn
+    // it starts is run and settled by the same build that will read it back.
+    let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
+    let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
+        .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
+        .with_supervisor(&executable);
+    if let Some(first_delay) = cli.auto_resume_delay {
+        store = store.with_auto_resume(Some(AutoResumePolicy {
+            first_delay,
+            ..AutoResumePolicy::DEFAULT
+        }));
+    }
+    if cli.codex_launch == CodexLaunchArg::AppServer {
+        store = store.with_codex_app_server(executable);
+    }
+    Ok(store)
 }
 
 /// Delete the consultations past the machine's retention window.

@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::delegate::SessionRef;
-use crate::stream::{Fold, MALFORMED_LINE, classify, complete_lines};
+use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
 use crate::transcript::{FailureKind, Message, Outcome, Role, Turn, Usage, UsageWindow};
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
@@ -648,9 +648,10 @@ fn outcome_of(event: &ResultEvent, reopened: bool) -> Outcome {
         (_, Some(404)) => FailureKind::ModelUnavailable,
         (_, Some(429)) => FailureKind::RateLimited,
         (_, Some(402)) => FailureKind::BudgetExceeded,
+        (_, Some(529)) => FailureKind::Overloaded,
         (Some(TerminalReason::MaxTurns | TerminalReason::TurnLimit), _) => FailureKind::TurnLimit,
         (Some(TerminalReason::Refusal), _) => FailureKind::ContentFlagged,
-        (None, _) => classify(&detail),
+        (None, _) => classify_reported(&detail),
     };
 
     Outcome::Failed {

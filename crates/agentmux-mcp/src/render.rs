@@ -25,12 +25,12 @@ use agentmux::config::ModelRules;
 use agentmux::delegate::Delegate;
 use agentmux::quota::{AccountQuota, Observation};
 use agentmux::report::{
-    Warning, delegate_line, duration, earlier_failures_line, outcome_line, quota_block,
-    quota_report, summarise,
+    Warning, auto_resume_line, delegate_line, duration, earlier_failures_line, outcome_line,
+    quota_block, quota_report, summarise,
 };
 use agentmux::run::{
-    HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn, TranscriptPage,
-    describe_delegate,
+    AutoResume, HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn,
+    TranscriptPage, describe_delegate,
 };
 use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
 use chrono::Utc;
@@ -147,13 +147,7 @@ pub fn warnings(status: &RunStatus) -> String {
                      \x20           The delegate said: {}\n",
                     kind.label(),
                     status.message_count,
-                    recovery_advice(
-                        kind,
-                        status.exhausted_window(),
-                        &status.quota,
-                        status.delegate.vendor(),
-                        status.delegate.account().alias()
-                    ),
+                    failure_advice(status, kind),
                     summarise(detail, 600),
                 );
                 if let Some(stderr) = stderr {
@@ -169,8 +163,10 @@ pub fn warnings(status: &RunStatus) -> String {
                     let _ = writeln!(out, "\x20           {line}");
                 }
             }
-            // Said on the header's own `earlier:` line, beside the state it must not be read as.
-            Warning::EarlierFailures(_) => {}
+            // Both said elsewhere: an automatic resume as the failure's advice above, in the place
+            // of what the caller should do, and earlier failures on the header's own `earlier:`
+            // line, beside the state they must not be read as.
+            Warning::AutoResume(_) | Warning::EarlierFailures(_) => {}
             Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
                     warning:    this consultation cannot be followed up: {fact}.
@@ -233,6 +229,21 @@ pub fn warnings(status: &RunStatus) -> String {
         }
     }
     out
+}
+
+/// What a caller should do about the newest turn's failure, or what agentmux is doing about it in
+/// the caller's place.
+fn failure_advice(status: &RunStatus, kind: FailureKind) -> Cow<'static, str> {
+    match &status.auto_resume {
+        Some(resume) => Cow::Owned(auto_resume_advice(resume)),
+        None => recovery_advice(
+            kind,
+            status.exhausted_window(),
+            &status.quota,
+            status.delegate.vendor(),
+            status.delegate.account().alias(),
+        ),
+    }
 }
 
 /// What a caller should do about a particular failure.
@@ -312,6 +323,29 @@ fn recovery_advice(
     Cow::Borrowed(fixed_advice(kind))
 }
 
+/// What agentmux is doing about a turn that failed because the model was overloaded, and what
+/// that leaves the caller to do.
+///
+/// While a resume is pending the caller has nothing to do but wait for the turn it starts, which
+/// can only be waited for once it has begun; once agentmux has stopped resuming, the advice for
+/// the failure itself applies.
+fn auto_resume_advice(resume: &AutoResume) -> String {
+    let line = auto_resume_line(resume);
+    match resume {
+        AutoResume::Scheduled { turn, .. } => format!(
+            "{line}. Nothing to do but wait: once that time has passed, wait for turn {turn}."
+        ),
+        AutoResume::Resumed { turn, .. } | AutoResume::Unknown { turn, .. } => {
+            format!("{line}; wait for turn {turn}.")
+        }
+        AutoResume::Cancelled { .. }
+        | AutoResume::Abandoned { .. }
+        | AutoResume::Exhausted { .. } => {
+            format!("{line}. {}", fixed_advice(FailureKind::Overloaded))
+        }
+    }
+}
+
 /// Advice for a rate limit whose window reopening time the vendor disclosed.
 ///
 /// The choice between waiting and switching is not a matter of taste: within the longest wait one
@@ -367,6 +401,11 @@ fn fixed_advice(kind: FailureKind) -> &'static str {
         FailureKind::BudgetExceeded => {
             "The account is out of credit or over a cap. Nothing to retry until that changes."
         }
+        FailureKind::Overloaded => {
+            "The model was at capacity for the moment, which is nothing to do with your call or \
+             your account. Its session is intact, so after a short wait a `follow_up` asking it to \
+             continue picks the work up where it stopped."
+        }
         FailureKind::TurnLimit => {
             "The delegate ran out of turns with work still to do. Its session is still open, so a \
              `follow_up` asking it to continue is cheaper than starting over."
@@ -393,6 +432,25 @@ fn follow_up_step(status: &RunStatus, lead: &str) -> String {
     "#}
 }
 
+/// The calls that follow an automatic resume agentmux is about to send, under whichever lead-in
+/// the caller needs, or `None` when none is pending.
+///
+/// A follow-up would take the resume's place, so these are offered instead of one: the turn the
+/// resume starts, and the way to stop it.
+fn pending_resume_steps(status: &RunStatus, lead: &str) -> Option<String> {
+    let Some(AutoResume::Scheduled { turn, due_at, .. }) = &status.auto_resume else {
+        return None;
+    };
+    let id = &status.run_id;
+    Some(indoc::formatdoc! {r#"
+        {lead}wait {{"run_id": "{id}", "turn": {turn}}} — after {due}, once agentmux
+                    has resumed it
+                    cancel {{"run_id": "{id}"}} — stop the automatic resume
+    "#,
+        due = due_at.to_rfc3339(),
+    })
+}
+
 /// What to call next, with the arguments filled in.
 #[must_use]
 pub fn next_steps(status: &RunStatus) -> String {
@@ -402,7 +460,9 @@ pub fn next_steps(status: &RunStatus) -> String {
 
             next:       result {{"run_id": "{id}"}}
         "#};
-        if status.resumable {
+        if let Some(steps) = pending_resume_steps(status, "            ") {
+            next_steps_text.push_str(&steps);
+        } else if status.resumable {
             next_steps_text.push_str(&follow_up_step(status, "            "));
         }
         next_steps_text
@@ -471,7 +531,9 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
     // A finished consultation's one remaining move is the follow-up, and a running one still needs
     // the whole watch loop, so neither is left for a caller holding the answer to reconstruct.
     if status.is_terminal() {
-        if status.resumable {
+        if let Some(steps) = pending_resume_steps(status, "\nnext:       ") {
+            out.push_str(&steps);
+        } else if status.resumable {
             out.push_str(&follow_up_step(status, "\nnext:       "));
         }
     } else {
@@ -493,6 +555,7 @@ pub fn settled(
     meta: &Meta,
     delegate: &Delegate,
     newest: Option<u32>,
+    auto_resume: Option<&AutoResume>,
     page: &TranscriptPage,
 ) -> String {
     let id = settled.run_id();
@@ -523,6 +586,9 @@ pub fn settled(
             out,
             "bytes:      {bytes} — more follows; call wait with offset {next}"
         );
+    }
+    if let Some(resume) = auto_resume {
+        let _ = writeln!(out, "resume:     {}", auto_resume_advice(resume));
     }
     if let Some(newest) = newest.filter(|newest| *newest > turn) {
         out.push_str(&indoc::formatdoc! {r#"

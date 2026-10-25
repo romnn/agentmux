@@ -7,12 +7,13 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Billing, Delegate, DelegateError, Isolation, ModelId, PermissionOptions,
-    SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    AccountChoice, AppServerSettings, Billing, Delegate, DelegateError, Isolation, ModelId,
+    PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
 use crate::launch::{LaunchSpec, Liveness};
-use crate::transcript::Outcome;
+use crate::transcript::{Outcome, ResumeAttempt};
 
+use super::auto_resume::AutoResumePlan;
 use super::error::{NotResumable, RunError};
 use super::id::RunId;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
@@ -65,6 +66,64 @@ pub(super) struct NextTurn<'a> {
     pub(super) question: &'a str,
     /// The delegate's own session to continue, for a follow-up.
     pub(super) resume: Option<&'a SessionRef>,
+}
+
+/// How a turn's child process is built.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Resolution<'a> {
+    /// From this store's environment and the machine's configuration as it reads now, for every
+    /// turn a caller asks for.
+    Configured(&'a crate::config::Config),
+    /// In this process's own environment, for an automatic resume made by the supervisor of the
+    /// turn it continues.
+    ///
+    /// That supervisor was started with the environment resolved for the turn it supervises,
+    /// and holds neither the host environment nor the configuration it was resolved from, so
+    /// the resumed turn runs in that environment unchanged.
+    Inherited(Inherited),
+}
+
+impl Resolution<'_> {
+    /// Build `delegate`'s child for `plan`, from `host_env`, the environment the store was opened
+    /// with.
+    fn resolve(
+        self,
+        delegate: &Delegate,
+        plan: &TurnPlan<'_>,
+        host_env: &BTreeMap<String, String>,
+    ) -> Result<Resolved, RunError> {
+        Ok(match self {
+            Self::Configured(config) => Resolved {
+                invocation: delegate.invocation(plan, host_env, config)?,
+                app_server_settings: delegate.app_server_settings(config),
+                auto_resume: None,
+            },
+            Self::Inherited(Inherited { billing, attempt }) => Resolved {
+                invocation: delegate.continuation(plan, host_env.clone(), billing),
+                app_server_settings: delegate
+                    .app_server_settings_under(delegate.isolation().unwrap_or(Isolation::Isolated)),
+                auto_resume: Some(attempt),
+            },
+        })
+    }
+}
+
+/// A turn's child as a [`Resolution`] built it.
+struct Resolved {
+    invocation: crate::delegate::Invocation,
+    /// How it runs over `codex app-server`, when it can.
+    app_server_settings: Option<AppServerSettings>,
+    /// Which automatic resume it is, when it is one.
+    auto_resume: Option<ResumeAttempt>,
+}
+
+/// What an automatic resume carries over from the turn it continues.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Inherited {
+    /// The pricing the environment was resolved for.
+    pub(super) billing: Billing,
+    /// Which automatic resume in a row this is.
+    pub(super) attempt: ResumeAttempt,
 }
 
 /// What the machine's configuration decided about a requested delegate.
@@ -199,7 +258,7 @@ impl RunStore {
                     question: &request.question,
                     resume: None,
                 };
-                run.launch_turn(&meta, &first, &config)
+                run.launch_turn(&meta, &first, Resolution::Configured(&config))
             });
         if let Err(error) = started {
             std::fs::remove_dir_all(&dir)
@@ -379,7 +438,7 @@ impl RunStore {
                 question,
                 resume: Some(&session),
             };
-            run.launch_turn(&meta, &next, &config)?;
+            run.launch_turn(&meta, &next, Resolution::Configured(&config))?;
         }
         self.status(run_id)
     }
@@ -510,16 +569,25 @@ impl LockedRun<'_> {
     /// `follow_up` and anything added later are then covered by construction rather than by
     /// remembering: a consultation begun from a terminal is not a way to drive a denied vendor
     /// from a server, because its follow-up spawns the same delegate again from here.
+    ///
+    /// An automatic resume is the one turn they do not apply to.
+    /// It continues a consultation a caller's launch already admitted, and is made by that
+    /// launch's own supervisor, whose environment carries the delegate marker it hands on, so the
+    /// recursion guard would refuse it for the marker it set itself.
+    /// Only [`super::auto_resume`] builds a [`Resolution::Inherited`], from a plan that admitted
+    /// launch wrote.
     pub(super) fn launch_turn(
         &self,
         meta: &Meta,
         next: &NextTurn<'_>,
-        config: &crate::config::Config,
+        resolution: Resolution<'_>,
     ) -> Result<(), RunError> {
         let NextTurn {
             delegate, index, ..
         } = *next;
-        self.store.refuse_to_spawn(delegate.vendor())?;
+        if let Resolution::Configured(_) = resolution {
+            self.store.refuse_to_spawn(delegate.vendor())?;
+        }
         // The run may have been swept or removed while this caller waited for the lock, and a
         // turn launched into a directory with no metadata would be a child nothing can reach.
         if !self.store.run_dir(&self.run_id).join("meta.json").is_file() {
@@ -529,7 +597,7 @@ impl LockedRun<'_> {
         claim_turn(&turn, index, &self.run_id)?;
         // A claim that does not end in a running child is given back, so a refused follow-up
         // does not leave a phantom failed turn in the transcript.
-        let launched = self.store.launch_into(&turn, meta, next, config);
+        let launched = self.store.launch_into(&turn, meta, next, resolution);
         if launched.is_err() {
             std::fs::remove_dir_all(&turn.root)
                 .inspect_err(|err| {
@@ -548,22 +616,20 @@ impl LockedRun<'_> {
 impl RunStore {
     /// Decide how a turn runs, and point `invocation` at the driver when it is driven.
     ///
-    /// Decided per turn, from the delegate and this store: the environment, the refusals and the
-    /// billing already in `invocation` are the same either way, and only what is run differs.
+    /// Decided per turn, from the delegate's app-server `settings` and this store: the
+    /// environment, the refusals and the billing already in `invocation` are the same either way,
+    /// and only what is run differs.
     pub(super) fn prepare_launch_mode(
         &self,
         turn: &TurnDir,
         meta: &Meta,
-        delegate: &Delegate,
+        settings: Option<AppServerSettings>,
         resume: Option<&SessionRef>,
-        config: &crate::config::Config,
         invocation: &mut crate::delegate::Invocation,
     ) -> Result<LaunchMode, RunError> {
-        let (Some(driver), Some(settings), false) = (
-            &self.codex_driver,
-            delegate.app_server_settings(config),
-            meta.force_codex_exec,
-        ) else {
+        let (Some(driver), Some(settings), false) =
+            (&self.codex_driver, settings, meta.force_codex_exec)
+        else {
             return Ok(LaunchMode::DirectCli);
         };
         let plan_path = turn.app_server_plan_path();
@@ -585,12 +651,14 @@ impl RunStore {
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
     /// [`Delegate::invocation`] holds it once more as it builds the launch.
+    /// An automatic resume runs as the turn it continues ran, held to the limits that turn was
+    /// admitted under, because its supervisor has no configuration to hold it to.
     pub(super) fn launch_into(
         &self,
         turn: &TurnDir,
         meta: &Meta,
         next: &NextTurn<'_>,
-        config: &crate::config::Config,
+        resolution: Resolution<'_>,
     ) -> Result<(), RunError> {
         let NextTurn {
             delegate,
@@ -609,7 +677,11 @@ impl RunStore {
             extra_env: &meta.env,
             billing: meta.billing,
         };
-        let mut invocation = delegate.invocation(&plan, &self.host_env, config)?;
+        let Resolved {
+            mut invocation,
+            app_server_settings,
+            auto_resume,
+        } = resolution.resolve(delegate, &plan, &self.host_env)?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
@@ -618,7 +690,7 @@ impl RunStore {
         // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
         let launch_mode =
-            self.prepare_launch_mode(turn, meta, delegate, resume, config, &mut invocation)?;
+            self.prepare_launch_mode(turn, meta, app_server_settings, resume, &mut invocation)?;
         refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
@@ -661,6 +733,7 @@ impl RunStore {
                 cli_version,
                 agentmux_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 delegate: Some(delegate.clone()),
+                auto_resume,
             },
         )?;
 
@@ -674,6 +747,7 @@ impl RunStore {
             args = ?invocation.args(),
             cwd = %meta.cwd.display(),
             resumed = resume.is_some(),
+            automatic = auto_resume.is_some(),
             mode = ?launch_mode,
             billing = %invocation.billing(),
             "launching delegate",
@@ -737,6 +811,11 @@ impl RunStore {
                     cwd: meta.cwd.clone(),
                     billing: delegate.billing(),
                 },
+                auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
+                    policy,
+                    supervisor: supervisor.to_path_buf(),
+                    codex_driver: self.codex_driver.clone(),
+                }),
             },
         )?;
         let mut invocation = delegate.clone();

@@ -63,6 +63,8 @@ a record names to show where the decision is enforced must be renamed there too.
   has exited.
 - [0025](0025-eager-settlement-and-terminal-waiting.md): A supervisor settles each turn as its
   delegate leaves, and waits return only then.
+- [0027](0027-automatic-resume-after-overload.md): A turn that fails because the model is
+  overloaded is resumed by its own supervisor.
 
 ## Codex integration
 

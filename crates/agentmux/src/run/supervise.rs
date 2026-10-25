@@ -26,6 +26,9 @@
 //! The one gap is the instant between spawning the delegate and recording it, which no ordinary
 //! spawn closes: a supervisor found gone there leaves a turn that is neither settled nor
 //! replaced, and says so.
+//!
+//! A turn that failed because the model was overloaded is not the end of its supervisor's work:
+//! it waits, and resumes the consultation as the next turn, which gets a supervisor of its own.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +39,7 @@ use chrono::Utc;
 use crate::delegate::Invocation;
 use crate::launch::{LaunchSpec, Launched, ProcessLauncher};
 
+use super::auto_resume::Resumption;
 use super::error::RunError;
 use super::layout::TurnDir;
 use super::records::{
@@ -56,10 +60,10 @@ const POLL: Duration = Duration::from_millis(100);
 ///
 /// `host_env` is the environment this process was started with, which is the delegate's own:
 /// the run store launches the supervisor with the environment it built for the delegate, and the
-/// supervisor hands it on unchanged.
-/// Returns the process's exit status: zero once the turn is settled, non-zero when the plan could
-/// not be read or does not belong to the turn it names, or when the turn could not be settled,
-/// which the next observer then does.
+/// supervisor hands it on unchanged, to an automatic resume's turn too.
+/// Returns the process's exit status: zero once the turn is settled, and any automatic resume it
+/// called for launched or given up, non-zero when the plan could not be read or does not belong
+/// to the turn it names, or when the turn could not be settled, which the next observer then does.
 pub async fn supervise(
     plan_path: &Path,
     host_env: std::collections::BTreeMap<String, String>,
@@ -78,15 +82,48 @@ pub async fn supervise(
             return 2;
         }
     };
-    let store = match RunStore::open(&plan.store_root, Arc::new(ProcessLauncher::new()), host_env) {
-        Ok(store) => store,
-        Err(err) => {
-            eprintln!("agentmux: {err}");
-            return 2;
+    let mut store =
+        match RunStore::open(&plan.store_root, Arc::new(ProcessLauncher::new()), host_env) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("agentmux: {err}");
+                return 2;
+            }
+        };
+    // An automatic resume runs as the store that launched this turn would have run it:
+    // supervised, by the same executables, under the same policy.
+    store = match &plan.auto_resume {
+        Some(resume) => {
+            let configured = store
+                .with_supervisor(&resume.supervisor)
+                .with_auto_resume(Some(resume.policy));
+            match &resume.codex_driver {
+                Some(driver) => configured.with_codex_app_server(driver),
+                None => configured,
+            }
         }
+        None => store.with_auto_resume(None),
     };
     match store.supervise_turn(&plan).await {
-        Ok(Supervised::Settled) => 0,
+        Ok(Supervised::Settled) => match store.resume_when_due(&plan).await {
+            Ok(Resumption::Resumed) => {
+                eprintln!("agentmux: the model was overloaded; resumed the consultation");
+                0
+            }
+            Ok(Resumption::NotScheduled) => 0,
+            Ok(Resumption::Cancelled) => {
+                eprintln!("agentmux: the automatic resume was cancelled");
+                0
+            }
+            Ok(Resumption::Superseded) => {
+                eprintln!("agentmux: a follow-up took the place of the automatic resume");
+                0
+            }
+            Err(err) => {
+                eprintln!("agentmux: the consultation was not resumed automatically: {err}");
+                1
+            }
+        },
         Ok(Supervised::Refused(reason)) => {
             eprintln!("agentmux: {reason}, so no delegate was started");
             2

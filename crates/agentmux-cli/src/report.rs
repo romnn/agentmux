@@ -7,13 +7,14 @@
 //! Prose goes to stdout so it can be piped; progress and warnings go to stderr through `tracing`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
 use agentmux::report::{self, Warning};
 use agentmux::run::{
-    HookReopening, RunError, RunId, RunStatus, RunStore, RunSummary, SettledTurn, TranscriptPage,
-    TurnRef, WaitFor,
+    AutoResume, HookReopening, RunError, RunId, RunStatus, RunStore, RunSummary, SettledTurn,
+    TranscriptPage, TurnRef, WaitFor,
 };
 use agentmux::transcript::{Outcome, TurnState};
 use color_eyre::eyre::Result;
@@ -65,7 +66,10 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     if status.steerable {
         println!("  steer       agentmux steer {} '…'", status.run_id);
     }
-    if status.resumable {
+    // A follow-up would take the place of the resume agentmux is about to send.
+    if let Some(AutoResume::Scheduled { .. }) = &status.auto_resume {
+        println!("  stop it     agentmux cancel {}", status.run_id);
+    } else if status.resumable {
         println!("  follow up   agentmux follow-up {} '…'", status.run_id);
     }
     Ok(())
@@ -86,6 +90,12 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
                 format!("  stderr      {last_stderr_line}")
             })
             .collect(),
+        Warning::AutoResume(resume) => {
+            vec![format!(
+                "  resume      {}",
+                report::auto_resume_line(resume)
+            )]
+        }
         Warning::EarlierFailures(failures) => vec![format!(
             "  EARLIER     {} — see the transcript",
             report::earlier_failures_line(failures)
@@ -214,6 +224,7 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
             let report = TailJson {
                 run_id: &status.run_id,
                 outcome: &status.outcome,
+                auto_resume: status.auto_resume.as_ref(),
                 text: &page.text,
                 next_cursor: page.next_offset,
                 at_end: page.at_end,
@@ -221,6 +232,15 @@ pub async fn tail(store: &RunStore, args: &TailArgs, json: bool) -> Result<()> {
             println!("{}", serde_json::to_string(&report)?);
         } else {
             print!("{}", page.text);
+            // Once the end of a finished consultation is reached, what `result` says beside it,
+            // on stderr so stdout stays the transcript.
+            if status.is_terminal() && page.at_end {
+                for warning in status.warnings() {
+                    for line in warning_lines(&warning) {
+                        eprintln!("{line}");
+                    }
+                }
+            }
         }
 
         if !args.follow {
@@ -321,6 +341,8 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
         let page = settled.page(offset, usize::MAX)?;
         reports.push(SettledJson {
             settled,
+            // Decided before the settlement was committed, so it is there for a turn that has one.
+            auto_resume: store.auto_resume(settled.run_id(), settled.turn_number())?,
             text_offset: offset,
             text: page.text,
         });
@@ -355,28 +377,58 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
         if position > 0 {
             println!();
         }
-        let settled = settled_report.settled;
-        print!(
-            "{}",
-            indoc::formatdoc! {"
-                {id}  turn {turn} settled
-                  state       {state}
-                  transcript  {transcript}
-                  settled     {marker}
-
-                ---
-
-                {text}",
-                id = settled.run_id(),
-                turn = settled.turn_number(),
-                state = report::outcome_line(settled.outcome()),
-                transcript = settled.transcript_path().display(),
-                marker = settled.marker_path().display(),
-                text = settled_report.text,
-            }
-        );
+        print_settled(settled_report)?;
     }
     Ok(status)
+}
+
+/// Print one settled turn of a wait, with what agentmux does about it failing overloaded, and its
+/// transcript.
+///
+/// # Errors
+///
+/// Returns an error when the lines cannot be formatted.
+fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
+    let settled = settled_report.settled;
+    // Its own lines under the state, ending in a newline each, or nothing.
+    let mut resume = String::new();
+    if let Some(auto_resume) = &settled_report.auto_resume {
+        writeln!(
+            resume,
+            "  resume      {}",
+            report::auto_resume_line(auto_resume)
+        )?;
+        if let AutoResume::Scheduled { turn, .. }
+        | AutoResume::Resumed { turn, .. }
+        | AutoResume::Unknown { turn, .. } = auto_resume
+        {
+            writeln!(
+                resume,
+                "  next        agentmux wait {} --turn {turn}, once it has begun",
+                settled.run_id()
+            )?;
+        }
+    }
+    print!(
+        "{}",
+        indoc::formatdoc! {"
+            {id}  turn {turn} settled
+              state       {state}
+            {resume}  transcript  {transcript}
+              settled     {marker}
+
+            ---
+
+            {text}",
+            id = settled.run_id(),
+            turn = settled.turn_number(),
+            state = report::outcome_line(settled.outcome()),
+            transcript = settled.transcript_path().display(),
+            marker = settled.marker_path().display(),
+            text = settled_report.text,
+        }
+    );
+    Ok(())
 }
 
 /// One settled turn in `wait --json`: the settlement, and its transcript from `text_offset`.
@@ -384,6 +436,9 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
 struct SettledJson<'a> {
     #[serde(flatten)]
     settled: &'a SettledTurn,
+    /// What agentmux does about the turn having failed because the model was overloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_resume: Option<AutoResume>,
     text_offset: u64,
     text: String,
 }
@@ -703,6 +758,9 @@ struct TranscriptJson<'a> {
 struct TailJson<'a> {
     run_id: &'a RunId,
     outcome: &'a Outcome,
+    /// What agentmux does about the newest turn having failed because the model was overloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_resume: Option<&'a AutoResume>,
     text: &'a str,
     next_cursor: u64,
     at_end: bool,

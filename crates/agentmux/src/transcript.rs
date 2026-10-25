@@ -214,6 +214,11 @@ pub enum FailureKind {
     RateLimited,
     /// The account is out of credit or over a spend cap.
     BudgetExceeded,
+    /// The vendor's model is at capacity or overloaded for everyone, for the moment.
+    ///
+    /// Transient and nothing to do with the account: the session is intact, and the same model
+    /// usually answers again within seconds.
+    Overloaded,
     /// The delegate hit its own maximum number of turns.
     TurnLimit,
     /// The child process could not be started, or died before saying anything.
@@ -232,6 +237,7 @@ impl FailureKind {
             Self::ContentFlagged => "content flagged",
             Self::RateLimited => "rate limited",
             Self::BudgetExceeded => "budget exceeded",
+            Self::Overloaded => "model overloaded",
             Self::TurnLimit => "turn limit",
             Self::LaunchFailed => "launch failed",
             Self::Unclassified => "error",
@@ -503,6 +509,23 @@ pub struct Turn {
     /// question, and the header above every turn never changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ran_as: Option<String>,
+    /// Which automatic resume this turn is, when agentmux rather than the caller asked its
+    /// question, after the model was overloaded.
+    ///
+    /// Recorded before the child is spawned, so like [`Self::billing`] it renders under the
+    /// question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<ResumeAttempt>,
+}
+
+/// Which automatic resume a turn is, in an unbroken run of turns that failed because the model
+/// was overloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeAttempt {
+    /// Which automatic resume in a row it is, counted from 1.
+    pub attempt: u32,
+    /// How many agentmux makes in a row before it stops.
+    pub attempts: u32,
 }
 
 impl Turn {
@@ -531,6 +554,7 @@ impl Turn {
             billing: None,
             isolation: None,
             ran_as: None,
+            auto_resume: None,
         }
     }
 
@@ -726,6 +750,17 @@ fn render_question(turn: &Turn) -> String {
         turn.index.saturating_add(1),
         turn.question.trim_end()
     );
+    if let Some(ResumeAttempt { attempt, attempts }) = turn.auto_resume {
+        let _ = indoc::writedoc!(
+            out,
+            "
+
+            > [!NOTE]
+            > **agentmux sent this question itself** after the model was overloaded, not the \
+            caller: automatic resume {attempt} of {attempts}.
+        "
+        );
+    }
     if let Some(store) = &turn.unsaved_session_store {
         let _ = indoc::writedoc!(
             out,

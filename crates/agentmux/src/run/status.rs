@@ -130,6 +130,10 @@ pub struct RunStatus {
     /// Apart from [`RunStatus::outcome`], which says what the stream reported: a turn whose
     /// stream has ended settles once its delegate has gone, a moment later.
     pub settled: bool,
+    /// What agentmux does about the newest turn having failed because the model was overloaded,
+    /// when it does anything: resume it automatically, or say why it no longer will.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<super::AutoResume>,
 }
 
 pub(super) fn whole_seconds<S: serde::Serializer>(

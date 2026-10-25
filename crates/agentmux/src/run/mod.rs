@@ -29,6 +29,9 @@
 //!     app-server.json          the plan a turn driven over `codex app-server` runs under
 //!     steer/                   messages steered into such a turn, and the driver's replies
 //!     cancelling               present once a cancellation was asked for
+//!     auto-resume.json         whether agentmux resumes the consultation itself after this turn
+//!                              failed overloaded, written once, before settled.json
+//!     auto-resume-cancelled    present once a cancellation stopped that resume
 //!     exit.json                how the child ended and how much it had written, written once and
 //!                              never rewritten
 //!     settled.json             the commitment that the turn's transcript is published and final,
@@ -44,6 +47,9 @@
 //! `agentmux supervise`, which starts the delegate itself and settles the turn the moment the
 //! delegate has gone; one opened without launches the delegate directly, and its turns settle
 //! when they are next read.
+//!
+//! A supervised turn that fails because the model was overloaded is resumed by its own supervisor,
+//! which waits and then sends "continue" as the next turn, as [`AutoResumePolicy`] says.
 //!
 //! One directory per turn, because each turn is a separate child process.
 //! Nothing ever appends to another turn's capture file, so the "the child owns the file
@@ -70,6 +76,7 @@
 //! So each runs while a `LockedRun` holds the run's advisory lock, either as one of its
 //! methods or inside a store method that holds one; the module says which are which.
 
+mod auto_resume;
 mod cancel;
 mod error;
 mod id;
@@ -103,6 +110,7 @@ use records::{
 };
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, last_page_of, page_of};
 
+pub use auto_resume::{AutoResume, AutoResumePolicy, CONTINUE as AUTO_RESUME_QUESTION};
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
 pub use quota::QuotaReport;
@@ -130,6 +138,9 @@ pub struct RunStore {
     /// The agentmux executable that supervises each turn this store launches, when it launches
     /// them that way.
     supervisor: Option<PathBuf>,
+    /// How a supervised turn that fails because the model was overloaded is resumed, or `None`
+    /// when it is left failed.
+    auto_resume: Option<AutoResumePolicy>,
 }
 
 impl std::fmt::Debug for RunStore {
@@ -181,6 +192,8 @@ impl RunStore {
             codex_driver: None,
             // Unsupervised for the same reason.
             supervisor: None,
+            // Resumed only by a supervisor, so nothing runs until one is named.
+            auto_resume: Some(AutoResumePolicy::DEFAULT),
         };
         store.migrate_zero_based_turn_dirs()?;
         Ok(store)
@@ -199,6 +212,19 @@ impl RunStore {
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: impl Into<PathBuf>) -> Self {
         self.supervisor = Some(supervisor.into());
+        self
+    }
+
+    /// Resume a supervised turn that fails because the model was overloaded as `policy` says, or
+    /// never with `None`.
+    ///
+    /// [`AutoResumePolicy::DEFAULT`] until this is called.
+    /// Only a store [`with_supervisor`](RunStore::with_supervisor) resumes anything: the turn's
+    /// supervisor is what waits and sends [`AUTO_RESUME_QUESTION`], and the policy travels in
+    /// its plan.
+    #[must_use]
+    pub fn with_auto_resume(mut self, policy: Option<AutoResumePolicy>) -> Self {
+        self.auto_resume = policy;
         self
     }
 
@@ -527,6 +553,10 @@ impl RunStore {
             }),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
+            auto_resume: match &state.newest {
+                Some(newest) => self.auto_resume_at_index(run_id, newest.index)?,
+                None => None,
+            },
             outcome,
         };
         Ok((status, full))
