@@ -488,6 +488,35 @@ fn a_label_reaches_wait_and_list() -> Result<()> {
     Ok(())
 }
 
+/// `agentmux continue-fresh` starts a new consultation recorded as continuing the old one, which
+/// `status` then names as having continued it.
+#[gtest]
+fn continue_fresh_links_the_new_consultation_to_the_old() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: fixtures::CLAUDE_HAPPY,
+        stderr: "",
+        exit_code: 0,
+    })?;
+    machine.release()?;
+    let old = machine.start()?;
+    machine
+        .spawn_wait(&old, &[])?
+        .finish(Duration::from_secs(20))?;
+    let json = |args: &[&str]| -> Result<serde_json::Value> {
+        let finished = run_in_background(machine.agentmux(args))?.finish(COMMAND_LIMIT)?;
+        if !finished.status.success() {
+            fail!("{args:?} failed: {}", finished.stderr)?;
+        }
+        serde_json::from_str(&finished.stdout).or_fail()
+    };
+    let fresh = json(&["continue-fresh", &old, "Finish it.", "--json"])?;
+    assert_that!(fresh.get("continues"), some(eq(&serde_json::json!(old))));
+    let fresh_id = fresh.get("run_id").or_fail()?;
+    let old_status = json(&["status", &old, "--json"])?;
+    assert_that!(old_status.get("continued_by"), some(eq(fresh_id)));
+    Ok(())
+}
+
 /// A wait that runs out of time exits 124 and says, under `--json`, that it timed out and what
 /// it was still waiting for; the consultation carries on.
 #[gtest]

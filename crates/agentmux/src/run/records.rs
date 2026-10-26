@@ -82,6 +82,19 @@ pub struct Meta {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub force_codex_exec: bool,
+    /// The consultation this one continues in a fresh session, when it does.
+    ///
+    /// Every turn's delegate may read that consultation's directory, where its transcript is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<RunId>,
+}
+
+/// `continued-by.json`: the consultation that continued this one in a fresh session, the most
+/// recent when there were several.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ContinuedBy {
+    pub(super) run_id: RunId,
+    pub(super) at: DateTime<Utc>,
 }
 
 /// The turn's delegate, recorded once it is running.

@@ -106,23 +106,24 @@ restart, and every result carries the path to the transcript on disk. The inline
 convenience; the file is the record. `wait` is the one tool that blocks for as long as a turn
 takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 
-| Tool        | What it does                                                                       |
-| ----------- | ---------------------------------------------------------------------------------- |
-| `ask`       | Start a consultation and wait up to `wait_seconds` for it — the one-call path       |
-| `start`     | Start one and return the id immediately, for work that will take minutes            |
-| `status`    | State, elapsed time, message count, token usage, and anything that needs a warning  |
-| `tail`      | The transcript since a cursor, or its newest bytes, plus the next cursor           |
-| `result`    | The complete transcript, paged, optionally after blocking for the consultation      |
-| `follow_up` | Ask one more question, resuming the delegate's own session so the brief is retained |
-| `steer`     | Add an instruction to a turn that is still running, read before its next model call |
-| `wait`      | Block until a turn has settled, then return it — never earlier, with no time limit   |
-| `cancel`    | Stop a running consultation or a pending automatic resume, keeping what was collected |
-| `list`      | Recent consultations with their ids and labels, filtered by `label` or `state`       |
-| `quota`     | What each configured account has left, in the vendor's own numbers — free, no tokens |
+| Tool             | What it does                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| `ask`            | Start a consultation and wait up to `wait_seconds` for it — the one-call path              |
+| `start`          | Start one and return the id immediately, for work that will take minutes                   |
+| `status`         | State, elapsed time, message count, token usage, and anything that needs a warning         |
+| `tail`           | The transcript since a cursor, or its newest bytes, plus the next cursor                   |
+| `result`         | The complete transcript, paged, optionally after blocking for the consultation             |
+| `follow_up`      | Ask one more question, resuming the delegate's own session so the brief is retained        |
+| `continue_fresh` | Continue in a new session that reads the old transcript, when the old session cannot go on |
+| `steer`          | Add an instruction to a turn that is still running, read before its next model call        |
+| `wait`           | Block until a turn has settled, then return it — never earlier, with no time limit         |
+| `cancel`         | Stop a running consultation or a pending automatic resume, keeping what was collected      |
+| `list`           | Recent consultations with their ids and labels, filtered by `label` or `state`             |
+| `quota`          | What each configured account has left, in the vendor's own numbers — free, no tokens       |
 
 ### Use from the command line
 
-The same eleven verbs are available directly, as a unified CLI over both vendors:
+The same twelve verbs are available directly, as a unified CLI over both vendors:
 
 ```bash
 # One consultation, start to finish.
@@ -147,6 +148,9 @@ agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 # A `--label` labels this turn and the ones after it; without one the turn keeps the current one.
 agentmux follow-up <run-id> 'Which of those would you fix first, and why?'
 agentmux follow-up <run-id> --label 'RE-REVIEW after rework' 'The fix is in; review it again.'
+
+# A session a content filter refuses whatever is asked, handed over to a new one.
+agentmux continue-fresh <run-id> 'Finish the alias-expansion limit.'
 
 # Read-only, but with network, for a question that needs `cargo` or `gh` to answer.
 agentmux ask --delegate codex --model sol --effort high --network-access \
@@ -429,6 +433,21 @@ turn to wait for next can be waited for once that time has passed. The transcrip
 automatic turn's `continue` that agentmux sent it, and with which attempt, and its
 `invocation.json` records the same as `auto_resume`. `cancel` stops a pending resume and leaves the turn failed. Why it
 works this way is in [ADR 0027](docs/adr/0027-automatic-resume-after-overload.md).
+
+### Sessions a content filter keeps refusing
+
+A turn a provider's guardrail refuses fails as `content flagged`, and a rephrased follow-up usually
+gets past it. Sometimes the session's own context is what trips the filter, and every later turn
+is refused however it is worded. `status` counts the refused turns in a row as
+`content_flagged_in_a_row`, and from two on it suggests `continue_fresh` (`agentmux
+continue-fresh <run-id> '…'`) instead of a follow-up. That starts a new consultation with the same
+delegate, model, effort, permissions, working directory, environment and label, whose first
+question names the old consultation, gives its transcript's path, says the working tree may hold
+its uncommitted work, and then asks the new question. The new consultation's `meta.json` records
+`continues`, the old one's `continued-by.json` names its successor, and each one's `status` points
+at the other. A Claude delegate is given `--add-dir` for the old consultation's directory, so it
+can read the transcript. Why it works this way is in
+[ADR 0029](docs/adr/0029-continue-in-a-fresh-session.md).
 
 ### Environment
 

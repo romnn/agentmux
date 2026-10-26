@@ -36,6 +36,12 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     if let Some(label) = &status.label {
         println!("  label       {label}");
     }
+    if let Some(continued_by) = &status.continued_by {
+        println!("  continued   in {continued_by}, a fresh session; follow that one instead");
+    }
+    if let Some(continues) = &status.continues {
+        println!("  continues   {continues}, whose session could not go on");
+    }
     println!("  state       {}", report::outcome_line(&status.outcome));
     // Above the facts, as every front end puts them: each changes how what follows is read.
     for warning in status.warnings() {
@@ -69,9 +75,17 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     if status.steerable {
         println!("  steer       agentmux steer {} '…'", status.run_id);
     }
-    // A follow-up would take the place of the resume agentmux is about to send.
-    if let Some(AutoResume::Scheduled { .. }) = &status.auto_resume {
+    // A follow-up would take the place of the resume agentmux is about to send, and one into a
+    // session a content filter keeps refusing would be refused too.
+    if let Some(successor) = &status.continued_by {
+        println!("  successor   agentmux status {successor}");
+    } else if let Some(AutoResume::Scheduled { .. }) = &status.auto_resume {
         println!("  stop it     agentmux cancel {}", status.run_id);
+    } else if status.suggests_continue_fresh() {
+        println!(
+            "  fresh       agentmux continue-fresh {} '…'  ({} turns in a row refused by a content filter)",
+            status.run_id, status.content_flagged_in_a_row
+        );
     } else if status.resumable {
         println!("  follow up   agentmux follow-up {} '…'", status.run_id);
     }

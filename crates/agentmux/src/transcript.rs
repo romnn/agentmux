@@ -636,6 +636,26 @@ impl Transcript {
             .collect()
     }
 
+    /// How many of the newest turns in a row a content filter refused.
+    #[must_use]
+    pub fn content_flagged_in_a_row(&self) -> u32 {
+        let refused = self
+            .turns
+            .iter()
+            .rev()
+            .take_while(|turn| {
+                matches!(
+                    turn.outcome,
+                    Outcome::Failed {
+                        kind: FailureKind::ContentFlagged,
+                        ..
+                    }
+                )
+            })
+            .count();
+        u32::try_from(refused).unwrap_or(u32::MAX)
+    }
+
     /// Whether the delegate ever said anything, across every turn.
     ///
     /// This is the evidence that there is a conversation worth continuing, and it is deliberately

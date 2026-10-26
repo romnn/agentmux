@@ -132,6 +132,15 @@ pub(super) struct Inherited {
     pub(super) attempt: ResumeAttempt,
 }
 
+/// How a consultation comes to be started.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Admission<'a> {
+    /// By a caller's `start`, which takes the machine file's defaults for whatever it leaves out.
+    New,
+    /// By [`RunStore::continue_fresh`], continuing this consultation as its newest turn ran.
+    Continuing(&'a RunId),
+}
+
 /// What the machine's configuration decided about a requested delegate.
 ///
 /// A named shape rather than a pair: both halves name a model, and nothing about a positional
@@ -225,6 +234,19 @@ impl RunStore {
     /// Under a supervisor, a delegate that then cannot be started is a failed turn, kept with the
     /// reason.
     pub fn start(&self, request: &StartRequest) -> Result<RunStatus, RunError> {
+        self.begin(request, Admission::New)
+    }
+
+    /// Begin a consultation as `admission` says.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`RunStore::start`].
+    pub(super) fn begin(
+        &self,
+        request: &StartRequest,
+        admission: Admission<'_>,
+    ) -> Result<RunStatus, RunError> {
         // Everything that can be decided without touching the store is decided first, so a
         // refused request leaves no half-made consultation for `list` to report as running.
         self.refuse_to_spawn(request.delegate.vendor())?;
@@ -239,7 +261,7 @@ impl RunStore {
         let Pinned {
             delegate,
             rewritten_from,
-        } = Self::pin_defaults(&request.delegate, &config)?;
+        } = Self::pin_defaults(&request.delegate, &config, admission)?;
         let billing = delegate.resolve_billing(request.billing, &self.host_env, &config)?;
         let (run_id, dir) = self.create_run_dir()?;
         let meta = Meta {
@@ -254,6 +276,10 @@ impl RunStore {
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
+            continues: match admission {
+                Admission::New => None,
+                Admission::Continuing(run_id) => Some(run_id.clone()),
+            },
         };
         let started = write_json(&dir.join("meta.json"), &meta)
             .and_then(|()| self.lock(&run_id))
@@ -328,6 +354,10 @@ impl RunStore {
     /// The permissions are filled from the machine file's defaults and held to its limits, and
     /// what the limits let run is what is recorded.
     ///
+    /// A consultation [continuing](Admission::Continuing) another runs as that one's newest turn
+    /// did, so neither an effort nor a permission it left to its CLI's own default is filled from
+    /// the file's defaults now; only the model rules and the limits apply to it afresh.
+    ///
     /// # Errors
     ///
     /// Returns [`RunError::ModelBlocked`] when the model that would run is blocked, and
@@ -335,7 +365,9 @@ impl RunStore {
     pub(super) fn pin_defaults(
         delegate: &Delegate,
         config: &crate::config::Config,
+        admission: Admission<'_>,
     ) -> Result<Pinned, RunError> {
+        let fill_defaults = matches!(admission, Admission::New);
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
         if *pinned.account() == AccountChoice::Default {
@@ -360,15 +392,17 @@ impl RunStore {
             },
         )?;
         pinned = pinned.with_model(launched);
-        if pinned.effort().is_none()
+        if fill_defaults
+            && pinned.effort().is_none()
             && let Some(effort) = default_effort
         {
             pinned = pinned.with_effort(effort);
         }
-        let delegate = pinned
-            .with_isolation(isolation)
-            .with_default_permissions(config)
-            .held_to_limits(config)?;
+        pinned = pinned.with_isolation(isolation);
+        if fill_defaults {
+            pinned = pinned.with_default_permissions(config);
+        }
+        let delegate = pinned.held_to_limits(config)?;
         Ok(Pinned {
             delegate,
             rewritten_from,
@@ -713,12 +747,15 @@ impl RunStore {
             .map_err(RunError::io(format!("writing turn {index} question")))?;
 
         let last_message = turn.last_message();
+        // The consultation this one continues holds the transcript its first question points at.
+        let read_dirs: Vec<PathBuf> = meta.continues.iter().map(|id| self.run_dir(id)).collect();
         let plan = TurnPlan {
             question_path: &turn.question(),
             last_message_path: &last_message,
             resume,
             extra_env: &meta.env,
             billing: meta.billing,
+            read_dirs: &read_dirs,
         };
         let Resolved {
             mut invocation,

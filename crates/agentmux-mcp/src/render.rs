@@ -59,6 +59,18 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
     if let Some(label) = &status.label {
         let _ = writeln!(out, "label:      {label}");
     }
+    if let Some(continued_by) = &status.continued_by {
+        let _ = writeln!(
+            out,
+            "continued:  in {continued_by}, a fresh session; follow that consultation instead"
+        );
+    }
+    if let Some(continues) = &status.continues {
+        let _ = writeln!(
+            out,
+            "continues:  {continues}, whose session could not go on; its transcript is in the brief"
+        );
+    }
     let _ = writeln!(out, "state:      {}", outcome_line(&status.outcome));
     if !status.earlier_failures.is_empty() {
         // On a line of its own, beside the state rather than inside it: the state reports the
@@ -237,6 +249,15 @@ pub fn warnings(status: &RunStatus) -> String {
 /// What a caller should do about the newest turn's failure, or what agentmux is doing about it in
 /// the caller's place.
 fn failure_advice(status: &RunStatus, kind: FailureKind) -> Cow<'static, str> {
+    if status.suggests_continue_fresh() {
+        return Cow::Owned(format!(
+            "A content filter refused the last {} turns in a row, which suggests this session's \
+             own context is what it refuses, so another rephrased follow-up is likely to be \
+             refused too. `continue_fresh` starts a new consultation that reads this transcript \
+             and the working tree, and carries on.",
+            status.content_flagged_in_a_row
+        ));
+    }
     match &status.auto_resume {
         Some(resume) => Cow::Owned(auto_resume_advice(resume)),
         None => recovery_advice(
@@ -435,6 +456,25 @@ fn follow_up_step(status: &RunStatus, lead: &str) -> String {
     "#}
 }
 
+/// The `continue_fresh` call, filled in, under whichever lead-in the caller needs, offered in the
+/// place of a follow-up the session's own context would see refused.
+fn continue_fresh_step(status: &RunStatus, lead: &str) -> String {
+    let id = &status.run_id;
+    indoc::formatdoc! {r#"
+        {lead}continue_fresh {{"run_id": "{id}", "question": "…"}} — a new session
+                    that reads this transcript and the working tree, then the question
+    "#}
+}
+
+/// The `status` call for the consultation that continued this one, under whichever lead-in the
+/// caller needs, offered in the place of anything more on this one.
+fn successor_step(status: &RunStatus, lead: &str) -> Option<String> {
+    let successor = status.continued_by.as_ref()?;
+    Some(indoc::formatdoc! {r#"
+        {lead}status {{"run_id": "{successor}"}} — the consultation that took this one over
+    "#})
+}
+
 /// The calls that follow an automatic resume agentmux is about to send, under whichever lead-in
 /// the caller needs, or `None` when none is pending.
 ///
@@ -463,8 +503,12 @@ pub fn next_steps(status: &RunStatus) -> String {
 
             next:       result {{"run_id": "{id}"}}
         "#};
-        if let Some(steps) = pending_resume_steps(status, "            ") {
+        if let Some(step) = successor_step(status, "            ") {
+            next_steps_text.push_str(&step);
+        } else if let Some(steps) = pending_resume_steps(status, "            ") {
             next_steps_text.push_str(&steps);
+        } else if status.suggests_continue_fresh() {
+            next_steps_text.push_str(&continue_fresh_step(status, "            "));
         } else if status.resumable {
             next_steps_text.push_str(&follow_up_step(status, "            "));
         }
@@ -534,8 +578,12 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
     // A finished consultation's one remaining move is the follow-up, and a running one still needs
     // the whole watch loop, so neither is left for a caller holding the answer to reconstruct.
     if status.is_terminal() {
-        if let Some(steps) = pending_resume_steps(status, "\nnext:       ") {
+        if let Some(step) = successor_step(status, "\nnext:       ") {
+            out.push_str(&step);
+        } else if let Some(steps) = pending_resume_steps(status, "\nnext:       ") {
             out.push_str(&steps);
+        } else if status.suggests_continue_fresh() {
+            out.push_str(&continue_fresh_step(status, "\nnext:       "));
         } else if status.resumable {
             out.push_str(&follow_up_step(status, "\nnext:       "));
         }

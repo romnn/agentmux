@@ -96,6 +96,7 @@ fn build(
         resume,
         extra_env: &extra_env,
         billing: None,
+        read_dirs: &[],
     };
     delegate.invocation(&plan, &host_env(), config)
 }
@@ -1375,5 +1376,40 @@ async fn a_steer_refusal_names_the_running_turns_isolation() -> Result<()> {
         refused.map_err(|err| err.to_string()),
         err(contains_substring("it runs isolated"))
     );
+    Ok(())
+}
+
+/// A consultation continued afresh runs with the permissions its newest turn ran with, even a
+/// tool list that turn left to agentmux's read-only default, after the machine file's defaults
+/// have changed.
+#[gtest]
+fn a_fresh_continuation_keeps_the_permissions_it_ran_with() -> Result<()> {
+    let machine = Machine::new(
+        OWNER_FILE,
+        ScriptedLauncher::new([
+            Script::completed(fixtures::CLAUDE_HAPPY),
+            Script::completed(fixtures::CLAUDE_HAPPY),
+        ]),
+    )?;
+    let started = machine
+        .store
+        .start(&machine.request(claude(ClaudePermissions::default())?))?;
+    let read_only = machine.args(0)?;
+
+    machine.rewrite(&OWNER_FILE.replace(
+        "permission_mode = \"plan\"",
+        indoc::indoc! {r#"
+            permission_mode = "plan"
+            tools = ["Read", "Edit"]"#},
+    ))?;
+    machine.store.continue_fresh(&started.run_id, None)?;
+
+    let tools = |args: &[String]| {
+        args.windows(2)
+            .find(|pair| pair.first().is_some_and(|flag| flag == "--tools"))
+            .and_then(|pair| pair.get(1).cloned())
+    };
+    assert_that!(tools(&machine.args(1)?), eq(&tools(&read_only)));
+    assert_that!(tools(&machine.args(1)?), not(some(eq("Read,Edit"))));
     Ok(())
 }

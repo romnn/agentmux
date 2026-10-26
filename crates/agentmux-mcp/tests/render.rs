@@ -110,6 +110,87 @@ fn a_content_flagged_failure_says_the_work_survived() -> Result<()> {
     Ok(())
 }
 
+/// A content filter that refuses the session turn after turn is answered with a fresh session,
+/// not another rephrased follow-up, and once one has taken over, the old consultation points at
+/// it.
+#[gtest]
+fn a_session_the_filter_keeps_refusing_is_pointed_at_a_fresh_one() -> Result<()> {
+    let flagged = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
+        {"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk"}}
+    "#};
+    let dir = tempfile::tempdir().or_fail()?;
+    let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    let launcher = ScriptedLauncher::new([
+        Script::completed(flagged),
+        Script::completed(flagged),
+        Script::completed(agentmux::testing::fixtures::CODEX_HAPPY),
+    ]);
+    let store = RunStore::open(dir.path(), Arc::new(launcher), env).or_fail()?;
+    let status = store
+        .start(&StartRequest {
+            delegate: Delegate::Codex {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
+                account: AccountChoice::Default,
+                isolation: None,
+            },
+            question: "Review the parser.".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })
+        .or_fail()?;
+    // One refusal: rephrase.
+    let once = agentmux_mcp::render::status(&status);
+    assert_that!(once, contains_substring("rephrase rather than escalate"));
+    assert_that!(once, not(contains_substring("continue_fresh {")));
+
+    // Two in a row: the session itself is refused, so the next call is a fresh session.
+    let twice = store
+        .follow_up(&status.run_id, "Only the limit check, please.")
+        .or_fail()?;
+    let rendered = agentmux_mcp::render::status(&twice);
+    assert_that!(
+        rendered,
+        all![
+            contains_substring("refused the last 2 turns in a row"),
+            contains_substring("likely to be refused too"),
+            contains_substring("continue_fresh {\"run_id\""),
+            not(contains_substring("follow_up {")),
+        ]
+    );
+
+    let fresh = store.continue_fresh(&status.run_id, None).or_fail()?;
+    let old = agentmux_mcp::render::status(&store.status(&status.run_id).or_fail()?);
+    assert_that!(
+        old,
+        contains_substring(format!("continued:  in {}", fresh.run_id).as_str())
+    );
+    assert_that!(old, not(contains_substring("continue_fresh {")));
+    assert_that!(
+        old,
+        contains_substring(format!("status {{\"run_id\": \"{}\"}}", fresh.run_id).as_str())
+    );
+    assert_that!(old, not(contains_substring("follow_up {")));
+    assert_that!(
+        agentmux_mcp::render::status(&fresh),
+        contains_substring(format!("continues:  {}", status.run_id).as_str())
+    );
+    Ok(())
+}
+
 /// The advice varies by failure, because the right next move does.
 #[gtest]
 fn an_unavailable_model_is_told_to_fix_the_model_not_to_wait() -> Result<()> {

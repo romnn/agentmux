@@ -2,7 +2,7 @@
 //!
 //! Changes when the CLI's arguments change.
 //!
-//! The same eleven verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
+//! The same twelve verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
 //! Two more are hidden: `supervise`, the process the run store launches for every turn to start
 //! its delegate and settle it, and `codex-app-server`, the driver it launches as the delegate of a
@@ -89,6 +89,15 @@ pub enum Command {
     /// Ask a finished consultation one more question, in the delegate's own session.
     #[command(name = "follow-up", alias = "followup")]
     FollowUp(FollowUpArgs),
+
+    /// Continue a consultation whose session cannot go on in a new one, which reads its
+    /// transcript and the working tree first.
+    ///
+    /// The new consultation runs as the old one's newest turn did, with its working directory and
+    /// label, and each one's `status` names the other.
+    /// The question is the argument or `--file`; stdin is not read.
+    #[command(name = "continue-fresh")]
+    ContinueFresh(ContinueFreshArgs),
 
     /// Add an instruction to a consultation's running turn, which the delegate sees before its
     /// next model call.
@@ -605,6 +614,40 @@ impl FollowUpArgs {
     /// Returns an error when the file or stdin cannot be read, or the question is empty.
     pub fn text(&self) -> Result<String> {
         supplied_text(self.question.as_deref(), self.file.as_deref())
+    }
+}
+
+/// Arguments for `agentmux continue-fresh`: which consultation to continue, and what to ask.
+#[derive(Debug, Args)]
+pub struct ContinueFreshArgs {
+    /// The consultation id.
+    pub run_id: RunIdArg,
+
+    /// What the new session should do once it has read the old transcript and the working tree.
+    /// Omitted, it carries on with the work the old consultation was doing.
+    pub question: Option<String>,
+
+    /// Read the question from a file instead.
+    #[arg(long, short = 'f', conflicts_with = "question")]
+    pub file: Option<PathBuf>,
+}
+
+impl ContinueFreshArgs {
+    /// The question, from wherever it was supplied, or `None` when none was.
+    ///
+    /// Unlike the other commands this never reads stdin, because the question is optional.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read.
+    pub fn text(&self) -> Result<Option<String>> {
+        match (&self.question, &self.file) {
+            (Some(question), _) => Ok(Some(question.clone())),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .map(Some)
+                .wrap_err_with(|| format!("reading the question from {}", path.display())),
+            (None, None) => Ok(None),
+        }
     }
 }
 

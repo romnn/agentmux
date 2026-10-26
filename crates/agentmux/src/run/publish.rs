@@ -37,6 +37,11 @@ impl RunStore {
             meta.cwd.display(),
             meta.created_at.to_rfc3339(),
         );
+        // Written only when there is one, so a transcript rendered before it existed renders
+        // byte for byte as it did.
+        if let Some(continues) = &meta.continues {
+            let _ = writeln!(text, "- continues: {continues}");
+        }
         let offset = |text: &str| u64::try_from(text.len()).unwrap_or(u64::MAX);
         let mut spans = Vec::with_capacity(state.transcript.turns.len());
         for turn in &state.transcript.turns {

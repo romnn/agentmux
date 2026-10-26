@@ -111,6 +111,10 @@ async fn main() -> Result<()> {
                 .await?;
             report::answer(&store, &status.run_id, cli.json)
         }
+        Command::ContinueFresh(args) => {
+            let status = store.continue_fresh(args.run_id.id(), args.text()?.as_deref())?;
+            report::status(&status, cli.json)
+        }
         Command::Steer(args) => {
             let status = store.steer(args.run_id.id(), &args.text()?).await?;
             if !cli.json {

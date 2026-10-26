@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use agentmux::delegate::Vendor;
 use googletest::prelude::*;
 
-/// The eleven tools, and nothing else.
+/// The twelve tools, and nothing else.
 #[gtest]
 fn the_server_offers_exactly_the_documented_tools() {
     let names: BTreeSet<String> = agentmux_mcp::tool_router(&BTreeSet::new())
@@ -25,6 +25,7 @@ fn the_server_offers_exactly_the_documented_tools() {
         "tail",
         "result",
         "follow_up",
+        "continue_fresh",
         "steer",
         "wait",
         "cancel",

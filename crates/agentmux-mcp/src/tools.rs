@@ -1,4 +1,4 @@
-//! The eleven tools.
+//! The twelve tools.
 //!
 //! Changes when the tool API changes.
 
@@ -215,6 +215,21 @@ pub struct FollowUpParams {
     #[serde(flatten)]
     #[schemars(flatten)]
     pub permissions: PermissionParams,
+}
+
+/// Arguments for `continue_fresh`: which consultation to continue, and what to ask.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContinueFreshParams {
+    /// The consultation id to continue, from `ask`, `start` or `list`.
+    /// Its newest turn must have settled.
+    pub run_id: String,
+
+    /// What the new session should do, after it has read the old transcript and the working
+    /// tree.
+    /// Omitted, it carries on with the work the old consultation was doing.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub question: Option<String>,
 }
 
 /// Arguments for `wait`: which turn to wait for, and which page of the transcript to return.
@@ -544,6 +559,29 @@ impl AgentMux {
             params.offset.unwrap_or(before),
             slice(params.max_bytes, DEFAULT_RESULT_BYTES),
         )
+    }
+
+    #[tool(
+        description = "Continue a consultation in a new one when its own session cannot go on — \
+                       typically when a content filter refused two or more turns in a row, which \
+                       suggests the session's context rather than your wording is what it \
+                       refuses. Starts a new consultation run as the old one's newest turn ran — \
+                       delegate, account, effort, permissions, working directory and label — with \
+                       the model it asked for under this machine's current model rules, whose \
+                       first question gives the old transcript's path, says the working tree may \
+                       hold the old consultation's uncommitted work, and then asks `question`. \
+                       Each consultation's `status` names the other. Returns the new \
+                       consultation's id immediately, like `start`; collect it with `wait`."
+    )]
+    fn continue_fresh(
+        &self,
+        Parameters(params): Parameters<ContinueFreshParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let status = self
+            .store
+            .continue_fresh(&run_id(&params.run_id)?, params.question.as_deref())
+            .map_err(|error| run_error(&error))?;
+        Ok(text(render::status(&status)))
     }
 
     #[tool(
@@ -1010,8 +1048,11 @@ observed the consultation, not seen it finish. It has lost nothing; wait for the
 calling again. Use `status` for a cheap look that carries no transcript text, `tail` when you want
 to see what the delegate is actually doing — with `from_end` for its latest output — `result` to
 page the transcript, and `cancel` to stop one while keeping what it collected. `ask` is `start`
-plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep.
-`follow_up` continues the delegate's own session, so ask only the new thing. `steer` adds an
+plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep,
+and with `label` and `state` finds the consultations you gave a `label` on `start` or `follow_up`.
+`follow_up` continues the delegate's own session, so ask only the new thing. When that session
+itself cannot go on — a content filter refusing turn after turn however you rephrase —
+`continue_fresh` starts a new consultation that reads the old transcript and working tree. `steer` adds an
 instruction to a turn that is still running, which the delegate sees before its next model call;
 only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`
 consultation that inherits its account's settings, because only those are launched over Codex's
