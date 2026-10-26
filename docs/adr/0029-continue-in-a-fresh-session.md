@@ -16,7 +16,9 @@ transcript's path, the uncommitted work in the working tree, what had been decid
 question points the delegate at the old transcript and working tree, and the two records link each
 other.** `RunStore::continue_fresh` (`crates/agentmux/src/run/continue_fresh.rs`) refuses with
 `RunError::StillRunning` until the old consultation's newest turn has settled, so the transcript
-it points at is published, and while agentmux has scheduled an automatic resume of it
+it points at is published, and its delegate has exited, since one that survived a cancellation is
+still a writer in the working tree the successor would share
+([0023](0023-resume-after-delegate-exit.md)); and while agentmux has scheduled an automatic resume of it
 ([0027](0027-automatic-resume-after-overload.md)), which would run the old session beside the new
 one. It holds the old run's lock ([0020](0020-run-state-locking.md)) from that check until the
 successor is linked, so nothing can remove the old run or begin a turn of it in between.

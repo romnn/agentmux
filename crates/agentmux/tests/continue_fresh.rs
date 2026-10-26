@@ -193,3 +193,19 @@ fn a_running_consultation_is_not_continued_afresh() -> Result<()> {
     assert_that!(harness.launcher.launches().len(), eq(1));
     Ok(())
 }
+
+/// A delegate that survived its cancellation is settled but still writing in the working tree, so
+/// no successor is started beside it.
+#[gtest]
+#[tokio::test]
+async fn a_delegate_that_survived_its_cancellation_is_not_continued_beside() -> Result<()> {
+    let harness = harness([Script::survives_stop("")])?;
+    let old = harness.store.start(&request(codex()?)?)?;
+    harness.store.cancel(&old.run_id).await?;
+    assert_that!(
+        harness.store.continue_fresh(&old.run_id, None),
+        err(matches_pattern!(RunError::StillRunning { .. }))
+    );
+    assert_that!(harness.launcher.launches().len(), eq(1));
+    Ok(())
+}

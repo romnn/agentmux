@@ -39,7 +39,8 @@ impl RunStore {
     /// # Errors
     ///
     /// Returns [`RunError::NotFound`] when there is no such consultation,
-    /// [`RunError::StillRunning`] while its newest turn has not settled or agentmux has
+    /// [`RunError::StillRunning`] while its newest turn has not settled, its delegate has not
+    /// exited, or agentmux has
     /// scheduled an automatic resume of it, and whatever [`RunStore::start`] refuses the new
     /// consultation for.
     pub fn continue_fresh(
@@ -53,7 +54,12 @@ impl RunStore {
         // successor.
         let run = self.lock(run_id)?;
         let state = run.fold_and_publish(&meta)?.state;
-        let Some(newest) = state.newest.filter(|newest| newest.settled) else {
+        // Gone as well as settled: a delegate that survived a cancellation is settled, and is
+        // still a writer in the working tree the successor would share.
+        let Some(newest) = state
+            .newest
+            .filter(|newest| newest.settled && newest.delegate_gone)
+        else {
             return Err(RunError::StillRunning {
                 run_id: run_id.clone(),
             });
