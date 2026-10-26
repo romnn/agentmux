@@ -65,6 +65,8 @@ a record names to show where the decision is enforced must be renamed there too.
   delegate leaves, and waits return only then.
 - [0027](0027-automatic-resume-after-overload.md): A turn that fails because the model is
   overloaded is resumed by its own supervisor.
+- [0028](0028-labels-belong-to-turns.md): A label belongs to the turn it was given for, and later
+  turns inherit it.
 
 ## Codex integration
 

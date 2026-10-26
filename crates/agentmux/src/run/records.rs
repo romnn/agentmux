@@ -16,6 +16,7 @@ use super::SettledBy;
 use super::auto_resume::AutoResumePlan;
 use super::error::RunError;
 use super::id::RunId;
+use super::label::RunLabel;
 use super::layout::TurnDir;
 use super::retention::Retention;
 
@@ -486,6 +487,13 @@ pub(super) struct InvocationRecord {
     /// overloaded, when agentmux rather than a caller sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) auto_resume: Option<ResumeAttempt>,
+    /// The label the caller gave this turn, when it gave one: `start`'s for the first turn, a
+    /// follow-up's for a later one.
+    ///
+    /// A turn given none is for what the turn before it was for, which
+    /// [`super::RunStore::label_of_turn`] reads back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) label: Option<RunLabel>,
 }
 
 /// Write a record, replacing any there before, so that a reader never sees a partial one.

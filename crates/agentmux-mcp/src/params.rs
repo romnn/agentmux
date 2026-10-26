@@ -15,7 +15,8 @@ use agentmux::delegate::{
     Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, DelegateError, Isolation,
     PermissionOptions, Vendor,
 };
-use agentmux::run::{Retention, RunId};
+use agentmux::run::{Retention, RunId, RunLabel};
+use agentmux::transcript::TurnState;
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,10 @@ fn sandbox_schema(_generator: &mut SchemaGenerator) -> Schema {
     string_enum_schema::<CodexSandbox>(
         "`codex` only: how much its commands may write. Codex's own sandbox modes.",
     )
+}
+
+fn state_schema(_generator: &mut SchemaGenerator) -> Schema {
+    string_enum_schema::<TurnState>("Only consultations whose newest turn stands so.")
 }
 
 fn permission_mode_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -320,6 +325,14 @@ pub struct QuestionParams {
     #[serde(default)]
     #[schemars(with = "bool")]
     pub keep: Option<bool>,
+
+    /// A short purpose for the consultation, such as `"REVIEW CRD G1"`: one line of up to 120
+    /// characters.
+    /// `status`, `list` and `wait` show it, and `list` finds consultations by it, so you need no
+    /// note of your own of what each id is for.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub label: Option<String>,
 }
 
 impl QuestionParams {
@@ -386,6 +399,15 @@ impl QuestionParams {
         Ok(path)
     }
 
+    /// The label, checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-params error for a label that is not one short line.
+    pub fn label(&self) -> Result<Option<RunLabel>, ErrorData> {
+        label(self.label.as_deref())
+    }
+
     /// How long the consultation is kept.
     #[must_use]
     pub fn retention(&self) -> Retention {
@@ -395,6 +417,18 @@ impl QuestionParams {
             Retention::Ttl
         }
     }
+}
+
+/// Parse a label supplied by a caller, when it supplied one.
+///
+/// # Errors
+///
+/// Returns an invalid-params error naming the accepted shape.
+pub fn label(value: Option<&str>) -> Result<Option<RunLabel>, ErrorData> {
+    value
+        .map(RunLabel::parse)
+        .transpose()
+        .map_err(|error| ErrorData::invalid_params(format!("{error}."), None))
 }
 
 /// Parse a run id supplied by a caller.
@@ -420,4 +454,25 @@ pub struct QuotaParams {
     #[serde(default)]
     #[schemars(schema_with = "vendor_schema")]
     pub delegate: Option<Vendor>,
+}
+
+/// Arguments for `list`: how many consultations to show, and which.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ListParams {
+    /// Most consultations to list, newest first.
+    /// Defaults to 20.
+    #[serde(default)]
+    #[schemars(with = "usize")]
+    pub limit: Option<usize>,
+
+    /// Only consultations whose current label holds this text, ignoring case.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub label: Option<String>,
+
+    /// Only consultations whose newest turn stands so: `running`, `completed`, `failed` or
+    /// `cancelled`.
+    #[serde(default)]
+    #[schemars(schema_with = "state_schema")]
+    pub state: Option<TurnState>,
 }

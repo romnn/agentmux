@@ -16,7 +16,7 @@ use agentmux::delegate::{
     AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
     Vendor,
 };
-use agentmux::run::{Retention, RunError, RunStore, StartRequest};
+use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use googletest::prelude::*;
 
@@ -59,6 +59,7 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     }
 }
 
@@ -84,7 +85,10 @@ fn a_denied_vendor_is_never_spawned() -> Result<()> {
     // No child, and no half-made consultation for `list` to report as running: a caller that
     // retries elsewhere must not leave a trail of runs nobody will ever collect.
     assert_that!(launcher.launches(), is_empty());
-    assert_that!(store.list(20).or_fail()?, is_empty());
+    assert_that!(
+        store.list(20, &ListFilter::default()).or_fail()?,
+        is_empty()
+    );
     Ok(())
 }
 

@@ -29,7 +29,7 @@ use agentmux::report::{
     quota_block, quota_report, summarise,
 };
 use agentmux::run::{
-    AutoResume, HookReopening, Meta, QuotaReport, RunStatus, RunSummary, SettledTurn,
+    AutoResume, HookReopening, Meta, QuotaReport, RunLabel, RunStatus, RunSummary, SettledTurn,
     TranscriptPage, describe_delegate,
 };
 use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
@@ -56,6 +56,9 @@ pub enum Caller {
 pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "run_id:     {}", status.run_id);
+    if let Some(label) = &status.label {
+        let _ = writeln!(out, "label:      {label}");
+    }
     let _ = writeln!(out, "state:      {}", outcome_line(&status.outcome));
     if !status.earlier_failures.is_empty() {
         // On a line of its own, beside the state rather than inside it: the state reports the
@@ -543,7 +546,8 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
 }
 
 /// What `wait` returns: a settled turn's transcript, under a header built from the settlement,
-/// from what the consultation recorded when it began, and from `delegate`, who that turn ran as.
+/// from what the consultation recorded when it began, and from `delegate` and `label`, who that
+/// turn ran as and what it was for.
 ///
 /// Nothing in it depends on a later turn, so a follow-up that is running, or one whose records
 /// cannot be read, neither delays nor fails a wait for a turn that has settled; `newest` is the
@@ -554,15 +558,21 @@ pub fn settled(
     settled: &SettledTurn,
     meta: &Meta,
     delegate: &Delegate,
+    label: Option<&RunLabel>,
     newest: Option<u32>,
     auto_resume: Option<&AutoResume>,
     page: &TranscriptPage,
 ) -> String {
     let id = settled.run_id();
     let turn = settled.turn_number();
+    // Its own line under the id, ending in a newline, or nothing.
+    let mut label_line = String::new();
+    if let Some(label) = label {
+        let _ = writeln!(label_line, "label:      {label}");
+    }
     let mut out = indoc::formatdoc! {"
         run_id:     {id}
-        state:      {state}
+        {label_line}state:      {state}
         delegate:   {delegate}
         reading:    {cwd}
         settled:    turn {turn} is final; its record is {marker}
@@ -639,28 +649,35 @@ pub fn tail(status: &RunStatus, page: &TranscriptPage) -> String {
     out
 }
 
-/// Recent consultations.
+/// Recent consultations, as `filtered` by the caller's `label` or `state` or not.
 #[must_use]
-pub fn list(runs: &[RunSummary]) -> String {
+pub fn list(runs: &[RunSummary], filtered: bool) -> String {
     if runs.is_empty() {
-        return "no consultations yet. Start one with `ask`, or with `start` if it will take \
-                minutes."
-            .to_owned();
+        // A caller that filtered may well have consultations, and starting another would only
+        // duplicate one it could not find.
+        return if filtered {
+            "no consultations match the `label` and `state` you passed. Call `list` without them \
+             to see every recent one."
+        } else {
+            "no consultations yet. Start one with `ask`, or with `start` if it will take minutes."
+        }
+        .to_owned();
     }
     let mut out = String::new();
     for run in runs {
-        out.push_str(&indoc::formatdoc! {"
-            {run_id}  {state:<9}  {turns} turn(s)  {created_at}
-                {delegate}
-                {question}
-            ",
+        let _ = writeln!(
+            out,
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
             run_id = run.run_id,
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
-            delegate = run.delegate,
-            question = run.question,
-        });
+        );
+        if let Some(label) = &run.label {
+            let _ = writeln!(out, "    label: {label}");
+        }
+        let _ = writeln!(out, "    {}", run.delegate);
+        let _ = writeln!(out, "    {}", run.question);
     }
     out
 }

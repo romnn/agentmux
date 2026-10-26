@@ -6,10 +6,13 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::delegate::{Billing, Delegate, Isolation, ModelId};
-use crate::transcript::{EarlierFailure, Outcome, UnrecognisedEvents, Usage, UsageWindow};
+use crate::delegate::{Billing, Delegate, Effort, Isolation, ModelId, Vendor};
+use crate::transcript::{
+    EarlierFailure, Outcome, TurnState, UnrecognisedEvents, Usage, UsageWindow,
+};
 
 use super::id::RunId;
+use super::label::RunLabel;
 
 /// A consultation as a caller sees it.
 ///
@@ -19,6 +22,10 @@ use super::id::RunId;
 pub struct RunStatus {
     /// The consultation's id.
     pub run_id: RunId,
+    /// What the consultation is for now: the label its newest turn was given, or else the latest
+    /// one an earlier turn was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<RunLabel>,
     /// Who is being consulted, as its newest turn ran: the isolation and permissions a follow-up
     /// keeps unless it changes them.
     pub delegate: Delegate,
@@ -199,14 +206,33 @@ impl HookReopening {
 }
 
 /// One line about a consultation, for `list`.
+///
+/// Carries what a caller watching many consultations needs from one call: what each is for, where
+/// it reads, what it runs, how its newest turn stands and when it last did anything.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
     /// The consultation's id.
     pub run_id: RunId,
+    /// What the consultation is for now, as [`RunStatus::label`] says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<RunLabel>,
     /// A one-line description of the delegate.
     pub delegate: String,
-    /// How the consultation stands: the newest turn's outcome.
+    /// Which CLI the consultation runs.
+    pub vendor: Vendor,
+    /// The model its newest turn ran.
+    pub model: ModelId,
+    /// The effort its newest turn ran at, or `None` for the CLI's own default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// The directory the delegate reads the project from.
+    pub cwd: PathBuf,
+    /// How the consultation stands: the newest turn's outcome, with the failure's kind.
     pub outcome: Outcome,
+    /// The newest write to any of the newest turn's capture files, or `None` before it wrote
+    /// any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<DateTime<Utc>>,
     /// How many turns the consultation has, which is also the newest turn's number.
     pub turns: u32,
     /// When `start` was called.
@@ -217,6 +243,17 @@ pub struct RunSummary {
     /// kept it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
+}
+
+/// Which consultations `list` shows.
+///
+/// The default shows every one.
+#[derive(Debug, Clone, Default)]
+pub struct ListFilter {
+    /// Only consultations whose current label holds this text, ignoring case.
+    pub label: Option<String>,
+    /// Only consultations whose newest turn stands so.
+    pub state: Option<TurnState>,
 }
 
 /// A slice of the rendered transcript.

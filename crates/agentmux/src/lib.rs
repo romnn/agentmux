@@ -58,6 +58,7 @@
 //!     env: Default::default(),
 //!     billing: None,
 //!     force_codex_exec: false,
+//!     label: None,
 //! })?;
 //!
 //! println!("consultation {} started", status.run_id);

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{AutoResumePolicy, RunStore, StartRequest};
+use agentmux::run::{AutoResumePolicy, ListFilter, RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
@@ -36,6 +36,7 @@ fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<Sta
         env: question.environment()?,
         billing: delegate.billing,
         force_codex_exec: false,
+        label: question.label.clone(),
     })
 }
 
@@ -103,6 +104,7 @@ async fn main() -> Result<()> {
                 args.run_id.id(),
                 &args.text()?,
                 args.permissions.options()?,
+                args.label.as_ref(),
             )?;
             store
                 .wait_until_terminal(&status.run_id, Duration::from_secs(args.wait))
@@ -129,7 +131,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
-        Command::List(args) => report::list(&store.list(args.limit)?, cli.json),
+        Command::List(args) => {
+            let filtered = args.label.is_some() || args.state.is_some();
+            let filter = ListFilter {
+                label: args.label,
+                state: args.state,
+            };
+            report::list(&store.list(args.limit, &filter)?, filtered, cli.json)
+        }
         // Dispatched before the store was opened.
         Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
         Command::Prune(args) => {

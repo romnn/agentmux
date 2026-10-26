@@ -316,6 +316,7 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })?;
     let id = started.run_id.clone();
     assert_that!(until_steerable(&harness.store, &id).await?, eq(true));

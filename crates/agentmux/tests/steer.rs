@@ -94,6 +94,7 @@ impl Harness {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         }
     }
 
@@ -221,6 +222,7 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })?;
     exec_only
         .wait_until_terminal(&started.run_id, Duration::from_secs(5))
@@ -614,6 +616,7 @@ async fn a_store_without_a_driver_launches_codex_over_exec() -> Result<()> {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })?;
     assert_that!(
         launcher

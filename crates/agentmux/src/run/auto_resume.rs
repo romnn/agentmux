@@ -335,6 +335,7 @@ impl RunStore {
             index: next_index,
             question: CONTINUE,
             resume: Some(&session),
+            label: None,
         };
         run.launch_turn(
             &meta,

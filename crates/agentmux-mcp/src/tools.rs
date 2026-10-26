@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::Vendor;
-use agentmux::run::{RunId, RunStore, SettledTurn, StartRequest, TurnRef};
+use agentmux::run::{ListFilter, RunId, RunStore, SettledTurn, StartRequest, TurnRef};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -19,7 +19,9 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::params::{DelegateParams, PermissionParams, QuestionParams, QuotaParams, run_id};
+use crate::params::{
+    DelegateParams, ListParams, PermissionParams, QuestionParams, QuotaParams, label, run_id,
+};
 use crate::render;
 
 /// Default seconds a blocking tool waits.
@@ -201,6 +203,13 @@ pub struct FollowUpParams {
     #[schemars(with = "usize")]
     pub max_bytes: Option<usize>,
 
+    /// A new short purpose for this turn and the ones after it, such as
+    /// `"RE-REVIEW after rework"`: one line of up to 120 characters.
+    /// Omitted, the turn keeps the consultation's current label.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub label: Option<String>,
+
     /// Changes to the consultation's isolation or permissions for this turn and the ones after
     /// it; whatever is omitted keeps what the newest turn ran with.
     #[serde(flatten)]
@@ -250,16 +259,6 @@ pub struct SteerParams {
     pub message: String,
 }
 
-/// Arguments for `list`: how many consultations to show.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListParams {
-    /// Most consultations to list, newest first.
-    /// Defaults to 20.
-    #[serde(default)]
-    #[schemars(with = "usize")]
-    pub limit: Option<usize>,
-}
-
 /// Wrap rendered prose as a tool result.
 ///
 /// Plain text rather than `structuredContent`: Claude Code's handling of structured results is
@@ -281,6 +280,7 @@ fn start_request(
         env: question.environment(),
         billing: delegate.billing,
         force_codex_exec: delegate.force_codex_exec,
+        label: question.label()?,
     })
 }
 
@@ -475,6 +475,10 @@ impl AgentMux {
             .store
             .turn_delegate(&meta, &settled)
             .map_err(|error| run_error(&error))?;
+        let turn_label = self
+            .store
+            .turn_label(&settled)
+            .map_err(|error| run_error(&error))?;
         let newest = self
             .store
             .pin_turn(&id, None)
@@ -489,6 +493,7 @@ impl AgentMux {
             &settled,
             &meta,
             &delegate,
+            turn_label.as_ref(),
             newest,
             auto_resume.as_ref(),
             &page,
@@ -514,6 +519,7 @@ impl AgentMux {
             ));
         }
         let overrides = params.permissions.options()?;
+        let label = label(params.label.as_deref())?;
         // Read before the turn is claimed, so it is the length through the previous turn exactly.
         // The rendered transcript is append-only, which is what makes that a turn boundary and
         // not a cut through the middle of one.
@@ -524,7 +530,7 @@ impl AgentMux {
             .transcript_bytes;
         let status = self
             .store
-            .follow_up_with(&id, &params.question, overrides)
+            .follow_up_with(&id, &params.question, overrides, label.as_ref())
             .map_err(|error| run_error(&error))?;
         self.store
             .wait_until_terminal(
@@ -585,18 +591,25 @@ impl AgentMux {
     }
 
     #[tool(
-        description = "List recent consultations with their ids, delegates, states and questions, \
-                       newest first. Use it to recover an id you did not keep."
+        description = "List recent consultations with their ids, labels, delegates, states and \
+                       questions, newest first. Use it to recover an id you did not keep, or with \
+                       `label` and `state` to find the consultations you started for one purpose \
+                       and see which are still running or failed."
     )]
     fn list(
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let filtered = params.label.is_some() || params.state.is_some();
+        let filter = ListFilter {
+            label: params.label,
+            state: params.state,
+        };
         let runs = self
             .store
-            .list(params.limit.unwrap_or(20).clamp(1, 200))
+            .list(params.limit.unwrap_or(20).clamp(1, 200), &filter)
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::list(&runs)))
+        Ok(text(render::list(&runs, filtered)))
     }
 
     #[tool(
@@ -1364,6 +1377,70 @@ mod tests {
         Ok(())
     }
 
+    /// The text of a tool's result.
+    fn result_text(result: &rmcp::model::CallToolResult) -> Result<String> {
+        let text = result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .or_fail()?;
+        Ok(text.text.clone())
+    }
+
+    /// A label given to `start` is shown by `status` and `list`, `list` finds the consultation by
+    /// it and by its state, and a label that is not one short line is refused before anything
+    /// launches.
+    #[gtest]
+    fn the_start_and_list_tools_carry_a_label() -> Result<()> {
+        let state_directory = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([
+            Script::completed(agentmux::testing::fixtures::CODEX_HAPPY),
+            Script::completed(agentmux::testing::fixtures::CODEX_HAPPY),
+        ]));
+        let host_env = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let store = RunStore::open(state_directory.path(), launcher.clone(), host_env).or_fail()?;
+        let server = AgentMux::new(Arc::new(store));
+        let start = |label: Option<&str>| -> Result<std::result::Result<_, rmcp::ErrorData>> {
+            let mut arguments = serde_json::json!({
+                "delegate": "codex",
+                "model": "gpt-6-astra",
+                "effort": "high",
+                "question": "Review the diff.",
+                "cwd": state_directory.path(),
+            });
+            if let (Some(label), Some(object)) = (label, arguments.as_object_mut()) {
+                object.insert("label".to_owned(), label.into());
+            }
+            let params = serde_json::from_value(arguments).or_fail()?;
+            Ok(server.start(Parameters(params)))
+        };
+
+        let started = result_text(&start(Some(" REVIEW CRD G1 "))?.or_fail()?)?;
+        assert_that!(started, contains_substring("label:      REVIEW CRD G1"));
+        start(None)?.or_fail()?;
+        let refusal = start(Some(indoc::indoc! {"
+            two
+            lines"}))?
+        .err()
+        .or_fail()?;
+        assert_that!(refusal.code, eq(ErrorCode::INVALID_PARAMS));
+        assert_that!(launcher.launches().len(), eq(2));
+
+        let list = |arguments: serde_json::Value| -> Result<String> {
+            let params = serde_json::from_value(arguments).or_fail()?;
+            result_text(&server.list(Parameters(params)).or_fail()?)
+        };
+        let found = list(serde_json::json!({ "label": "crd", "state": "completed" }))?;
+        assert_that!(found, contains_substring("    label: REVIEW CRD G1"));
+        assert_that!(found.matches(" turn(s) ").count(), eq(1));
+        let none = list(serde_json::json!({ "state": "running" }))?;
+        assert_that!(none, starts_with("no consultations match"));
+        Ok(())
+    }
+
     /// A steerable consultation behind an MCP server, and the thread playing its driver.
     struct SteerTestContext {
         server: AgentMux,
@@ -1409,6 +1486,7 @@ mod tests {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })?;
         // The mailbox the driver was pointed at, from the plan it was launched with.
         let launch = launcher.launches().into_iter().next().or_fail()?;

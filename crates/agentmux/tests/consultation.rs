@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use agentmux::delegate::{
     AccountAlias, AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate,
-    Effort, Isolation, ModelId,
+    Effort, Isolation, ModelId, PermissionOptions,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
-    HookReopening, NotResumable, Retention, RunError, RunId, RunStore, StartRequest,
+    HookReopening, ListFilter, NotResumable, Retention, RunError, RunId, RunLabel, RunStore,
+    StartRequest,
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
-use agentmux::transcript::{FailureKind, Outcome};
+use agentmux::transcript::{FailureKind, Outcome, TurnState};
 use googletest::prelude::*;
 
 fn env() -> BTreeMap<String, String> {
@@ -73,6 +74,7 @@ fn request(delegate: Delegate, question: &str) -> StartRequest {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     }
 }
 
@@ -445,7 +447,7 @@ fn recent_consultations_are_listed_newest_first() -> Result<()> {
         .store
         .start(&request(codex()?, "the second question"))?;
 
-    let listed = harness.store.list(10)?;
+    let listed = harness.store.list(10, &ListFilter::default())?;
     assert_that!(listed.len(), eq(2));
     let ids: Vec<String> = listed.iter().map(|r| r.run_id.to_string()).collect();
     assert_that!(
@@ -459,6 +461,121 @@ fn recent_consultations_are_listed_newest_first() -> Result<()> {
         listed.last().map(|r| r.question.clone()),
         some(eq("the first question"))
     );
+    Ok(())
+}
+
+/// A label given at `start` names the consultation everywhere a caller looks, a follow-up's own
+/// label takes over from its turn on, and a follow-up that names none keeps the current one.
+#[gtest]
+#[tokio::test]
+async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Result<()> {
+    let flagged = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
+        {"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk"}}
+    "#};
+    let harness = harness([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(flagged),
+        Script::completed(fixtures::CODEX_HAPPY),
+    ])?;
+    let label = |text: &str| RunLabel::parse(text).or_fail();
+
+    // Started labelled, renamed by one follow-up, kept by the next.
+    let mut labelled = request(codex()?, "review it");
+    labelled.label = Some(label("REVIEW CRD G1")?);
+    let started = harness.store.start(&labelled)?;
+    assert_that!(started.label, some(eq(&label("REVIEW CRD G1")?)));
+    let renamed = harness.store.follow_up_with(
+        &started.run_id,
+        "review the rework",
+        PermissionOptions::default(),
+        Some(&label("RE-REVIEW after rework")?),
+    )?;
+    assert_that!(renamed.label, some(eq(&label("RE-REVIEW after rework")?)));
+    let kept = harness.store.follow_up(&started.run_id, "and the tests")?;
+    assert_that!(kept.label, some(eq(&label("RE-REVIEW after rework")?)));
+    let unlabelled = harness.store.start(&request(codex()?, "another"))?;
+    assert_that!(unlabelled.label, none());
+
+    // Each turn's label is the one it was given or inherited, whichever turn is asked about.
+    for (turn, expected) in [
+        (1, "REVIEW CRD G1"),
+        (2, "RE-REVIEW after rework"),
+        (3, "RE-REVIEW after rework"),
+    ] {
+        let settled = harness
+            .store
+            .wait_for_settlement(&harness.store.pin_turn(&started.run_id, Some(turn))?)
+            .await?;
+        assert_that!(
+            harness.store.turn_label(&settled)?,
+            some(eq(&label(expected)?)),
+            "turn {turn}"
+        );
+    }
+
+    // The transcript says where the purpose changed, under the turns that were given a label.
+    let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
+    assert_that!(transcript.matches("> **Label:** ").count(), eq(2));
+    assert_that!(
+        transcript,
+        contains_substring("> **Label:** RE-REVIEW after rework")
+    );
+
+    // `list` finds the consultation by its current label, ignoring case, before applying its
+    // limit, and by its newest turn's state.
+    let listed = |limit: usize, filter: ListFilter| -> Result<Vec<String>> {
+        Ok(harness
+            .store
+            .list(limit, &filter)?
+            .into_iter()
+            .map(|summary| summary.run_id.to_string())
+            .collect())
+    };
+    let started_id = started.run_id.to_string();
+    let by_label = |needle: &str| ListFilter {
+        label: Some(needle.to_owned()),
+        ..ListFilter::default()
+    };
+    assert_that!(
+        listed(1, by_label("after REWORK"))?,
+        elements_are![eq(&started_id)]
+    );
+    assert_that!(listed(10, by_label("crd g1"))?, is_empty());
+    let by_state = |state: TurnState| ListFilter {
+        state: Some(state),
+        ..ListFilter::default()
+    };
+    assert_that!(
+        listed(1, by_state(TurnState::Failed))?,
+        elements_are![eq(&started_id)]
+    );
+    assert_that!(
+        listed(10, by_state(TurnState::Completed))?,
+        elements_are![eq(&unlabelled.run_id.to_string())]
+    );
+
+    // One listing carries what a heartbeat needs of each consultation.
+    let summaries = harness.store.list(1, &by_label("review"))?;
+    let summary = summaries.first().or_fail()?;
+    assert_that!(summary.label, some(eq(&label("RE-REVIEW after rework")?)));
+    assert_that!(summary.cwd, eq(Path::new("/work/project")));
+    assert_that!(summary.model.as_str(), eq("gpt-6-astra"));
+    assert_that!(
+        summary.effort.as_ref().map(Effort::as_str),
+        some(eq("high"))
+    );
+    assert_that!(summary.turns, eq(3));
+    assert_that!(
+        summary.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::ContentFlagged),
+            ..
+        })
+    );
+    assert_that!(summary.last_activity, some(anything()));
     Ok(())
 }
 
@@ -1089,7 +1206,7 @@ fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     ));
     assert_that!(refused.map(|_| ()), err(anything()));
     assert_that!(harness.launcher.launches().len(), eq(0));
-    assert_that!(harness.store.list(10)?, is_empty());
+    assert_that!(harness.store.list(10, &ListFilter::default())?, is_empty());
     assert_that!(
         harness
             .store
@@ -1422,6 +1539,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
 
@@ -1496,6 +1614,7 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
         .or_fail()?;
     // With no default configured, the record says the CLI's own login ran.
@@ -1826,6 +1945,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
                 .collect(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
     };
 
@@ -1995,6 +2115,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })?;
 
     let launch = launcher.launches().into_iter().next().or_fail()?;
@@ -2078,6 +2199,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
             env: BTreeMap::new(),
             billing: None,
             force_codex_exec: false,
+            label: None,
         })
     };
     let reasoning = |effort: &str| format!("model_reasoning_effort=\"{effort}\"");
@@ -2424,6 +2546,7 @@ fn codex_request(model: &str, cwd: &Path) -> Result<StartRequest> {
         env: BTreeMap::new(),
         billing: None,
         force_codex_exec: false,
+        label: None,
     })
 }
 
@@ -2466,7 +2589,13 @@ fn a_blocked_model_is_refused_before_anything_is_launched() -> Result<()> {
     );
     // No child, and no half-made consultation for `list` to report.
     assert_that!(configured.launcher.launches(), is_empty());
-    assert_that!(configured.store.list(20).or_fail()?, is_empty());
+    assert_that!(
+        configured
+            .store
+            .list(20, &ListFilter::default())
+            .or_fail()?,
+        is_empty()
+    );
     Ok(())
 }
 

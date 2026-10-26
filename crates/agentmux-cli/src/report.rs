@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use agentmux::report::{self, Warning};
 use agentmux::run::{
-    AutoResume, HookReopening, RunError, RunId, RunStatus, RunStore, RunSummary, SettledTurn,
-    TranscriptPage, TurnRef, WaitFor,
+    AutoResume, HookReopening, RunError, RunId, RunLabel, RunStatus, RunStore, RunSummary,
+    SettledTurn, TranscriptPage, TurnRef, WaitFor,
 };
 use agentmux::transcript::{Outcome, TurnState};
 use color_eyre::eyre::Result;
@@ -33,6 +33,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
         return Ok(());
     }
     println!("{}  {}", status.run_id, report::delegate_line(status));
+    if let Some(label) = &status.label {
+        println!("  label       {label}");
+    }
     println!("  state       {}", report::outcome_line(&status.outcome));
     // Above the facts, as every front end puts them: each changes how what follows is read.
     for warning in status.warnings() {
@@ -341,6 +344,7 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
         let page = settled.page(offset, usize::MAX)?;
         reports.push(SettledJson {
             settled,
+            label: store.turn_label(settled)?,
             // Decided before the settlement was committed, so it is there for a turn that has one.
             auto_resume: store.auto_resume(settled.run_id(), settled.turn_number())?,
             text_offset: offset,
@@ -390,6 +394,11 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
 /// Returns an error when the lines cannot be formatted.
 fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
     let settled = settled_report.settled;
+    // Its own line under the heading, ending in a newline, or nothing.
+    let mut label = String::new();
+    if let Some(turn_label) = &settled_report.label {
+        writeln!(label, "  label       {turn_label}")?;
+    }
     // Its own lines under the state, ending in a newline each, or nothing.
     let mut resume = String::new();
     if let Some(auto_resume) = &settled_report.auto_resume {
@@ -413,7 +422,7 @@ fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
         "{}",
         indoc::formatdoc! {"
             {id}  turn {turn} settled
-              state       {state}
+            {label}  state       {state}
             {resume}  transcript  {transcript}
               settled     {marker}
 
@@ -436,6 +445,9 @@ fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
 struct SettledJson<'a> {
     #[serde(flatten)]
     settled: &'a SettledTurn,
+    /// What the turn was for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<RunLabel>,
     /// What agentmux does about the turn having failed because the model was overloaded.
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_resume: Option<AutoResume>,
@@ -452,36 +464,37 @@ struct WaitJson<'a> {
     pending: &'a [TurnRef],
 }
 
-/// Print recent consultations.
+/// Print recent consultations, as `filtered` by `--label` or `--state` or not.
 ///
 /// # Errors
 ///
 /// Returns an error when the JSON form cannot be serialised.
-pub fn list(runs: &[RunSummary], json: bool) -> Result<()> {
+pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(runs)?);
         return Ok(());
     }
     if runs.is_empty() {
-        println!("no consultations yet");
+        if filtered {
+            println!("no consultations match --label and --state");
+        } else {
+            println!("no consultations yet");
+        }
         return Ok(());
     }
     for run in runs {
-        print!(
-            "{}",
-            indoc::formatdoc! {"
-                {run_id}  {state:<9}  {turns} turn(s)  {created_at}
-                    {delegate}
-                    {question}
-                ",
-                run_id = run.run_id,
-                state = run.outcome.state(),
-                turns = run.turns,
-                created_at = run.created_at.to_rfc3339(),
-                delegate = run.delegate,
-                question = run.question,
-            }
+        println!(
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
+            run_id = run.run_id,
+            state = run.outcome.state(),
+            turns = run.turns,
+            created_at = run.created_at.to_rfc3339(),
         );
+        if let Some(label) = &run.label {
+            println!("    label: {label}");
+        }
+        println!("    {}", run.delegate);
+        println!("    {}", run.question);
     }
     Ok(())
 }

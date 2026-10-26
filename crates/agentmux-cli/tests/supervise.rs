@@ -443,6 +443,51 @@ fn agentmux_wait_returns_on_settlement_with_its_outcome() -> Result<()> {
     Ok(())
 }
 
+/// A label given to `agentmux start` comes back from `wait --json` and `list --json`, and
+/// `list` finds the consultation by it and by its state.
+#[gtest]
+fn a_label_reaches_wait_and_list() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: fixtures::CLAUDE_HAPPY,
+        stderr: "",
+        exit_code: 0,
+    })?;
+    let mut labelled = START.to_vec();
+    labelled.splice(2..2, ["--label", "REVIEW CRD G1"]);
+    let run_id =
+        started_run(&run_in_background(machine.agentmux(&labelled))?.finish(COMMAND_LIMIT)?)?;
+    machine.release()?;
+    let waited = machine
+        .spawn_wait(&run_id, &["--json"])?
+        .finish(Duration::from_secs(20))?;
+    let waited: serde_json::Value = serde_json::from_str(&waited.stdout).or_fail()?;
+    assert_that!(
+        waited.pointer("/settled/0/label"),
+        some(eq(&serde_json::json!("REVIEW CRD G1")))
+    );
+
+    let list = |filter: &[&str]| -> Result<serde_json::Value> {
+        let mut args = vec!["list", "--json"];
+        args.extend_from_slice(filter);
+        let listed = run_in_background(machine.agentmux(&args))?.finish(COMMAND_LIMIT)?;
+        serde_json::from_str(&listed.stdout).or_fail()
+    };
+    let found = list(&["--label", "crd", "--state", "completed"])?;
+    assert_that!(
+        found.pointer("/0/run_id"),
+        some(eq(&serde_json::json!(run_id)))
+    );
+    for field in ["label", "cwd", "model", "outcome", "last_activity"] {
+        assert_that!(
+            found.pointer(&format!("/0/{field}")),
+            some(anything()),
+            "{field}"
+        );
+    }
+    assert_that!(list(&["--state", "failed"])?, eq(&serde_json::json!([])));
+    Ok(())
+}
+
 /// A wait that runs out of time exits 124 and says, under `--json`, that it timed out and what
 /// it was still waiting for; the consultation carries on.
 #[gtest]
