@@ -67,6 +67,8 @@ a record names to show where the decision is enforced must be renamed there too.
   overloaded is resumed by its own supervisor.
 - [0028](0028-labels-belong-to-turns.md): A label belongs to the turn it was given for, and later
   turns inherit it.
+- [0029](0029-continue-in-a-fresh-session.md): A session that cannot go on is continued by a new
+  consultation that reads the old one.
 
 ## Codex integration
 

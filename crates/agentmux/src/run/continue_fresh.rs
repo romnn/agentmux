@@ -71,7 +71,7 @@ impl RunStore {
                 env: meta.env.clone(),
                 billing: meta.billing,
                 force_codex_exec: meta.force_codex_exec,
-                label: self.label_of_turn(run_id, newest.index),
+                label: self.label_of_turn(run_id, newest.index)?,
             };
             (request, newest)
         };

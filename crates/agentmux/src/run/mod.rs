@@ -108,7 +108,7 @@ use chrono::{DateTime, Utc};
 
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
-use crate::transcript::{FailureKind, Outcome, Transcript};
+use crate::transcript::{Outcome, Transcript};
 
 use layout::create_private_dir;
 use records::{
@@ -573,24 +573,7 @@ impl RunStore {
                 Some(newest) => self.auto_resume_at_index(run_id, newest.index)?,
                 None => None,
             },
-            content_flagged_in_a_row: u32::try_from(
-                state
-                    .transcript
-                    .turns
-                    .iter()
-                    .rev()
-                    .take_while(|turn| {
-                        matches!(
-                            turn.outcome,
-                            Outcome::Failed {
-                                kind: FailureKind::ContentFlagged,
-                                ..
-                            }
-                        )
-                    })
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
+            content_flagged_in_a_row: state.transcript.content_flagged_in_a_row(),
             continues: meta.continues.clone(),
             continued_by: read_json::<ContinuedBy>(&self.continued_by_path(run_id))?
                 .map(|record| record.run_id),
