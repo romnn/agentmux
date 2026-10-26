@@ -561,7 +561,9 @@ async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Resu
     let summaries = harness.store.list(1, &by_label("review"))?;
     let summary = summaries.first().or_fail()?;
     assert_that!(summary.label, some(eq(&label("RE-REVIEW after rework")?)));
-    assert_that!(summary.cwd, eq(Path::new("/work/project")));
+    // As `status` reports it: the working directory is recorded absolute, which on Windows
+    // puts a drive in front of this one.
+    assert_that!(summary.cwd, eq(&started.cwd));
     assert_that!(summary.model.as_str(), eq("gpt-6-astra"));
     assert_that!(
         summary.effort.as_ref().map(Effort::as_str),
