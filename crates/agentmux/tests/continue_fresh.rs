@@ -108,14 +108,21 @@ fn a_session_the_filter_keeps_refusing_continues_afresh() -> Result<()> {
             contains_substring(old.run_id.as_str()),
             contains_substring(old.transcript_path.to_string_lossy().as_ref()),
             contains_substring("uncommitted work"),
-            contains_substring("a content filter refused its session"),
-            ends_with("Finish the limit check.\n"),
+            contains_substring("a content filter kept refusing its turns"),
+            ends_with(indoc::indoc! {"
+                Finish the limit check.
+            "}),
         ]
     );
     let header = harness.store.page(&fresh.run_id, 0, 2_000)?.text;
     assert_that!(
         header,
-        contains_substring(format!("- continues: {}\n", old.run_id).as_str())
+        contains_substring(
+            indoc::formatdoc! {"
+                - continues: {}
+            ", old.run_id}
+            .as_str()
+        )
     );
 
     // The old consultation points forward, and stops suggesting what has been done.

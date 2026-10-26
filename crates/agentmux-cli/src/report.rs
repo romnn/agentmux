@@ -77,7 +77,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     }
     // A follow-up would take the place of the resume agentmux is about to send, and one into a
     // session a content filter keeps refusing would be refused too.
-    if let Some(AutoResume::Scheduled { .. }) = &status.auto_resume {
+    if let Some(successor) = &status.continued_by {
+        println!("  successor   agentmux status {successor}");
+    } else if let Some(AutoResume::Scheduled { .. }) = &status.auto_resume {
         println!("  stop it     agentmux cancel {}", status.run_id);
     } else if status.suggests_continue_fresh() {
         println!(

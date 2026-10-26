@@ -564,13 +564,14 @@ impl AgentMux {
     #[tool(
         description = "Continue a consultation in a new one when its own session cannot go on — \
                        typically when a content filter refused two or more turns in a row, which \
-                       means the session's context, not your wording, is what it refuses. Starts \
-                       a new consultation with the same delegate, model, effort, permissions, \
-                       working directory and label, whose first question gives the old \
-                       transcript's path, says the working tree may hold the old consultation's \
-                       uncommitted work, and then asks `question`. Each consultation's `status` \
-                       names the other. Returns the new consultation's id immediately, like \
-                       `start`; collect it with `wait`."
+                       suggests the session's context rather than your wording is what it \
+                       refuses. Starts a new consultation run as the old one's newest turn ran — \
+                       delegate, account, effort, permissions, working directory and label — with \
+                       the model it asked for under this machine's current model rules, whose \
+                       first question gives the old transcript's path, says the working tree may \
+                       hold the old consultation's uncommitted work, and then asks `question`. \
+                       Each consultation's `status` names the other. Returns the new \
+                       consultation's id immediately, like `start`; collect it with `wait`."
     )]
     fn continue_fresh(
         &self,

@@ -93,8 +93,9 @@ pub enum Command {
     /// Continue a consultation whose session cannot go on in a new one, which reads its
     /// transcript and the working tree first.
     ///
-    /// The new consultation runs the same delegate, model, effort, permissions, working directory
-    /// and label, and each one's `status` names the other.
+    /// The new consultation runs as the old one's newest turn did, with its working directory and
+    /// label, and each one's `status` names the other.
+    /// The question is the argument or `--file`; stdin is not read.
     #[command(name = "continue-fresh")]
     ContinueFresh(ContinueFreshArgs),
 

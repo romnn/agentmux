@@ -166,6 +166,7 @@ fn a_session_the_filter_keeps_refusing_is_pointed_at_a_fresh_one() -> Result<()>
         rendered,
         all![
             contains_substring("refused the last 2 turns in a row"),
+            contains_substring("likely to be refused too"),
             contains_substring("continue_fresh {\"run_id\""),
             not(contains_substring("follow_up {")),
         ]
@@ -178,6 +179,11 @@ fn a_session_the_filter_keeps_refusing_is_pointed_at_a_fresh_one() -> Result<()>
         contains_substring(format!("continued:  in {}", fresh.run_id).as_str())
     );
     assert_that!(old, not(contains_substring("continue_fresh {")));
+    assert_that!(
+        old,
+        contains_substring(format!("status {{\"run_id\": \"{}\"}}", fresh.run_id).as_str())
+    );
+    assert_that!(old, not(contains_substring("follow_up {")));
     assert_that!(
         agentmux_mcp::render::status(&fresh),
         contains_substring(format!("continues:  {}", status.run_id).as_str())
