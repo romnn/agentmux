@@ -171,6 +171,7 @@ fn open_store(cli: &Cli) -> Result<RunStore> {
     };
     // This executable is the supervisor of every turn and the driver of a driven one, so a turn
     // it starts is run and settled by the same build that will read it back.
+    // The store refuses to launch once an upgrade replaces the file under a running server.
     let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))

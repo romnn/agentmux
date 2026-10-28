@@ -635,6 +635,15 @@ impl RunStore {
         }
         Ok(())
     }
+
+    /// Refuse to launch anything once an agentmux executable this store launches from has been
+    /// replaced, rather than launch a child that fails once started.
+    fn refuse_replaced_executables(&self) -> Result<(), RunError> {
+        self.supervisor
+            .iter()
+            .chain(&self.codex_driver)
+            .try_for_each(super::Executable::refuse_if_replaced)
+    }
 }
 
 impl LockedRun<'_> {
@@ -695,6 +704,11 @@ impl RunStore {
     /// Decided per turn, from the delegate's app-server `settings` and this store: the
     /// environment, the refusals and the billing already in `invocation` are the same either way,
     /// and only what is run differs.
+    ///
+    /// Refused once an agentmux executable the turn would run has been replaced.
+    /// Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
+    /// during it would otherwise launch the new build with the plan this one writes; the caller
+    /// gives the claimed turn back.
     pub(super) fn prepare_launch_mode(
         &self,
         turn: &TurnDir,
@@ -703,6 +717,7 @@ impl RunStore {
         resume: Option<&SessionRef>,
         invocation: &mut crate::delegate::Invocation,
     ) -> Result<LaunchMode, RunError> {
+        self.refuse_replaced_executables()?;
         let (Some(driver), Some(settings), false) =
             (&self.codex_driver, settings, meta.force_codex_exec)
         else {
@@ -719,7 +734,7 @@ impl RunStore {
                 turn_dir: turn.root.clone(),
             },
         )?;
-        invocation.set_driver_command(driver, crate::appserver::SUBCOMMAND, &plan_path);
+        invocation.set_driver_command(driver.path(), crate::appserver::SUBCOMMAND, &plan_path);
         Ok(LaunchMode::AppServer)
     }
 
@@ -835,7 +850,7 @@ impl RunStore {
         );
 
         if let Some(supervisor) = &self.supervisor {
-            return self.launch_supervisor(turn, meta, index, &invocation, supervisor);
+            return self.launch_supervisor(turn, meta, index, &invocation, supervisor.path());
         }
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
@@ -895,7 +910,10 @@ impl RunStore {
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
                     supervisor: supervisor.to_path_buf(),
-                    codex_driver: self.codex_driver.clone(),
+                    codex_driver: self
+                        .codex_driver
+                        .as_ref()
+                        .map(|driver| driver.path().to_path_buf()),
                 }),
             },
         )?;
