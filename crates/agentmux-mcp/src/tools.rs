@@ -803,6 +803,16 @@ fn run_error(error: &agentmux::run::RunError) -> ErrorData {
             ),
             None,
         ),
+        // Only a restart of this server mends it, which the calling agent cannot do itself.
+        RunError::ExecutableReplaced { .. } => ErrorData::internal_error(
+            indoc::formatdoc! {"
+                {error}
+                Ask the user to restart the agentmux MCP server, as their harness offers it (in \
+                Claude Code, `/mcp` and reconnect agentmux). Every consultation started before \
+                can still be waited for, read and cancelled meanwhile."
+            },
+            None,
+        ),
         // A turn that cannot settle, or a settlement that does not hold, is the store's to repair;
         // the message names the files to look at.
         RunError::Corrupt { .. }
