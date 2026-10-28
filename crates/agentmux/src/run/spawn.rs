@@ -637,7 +637,7 @@ impl RunStore {
     }
 
     /// Refuse to launch anything once an agentmux executable this store launches from has been
-    /// replaced, before a turn is claimed for a launch that would fail once started.
+    /// replaced, rather than launch a child that fails once started.
     fn refuse_replaced_executables(&self) -> Result<(), RunError> {
         self.supervisor
             .iter()
@@ -678,7 +678,6 @@ impl LockedRun<'_> {
         if !self.store.run_dir(&self.run_id).join("meta.json").is_file() {
             return Err(RunError::NotFound(self.run_id.clone()));
         }
-        self.store.refuse_replaced_executables()?;
         let turn = self.store.turn_dir(&self.run_id, index);
         claim_turn(&turn, index, &self.run_id)?;
         // A claim that does not end in a running child is given back, so a refused follow-up
@@ -705,6 +704,11 @@ impl RunStore {
     /// Decided per turn, from the delegate's app-server `settings` and this store: the
     /// environment, the refusals and the billing already in `invocation` are the same either way,
     /// and only what is run differs.
+    ///
+    /// Refused once an agentmux executable the turn would run has been replaced.
+    /// Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
+    /// during it would otherwise launch the new build with the plan this one writes; the caller
+    /// gives the claimed turn back.
     pub(super) fn prepare_launch_mode(
         &self,
         turn: &TurnDir,
@@ -713,6 +717,7 @@ impl RunStore {
         resume: Option<&SessionRef>,
         invocation: &mut crate::delegate::Invocation,
     ) -> Result<LaunchMode, RunError> {
+        self.refuse_replaced_executables()?;
         let (Some(driver), Some(settings), false) =
             (&self.codex_driver, settings, meta.force_codex_exec)
         else {
