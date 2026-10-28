@@ -111,9 +111,7 @@ impl RunStore {
         };
         let mut removed = 0;
         for run_id in self.run_ids()? {
-            if super::migrate_zero_based_turn_dirs::pending(&self.run_dir(&run_id))
-                || !self.meta(&run_id).is_ok_and(|meta| expired(&run_id, &meta))
-            {
+            if !self.meta(&run_id).is_ok_and(|meta| expired(&run_id, &meta)) {
                 continue;
             }
             let Ok(run) = self.lock(&run_id) else {

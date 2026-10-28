@@ -88,7 +88,6 @@ mod id;
 mod label;
 pub(crate) mod layout;
 mod lock;
-mod migrate_zero_based_turn_dirs;
 mod publish;
 mod quota;
 mod records;
@@ -178,8 +177,7 @@ impl RunStore {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Io`] when the directory cannot be created, or a run still in the
-    /// zero-based turn layout cannot be renumbered.
+    /// Returns [`RunError::Io`] when the directory cannot be created.
     pub fn open(
         root: impl Into<PathBuf>,
         launcher: Arc<dyn Launcher>,
@@ -190,7 +188,7 @@ impl RunStore {
         let root = std::path::absolute(root.into())
             .map_err(RunError::io("resolving the state directory"))?;
         create_private_dir(&root)?;
-        let store = Self {
+        Ok(Self {
             root,
             launcher,
             // Asking nothing by default, so embedding this library never spawns a process the
@@ -207,9 +205,7 @@ impl RunStore {
             supervisor: None,
             // Resumed only by a supervisor, so nothing runs until one is named.
             auto_resume: Some(AutoResumePolicy::DEFAULT),
-        };
-        store.migrate_zero_based_turn_dirs()?;
-        Ok(store)
+        })
     }
 
     /// Launch every turn under a supervisor, `<supervisor> supervise <plan>`, which starts the
