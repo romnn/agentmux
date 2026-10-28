@@ -69,6 +69,8 @@ a record names to show where the decision is enforced must be renamed there too.
   turns inherit it.
 - [0029](0029-continue-in-a-fresh-session.md): A session that cannot go on is continued by a new
   consultation that reads the old one.
+- [0030](0030-refuse-to-launch-from-a-replaced-executable.md): A store refuses to launch once the
+  executable it launches from has been replaced.
 
 ## Codex integration
 

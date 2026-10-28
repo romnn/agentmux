@@ -77,6 +77,17 @@ pub async fn supervise(
             );
             return 2;
         }
+        // Plans are written whole, so one this build cannot parse was written by another: an
+        // agentmux process that outlived an upgrade launches the new build with its old plan.
+        Err(err @ RunError::CorruptRecord { .. }) => {
+            eprintln!(
+                "agentmux: {err}; this supervisor is agentmux {}, so the plan was most likely \
+                 written by an agentmux process of another version that outlived an upgrade. \
+                 Restart the agentmux MCP server, or whichever agentmux process launched it.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return 2;
+        }
         Err(err) => {
             eprintln!("agentmux: {err}");
             return 2;

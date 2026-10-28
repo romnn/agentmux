@@ -83,6 +83,7 @@ mod auto_resume;
 mod cancel;
 mod continue_fresh;
 mod error;
+mod executable;
 mod id;
 mod label;
 pub(crate) mod layout;
@@ -110,6 +111,7 @@ use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
 use crate::transcript::{Outcome, Transcript};
 
+use executable::Executable;
 use layout::create_private_dir;
 use records::{
     ContinuedBy, ExitRecord, LaunchRecord, SettledRecord, SupervisorRecord, TurnFiles,
@@ -145,10 +147,10 @@ pub struct RunStore {
     inside_delegate: OnceLock<bool>,
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
     /// launches such turns that way.
-    codex_driver: Option<PathBuf>,
+    codex_driver: Option<Executable>,
     /// The agentmux executable that supervises each turn this store launches, when it launches
     /// them that way.
-    supervisor: Option<PathBuf>,
+    supervisor: Option<Executable>,
     /// How a supervised turn that fails because the model was overloaded is resumed, or `None`
     /// when it is left failed.
     auto_resume: Option<AutoResumePolicy>,
@@ -220,9 +222,12 @@ impl RunStore {
     /// reads it.
     /// Independent of [`RunStore::with_codex_app_server`]: a driven turn's driver is the delegate
     /// the supervisor starts.
+    ///
+    /// The file is remembered as it is now, and once it changes, as an upgrade changes it under a
+    /// running server, every launch is refused with [`RunError::ExecutableReplaced`].
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: impl Into<PathBuf>) -> Self {
-        self.supervisor = Some(supervisor.into());
+        self.supervisor = Some(Executable::new(supervisor.into()));
         self
     }
 
@@ -247,9 +252,11 @@ impl RunStore {
     /// Only a Codex delegate that inherits its account's settings runs this way — see
     /// [`crate::delegate::Delegate::app_server_settings`] — and every other turn still runs over
     /// `codex exec` or `claude --print`.
+    /// Like the supervisor, the file is remembered as it is now, and a launch is refused once it
+    /// changes.
     #[must_use]
     pub fn with_codex_app_server(mut self, driver: impl Into<PathBuf>) -> Self {
-        self.codex_driver = Some(driver.into());
+        self.codex_driver = Some(Executable::new(driver.into()));
         self
     }
 

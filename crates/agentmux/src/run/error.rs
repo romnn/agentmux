@@ -101,6 +101,21 @@ pub enum RunError {
         #[source]
         source: serde_json::Error,
     },
+    /// The agentmux executable this store launches supervisors and drivers from was replaced
+    /// after the store was given it, most likely by an upgrade this process outlived.
+    ///
+    /// A turn launched now would be run by a build that may not read what this one writes, and
+    /// would fail only once started, so nothing is launched.
+    #[error(
+        "{path} changed after this agentmux started, most likely by an upgrade, so a turn it \
+         launched now would be run by another build than the one that prepares it; nothing was \
+         launched. Restart the agentmux MCP server, or whichever agentmux process this is, and \
+         try again."
+    )]
+    ExecutableReplaced {
+        /// The executable.
+        path: PathBuf,
+    },
     /// A turn's `settled.json` does not hold for the files it vouches for.
     ///
     /// The marker is the commitment every waiter returns on, so one that names a running turn or

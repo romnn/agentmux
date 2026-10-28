@@ -577,6 +577,39 @@ fn a_delegate_that_cannot_start_is_a_failed_turn() -> Result<()> {
     Ok(())
 }
 
+/// A plan the supervisor cannot parse was written by another build, which an agentmux process
+/// that outlived an upgrade launches, so the supervisor says to restart it.
+#[gtest]
+fn a_plan_from_another_version_says_to_restart() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: "",
+        stderr: "",
+        exit_code: 0,
+    })?;
+    // A plan as an agentmux that numbered turns from zero wrote it.
+    let plan = machine.root.path().join("supervisor-plan.json");
+    let written = serde_json::json!({
+        "store_root": machine.root.path().join("state"),
+        "run_id": "20261028T133126-417503cf",
+        "turn_index": 0,
+        "launch_id": "0a1b2c",
+    });
+    std::fs::write(&plan, written.to_string()).or_fail()?;
+    let plan = plan.to_string_lossy();
+    let supervised = run_in_background(machine.agentmux(&["supervise", plan.as_ref()]))?
+        .finish(COMMAND_LIMIT)?;
+    assert_that!(supervised.status.code(), some(eq(2)));
+    assert_that!(
+        supervised.stderr,
+        all![
+            contains_substring("cannot be parsed"),
+            contains_substring(env!("CARGO_PKG_VERSION")),
+            contains_substring("Restart the agentmux MCP server"),
+        ]
+    );
+    Ok(())
+}
+
 /// The supervisor's pid, from the record its caller wrote.
 fn supervisor_pid(machine: &Machine, run_id: &str) -> Result<u32> {
     let path = machine.run_dir(run_id).join("turns/0001/supervisor.json");

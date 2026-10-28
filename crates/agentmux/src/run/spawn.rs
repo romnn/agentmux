@@ -635,6 +635,15 @@ impl RunStore {
         }
         Ok(())
     }
+
+    /// Refuse to launch anything once an agentmux executable this store launches from has been
+    /// replaced, before a turn is claimed for a launch that would fail once started.
+    fn refuse_replaced_executables(&self) -> Result<(), RunError> {
+        self.supervisor
+            .iter()
+            .chain(&self.codex_driver)
+            .try_for_each(super::Executable::refuse_if_replaced)
+    }
 }
 
 impl LockedRun<'_> {
@@ -669,6 +678,7 @@ impl LockedRun<'_> {
         if !self.store.run_dir(&self.run_id).join("meta.json").is_file() {
             return Err(RunError::NotFound(self.run_id.clone()));
         }
+        self.store.refuse_replaced_executables()?;
         let turn = self.store.turn_dir(&self.run_id, index);
         claim_turn(&turn, index, &self.run_id)?;
         // A claim that does not end in a running child is given back, so a refused follow-up
@@ -719,7 +729,7 @@ impl RunStore {
                 turn_dir: turn.root.clone(),
             },
         )?;
-        invocation.set_driver_command(driver, crate::appserver::SUBCOMMAND, &plan_path);
+        invocation.set_driver_command(driver.path(), crate::appserver::SUBCOMMAND, &plan_path);
         Ok(LaunchMode::AppServer)
     }
 
@@ -835,7 +845,7 @@ impl RunStore {
         );
 
         if let Some(supervisor) = &self.supervisor {
-            return self.launch_supervisor(turn, meta, index, &invocation, supervisor);
+            return self.launch_supervisor(turn, meta, index, &invocation, supervisor.path());
         }
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
@@ -895,7 +905,10 @@ impl RunStore {
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
                     supervisor: supervisor.to_path_buf(),
-                    codex_driver: self.codex_driver.clone(),
+                    codex_driver: self
+                        .codex_driver
+                        .as_ref()
+                        .map(|driver| driver.path().to_path_buf()),
                 }),
             },
         )?;
