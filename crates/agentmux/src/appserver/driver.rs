@@ -22,11 +22,13 @@ use codex_app_server_protocol::{ClientRequest, Method as _, TypedParams, TypedRe
 use serde_json::Value;
 
 use super::DriverPlan;
+use super::leftovers::{Cohort, ProcessIdentity, SeenProcess};
 use super::mailbox::{ClaimedSteer, Mailbox, SteerReply};
 use super::protocol;
 use super::protocol::{ThreadId, TurnId, TurnTarget};
 use super::translate::{self, Translator, TurnEndStatus};
 use crate::delegate::{Billing, scrub_billing_env};
+use crate::left_running::{LeftRunning, bounded_name};
 use crate::run::layout::TurnDir;
 use crate::stream::codex::CaptureEvent;
 
@@ -60,16 +62,21 @@ const SWEEP_GRACE: Duration = Duration::from_secs(2);
 /// driver's exit would not stop it: an adopted orphan is handed on to another parent, not killed.
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
+/// How long, once the sweep has given up, what it killed is given before the driver looks at it
+/// a last time to report what became of it.
+const REPORT_SETTLE: Duration = Duration::from_millis(100);
+
 /// The longest a cancelled driver takes to leave once it has seen the cancellation: the
 /// interrupt, which covers waiting for a turn being started, the server's own exit, and the sweep
-/// of whatever it left behind, both signals included.
+/// of whatever it left behind, both signals and the last look included.
 ///
 /// The store's `cancel` waits longer than this before it signals the driver, so a driver that
 /// honours the cancellation is never killed in the middle of cleaning up.
 pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
     .saturating_add(SERVER_EXIT_GRACE)
     .saturating_add(SWEEP_GRACE)
-    .saturating_add(KILL_GRACE);
+    .saturating_add(KILL_GRACE)
+    .saturating_add(REPORT_SETTLE);
 
 /// How long a driver waits for its turn's launch record to name it before it gives the turn up.
 ///
@@ -190,13 +197,14 @@ pub fn drive(plan_path: &Path) -> i32 {
     // The server's input stays open through a second handle until `stop_server` has read what
     // the server left running: closed earlier, the server could exit first and orphan it.
     let (Some(from_server), Ok(input)) = (child.stdout.take(), to_server.try_clone()) else {
-        stop_server(
+        let left_running = stop_server(
             &mut child,
             to_server,
             descendant_monitor
                 .map(DescendantMonitor::stop)
                 .unwrap_or_default(),
         );
+        keep_left_running(&plan, left_running);
         eprintln!("agentmux: codex app-server did not offer stdio");
         return 1;
     };
@@ -215,12 +223,50 @@ pub fn drive(plan_path: &Path) -> i32 {
     let recorded_descendants = descendant_monitor
         .map(DescendantMonitor::stop)
         .unwrap_or_default();
-    stop_server(&mut child, input, recorded_descendants);
+    let left_running = stop_server(&mut child, input, recorded_descendants);
+    if outcome != DriverOutcome::Cancelled {
+        keep_left_running(&plan, left_running);
+    }
     if let DriverOutcome::Failed(reason) = &outcome {
         eprintln!("agentmux: {reason}");
         eprintln!("agentmux: {}.", super::EXEC_FALLBACK_HINT);
     }
     outcome.exit_code()
+}
+
+/// Keep what the turn left running in its `left-running.json`, once, unless it left nothing or
+/// the turn is being cancelled.
+///
+/// Written before the driver exits, so a reader that sees the driver gone finds the record
+/// complete or finds none, ever.
+/// A cancelled turn's leftovers are the cancellation's doing, and its transcript never shows
+/// them, so nothing is kept for one.
+/// The `cancelling` marker is looked at last, which spares a turn already being cancelled a
+/// record nobody reads; a record kept just before `cancel` marks the turn is left to the fold,
+/// which reads no record once the marker exists.
+/// Only Unix gets a record: on Windows the job object stops what is left, and nothing is read.
+fn keep_left_running(plan: &DriverPlan, left_running: Option<LeftRunning>) {
+    let Some(left_running) = left_running else {
+        return;
+    };
+    if plan.cancel_marker_path().exists() {
+        return;
+    }
+    let path = plan.turn().left_running();
+    let kept = serde_json::to_vec(&left_running)
+        .map_err(std::io::Error::other)
+        .and_then(|json| crate::atomic_file::create_once(&path, &json));
+    match kept {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "agentmux: {} already exists, so what this turn left running is not kept",
+            path.display()
+        ),
+        Err(err) => eprintln!(
+            "agentmux: cannot keep what this turn left running in {}: {err}",
+            path.display()
+        ),
+    }
 }
 
 /// Wait up to `wait` for the turn's launch record to name this process.
@@ -1048,12 +1094,6 @@ struct Server {
     to_server: PipeWriter,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ProcessIdentity {
-    pid: u32,
-    start_time_secs: u64,
-}
-
 /// Start `codex app-server` for the plan, in the turn's working directory.
 ///
 /// Its stderr is the driver's own, which is the turn's `stderr.log`.
@@ -1108,17 +1148,32 @@ fn spawn_server(plan: &DriverPlan) -> std::io::Result<Server> {
 /// one a command started while it was being stopped, is still found below it.
 /// Each process is asked to stop and then made to, recognised by its pid and start time so a pid
 /// reused meanwhile is left alone.
-/// Elsewhere an orphan neither reading saw is out of reach: one a crashed server's command
-/// started after the last record.
+/// Elsewhere an orphan neither reading saw is out of reach: on macOS, any process started and
+/// orphaned between two of the once-a-second records.
 /// Once the polite signal's grace is over, every read for [`KILL_GRACE`] longer kills what it
 /// finds, so a process forked during the sweep is still caught.
-fn stop_server(child: &mut Child, input: PipeWriter, recorded_descendants: Vec<ProcessIdentity>) {
+///
+/// Returns what the turn left running, as a [`Cohort`] decides it from these reads, and what
+/// became of each once it was signalled; `None` when it left nothing.
+fn stop_server(
+    child: &mut Child,
+    input: PipeWriter,
+    recorded_descendants: Vec<ProcessIdentity>,
+) -> Option<LeftRunning> {
     let driver_pid = std::process::id();
-    let mut known_descendants = recorded_descendants;
-    add_unseen(&mut known_descendants, descendants(driver_pid));
     // The server is stopped and waited for through `child`; once waited for, its pid is free
     // for another process, which a start time to the second cannot tell apart.
     let server_pid = child.id();
+    // Read with each process's parent, which is what tells what runs below the server — its MCP
+    // servers and command shells, which codex stops itself — from what had already left its
+    // tree.
+    let before_eof = process_tree(driver_pid);
+    let mut cohort = Cohort::new(server_pid, &before_eof, &recorded_descendants);
+    let mut known_descendants = recorded_descendants;
+    add_unseen(
+        &mut known_descendants,
+        before_eof.iter().map(|process| process.identity),
+    );
     known_descendants.retain(|process| process.pid != server_pid);
     drop(input);
     let deadline = Instant::now() + SERVER_EXIT_GRACE;
@@ -1143,28 +1198,43 @@ fn stop_server(child: &mut Child, input: PipeWriter, recorded_descendants: Vec<P
                 .chain(&signalled_processes)
                 .copied(),
         );
-        if !signal_live_processes(&processes_to_check, None) {
-            return;
-        }
-        let unsignalled_processes: Vec<ProcessIdentity> = processes_to_check
-            .iter()
-            .filter(|process| !signalled_processes.contains(process))
-            .copied()
-            .collect();
         let now = Instant::now();
-        if now < polite_until {
-            signal_live_processes(&unsignalled_processes, Some(sysinfo::Signal::Term));
-        } else {
-            // Every pass from here kills all it finds, so what was forked since the last read is
-            // killed by the next one.
-            signal_live_processes(&processes_to_check, Some(sysinfo::Signal::Kill));
-            if now >= forceful_until {
-                return;
+        let polite = now < polite_until;
+        // Every pass after the polite one kills all it finds, so what was forked since the last
+        // read is killed by the next one.
+        let alive = observe_and_signal(&processes_to_check, |process| {
+            if !polite {
+                Some(sysinfo::Signal::Kill)
+            } else if signalled_processes.contains(&process) {
+                None
+            } else {
+                Some(sysinfo::Signal::Term)
             }
+        });
+        cohort.observe(&alive);
+        if alive.is_empty() {
+            return cohort.report(&[]);
         }
-        signalled_processes.extend(unsignalled_processes);
+        if !polite && now >= forceful_until {
+            break;
+        }
+        add_unseen(
+            &mut signalled_processes,
+            alive.iter().map(|process| process.identity),
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // The sweep gave up with something just killed: one last look says what it became.
+    if cohort.is_empty() {
+        return None;
+    }
+    std::thread::sleep(REPORT_SETTLE);
+    let still_alive: Vec<ProcessIdentity> = observe_and_signal(&cohort.identities(), |_| None)
+        .into_iter()
+        .map(|process| process.identity)
+        .collect();
+    cohort.report(&still_alive)
 }
 
 /// Add to `known` each of `processes` it does not hold yet.
@@ -1314,13 +1384,13 @@ fn process_table(pids: Option<&[sysinfo::Pid]>) -> sysinfo::System {
 }
 
 /// Every process below `root`, with the start time that tells it apart from a later holder of
-/// its pid.
+/// its pid, its parent and its name.
 ///
 /// A process counts as a child only if it started no earlier than its parent, so a pid reused
 /// since cannot claim an older process.
 /// Always empty on Windows, where the job object of [`contain_descendants`] stops them instead
 /// and a recorded parent pid proves nothing.
-fn descendants(root: u32) -> Vec<ProcessIdentity> {
+fn process_tree(root: u32) -> Vec<SeenProcess> {
     if cfg!(windows) {
         return Vec::new();
     }
@@ -1331,7 +1401,7 @@ fn descendants(root: u32) -> Vec<ProcessIdentity> {
     else {
         return Vec::new();
     };
-    let mut found: Vec<ProcessIdentity> = Vec::new();
+    let mut found: Vec<SeenProcess> = Vec::new();
     let mut parents = vec![ProcessIdentity {
         pid: root,
         start_time_secs: root_started,
@@ -1343,13 +1413,17 @@ fn descendants(root: u32) -> Vec<ProcessIdentity> {
             if process.parent().map(sysinfo::Pid::as_u32) == Some(parent.pid)
                 && start_time_secs >= parent.start_time_secs
                 && pid != root
-                && !found.iter().any(|known| known.pid == pid)
+                && !found.iter().any(|known| known.identity.pid == pid)
             {
                 let identity = ProcessIdentity {
                     pid,
                     start_time_secs,
                 };
-                found.push(identity);
+                found.push(SeenProcess {
+                    identity,
+                    parent_pid: Some(parent.pid),
+                    name: process_name(process),
+                });
                 parents.push(identity);
             }
         }
@@ -1357,47 +1431,64 @@ fn descendants(root: u32) -> Vec<ProcessIdentity> {
     found
 }
 
-/// Returns whether any process of `tree` is still alive, and sends `signal`, when given, to each
-/// live one.
+/// [`process_tree`], without what only the sweep's report needs.
+fn descendants(root: u32) -> Vec<ProcessIdentity> {
+    process_tree(root)
+        .into_iter()
+        .map(|process| process.identity)
+        .collect()
+}
+
+/// A process's name, bounded as a report keeps it; never its arguments, which can carry secrets.
+fn process_name(process: &sysinfo::Process) -> String {
+    bounded_name(&process.name().to_string_lossy())
+}
+
+/// Returns every process of `tree` that is still alive, after sending each the signal `signal`
+/// chooses for it, if any.
 ///
 /// A process counts as alive while its pid still has the start time recorded for it and it has
 /// not exited.
+/// One read decides both, so no process is reported alive that the signal chosen for it missed.
 ///
 /// A pid whose start time no longer matches belongs to someone else and is left alone, and a
 /// platform without the polite signal gets the forceful one.
-fn signal_live_processes(tree: &[ProcessIdentity], signal: Option<sysinfo::Signal>) -> bool {
+fn observe_and_signal(
+    tree: &[ProcessIdentity],
+    signal: impl Fn(ProcessIdentity) -> Option<sysinfo::Signal>,
+) -> Vec<SeenProcess> {
     if tree.is_empty() {
-        return false;
+        return Vec::new();
     }
     let pids: Vec<sysinfo::Pid> = tree
         .iter()
         .map(|process| sysinfo::Pid::from_u32(process.pid))
         .collect();
     let system = process_table(Some(&pids));
-    let mut any = false;
-    for &ProcessIdentity {
-        pid,
-        start_time_secs,
-    } in tree
-    {
-        let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) else {
+    let mut alive = Vec::new();
+    for &identity in tree {
+        let Some(process) = system.process(sysinfo::Pid::from_u32(identity.pid)) else {
             continue;
         };
         let exited = matches!(
             process.status(),
             sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
         );
-        if process.start_time() != start_time_secs || exited {
+        if process.start_time() != identity.start_time_secs || exited {
             continue;
         }
-        any = true;
-        if let Some(signal) = signal
+        if let Some(signal) = signal(identity)
             && process.kill_with(signal).is_none()
         {
             process.kill();
         }
+        alive.push(SeenProcess {
+            identity,
+            parent_pid: process.parent().map(sysinfo::Pid::as_u32),
+            name: process_name(process),
+        });
     }
-    any
+    alive
 }
 
 #[cfg(test)]

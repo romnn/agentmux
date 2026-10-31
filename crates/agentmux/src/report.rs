@@ -18,7 +18,9 @@ use chrono::Utc;
 use crate::accounting::{Spend, Tokens, Totals};
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
-use crate::run::{AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, describe_delegate};
+use crate::run::{
+    AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, TurnLeftRunning, describe_delegate,
+};
 use crate::transcript::{EarlierFailure, FailureKind, Outcome, UsageWindow};
 
 /// Something a reader must be told about a consultation, because it changes how the transcript
@@ -39,6 +41,9 @@ pub enum Warning<'a> {
     AutoResume(&'a AutoResume),
     /// Turns before the newest failed, whatever the newest is doing.
     EarlierFailures(&'a [EarlierFailure]),
+    /// A turn left processes running when it ended, which agentmux signalled to stop, so work in
+    /// them may be incomplete.
+    LeftRunning(&'a TurnLeftRunning),
     /// The delegate could not save its session, so no follow-up can resume it.
     SessionNotSaved {
         /// Where it would have been saved.
@@ -87,6 +92,7 @@ impl RunStatus {
         if !self.earlier_failures.is_empty() {
             warnings.push(Warning::EarlierFailures(&self.earlier_failures));
         }
+        warnings.extend(self.left_running.iter().map(Warning::LeftRunning));
         if let Some(store) = &self.unsaved_session_store {
             warnings.push(Warning::SessionNotSaved { store });
         }
@@ -125,6 +131,21 @@ impl RunStatus {
     pub fn exhausted_window(&self) -> Option<&UsageWindow> {
         self.usage_window.as_ref().filter(|window| window.exhausted)
     }
+}
+
+/// What a turn left running, in one line, such as `turn 2 left 3 processes running outside the
+/// delegate CLI's process tree after the CLI exited; agentmux signalled them to stop, and 2 are no
+/// longer running and 1 still is — work in them may be incomplete`.
+#[must_use]
+pub fn left_running_line(left_running: &TurnLeftRunning) -> String {
+    let TurnLeftRunning { turn, report } = left_running;
+    let them = report.pronoun();
+    format!(
+        "turn {turn} left {} running outside the delegate CLI's process tree after the CLI \
+         exited; agentmux signalled {them} to stop, and {} — work in {them} may be incomplete",
+        report.processes_phrase(),
+        report.fates(),
+    )
 }
 
 /// A one-line state, with the failure reason inline when there is one.

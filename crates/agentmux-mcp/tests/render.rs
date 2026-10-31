@@ -906,6 +906,43 @@ fn protocol_drift_points_at_codex_exec() -> Result<()> {
     Ok(())
 }
 
+/// A turn that left processes running is named in a warning above the transcript, with how many
+/// it left, how many still ran once signalled, and that their work may be incomplete.
+#[gtest]
+fn what_a_turn_left_running_is_a_warning() -> Result<()> {
+    use agentmux::left_running::{LeftProcess, LeftRunning, ProcessFate};
+    use agentmux::run::TurnLeftRunning;
+
+    let (_store, mut status, _dir) = consult(agentmux::testing::fixtures::CODEX_HAPPY)?;
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        not(contains_substring("processes running"))
+    );
+    let process = |pid: u32, fate: ProcessFate| LeftProcess {
+        pid,
+        start_time_secs: 1_790_000_000,
+        name: "python3".to_owned(),
+        fate,
+    };
+    status.left_running = vec![TurnLeftRunning {
+        turn: 2,
+        report: LeftRunning::of(vec![
+            process(1, ProcessFate::StillRunning),
+            process(2, ProcessFate::NoLongerRunning),
+        ])
+        .or_fail()?,
+    }];
+    assert_that!(
+        agentmux_mcp::render::warnings(&status),
+        contains_substring(indoc::indoc! {"
+            warning:    turn 2 left 2 processes running outside the delegate CLI's process tree after the CLI exited; agentmux signalled them to stop, and 1 is no longer running and 1 still is — work in them may be incomplete.
+                        The transcript names them at the end of that turn: do not rely on work the
+                        delegate left running there having finished.
+        "})
+    );
+    Ok(())
+}
+
 /// Earlier failures sit beside the newest turn's state, never inside it.
 ///
 /// Written into the state line, a failure from turn one reads as the state of the turn running

@@ -41,13 +41,25 @@
 //!   still found below it, and it waits for each adopted orphan that exits so none lingers in
 //!   the process table.
 //!   Elsewhere it records that tree every second while the turn runs instead, which is best
-//!   effort: on macOS, a command a crashed server's command started after the last record is out
-//!   of reach.
+//!   effort: on macOS, any process started and orphaned between two records is out of reach,
+//!   whether or not the server crashed — a job a command backgrounds with `nohup … &` is
+//!   orphaned as soon as its shell exits.
 //!   On Windows the driver holds everything below it in a kill-on-close job object instead, and
 //!   reads no process tree, because a recorded parent pid proves nothing there; a process codex
 //!   deliberately starts outside the job is let go.
 //!   All of it is bounded and best effort: the sweep gives up at its deadline, and a driver that
 //!   cannot adopt or cannot make the job says so on stderr and contains less.
+//! - What the turn left running is what the driver knew of before closing the server's input
+//!   that was already outside the server's process tree — an orphan whose shell exited, as a
+//!   job backgrounded with `nohup … &` is — and that the sweep still found alive once the server
+//!   had exited.
+//!   Everything below the server then is codex's to stop: its MCP servers, and its command
+//!   shells with whatever still runs below them, which is swept but not reported.
+//!   The driver looks once more after its last signal, and keeps each such process's pid, start
+//!   time, name and whether it still runs in the turn's `left-running.json` before it exits, so
+//!   the transcript and `status` can say that work in them may be incomplete
+//!   ([`crate::left_running`]).
+//!   Nothing is kept for a cancelled turn, nor on Windows, where nothing is read.
 //!
 //! # Protocol flow
 //!
@@ -158,6 +170,7 @@
 //!
 
 mod driver;
+mod leftovers;
 pub mod mailbox;
 mod protocol;
 mod translate;

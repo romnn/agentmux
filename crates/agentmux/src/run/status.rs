@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::accounting::{Accounting, Tokens, Totals};
 use crate::delegate::{Billing, Delegate, Effort, Isolation, ModelId, Vendor};
+use crate::left_running::LeftRunning;
 use crate::transcript::{EarlierFailure, Outcome, TurnState, UnrecognisedEvents, UsageWindow};
 
 use super::id::RunId;
@@ -103,6 +104,10 @@ pub struct RunStatus {
     /// and leave the failure visible only deep inside the transcript body.
     /// Kept apart from [`RunStatus::outcome`], which describes the newest turn alone.
     pub earlier_failures: Vec<EarlierFailure>,
+    /// What each turn that left processes running when it ended left, oldest first.
+    ///
+    /// Work in those processes may be incomplete, which nothing the delegate said tells.
+    pub left_running: Vec<TurnLeftRunning>,
     /// What each account of this vendor had left, when the consultation was rate limited.
     ///
     /// Empty for every other outcome: probing costs a process, and the answer is only actionable
@@ -184,6 +189,31 @@ impl RunStatus {
         self.settled
             && self.continued_by.is_none()
             && self.content_flagged_in_a_row >= super::CONTENT_FLAGGED_STREAK
+    }
+}
+
+/// What one turn left running when it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TurnLeftRunning {
+    /// The turn's number, counted from 1.
+    pub turn: u32,
+    /// What it left running, and what became of each process.
+    #[serde(flatten)]
+    pub report: LeftRunning,
+}
+
+impl TurnLeftRunning {
+    /// The reports of every turn in `turns` that has one, oldest first.
+    pub(super) fn of_turns(turns: &[crate::transcript::Turn]) -> Vec<Self> {
+        turns
+            .iter()
+            .filter_map(|turn| {
+                turn.left_running.clone().map(|report| Self {
+                    turn: turn.index.saturating_add(1),
+                    report,
+                })
+            })
+            .collect()
     }
 }
 

@@ -80,12 +80,16 @@ reaches the same policy through a permission profile
 input requests are declined; requests requiring unsupported client capabilities receive a JSON-RPC
 error, because a consultation has nobody available to answer them.
 
-**What the turn left running is stopped, within a budget.** Cleanup is bounded and best effort: the
-driver closes the server's input to allow session saving, then signals and rescans surviving
-descendants within its cleanup budget (`appserver::STOP_BUDGET`). The store allows that budget plus
-a margin before falling back to signalling the driver. The platform mechanisms — adopting orphans on
-Linux, a once-a-second record elsewhere, a job object on Windows — are documented in
-`crates/agentmux/src/appserver/mod.rs`.
+**What the turn left running is stopped, within a budget, and reported.** Cleanup is bounded and
+best effort: the driver reads its descendants with their parents and closes the server's input to
+allow session saving, then signals and rescans surviving descendants within its cleanup budget
+(`appserver::STOP_BUDGET`), and looks once more after its last signal. What survived the server
+from outside its process tree, as it stood before the server was asked to leave, is kept in the
+turn's `left-running.json` and reported in the transcript and `status`
+([0032](0032-leftover-processes-reported.md)). The store allows that budget plus a margin before
+falling back to signalling the driver. The platform mechanisms —
+adopting orphans on Linux, a once-a-second record elsewhere, a job object on Windows — are
+documented in `crates/agentmux/src/appserver/mod.rs`.
 
 ## Consequences
 
@@ -97,5 +101,6 @@ Linux, a once-a-second record elsewhere, a job object on Windows — are documen
   every Codex turn as `exec` instead; nothing is steerable then.
 - Failed subreaper or job setup weakens containment. Windows processes explicitly allowed to break
   away are outside the job's cleanup guarantee.
-- On macOS a command started by a crashed server's command after the last once-a-second check is out
-  of reach.
+- On macOS any process started and orphaned between two once-a-second checks is out of reach, not
+  only one a crashed server's command started: a job a command backgrounds is orphaned as soon as
+  its shell exits.

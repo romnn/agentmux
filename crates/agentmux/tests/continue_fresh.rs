@@ -8,7 +8,7 @@ use std::sync::Arc;
 use agentmux::delegate::{
     AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
 };
-use agentmux::run::{Retention, RunError, RunLabel, RunStore, StartRequest};
+use agentmux::run::{Retention, RunError, RunLabel, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use googletest::prelude::*;
 
@@ -98,7 +98,9 @@ fn a_session_the_filter_keeps_refusing_continues_afresh() -> Result<()> {
     assert_that!(fresh.cwd, eq(&old.cwd));
     assert_that!(fresh.delegate.summary(), eq(&refused.delegate.summary()));
 
-    // The brief names the old consultation, its transcript and the working tree, then asks.
+    // The brief names the old consultation, its transcript and the working tree, then asks, and
+    // as the first question of a consultation it carries agentmux's notice about what a turn
+    // leaves running.
     let launches = harness.launcher.launches();
     let brief = launches.last().or_fail()?;
     assert_that!(brief.has_flag("resume"), eq(false));
@@ -109,9 +111,16 @@ fn a_session_the_filter_keeps_refusing_continues_afresh() -> Result<()> {
             contains_substring(old.transcript_path.to_string_lossy().as_ref()),
             contains_substring("uncommitted work"),
             contains_substring("a content filter kept refusing its turns"),
-            ends_with(indoc::indoc! {"
-                Finish the limit check.
-            "}),
+            ends_with(
+                indoc::formatdoc! {"
+                    Finish the limit check.
+
+                    ---
+
+                    {TURN_END_NOTICE}"
+                }
+                .as_str()
+            ),
         ]
     );
     let header = harness.store.page(&fresh.run_id, 0, 2_000)?.text;

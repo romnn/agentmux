@@ -60,6 +60,7 @@ use super::records::{
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
+use crate::left_running::LeftRunning;
 use crate::stream::{self, Fold};
 use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
@@ -547,6 +548,7 @@ impl LockedRun<'_> {
         // depends on it — whether the turn can settle, and so whether a follow-up may continue it,
         // and whether a usage-window miss is final — so no two of them can disagree.
         let delegate_gone = self.delegate_gone(files, record.as_ref(), &turn.outcome);
+        turn.left_running = left_running(files, record.as_ref(), &turn.outcome, delegate_gone)?;
 
         let pending_rate_limit_lookup = if vendor == Vendor::Codex {
             cached_rate_limit_or_lookup(
@@ -721,6 +723,45 @@ fn cached_rate_limit_or_lookup(
             delegate_has_exited: delegate_gone,
         }),
     }
+}
+
+/// What a turn left running, read like a recovered reply: only once the turn is over and its
+/// delegate has gone, and never for a turn being cancelled.
+///
+/// The driver writes the record before it exits and never again, so every fold that reads it
+/// after the delegate has gone reads the same one, a committed turn's included.
+/// A cancelled turn's leftovers are the cancellation's doing, and its transcript is frozen at
+/// the cancellation: a record its driver kept must not add to it, even when a terminal event
+/// gave the turn its outcome.
+/// The `cancelling` marker decides that, not only the cancellation's record: `cancel` creates the
+/// marker under the run's lock, only after a fold under that same hold found the turn still
+/// running, and records the cancellation later, once the delegate is stopped.
+/// A fold in between, which sees the marker and no record yet, must already leave the note out,
+/// or the record's arrival would take back what that fold published.
+/// And a turn some fold found over can never be marked, so a note once published stays.
+///
+/// # Errors
+///
+/// Returns [`RunError::Io`] when the record is there but cannot be read: a fold that went on
+/// without it would publish the turn without a note an earlier fold published.
+fn left_running(
+    files: &TurnFiles,
+    record: Option<&ExitRecord>,
+    outcome: &Outcome,
+    delegate_gone: bool,
+) -> Result<Option<LeftRunning>, RunError> {
+    let cancelled = matches!(
+        record.or(files.exit.as_ref()),
+        Some(ExitRecord::Cancelled { .. })
+    );
+    if !outcome.is_terminal() || !delegate_gone || cancelled || files.dir.cancelling().exists() {
+        return Ok(None);
+    }
+    let path = files.dir.left_running();
+    LeftRunning::read(&path).map_err(|source| RunError::Io {
+        context: format!("reading {}", path.display()),
+        source,
+    })
 }
 
 /// Why a supervised turn's delegate never started, when its supervisor left before spawning it.

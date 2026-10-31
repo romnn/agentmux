@@ -31,6 +31,9 @@
 //!     supervisor.log           what the supervisor printed
 //!     app-server.json          the plan a turn driven over `codex app-server` runs under
 //!     steer/                   messages steered into such a turn, and the driver's replies
+//!     left-running.json        what such a turn left running once its server had exited, and
+//!                              whether each still ran after being signalled; written once by
+//!                              the driver before it exits, and only when it found anything
 //!     cancelling               present once a cancellation was asked for
 //!     auto-resume.json         whether agentmux resumes the consultation itself after this turn
 //!                              failed overloaded, written once, before settled.json
@@ -127,10 +130,10 @@ pub use label::{RunLabel, RunLabelError};
 pub use quota::QuotaReport;
 pub use records::{LaunchMode, Meta, SettledTurn};
 pub use retention::Retention;
-pub use spawn::StartRequest;
+pub use spawn::{StartRequest, TURN_END_NOTICE};
 pub use status::{
     HookReopening, InvalidSince, ListFilter, RunStatus, RunSummary, TranscriptPage,
-    describe_delegate, parse_since,
+    TurnLeftRunning, describe_delegate, parse_since,
 };
 pub use supervise::{SUBCOMMAND as SUPERVISE_SUBCOMMAND, supervise};
 pub use wait::{TurnRef, WaitFor, Waited};
@@ -545,6 +548,7 @@ impl RunStore {
                 meta.delegate.isolation(),
             ),
             earlier_failures: state.transcript.earlier_failures(),
+            left_running: TurnLeftRunning::of_turns(&state.transcript.turns),
             quota,
             // The newest window wins: an earlier turn's reading is stale the moment another
             // arrives, and a caller acting on it would wait against a window that already moved.

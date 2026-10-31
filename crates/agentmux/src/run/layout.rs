@@ -36,6 +36,11 @@ impl TurnDir {
     pub(super) fn recovered(&self) -> PathBuf {
         self.root.join("recovered.md")
     }
+    /// What the turn left running when it ended, kept by the driver of a turn over the
+    /// app-server before it exits, and only when it found anything.
+    pub(crate) fn left_running(&self) -> PathBuf {
+        self.root.join("left-running.json")
+    }
     pub(crate) fn launch(&self) -> PathBuf {
         self.root.join("launch.json")
     }

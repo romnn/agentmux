@@ -22,7 +22,7 @@ use agentmux::delegate::{
     AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
 };
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{Retention, RunId, RunStore, StartRequest};
+use agentmux::run::{Retention, RunId, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::transcript::Outcome;
 use codex_app_server_mock::scenario::{CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode};
 use googletest::prelude::*;
@@ -381,11 +381,29 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
         client_messages_for_method(&harness.client_messages_path, "turn/steer").len(),
         eq(1)
     );
-    // The command the finished turn left running went with its server.
+    // The command the finished turn left running went with its server, and is not reported as
+    // the turn's: the server ran it directly, as codex runs its command shells and MCP servers,
+    // which codex stops itself.
     assert_that!(
         wait_for_commands_to_exit(&harness.command_pids_path, 1).await,
         eq(true)
     );
+    assert_that!(turn_dir(1).join("left-running.json").exists(), eq(false));
+    assert_that!(status.left_running, is_empty());
+    // The first question reached the server with agentmux's notice about what a turn leaves
+    // running, exactly as the transcript shows it.
+    let first_input = client_messages_for_method(&harness.client_messages_path, "turn/start")
+        .first()
+        .and_then(|request| request.pointer("/params/input/0/text").cloned());
+    let delivered = indoc::formatdoc! {"
+        Review the repository.
+
+        ---
+
+        {TURN_END_NOTICE}"
+    };
+    assert_that!(first_input, some(eq(&serde_json::json!(delivered))));
+    assert_that!(page.text, contains_substring(delivered.trim_end()));
 
     // The server was asked for no key, and was given none.
     let server_env = std::fs::read_to_string(&harness.server_env_path).or_fail()?;
@@ -435,11 +453,134 @@ async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server
         .await?;
     assert_that!(cancelled_turn.outcome(), eq(&Outcome::Cancelled));
     // And so did the one the cancelled turn left running, in a session no signal to the driver
-    // would have reached.
+    // would have reached; a follow-up's question carries no notice.
     assert_that!(
         wait_for_commands_to_exit(&harness.command_pids_path, 2).await,
         eq(true)
     );
+    let second_input = client_messages_for_method(&harness.client_messages_path, "turn/start")
+        .get(1)
+        .and_then(|request| request.pointer("/params/input/0/text").cloned());
+    assert_that!(
+        second_input,
+        some(eq(&serde_json::json!("And the session code?")))
+    );
+    assert_that!(turn_dir(2).join("left-running.json").exists(), eq(false));
+    Ok(())
+}
+
+/// A job a turn's command backgrounds and abandons is still running once the server has exited:
+/// the driver stops it, keeps what it found in the turn's `left-running.json` before it exits,
+/// and the transcript and `status` say that work in it may be incomplete.
+///
+/// Linux only: elsewhere the driver cannot adopt the orphan, which the once-a-second record
+/// misses when it is orphaned as soon as it starts, as this one is.
+#[cfg(target_os = "linux")]
+#[gtest]
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_finished_turn_left_running_is_stopped_and_reported() -> Result<()> {
+    use agentmux::left_running::{LeftProcess, LeftRunning, ProcessFate};
+    use agentmux::report::Warning;
+    use agentmux::run::TurnLeftRunning;
+
+    let harness = cli_harness()?;
+    let completion = harness.project_dir.join("complete");
+    let helper_exit = harness.project_dir.join("release-helper");
+    let home = PathBuf::from(harness.host_env.get("HOME").or_fail()?);
+    configure(
+        &home.join(".codex"),
+        &Config {
+            scenario: Scenario::OrphanedHelper {
+                completion_trigger_path: completion.clone(),
+                helper_exit_trigger_path: helper_exit.clone(),
+            },
+            client_messages_path: Some(harness.client_messages_path.clone()),
+            environment_dump_path: None,
+            command_pids_path: harness.command_pids_path.clone(),
+        },
+    )?;
+    let started = harness.store.start(&StartRequest {
+        delegate: Delegate::Codex {
+            model: ModelId::parse("gpt-6-astra").or_fail()?,
+            effort: Some(Effort::parse("high").or_fail()?),
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
+            account: AccountChoice::Default,
+            isolation: Some(Isolation::Inherit),
+        },
+        question: "Run the long job.".to_owned(),
+        cwd: harness.project_dir.clone(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let id = started.run_id.clone();
+    let turn_dir = harness
+        .state_dir
+        .join("runs")
+        .join(id.as_str())
+        .join("turns/0001");
+
+    // The job is orphaned as soon as it starts, and is still running when the turn completes.
+    assert_that!(
+        wait_for_newest_command(&harness.command_pids_path, 1).await,
+        eq(true)
+    );
+    let job = read_command_pids(&harness.command_pids_path)
+        .pop()
+        .or_fail()?;
+    std::fs::write(&completion, "").or_fail()?;
+    assert_that!(until_exists(&turn_dir.join("settled.json")).await, eq(true));
+
+    // The driver stopped it, and kept it by pid and process name, as no longer running.
+    assert_that!(is_running(job), eq(false));
+    let record: LeftRunning = serde_json::from_str(
+        &std::fs::read_to_string(turn_dir.join("left-running.json")).or_fail()?,
+    )
+    .or_fail()?;
+    assert_that!(
+        record.processes,
+        elements_are![matches_pattern!(LeftProcess {
+            pid: eq(&job),
+            name: eq("codex"),
+            fate: eq(&ProcessFate::NoLongerRunning),
+            ..
+        })]
+    );
+
+    // The transcript says so at the end of the turn, and `status` names the turn.
+    let (status, page) = harness.store.view(&id, 0, 1_000_000)?;
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(
+        page.text,
+        ends_with(
+            indoc::formatdoc! {"
+                > **When this turn ended, 1 process outside the delegate CLI's process tree was still running after the CLI exited**: `codex` (pid {job}).
+                > agentmux signalled it to stop; it is no longer running.
+                > Work in it may be incomplete.
+            "}
+            .as_str()
+        )
+    );
+    assert_that!(
+        status.left_running,
+        elements_are![matches_pattern!(TurnLeftRunning {
+            turn: eq(&1),
+            report: eq(&record),
+        })]
+    );
+    assert_that!(
+        status
+            .warnings()
+            .iter()
+            .any(|warning| matches!(warning, Warning::LeftRunning(_))),
+        eq(true)
+    );
+    std::fs::write(&helper_exit, "").or_fail()?;
     Ok(())
 }
 
