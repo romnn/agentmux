@@ -39,8 +39,10 @@
 //!   measure's previous report, so a turn that reported nothing is covered by the next one that
 //!   does.
 //!   A running total that leaves out a count the baseline knows is skipped, as a report of
-//!   nothing is, so the next one covers its turn; a count only the total knows contributes
-//!   nothing until the baseline has it.
+//!   nothing is, so the next one covers its turn, unless a count it shares with the baseline
+//!   fell, which is a restart and counted as one.
+//!   A count only the total knows contributes nothing until the baseline has it, and one already
+//!   above zero marks the total incomplete, since what it counted before is not counted.
 //!   Either way, nothing is counted twice and every count of a contribution covers the same
 //!   turns.
 //! - A running total that follows figures for single turns in the same session, as a Claude
@@ -179,6 +181,9 @@ trait Measure: Copy {
     /// A count only this total knows contributes nothing: it has no baseline to be taken apart
     /// against, so what it says covers spend from before the turns this delta covers.
     fn since(&self, baseline: &Self) -> Self;
+    /// Whether this running total carries a count `baseline` does not, already above zero, whose
+    /// history before this report [`Measure::since`] therefore cannot count.
+    fn adds_spent_count(&self, baseline: &Self) -> bool;
 }
 
 impl Measure for Tokens {
@@ -206,6 +211,13 @@ impl Measure for Tokens {
                 .map(|(count, base)| count.saturating_sub(base))
         })
     }
+
+    fn adds_spent_count(&self, baseline: &Self) -> bool {
+        self.counts()
+            .iter()
+            .zip(baseline.counts())
+            .any(|(count, base)| matches!((count, base), (Some(count), None) if *count > 0))
+    }
 }
 
 /// A price in US dollars.
@@ -224,6 +236,10 @@ impl Measure for f64 {
 
     fn since(&self, baseline: &Self) -> Self {
         self - baseline
+    }
+
+    fn adds_spent_count(&self, _baseline: &Self) -> bool {
+        false
     }
 }
 
@@ -320,11 +336,14 @@ impl<T: Measure> Ledger<T> {
     /// Carrying the missing count's old value over would let a later report of it, taken apart
     /// against that, cover turns the rest of its figures did not; skipping it never counts more
     /// than was spent, and keeps every count of a contribution covering the same turns.
+    /// A count it shares with the baseline that fell is still a restart, though, and is counted
+    /// as one: skipped, the restart would go unseen and the next total be taken apart against a
+    /// baseline from before it.
     fn record(&mut self, turn: u32, amount: T, scope: Scope) -> bool {
         if scope == Scope::Session
-            && self
-                .baseline
-                .is_some_and(|baseline| !amount.comparable_with(&baseline))
+            && self.baseline.is_some_and(|baseline| {
+                !amount.comparable_with(&baseline) && !amount.fell_below(&baseline)
+            })
         {
             return true;
         }
@@ -355,13 +374,14 @@ impl<T: Measure> Ledger<T> {
                         })
                     }
                     Some(baseline) => {
-                        // It knows every count the baseline knows, and maybe more.
+                        // It knows every count the baseline knows, and maybe more; a count it
+                        // adds was spent on before, and that history is not counted.
                         self.baseline = Some(amount);
                         Some(Spend {
                             first_turn,
                             last_turn: turn,
                             amount: amount.since(&baseline),
-                            incomplete: false,
+                            incomplete: amount.adds_spent_count(&baseline),
                         })
                     }
                     None => {
@@ -843,8 +863,9 @@ mod tests {
         assert_that!(accounting.tokens_incomplete, eq(true));
     }
 
-    /// A count a total gains has no baseline yet, so it contributes nothing to that turn and
-    /// becomes the baseline the next total's count is taken apart against.
+    /// A count a total gains has no baseline yet, so it contributes nothing to that turn, marks
+    /// that turn incomplete since what it had counted before is not counted, and becomes the
+    /// baseline the next total's count is taken apart against.
     #[gtest]
     fn a_count_a_total_gains_counts_from_the_next_total() {
         let accounting = Accounting::of(
@@ -871,7 +892,7 @@ mod tests {
                     input: Some(50),
                     cached: None,
                     output: Some(5),
-                    incomplete: false,
+                    incomplete: true,
                 }),
                 eq(&Shape {
                     turns: 3..=3,
@@ -882,7 +903,55 @@ mod tests {
                 }),
             ]
         );
-        assert_that!(accounting.tokens_incomplete, eq(false));
+        // The 80 cached tokens turn 2's total first reports were spent before it, and are not
+        // counted, so the total is at least what it says.
+        assert_that!(accounting.tokens_incomplete, eq(true));
+    }
+
+    /// A running total skipped for leaving a count out still shows a restart in the counts it
+    /// shares with the baseline, and the next total is taken apart against it, not against the
+    /// baseline from before the restart.
+    #[gtest]
+    fn a_restart_in_a_skipped_total_is_still_a_restart() {
+        let accounting = Accounting::of(
+            Vendor::Codex,
+            &turns([
+                Some(partial(100, Some(90), 10)),
+                Some(partial(10, None, 1)),
+                Some(partial(200, Some(180), 20)),
+            ]),
+        );
+
+        assert_that!(
+            accounting.tokens.iter().map(shape).collect::<Vec<_>>(),
+            elements_are![
+                eq(&Shape {
+                    turns: 1..=1,
+                    input: Some(100),
+                    cached: Some(90),
+                    output: Some(10),
+                    incomplete: false,
+                }),
+                eq(&Shape {
+                    turns: 2..=2,
+                    input: Some(10),
+                    cached: None,
+                    output: Some(1),
+                    incomplete: true,
+                }),
+                eq(&Shape {
+                    turns: 3..=3,
+                    input: Some(190),
+                    cached: None,
+                    output: Some(19),
+                    incomplete: true,
+                }),
+            ]
+        );
+        let total = accounting.total();
+        assert_that!(total.input_tokens, some(eq(300)));
+        assert_that!(total.output_tokens, some(eq(30)));
+        assert_that!(accounting.tokens_incomplete, eq(true));
     }
 
     /// A running total that falls inside one session means the counter restarted, and what came

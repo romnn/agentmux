@@ -43,11 +43,12 @@ is the one place that derives what each turn spent from them.**
   listed as unreported.
 - A running total is taken apart against its baseline only when it knows every count the baseline
   knows. One that leaves a known count out is skipped like a report of nothing, so the next
-  comparable total covers its turn; a count only the total knows contributes nothing until the
-  baseline has adopted it. Carrying a missing count's old value over instead would let a later
-  report of that count cover turns the other counts did not, and so count more than was spent;
-  skipping never counts more than was spent, and every count of a contribution covers the same
-  turns.
+  comparable total covers its turn, unless a count it shares with the baseline fell, which is a
+  restart counted as one. A count only the total knows contributes nothing until the baseline has
+  adopted it, and when it is already above zero the total is marked incomplete, since its history
+  is not counted. Carrying a missing count's old value over instead would let a later report of
+  that count cover turns the other counts did not, and so count more than was spent; skipping
+  never counts more than was spent, and every count of a contribution covers the same turns.
 - Tokens and price are each marked incomplete on their own, so a price that could not be counted
   never qualifies the tokens. `status` reports the run total across all turns under `usage` and
   `cost_usd`, and the spans, unpriced and unreported turns and both marks under `spend`; `list`
