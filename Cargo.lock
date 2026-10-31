@@ -50,6 +50,7 @@ version = "0.0.10"
 dependencies = [
  "agentmux",
  "agentmux-mcp",
+ "chrono",
  "clap",
  "codex-app-server-mock",
  "color-eyre",

@@ -71,6 +71,8 @@ a record names to show where the decision is enforced must be renamed there too.
   consultation that reads the old one.
 - [0030](0030-refuse-to-launch-from-a-replaced-executable.md): A store refuses to launch once the
   executable it launches from has been replaced.
+- [0031](0031-spend-derived-from-vendor-reports.md): What a consultation spent is derived from the
+  vendors' reports, which stay evidence.
 
 ## Codex integration
 

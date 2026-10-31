@@ -475,4 +475,12 @@ pub struct ListParams {
     #[serde(default)]
     #[schemars(schema_with = "state_schema")]
     pub state: Option<TurnState>,
+
+    /// Only consultations created at or after this instant, an RFC 3339 timestamp with its
+    /// offset such as `2026-10-31T16:00:00+01:00`.
+    /// It filters by when a consultation was started, not by when its turns spent anything: one
+    /// started earlier and followed up since is not listed.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub since: Option<String>,
 }

@@ -118,7 +118,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 | `steer`          | Add an instruction to a turn that is still running, read before its next model call        |
 | `wait`           | Block until a turn has settled, then return it — never earlier, with no time limit         |
 | `cancel`         | Stop a running consultation or a pending automatic resume, keeping what was collected      |
-| `list`           | Recent consultations with their ids and labels, filtered by `label` or `state`             |
+| `list`           | Recent consultations with their ids, labels and totals, by `label`, `state` or `since`     |
 | `quota`          | What each configured account has left, in the vendor's own numbers — free, no tokens       |
 
 ### Use from the command line
@@ -159,6 +159,7 @@ agentmux ask --delegate codex --model sol --effort high --network-access \
 agentmux list
 # A heartbeat in one call: label, cwd, model, effort, newest outcome and last activity per run.
 agentmux list --label review --state failed --json
+agentmux list --since 2026-10-31T16:00:00+01:00   # started at or after an RFC 3339 instant
 agentmux prune            # drop consultations past their retention
 
 # Every command takes --json; a consultation's state is always under `outcome`.

@@ -461,6 +461,105 @@ fn recent_consultations_are_listed_newest_first() -> Result<()> {
         listed.last().map(|r| r.question.clone()),
         some(eq("the first question"))
     );
+
+    // `since` keeps the consultations created at or after it, its own instant included.
+    let since = |instant| ListFilter {
+        since: Some(instant),
+        ..ListFilter::default()
+    };
+    assert_that!(
+        harness.store.list(10, &since(first.created_at))?.len(),
+        eq(2)
+    );
+    assert_that!(
+        harness
+            .store
+            .list(10, &since(second.created_at))?
+            .iter()
+            .map(|r| r.run_id.to_string())
+            .collect::<Vec<_>>(),
+        contains(eq(&second.run_id.to_string()))
+    );
+    assert_that!(
+        harness
+            .store
+            .list(10, &since(second.created_at + chrono::Duration::seconds(1)))?,
+        is_empty()
+    );
+    Ok(())
+}
+
+/// `since` accepts an RFC 3339 instant with its offset, and refuses anything else by naming the
+/// format it expects.
+#[gtest]
+fn since_is_an_rfc_3339_instant() -> Result<()> {
+    let parsed = agentmux::run::parse_since("2026-10-31T16:00:00+01:00").or_fail()?;
+    assert_that!(parsed.to_rfc3339(), eq("2026-10-31T15:00:00+00:00"));
+
+    let refused = agentmux::run::parse_since("16:00").err().or_fail()?;
+    assert_that!(
+        refused.to_string(),
+        all![
+            contains_substring("`16:00`"),
+            contains_substring("RFC 3339")
+        ]
+    );
+    Ok(())
+}
+
+/// A Codex follow-up reports its thread's running total, so the run total is the newest total
+/// rather than the sum of every turn's figure, and `status` and `list` say the same.
+#[gtest]
+fn a_codex_running_total_is_counted_once() -> Result<()> {
+    // The happy fixture's thread, carried on: every count at least what the first turn reported.
+    let resumed = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"turn.started"}
+        {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"MORE"}}
+        {"type":"turn.completed","usage":{"input_tokens":19000,"cached_input_tokens":7040,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":22}}
+    "#};
+    let harness = harness([
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(resumed),
+    ])?;
+    let started = harness.store.start(&request(codex()?, "review it"))?;
+    harness.store.follow_up(&started.run_id, "and the tests")?;
+    let status = harness.store.status(&started.run_id)?;
+
+    // The second turn's 19000 is the session's total, of which the first turn spent 14003.
+    assert_that!(status.usage.input_tokens, some(eq(19_000)));
+    assert_that!(
+        status
+            .spend
+            .tokens
+            .iter()
+            .map(|spend| spend.amount.input_tokens)
+            .collect::<Vec<_>>(),
+        elements_are![some(eq(&14_003)), some(eq(&4_997))]
+    );
+    assert_that!(status.cost_usd, none());
+    assert_that!(status.spend.tokens_incomplete, eq(false));
+    // The footers still quote what the vendor reported, as they were published.
+    let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
+    assert_that!(
+        transcript,
+        all![
+            contains_substring("_Turn 1 completed — 14003 in, 31 out, 22 reasoning_"),
+            contains_substring("_Turn 2 completed — 19000 in, 40 out, 22 reasoning_")
+        ]
+    );
+    // The machine-readable form keeps its `usage` keys, now meaning the run total.
+    let json = serde_json::to_value(&status).or_fail()?;
+    assert_that!(
+        json["usage"]["input_tokens"],
+        eq(&serde_json::json!(19_000))
+    );
+
+    let listed = harness.store.list(10, &ListFilter::default())?;
+    assert_that!(
+        listed.first().map(|summary| summary.totals.usage),
+        some(eq(status.usage))
+    );
     Ok(())
 }
 

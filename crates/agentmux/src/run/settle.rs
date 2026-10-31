@@ -415,8 +415,8 @@ impl LockedRun<'_> {
     /// The outcome of the run's newest turn, folded on its own, or `None` for a run with no turn.
     ///
     /// A run's outcome is its newest turn's, and a turn folds from its own files alone, so the
-    /// callers that only need to know whether a consultation is over — the poll loop, `list`,
-    /// the sweep — do not re-read every settled turn's capture to find out.
+    /// callers that only need to know whether a consultation is over — the poll loop and the
+    /// sweep — do not re-read every settled turn's capture to find out.
     pub(super) fn fold_newest_turn(&self, meta: &Meta) -> Result<Option<FoldedTurn>, RunError> {
         let turns = self.store.turn_files(&self.run_id)?;
         let Some(newest) = turns.last() else {
@@ -856,8 +856,8 @@ impl RunStore {
 }
 
 /// Note on `turn` what its launch record says before the child ran: whether it could save its
-/// session, its pricing, its isolation, its label, and the delegate it ran as when a follow-up
-/// changed that from `header`, the one the transcript header names.
+/// session, its pricing, its isolation, its label, the delegate it ran as when a follow-up
+/// changed that from `header`, the one the transcript header names, and the CLI's release.
 fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &Delegate) {
     turn.unsaved_session_store
         .clone_from(&invocation.unsaved_session_store);
@@ -869,6 +869,13 @@ fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &D
     turn.ran_as = ran_as
         .map(Delegate::summary)
         .filter(|summary| *summary != header.summary());
+    // The release the stream names wins where it names one, since that process wrote the figures;
+    // the one asked before the launch stands in for a stream that does not.
+    if let Some(report) = &mut turn.spend_report
+        && report.cli_version.is_none()
+    {
+        report.cli_version.clone_from(&invocation.cli_version);
+    }
 }
 
 impl RunStore {

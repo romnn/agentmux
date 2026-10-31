@@ -106,6 +106,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use crate::accounting::Accounting;
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
 use crate::transcript::{Outcome, Transcript};
@@ -128,7 +129,8 @@ pub use records::{LaunchMode, Meta, SettledTurn};
 pub use retention::Retention;
 pub use spawn::StartRequest;
 pub use status::{
-    HookReopening, ListFilter, RunStatus, RunSummary, TranscriptPage, describe_delegate,
+    HookReopening, InvalidSince, ListFilter, RunStatus, RunSummary, TranscriptPage,
+    describe_delegate, parse_since,
 };
 pub use supervise::{SUBCOMMAND as SUPERVISE_SUBCOMMAND, supervise};
 pub use wait::{TurnRef, WaitFor, Waited};
@@ -517,6 +519,7 @@ impl RunStore {
         };
 
         let newest_index = state.newest.as_ref().map(|newest| newest.index);
+        let spend = Accounting::of(meta.delegate.vendor(), &state.transcript.turns);
         let status = RunStatus {
             run_id: run_id.clone(),
             label: match newest_index {
@@ -529,8 +532,9 @@ impl RunStore {
             created_at: meta.created_at,
             turns: u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX),
             message_count: state.transcript.messages().count(),
-            usage: state.transcript.usage(),
-            cost_usd: state.transcript.cost_usd(),
+            usage: spend.total(),
+            cost_usd: spend.total_cost_usd(),
+            spend,
             resolved_model: state.transcript.resolved_model().map(ToOwned::to_owned),
             rewritten_from: meta.rewritten_from.clone(),
             unsaved_session_store: state.unsaved_session_store().map(Path::to_path_buf),
@@ -609,9 +613,10 @@ impl RunStore {
         });
 
         // Summarised lazily, newest first, so a listing folds only as many runs as it needs to
-        // fill `limit` with ones the filter admits.
+        // fill `limit` with ones the filter admits, and none created before `since`.
         Ok(metas
             .into_iter()
+            .filter(|meta| filter.since.is_none_or(|since| meta.created_at >= since))
             .filter_map(|meta| {
                 let summary = self.summary(meta)?;
                 let labelled = filter.label.as_deref().is_none_or(|needle| {
@@ -631,17 +636,20 @@ impl RunStore {
 
     /// One consultation's line in `list`, or `None` for one whose records cannot be read.
     fn summary(&self, meta: Meta) -> Option<RunSummary> {
+        // The whole consultation is folded, because what it spent is derived from every turn's
+        // report: a Codex turn's figures are its session's running total, which only the turns
+        // before it can take apart.
         // The outcome and the pricing are the newest turn's, as `status` reports them, and the
-        // question is the first turn's own file; none needs the whole consultation folded.
-        let newest = self
+        // question is the first turn's own file.
+        let state = self
             .lock(&meta.run_id)
-            .and_then(|run| run.fold_newest_turn(&meta))
+            .and_then(|run| run.fold_run(&meta))
             .ok()?;
-        let newest_index = newest.as_ref().map(|folded| folded.turn.index);
-        let outcome = newest
-            .as_ref()
-            .map_or(Outcome::Running, |folded| folded.turn.outcome.clone());
-        let billing = newest.as_ref().and_then(|folded| folded.turn.billing);
+        let newest = state.transcript.turns.last();
+        let newest_index = newest.map(|turn| turn.index);
+        let outcome = newest.map_or(Outcome::Running, |turn| turn.outcome.clone());
+        let billing = newest.and_then(|turn| turn.billing);
+        let spend = Accounting::of(meta.delegate.vendor(), &state.transcript.turns);
         // As the newest turn ran, as `status` describes it.
         let current = self.current_delegate(&meta, newest_index).ok()?;
         let label = match newest_index {
@@ -665,14 +673,12 @@ impl RunStore {
             effort: current.effort().cloned(),
             cwd: meta.cwd,
             outcome,
-            last_activity: newest
-                .as_ref()
-                .and_then(|folded| folded.last_activity)
-                .map(DateTime::<Utc>::from),
+            last_activity: state.last_activity.map(DateTime::<Utc>::from),
             turns: newest_index.map_or(0, |index| index.saturating_add(1)),
             created_at: meta.created_at,
             question,
             billing,
+            totals: spend.totals(),
         })
     }
 

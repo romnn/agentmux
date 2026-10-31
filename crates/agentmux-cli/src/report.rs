@@ -53,12 +53,9 @@ pub fn status(status: &RunStatus, json: bool) -> Result<()> {
     println!("  elapsed     {}", report::duration(status.elapsed));
     println!("  turns       {}", status.turns);
     println!("  messages    {}", status.message_count);
-    if let Some(input) = status.usage.input_tokens {
-        let output = status.usage.output_tokens.unwrap_or(0);
-        println!("  tokens      {input} in, {output} out");
-    }
-    if let Some(cost) = status.cost_usd {
-        println!("  cost        ${cost:.4}");
+    println!("  usage       {}", report::usage_line(status));
+    for line in report::spend_lines(status) {
+        println!("                {line}");
     }
     if let Some(limit) = &status.usage_window {
         // Printed for a healthy run too: the point is to see the window closing before it closes.
@@ -478,7 +475,7 @@ struct WaitJson<'a> {
     pending: &'a [TurnRef],
 }
 
-/// Print recent consultations, as `filtered` by `--label` or `--state` or not.
+/// Print recent consultations, as `filtered` by `--label`, `--state` or `--since` or not.
 ///
 /// # Errors
 ///
@@ -490,7 +487,7 @@ pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
     }
     if runs.is_empty() {
         if filtered {
-            println!("no consultations match --label and --state");
+            println!("no consultations match --label, --state and --since");
         } else {
             println!("no consultations yet");
         }
@@ -498,11 +495,12 @@ pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
     }
     for run in runs {
         println!(
-            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}  {usage}",
             run_id = run.run_id,
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
+            usage = report::usage_column(&run.totals),
         );
         if let Some(label) = &run.label {
             println!("    label: {label}");

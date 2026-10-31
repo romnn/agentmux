@@ -25,7 +25,7 @@ use agentmux::config::ModelRules;
 use agentmux::delegate::Delegate;
 use agentmux::quota::{AccountQuota, Observation};
 use agentmux::report::{
-    Warning, auto_resume_line, delegate_line, duration, earlier_failures_line, outcome_line,
+    self, Warning, auto_resume_line, delegate_line, duration, earlier_failures_line, outcome_line,
     quota_block, quota_report, summarise,
 };
 use agentmux::run::{
@@ -92,21 +92,11 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
         turns = status.turns,
         messages = status.message_count,
     });
-    if let Some(input) = status.usage.input_tokens {
-        let _ = write!(
-            out,
-            " · {input} in / {} out",
-            status.usage.output_tokens.unwrap_or(0)
-        );
-    }
-    // Labelled because the figure is token counts priced at list: on a subscription account
-    // nothing of the sort is charged, and a bare dollar amount reads as money that was billed.
-    if let Some(cost) = status.cost_usd {
-        let _ = write!(out, " · ${cost:.4} list price");
-    } else if status.is_terminal() {
-        // Said rather than left blank, because a vendor that reports no figure and a turn that
-        // cost nothing render identically otherwise.
-        let _ = write!(out, " · no cost reported");
+    out.push('\n');
+    let _ = write!(out, "usage:      {}", report::usage_line(status));
+    for line in report::spend_lines(status) {
+        out.push('\n');
+        let _ = write!(out, "            {line}");
     }
     if status.steerable {
         let _ = write!(
@@ -697,15 +687,15 @@ pub fn tail(status: &RunStatus, page: &TranscriptPage) -> String {
     out
 }
 
-/// Recent consultations, as `filtered` by the caller's `label` or `state` or not.
+/// Recent consultations, as `filtered` by the caller's `label`, `state` or `since` or not.
 #[must_use]
 pub fn list(runs: &[RunSummary], filtered: bool) -> String {
     if runs.is_empty() {
         // A caller that filtered may well have consultations, and starting another would only
         // duplicate one it could not find.
         return if filtered {
-            "no consultations match the `label` and `state` you passed. Call `list` without them \
-             to see every recent one."
+            "no consultations match the `label`, `state` and `since` you passed. Call `list` \
+             without them to see every recent one."
         } else {
             "no consultations yet. Start one with `ask`, or with `start` if it will take minutes."
         }
@@ -715,11 +705,12 @@ pub fn list(runs: &[RunSummary], filtered: bool) -> String {
     for run in runs {
         let _ = writeln!(
             out,
-            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}",
+            "{run_id}  {state:<9}  {turns} turn(s)  {created_at}  {usage}",
             run_id = run.run_id,
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
+            usage = report::usage_column(&run.totals),
         );
         if let Some(label) = &run.label {
             let _ = writeln!(out, "    label: {label}");

@@ -10,10 +10,12 @@
 //! it.
 //! The lines below are facts with one phrasing, which both front ends print verbatim.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use chrono::Utc;
 
+use crate::accounting::{Spend, Tokens, Totals};
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
 use crate::run::{AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, describe_delegate};
@@ -256,6 +258,263 @@ pub fn duration(duration: std::time::Duration) -> String {
         0..60 => format!("{seconds}s"),
         60..3600 => format!("{}m{}s", seconds / 60, seconds % 60),
         _ => format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
+/// How many per-turn lines [`spend_lines`] prints at most, newest kept.
+const MAX_SPEND_LINES: usize = 10;
+
+/// What the consultation spent across all its turns, as one line.
+///
+/// Says so when nothing was reported, rather than leaving the line blank, because a vendor that
+/// reports no figure and a turn that spent nothing would otherwise read the same.
+#[must_use]
+pub fn usage_line(status: &RunStatus) -> String {
+    let spend = &status.spend;
+    // Each total says for itself whether it is all that was spent: a price that could not be
+    // attributed says nothing about the tokens beside it.
+    let tokens = tokens_text(&status.usage)
+        .map(|tokens| format!("{}{tokens}", at_least(spend.tokens_incomplete)));
+    // Labelled because the figure is token counts priced at list: on a subscription account
+    // nothing of the sort is charged, and a bare dollar amount reads as money that was billed.
+    let price = price_text(status.cost_usd, spend.price_incomplete, |cost| {
+        format!("${cost:.4} list price")
+    });
+    let totals = match (tokens, price) {
+        (None, None) if status.is_terminal() => return "nothing reported".to_owned(),
+        (None, None) => return "nothing reported yet".to_owned(),
+        (Some(tokens), Some(price)) => format!("run total, all turns: {tokens} · {price}"),
+        (Some(tokens), None) => format!("run total, all turns: {tokens} · no price reported"),
+        (None, Some(price)) => format!("run total, all turns: no tokens reported · {price}"),
+    };
+    let unreported = u32::try_from(spend.unreported_turns.len()).unwrap_or(u32::MAX);
+    match unreported_text(unreported) {
+        Some(unreported) => format!("{totals} · {unreported}"),
+        None => totals,
+    }
+}
+
+/// How many turns the totals leave out because they reported nothing, or `None` for none.
+fn unreported_text(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 turn unreported".to_owned()),
+        count => Some(format!("{count} turns unreported")),
+    }
+}
+
+/// A price total as `priced` writes it, qualified when it is not all that was spent, or
+/// `price unknown` when a price was reported and none could be counted.
+fn price_text(
+    cost_usd: Option<f64>,
+    incomplete: bool,
+    priced: impl Fn(f64) -> String,
+) -> Option<String> {
+    match cost_usd {
+        Some(cost) => Some(format!("{}{}", at_least(incomplete), priced(cost))),
+        None if incomplete => Some("price unknown".to_owned()),
+        None => None,
+    }
+}
+
+/// The turns a line of [`spend_lines`] covers, ordered newest last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Span {
+    last_turn: u32,
+    first_turn: u32,
+}
+
+/// What one line of [`spend_lines`] says about its turns.
+#[derive(Debug, Default)]
+struct SpanFacts<'a> {
+    tokens: Option<&'a Spend<Tokens>>,
+    price: Option<&'a Spend<f64>>,
+    price_unknown: bool,
+    unreported: bool,
+}
+
+/// What each turn, or each run of turns a running total covered, spent, one line each, newest
+/// last, when there is more than one line to show.
+///
+/// A token and a price figure covering the same turns share a line.
+/// At most [`MAX_SPEND_LINES`] are shown, after a line saying how many earlier turns are not.
+#[must_use]
+pub fn spend_lines(status: &RunStatus) -> Vec<String> {
+    let spend = &status.spend;
+    let mut spans: BTreeMap<Span, SpanFacts<'_>> = BTreeMap::new();
+    let single = |turn: u32| Span {
+        last_turn: turn,
+        first_turn: turn,
+    };
+    for tokens in &spend.tokens {
+        spans
+            .entry(Span {
+                last_turn: tokens.last_turn,
+                first_turn: tokens.first_turn,
+            })
+            .or_default()
+            .tokens = Some(tokens);
+    }
+    for price in &spend.prices {
+        spans
+            .entry(Span {
+                last_turn: price.last_turn,
+                first_turn: price.first_turn,
+            })
+            .or_default()
+            .price = Some(price);
+    }
+    for turn in &spend.unpriced_turns {
+        spans.entry(single(*turn)).or_default().price_unknown = true;
+    }
+    for turn in &spend.unreported_turns {
+        spans.entry(single(*turn)).or_default().unreported = true;
+    }
+    if spans.len() < 2 {
+        return Vec::new();
+    }
+
+    let shown = spans
+        .iter()
+        .skip(spans.len().saturating_sub(MAX_SPEND_LINES));
+    let mut lines = Vec::new();
+    let earliest_shown = shown.clone().map(|(span, _)| span.first_turn).min();
+    if let Some(hidden) = earliest_shown
+        .map(|turn| turn.saturating_sub(1))
+        .filter(|hidden| *hidden > 0)
+    {
+        lines.push(format!("… {hidden} earlier turn(s)"));
+    }
+    for (span, facts) in shown {
+        let turns = if span.first_turn == span.last_turn {
+            format!("turn {}", span.last_turn)
+        } else {
+            format!("turns {}–{}", span.first_turn, span.last_turn)
+        };
+        let mut parts = Vec::new();
+        if let Some(tokens) = facts.tokens
+            && let Some(text) = tokens_text(&tokens.amount)
+        {
+            parts.push(format!("{}{text}", at_least(tokens.incomplete)));
+        }
+        if let Some(price) = facts.price {
+            parts.push(format!(
+                "{}${:.4}",
+                at_least(price.incomplete),
+                price.amount
+            ));
+        }
+        if facts.price_unknown {
+            parts.push("price unknown".to_owned());
+        }
+        if facts.unreported {
+            parts.push("nothing reported".to_owned());
+        }
+        lines.push(format!("{turns}: {}", parts.join(" · ")));
+    }
+    lines
+}
+
+fn at_least(incomplete: bool) -> &'static str {
+    if incomplete { "at least " } else { "" }
+}
+
+/// A token figure in full, or `None` when it knows neither the input nor the output.
+///
+/// The parts of a count, such as cached input or reasoning, are left out when zero or unknown.
+fn tokens_text(tokens: &Tokens) -> Option<String> {
+    let input = tokens.input_tokens.map(|input| {
+        let cached = parenthesised([
+            counted(tokens.cached_input_tokens, "cached"),
+            counted(tokens.cache_write_input_tokens, "cache write"),
+        ]);
+        format!("{input} in{cached}")
+    });
+    let output = tokens.output_tokens.map(|output| {
+        let reasoning = parenthesised([counted(tokens.reasoning_output_tokens, "reasoning")]);
+        format!("{output} out{reasoning}")
+    });
+    match (input, output) {
+        (None, None) => None,
+        (Some(input), Some(output)) => Some(format!("{input} / {output}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+    }
+}
+
+/// A part of a token count, such as `300 cached`, or `None` when it is zero or unknown.
+fn counted(count: Option<u64>, name: &str) -> Option<String> {
+    count
+        .filter(|count| *count > 0)
+        .map(|count| format!("{count} {name}"))
+}
+
+/// The parts that are there, as ` (a, b)`, or nothing when none is.
+fn parenthesised(parts: impl IntoIterator<Item = Option<String>>) -> String {
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// A consultation's run totals in the few characters a `list` line has room for, such as
+/// `12.3M in / 45k out · $0.12`, or `-` when nothing was reported.
+///
+/// Qualified as [`usage_line`] qualifies them: `at least` before a total that is not all that was
+/// spent, `price unknown` for a price that could not be counted, and how many turns reported
+/// nothing.
+#[must_use]
+pub fn usage_column(totals: &Totals) -> String {
+    let Totals {
+        usage,
+        cost_usd,
+        tokens_incomplete,
+        price_incomplete,
+        unreported_turn_count,
+    } = totals;
+    let mut parts = Vec::new();
+    let tokens: Vec<String> = [
+        usage
+            .input_tokens
+            .map(|input| format!("{} in", compact_count(input))),
+        usage
+            .output_tokens
+            .map(|output| format!("{} out", compact_count(output))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !tokens.is_empty() {
+        parts.push(format!(
+            "{}{}",
+            at_least(*tokens_incomplete),
+            tokens.join(" / ")
+        ));
+    }
+    parts.extend(price_text(*cost_usd, *price_incomplete, |cost| {
+        format!("${cost:.2}")
+    }));
+    // A consultation that reported nothing at all is a dash, unreported turns or not.
+    if parts.is_empty() {
+        return "-".to_owned();
+    }
+    parts.extend(unreported_text(*unreported_turn_count));
+    parts.join(" · ")
+}
+
+/// A count to one decimal of its thousands, millions or billions, rounded down: `45k`, `12.3M`.
+fn compact_count(count: u64) -> String {
+    let (unit, suffix) = match count {
+        0..1_000 => return count.to_string(),
+        1_000..1_000_000 => (1_000, "k"),
+        1_000_000..1_000_000_000 => (1_000_000, "M"),
+        _ => (1_000_000_000, "G"),
+    };
+    let tenths = count / (unit / 10);
+    match tenths % 10 {
+        0 => format!("{}{suffix}", tenths / 10),
+        fraction => format!("{}.{fraction}{suffix}", tenths / 10),
     }
 }
 
