@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use agentmux::delegate::Vendor;
 use agentmux::launch::ProcessLauncher;
-use agentmux::run::{AutoResumePolicy, ListFilter, RunStore, StartRequest};
+use agentmux::run::{AutoResumePolicy, RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
@@ -136,12 +136,9 @@ async fn main() -> Result<()> {
         }
         Command::Cancel(args) => report::status(&store.cancel(args.run_id.id()).await?, cli.json),
         Command::List(args) => {
-            let filtered = args.label.is_some() || args.state.is_some();
-            let filter = ListFilter {
-                label: args.label,
-                state: args.state,
-            };
-            report::list(&store.list(args.limit, &filter)?, filtered, cli.json)
+            let filter = args.filter();
+            let runs = store.list(args.limit, &filter)?;
+            report::list(&runs, filter.filters(), cli.json)
         }
         // Dispatched before the store was opened.
         Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),

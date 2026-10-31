@@ -645,8 +645,10 @@ fn a_model_that_matches_the_request_is_not_repeated() -> Result<()> {
 /// An unlabelled amount reads as money charged, which it is not on a subscription account, and a
 /// blank reads as a consultation that cost nothing rather than one whose vendor reported no
 /// figure at all.
+/// The input counts every prompt token, Claude's cached ones included, so the two vendors'
+/// figures read alike.
 #[gtest]
-fn cost_says_which_kind_of_number_it_is() -> Result<()> {
+fn usage_says_which_kind_of_number_it_is() -> Result<()> {
     let (_store, priced, _dir) =
         consult_claude(agentmux::testing::fixtures::CLAUDE_HAPPY, "claude-opus-5")?;
     let (_store, unpriced, _dir2) = consult(agentmux::testing::fixtures::CODEX_HAPPY)?;
@@ -654,8 +656,103 @@ fn cost_says_which_kind_of_number_it_is() -> Result<()> {
     let priced = agentmux_mcp::render::status(&priced);
     let unpriced = agentmux_mcp::render::status(&unpriced);
 
-    assert_that!(priced, contains_substring("list price"));
-    assert_that!(unpriced, contains_substring("no cost reported"));
+    assert_that!(
+        priced,
+        contains_substring(
+            "usage:      run total, all turns: 29442 in (18574 cached, 10866 cache write) / 128 \
+             out (116 reasoning) · $0.0100 list price\n"
+        )
+    );
+    assert_that!(
+        unpriced,
+        contains_substring(
+            "usage:      run total, all turns: 14003 in (4480 cached) / 31 out (22 reasoning) · no \
+             price reported\n"
+        )
+    );
+    // One turn needs no breakdown, and the progress line no longer carries token counts.
+    assert_that!(unpriced, not(contains_substring("turn 1:")));
+    let progress = unpriced
+        .lines()
+        .find(|line| line.starts_with("progress:"))
+        .or_fail()?;
+    assert_that!(progress, not(contains_substring(" in ")));
+    Ok(())
+}
+
+/// A follow-up's figures are taken apart into what each turn spent, a turn that reported nothing
+/// is covered by the next running total, and a running turn says it has reported nothing yet.
+#[gtest]
+fn usage_is_broken_down_by_turn() -> Result<()> {
+    let completed = |input: u64, output: u64| {
+        Script::completed(indoc::formatdoc! {r#"
+            {{"type":"thread.started","thread_id":"01a0"}}
+            {{"type":"item.completed","item":{{"id":"i0","type":"agent_message","text":"done"}}}}
+            {{"type":"turn.completed","usage":{{"input_tokens":{input},"cached_input_tokens":0,"output_tokens":{output}}}}}
+        "#})
+    };
+    let dir = tempfile::tempdir().or_fail()?;
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([
+            completed(100, 10),
+            Script::completed(indoc::indoc! {r#"
+                {"type":"thread.started","thread_id":"01a0"}
+                {"type":"turn.failed","error":{"message":"stream disconnected"}}
+            "#}),
+            completed(250, 30),
+            Script::running(indoc::indoc! {r#"
+                {"type":"thread.started","thread_id":"01a0"}
+            "#}),
+        ])),
+        BTreeMap::new(),
+    )
+    .or_fail()?;
+    let started = store
+        .start(&StartRequest {
+            delegate: Delegate::Codex {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: Some(Effort::parse("xhigh").or_fail()?),
+                permissions: CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                },
+                account: AccountChoice::Default,
+                isolation: None,
+            },
+            question: "Review the diff for correctness bugs.".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })
+        .or_fail()?;
+    for question in ["again", "once more", "and the tests"] {
+        store.follow_up(&started.run_id, question).or_fail()?;
+    }
+    let status = store.status(&started.run_id).or_fail()?;
+
+    // Turn 3's 250 is the session's total, so turns 2 and 3 together spent 150 of it.
+    let rendered = agentmux_mcp::render::status(&status);
+    assert_that!(
+        rendered,
+        contains_substring(indoc::indoc! {"
+            usage:      run total, all turns: 250 in / 30 out · no price reported
+                        turn 1: 100 in / 10 out
+                        turns 2–3: 150 in / 20 out
+                        turn 4: nothing reported yet
+        "})
+    );
+    // The CLI's `list` and the MCP server's carry the same compact total.
+    let listed = store
+        .list(10, &agentmux::run::ListFilter::default())
+        .or_fail()?;
+    assert_that!(
+        agentmux_mcp::render::list(&listed, false),
+        contains_substring("  250 in / 30 out\n")
+    );
     Ok(())
 }
 

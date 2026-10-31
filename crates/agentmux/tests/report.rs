@@ -1,6 +1,7 @@
 //! What both front ends say about a consultation, phrased once in `agentmux::report`.
 
-use agentmux::report::usage_window_line;
+use agentmux::accounting::Tokens;
+use agentmux::report::{usage_column, usage_window_line};
 use agentmux::transcript::UsageWindow;
 use chrono::Utc;
 use googletest::prelude::*;
@@ -49,4 +50,28 @@ fn an_exhausted_window_says_when_it_reopens() {
         ..codex_window(-1)
     });
     assert_that!(line, eq("codex window has reopened"));
+}
+
+/// A listing's total fits a column: counts to one decimal of their unit, rounded down, the
+/// price to the cent, and a dash for a consultation that reported nothing.
+#[gtest]
+fn a_listed_total_is_compact() {
+    let usage = Tokens {
+        input_tokens: Some(12_345_678),
+        output_tokens: Some(45_000),
+        ..Tokens::default()
+    };
+    assert_that!(usage_column(&usage, None), eq("12.3M in / 45k out"));
+    assert_that!(
+        usage_column(
+            &Tokens {
+                input_tokens: Some(999),
+                output_tokens: Some(1_999),
+                ..Tokens::default()
+            },
+            Some(0.1234)
+        ),
+        eq("999 in / 1.9k out · $0.12")
+    );
+    assert_that!(usage_column(&Tokens::default(), None), eq("-"));
 }

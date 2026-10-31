@@ -6,10 +6,9 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::accounting::{Accounting, Tokens};
 use crate::delegate::{Billing, Delegate, Effort, Isolation, ModelId, Vendor};
-use crate::transcript::{
-    EarlierFailure, Outcome, TurnState, UnrecognisedEvents, Usage, UsageWindow,
-};
+use crate::transcript::{EarlierFailure, Outcome, TurnState, UnrecognisedEvents, UsageWindow};
 
 use super::id::RunId;
 use super::label::RunLabel;
@@ -48,10 +47,17 @@ pub struct RunStatus {
     /// Counts hook injections and agentmux's own notes alongside the delegate's replies, because
     /// a caller polling this wants to know that *something* arrived.
     pub message_count: usize,
-    /// Token accounting so far.
-    pub usage: Usage,
-    /// Reported dollar cost so far, where the vendor reports one.
+    /// The run total across all turns, in tokens, every prompt token counted in `input_tokens`.
+    ///
+    /// Derived from the vendors' reports by [`Accounting`], so a running total is counted once
+    /// rather than once per turn that reported it.
+    pub usage: Tokens,
+    /// The run total across all turns, in US dollars at list price, where the vendor reports a
+    /// price agentmux can attribute.
     pub cost_usd: Option<f64>,
+    /// What each turn, or each run of turns a running total covered, spent, and which turns
+    /// reported nothing.
+    pub spend: Accounting,
     /// The model identifier the vendor reported running, where it reported one.
     ///
     /// Kept beside the requested identifier rather than replacing it: a vendor may expand an alias
@@ -252,8 +258,8 @@ pub struct RunSummary {
     pub cwd: PathBuf,
     /// How the consultation stands: the newest turn's outcome, with the failure's kind.
     pub outcome: Outcome,
-    /// The newest write to any of the newest turn's capture files, or `None` before it wrote
-    /// any.
+    /// The newest write to any of the consultation's capture files, or `None` before one was
+    /// written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<DateTime<Utc>>,
     /// How many turns the consultation has, which is also the newest turn's number.
@@ -266,6 +272,12 @@ pub struct RunSummary {
     /// kept it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
+    /// The run total across all turns, in tokens, as [`RunStatus::usage`] counts it.
+    pub usage: Tokens,
+    /// The run total across all turns, in US dollars at list price, as [`RunStatus::cost_usd`]
+    /// counts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Which consultations `list` shows.
@@ -277,6 +289,45 @@ pub struct ListFilter {
     pub label: Option<String>,
     /// Only consultations whose newest turn stands so.
     pub state: Option<TurnState>,
+    /// Only consultations created at or after this instant.
+    ///
+    /// The consultation's creation, not when its turns spent anything: a consultation started
+    /// before it and followed up since is not listed.
+    pub since: Option<DateTime<Utc>>,
+}
+
+impl ListFilter {
+    /// Whether the filter can leave a consultation out, so an empty listing says why.
+    #[must_use]
+    pub fn filters(&self) -> bool {
+        self.label.is_some() || self.state.is_some() || self.since.is_some()
+    }
+}
+
+/// A `since` for [`ListFilter`] that is not an RFC 3339 instant.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "`{text}` is not an RFC 3339 instant; write one such as `2026-10-31T16:00:00Z` or \
+     `2026-10-31T16:00:00+01:00`"
+)]
+pub struct InvalidSince {
+    text: String,
+    #[source]
+    source: chrono::ParseError,
+}
+
+/// Read the instant a [`ListFilter::since`] is given as, an RFC 3339 timestamp with its offset.
+///
+/// # Errors
+///
+/// Returns [`InvalidSince`], naming the expected format, when `text` is not one.
+pub fn parse_since(text: &str) -> Result<DateTime<Utc>, InvalidSince> {
+    DateTime::parse_from_rfc3339(text.trim())
+        .map(|instant| instant.with_timezone(&Utc))
+        .map_err(|source| InvalidSince {
+            text: text.to_owned(),
+            source,
+        })
 }
 
 /// A slice of the rendered transcript.

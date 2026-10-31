@@ -7,8 +7,8 @@ already provides native same-vendor subagents.
 
 ## Crate layout
 
-Each crate is under `crates/`; the `agentmux` library's modules are `config`, `delegate`, `launch`,
-`run`, `stream`, `transcript`, `quota` and `appserver`.
+Each crate is under `crates/`; the `agentmux` library's modules are `accounting`, `config`,
+`delegate`, `launch`, `run`, `stream`, `transcript`, `quota` and `appserver`.
 
 | Crate                       | What it is                                                       |
 | --------------------------- | ---------------------------------------------------------------- |

@@ -31,7 +31,9 @@ use serde_json::Value;
 
 use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
-use crate::transcript::{FailureKind, Message, Outcome, Role, Turn, Usage, UsageWindow};
+use crate::transcript::{
+    FailureKind, Message, Outcome, Role, SpendReport, Turn, Usage, UsageWindow,
+};
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
 ///
@@ -97,6 +99,9 @@ struct Init {
     /// which one it used.
     #[serde(default, rename = "apiKeySource")]
     api_key_source: Option<ApiKeySource>,
+    /// The CLI's own release, which decides what scope the turn's `total_cost_usd` covers.
+    #[serde(default)]
+    claude_code_version: Option<String>,
 }
 
 /// Where the CLI found an API key, which it says is `none`, in any case, when it runs on a
@@ -403,12 +408,13 @@ fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
 }
 
 /// Fold one `system` event: the session it announces on `init`, the key it authenticated with,
-/// and a subtype the parser does not name.
+/// the CLI's release, and a subtype the parser does not name.
 fn fold_system(
     event: SystemEvent,
     line: &Value,
     turn: &mut Turn,
     session: &mut Option<SessionRef>,
+    cli_version: &mut Option<String>,
 ) {
     let init = match event {
         SystemEvent::Init(init) => init,
@@ -432,6 +438,9 @@ fn fold_system(
     {
         *session = Some(parsed);
     }
+    if init.claude_code_version.is_some() {
+        *cli_version = init.claude_code_version;
+    }
     // Said in the transcript rather than refused, because by the time the stream says it the CLI
     // has already chosen; a reader comparing it with the turn's billing note sees whether that was
     // the account's own opt-in.
@@ -448,6 +457,7 @@ fn fold_system(
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn = Turn::new(index, question);
     let mut session = None;
+    let mut cli_version = None;
     let mut reopened = false;
     // What the delegate was doing when a `user` text message arrives decides what that message
     // is: see [`classify_injection`].
@@ -465,7 +475,9 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         };
 
         match event {
-            Event::System(event) => fold_system(event, &value, &mut turn, &mut session),
+            Event::System(event) => {
+                fold_system(event, &value, &mut turn, &mut session, &mut cli_version);
+            }
             Event::Assistant(event) => {
                 if event.parent_tool_use_id.is_some() {
                     continue;
@@ -528,6 +540,13 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                 {
                     session = Some(parsed);
                 }
+                // Kept whether or not the turn succeeded: an error result reports what the
+                // turn spent before it failed, which the failed outcome has no room for.
+                turn.spend_report = Some(SpendReport {
+                    usage: event.usage.as_ref().map(Usage::from).unwrap_or_default(),
+                    cost_usd: event.total_cost_usd,
+                    cli_version: cli_version.take(),
+                });
                 turn.outcome = outcome_of(&event, reopened);
                 // Nothing may follow a terminal event.
                 // Stopping here keeps the rendered transcript strictly append-only, which is what

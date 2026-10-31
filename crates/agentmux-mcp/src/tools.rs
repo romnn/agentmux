@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::Vendor;
-use agentmux::run::{ListFilter, RunId, RunStore, SettledTurn, StartRequest, TurnRef};
+use agentmux::run::{ListFilter, RunId, RunStore, SettledTurn, StartRequest, TurnRef, parse_since};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -377,8 +377,9 @@ impl AgentMux {
 
     #[tool(
         description = "Report how a consultation is doing: state, elapsed time, message count, \
-                       token usage and cost, and whether anything happened that makes the \
-                       transcript need careful reading. Cheap; safe to poll."
+                       what it spent in tokens and list price, in total and turn by turn, and \
+                       whether anything happened that makes the transcript need careful reading. \
+                       Cheap; safe to poll."
     )]
     fn status(
         &self,
@@ -629,25 +630,32 @@ impl AgentMux {
     }
 
     #[tool(
-        description = "List recent consultations with their ids, labels, delegates, states and \
-                       questions, newest first. Use it to recover an id you did not keep, or with \
-                       `label` and `state` to find the consultations you started for one purpose \
-                       and see which are still running or failed."
+        description = "List recent consultations with their ids, labels, delegates, states, \
+                       questions and what each spent in total, newest first. Use it to recover an \
+                       id you did not keep, with `label` and `state` to find the consultations you \
+                       started for one purpose and see which are still running or failed, or with \
+                       `since` to see only those started at or after an instant."
     )]
     fn list(
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let filtered = params.label.is_some() || params.state.is_some();
+        let since = params
+            .since
+            .as_deref()
+            .map(parse_since)
+            .transpose()
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let filter = ListFilter {
             label: params.label,
             state: params.state,
+            since,
         };
         let runs = self
             .store
             .list(params.limit.unwrap_or(20).clamp(1, 200), &filter)
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::list(&runs, filtered)))
+        Ok(text(render::list(&runs, filter.filters())))
     }
 
     #[tool(
@@ -1058,7 +1066,8 @@ calling again. Use `status` for a cheap look that carries no transcript text, `t
 to see what the delegate is actually doing — with `from_end` for its latest output — `result` to
 page the transcript, and `cancel` to stop one while keeping what it collected. `ask` is `start`
 plus a 45-second wait, for a question you expect answered quickly; a review is not that. `list` recovers an id you did not keep,
-and with `label` and `state` finds the consultations you gave a `label` on `start` or `follow_up`.
+and with `label` and `state` finds the consultations you gave a `label` on `start` or `follow_up`;
+`since` keeps only those started at or after an instant.
 `follow_up` continues the delegate's own session, so ask only the new thing. When that session
 itself cannot go on — a content filter refusing turn after turn however you rephrase —
 `continue_fresh` starts a new consultation that reads the old transcript and working tree. `steer` adds an

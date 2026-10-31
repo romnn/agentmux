@@ -168,7 +168,15 @@ impl Message {
     }
 }
 
-/// Token accounting for one turn, in the union of what both vendors report.
+/// Token figures for one turn, exactly as the vendor reported them: in the vendor's own
+/// categories and over the vendor's own scope.
+///
+/// They are evidence, not what the turn spent.
+/// Codex reports its thread's running total, so a follow-up's figures include every earlier turn
+/// of the session, while Claude reports the one call.
+/// Codex counts cache reads inside `input_tokens`, and Claude counts them beside it.
+/// [`crate::accounting`] derives what each turn spent from them; the turn's footer quotes them as
+/// they are, because a published footer never changes.
 ///
 /// Every field is optional because neither vendor promises to report all of them, and a missing
 /// count must stay distinguishable from a zero count.
@@ -179,21 +187,51 @@ impl Message {
               counts, which this struct sits next to"
 )]
 pub struct Usage {
-    /// Prompt tokens billed at the full rate.
+    /// Prompt tokens.
+    ///
+    /// Codex: every prompt token, those read from the cache included.
+    /// Claude: only the prompt tokens the cache played no part in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
-    /// Prompt tokens served from the provider's cache.
+    /// Prompt tokens read from the provider's cache.
+    ///
+    /// Codex: a part of `input_tokens`.
+    /// Claude: its `cache_read_input_tokens`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
     /// Prompt tokens written into the provider's cache.
+    ///
+    /// Codex: read as a part of `input_tokens`, as its cache reads are.
+    /// Claude: its `cache_creation_input_tokens`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_input_tokens: Option<u64>,
-    /// Tokens the model emitted, including reasoning where the vendor folds it in.
+    /// Tokens the model emitted, reasoning included for both vendors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
-    /// Reasoning tokens, where the vendor reports them separately.
+    /// Reasoning tokens, a part of `output_tokens`.
+    ///
+    /// Claude: its `output_tokens_details.thinking_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
+}
+
+/// What a vendor reported spending in a turn's terminal result, whether the turn succeeded or
+/// failed.
+///
+/// Kept beside the outcome rather than in it: a failed turn spent tokens too, and a Claude error
+/// result reports them, but [`Outcome::Failed`] is published in `settled.json` and has no room for
+/// them.
+/// Neither serialised nor rendered; [`crate::accounting`] is its only reader.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpendReport {
+    /// The token figures, in the vendor's own categories and scope.
+    pub usage: Usage,
+    /// The dollar figure, in the vendor's own scope, where it reported one.
+    pub cost_usd: Option<f64>,
+    /// The delegate CLI release that reported them, as it names itself, where that is known.
+    ///
+    /// Which release it was decides what scope Claude's dollar figure covers.
+    pub cli_version: Option<String>,
 }
 
 /// Why a turn ended badly.
@@ -305,9 +343,9 @@ pub enum Outcome {
     Running,
     /// The delegate finished its turn.
     Completed {
-        /// Token accounting, empty if the vendor reported none.
+        /// The vendor's token figures, as [`Usage`] describes them, empty if it reported none.
         usage: Usage,
-        /// Dollar cost, where the vendor reports it.
+        /// The vendor's dollar figure, in its own scope, where it reports one.
         #[serde(skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
     },
@@ -526,6 +564,10 @@ pub struct Turn {
     /// question, which makes the transcript say where a consultation's purpose changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<crate::run::RunLabel>,
+    /// What the vendor reported spending in this turn's terminal result, or `None` before the
+    /// turn ended and for a turn whose stream carried no terminal result.
+    #[serde(skip)]
+    pub spend_report: Option<SpendReport>,
 }
 
 /// Which automatic resume a turn is, in an unbroken run of turns that failed because the model
@@ -566,6 +608,7 @@ impl Turn {
             ran_as: None,
             auto_resume: None,
             label: None,
+            spend_report: None,
         }
     }
 
@@ -697,33 +740,6 @@ impl Transcript {
         merged
     }
 
-    /// Total token accounting across every turn that reported any.
-    #[must_use]
-    pub fn usage(&self) -> Usage {
-        fn add(total: &mut Option<u64>, part: Option<u64>) {
-            if let Some(part) = part {
-                *total = Some(total.unwrap_or(0).saturating_add(part));
-            }
-        }
-        let mut total = Usage::default();
-        for turn in &self.turns {
-            if let Outcome::Completed { usage, .. } = &turn.outcome {
-                add(&mut total.input_tokens, usage.input_tokens);
-                add(&mut total.cached_input_tokens, usage.cached_input_tokens);
-                add(
-                    &mut total.cache_write_input_tokens,
-                    usage.cache_write_input_tokens,
-                );
-                add(&mut total.output_tokens, usage.output_tokens);
-                add(
-                    &mut total.reasoning_output_tokens,
-                    usage.reasoning_output_tokens,
-                );
-            }
-        }
-        total
-    }
-
     /// The model the vendor last reported running, or `None` when no turn reported one.
     ///
     /// The newest turn wins, because a follow-up may be answered by a different model than the
@@ -734,22 +750,6 @@ impl Transcript {
             .iter()
             .rev()
             .find_map(|turn| turn.resolved_model.as_deref())
-    }
-
-    /// Total reported dollar cost, or `None` when no turn reported one.
-    #[must_use]
-    pub fn cost_usd(&self) -> Option<f64> {
-        let mut total: Option<f64> = None;
-        for turn in &self.turns {
-            if let Outcome::Completed {
-                cost_usd: Some(cost),
-                ..
-            } = &turn.outcome
-            {
-                total = Some(total.unwrap_or(0.0) + cost);
-            }
-        }
-        total
     }
 }
 

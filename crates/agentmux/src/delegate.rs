@@ -2769,8 +2769,9 @@ pub fn codex_supports_permission_profiles(cli_version: Option<&str>) -> bool {
         .is_some_and(|release| release >= crate::config::PERMISSION_PROFILE_MIN_CODEX)
 }
 
-/// The `major.minor.patch` release a `--version` line names, as `codex-cli 0.163.0` does.
-fn release_of(version: &str) -> Option<(u64, u64, u64)> {
+/// The `major.minor.patch` release a `--version` line names, as `codex-cli 0.163.0` and
+/// `2.1.277 (Claude Code)` do, or a bare release such as Claude's stream reports.
+pub(crate) fn release_of(version: &str) -> Option<(u64, u64, u64)> {
     let number = version
         .split_whitespace()
         .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))?;

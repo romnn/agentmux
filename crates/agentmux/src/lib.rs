@@ -14,6 +14,7 @@
 //! - [`stream`] — folds each vendor's event stream into a transcript.
 //!   Nothing else parses a capture.
 //! - [`transcript`] — the vendor-neutral record of what a delegate said.
+//! - [`accounting`] — what a consultation spent, derived from what its vendor reported.
 //! - [`launch`] — turns a prepared invocation into a detached child writing to files.
 //! - [`appserver`] — the driver that runs a Codex turn over `codex app-server`, so the turn can
 //!   be steered while it runs.
@@ -22,8 +23,9 @@
 //!   runs with no credentials and no network.
 //!
 //! The dependency direction is one way: `transcript` and `delegate` import nothing heavy;
-//! `stream` imports `transcript`; `appserver` imports `stream` and `delegate`; `run` imports
-//! `launch`, `stream`, `appserver` and `delegate`.
+//! `stream` imports `transcript`; `accounting` imports `transcript` and `delegate`; `appserver`
+//! imports `stream` and `delegate`; `run` imports `launch`, `stream`, `appserver`, `accounting`
+//! and `delegate`.
 //! Nothing here knows about MCP, which is what makes the whole pipeline testable without a client.
 //!
 //! # Example
@@ -66,6 +68,7 @@
 //! # }
 //! ```
 
+pub mod accounting;
 pub mod appserver;
 mod atomic_file;
 pub mod config;

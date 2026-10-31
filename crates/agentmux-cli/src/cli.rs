@@ -717,6 +717,26 @@ pub struct ListArgs {
     /// Only consultations whose newest turn stands so.
     #[arg(long, value_enum)]
     pub state: Option<TurnState>,
+
+    /// Only consultations created at or after this RFC 3339 instant, such as
+    /// `2026-10-31T16:00:00+01:00`.
+    ///
+    /// It filters by when a consultation was started, not by when its turns spent anything: one
+    /// started earlier and followed up since is not listed.
+    #[arg(long, value_name = "INSTANT", value_parser = agentmux::run::parse_since)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ListArgs {
+    /// Which consultations these arguments admit.
+    #[must_use]
+    pub fn filter(&self) -> agentmux::run::ListFilter {
+        agentmux::run::ListFilter {
+            label: self.label.clone(),
+            state: self.state,
+            since: self.since,
+        }
+    }
 }
 
 /// Arguments for `agentmux prune`: one consultation to delete, or none to sweep.

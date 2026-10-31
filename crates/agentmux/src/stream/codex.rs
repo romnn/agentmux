@@ -38,7 +38,7 @@ use serde_json::Value;
 
 use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
-use crate::transcript::{Message, Outcome, Role, Turn, Usage};
+use crate::transcript::{Message, Outcome, Role, SpendReport, Turn, Usage};
 
 /// One line of a Codex capture: an event `codex exec --json` writes, or one agentmux adds.
 ///
@@ -140,6 +140,26 @@ impl From<&exec::Usage> for Usage {
     }
 }
 
+/// End `turn` as completed, with the usage `turn.completed` reported.
+///
+/// `turn.failed` carries no usage, so only a completed turn reports what it spent.
+fn complete(turn: &mut Turn, completed: &exec::TurnCompletedEvent) {
+    let usage = completed
+        .usage
+        .as_ref()
+        .map(Usage::from)
+        .unwrap_or_default();
+    turn.outcome = Outcome::Completed {
+        usage,
+        cost_usd: None,
+    };
+    turn.spend_report = Some(SpendReport {
+        usage,
+        cost_usd: None,
+        cli_version: None,
+    });
+}
+
 /// Fold a Codex `--json` stream into a turn.
 #[must_use]
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
@@ -219,14 +239,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             },
             ThreadEvent::TurnCompleted(completed) => {
                 if !turn.outcome.is_terminal() {
-                    turn.outcome = Outcome::Completed {
-                        usage: completed
-                            .usage
-                            .as_ref()
-                            .map(Usage::from)
-                            .unwrap_or_default(),
-                        cost_usd: None,
-                    };
+                    complete(&mut turn, &completed);
                 }
                 // See the note in the Claude parser: a terminal event ends the fold so the
                 // rendered transcript can only ever grow at its end.
