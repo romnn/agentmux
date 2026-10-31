@@ -7,8 +7,9 @@
 //! agentmux stops it once the turn is over (ADR 0032,
 //! `docs/adr/0032-leftover-processes-reported.md`).
 //! Its work is then incomplete, and nothing the delegate said tells the caller so.
-//! This record says which processes were still running once the server had exited, and whether
-//! each still was after agentmux had signalled it, so the transcript and `status` can say it.
+//! This record says which processes were still running once the server had exited, outside the
+//! server's process tree, and whether each still was after agentmux had signalled it, so the
+//! transcript and `status` can say it.
 //!
 //! The record names each process by pid, start time and process name, never by its arguments,
 //! which can carry secrets.
@@ -129,17 +130,21 @@ impl LeftRunning {
 
     /// Read the record a driver kept at `path`, or `None` when there is none.
     ///
-    /// A record that cannot be read, is not one, or has another version is treated as absent:
-    /// it adds a note to the transcript, and is no reason to fail reading the consultation.
+    /// A record that is not one, or has another version, is treated as absent: it would only add
+    /// a note to the transcript, is no reason to fail reading the consultation, and reads the
+    /// same every time.
+    /// A record that cannot be read is an error instead, because a failure that passes would
+    /// render the turn without the note it published before.
     /// What it says is held to the bounds this agentmux writes, whoever wrote it.
-    pub(crate) fn read(path: &Path) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the file when it is there but cannot be read.
+    pub(crate) fn read(path: &Path) -> std::io::Result<Option<Self>> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(err) => {
-                tracing::debug!(?err, path = %path.display(), "cannot read a left-running record");
-                return None;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
         };
         let record = match serde_json::from_str::<Self>(&text) {
             Ok(record) if record.version == VERSION => record,
@@ -149,11 +154,11 @@ impl LeftRunning {
                     path = %path.display(),
                     "ignoring a left-running record of another version"
                 );
-                return None;
+                return Ok(None);
             }
             Err(err) => {
                 tracing::debug!(?err, path = %path.display(), "ignoring a corrupt left-running record");
-                return None;
+                return Ok(None);
             }
         };
         let Self {
@@ -171,11 +176,13 @@ impl LeftRunning {
             };
             *count = count.saturating_add(1);
         }
-        (!processes.is_empty() || omitted != OmittedProcesses::default()).then_some(Self {
-            version,
-            processes,
-            omitted,
-        })
+        Ok(
+            (!processes.is_empty() || omitted != OmittedProcesses::default()).then_some(Self {
+                version,
+                processes,
+                omitted,
+            }),
+        )
     }
 
     /// What became of the processes, as a clause such as `2 are no longer running and 1 still
@@ -307,49 +314,57 @@ mod tests {
     fn fates_agree_in_number() -> Result<()> {
         use ProcessFate::{NoLongerRunning as Gone, StillRunning as Still};
 
-        let phrase = |fates: &[ProcessFate]| -> Result<(String, String)> {
+        /// How a record of some processes counts them and says what became of them.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Phrases {
+            processes: String,
+            fates: String,
+        }
+        let phrases = |fates: &[ProcessFate]| -> Result<Phrases> {
             let processes = fates
                 .iter()
                 .zip(1..)
                 .map(|(fate, pid)| process(pid, *fate))
                 .collect();
             let record = LeftRunning::of(processes).or_fail()?;
-            Ok((record.processes_phrase(), record.fates()))
+            Ok(Phrases {
+                processes: record.processes_phrase(),
+                fates: record.fates(),
+            })
         };
+        let expect = |processes: &str, fates: &str| Phrases {
+            processes: processes.to_owned(),
+            fates: fates.to_owned(),
+        };
+
         assert_that!(
-            phrase(&[Gone])?,
-            eq(&("1 process".to_owned(), "it is no longer running".to_owned()))
+            phrases(&[Gone])?,
+            eq(&expect("1 process", "it is no longer running"))
         );
         assert_that!(
-            phrase(&[Still])?,
-            eq(&("1 process".to_owned(), "it is still running".to_owned()))
+            phrases(&[Still])?,
+            eq(&expect("1 process", "it is still running"))
         );
         assert_that!(
-            phrase(&[Gone, Gone])?,
-            eq(&(
-                "2 processes".to_owned(),
-                "none of them is still running".to_owned()
+            phrases(&[Gone, Gone])?,
+            eq(&expect("2 processes", "none of them is still running"))
+        );
+        assert_that!(
+            phrases(&[Still, Still])?,
+            eq(&expect("2 processes", "all of them are still running"))
+        );
+        assert_that!(
+            phrases(&[Gone, Gone, Still])?,
+            eq(&expect(
+                "3 processes",
+                "2 are no longer running and 1 still is"
             ))
         );
         assert_that!(
-            phrase(&[Still, Still])?,
-            eq(&(
-                "2 processes".to_owned(),
-                "all of them are still running".to_owned()
-            ))
-        );
-        assert_that!(
-            phrase(&[Gone, Gone, Still])?,
-            eq(&(
-                "3 processes".to_owned(),
-                "2 are no longer running and 1 still is".to_owned()
-            ))
-        );
-        assert_that!(
-            phrase(&[Gone, Still, Still])?,
-            eq(&(
-                "3 processes".to_owned(),
-                "1 is no longer running and 2 still are".to_owned()
+            phrases(&[Gone, Still, Still])?,
+            eq(&expect(
+                "3 processes",
+                "1 is no longer running and 2 still are"
             ))
         );
         Ok(())
@@ -366,21 +381,26 @@ mod tests {
         assert_that!(bounded, ends_with("…"));
     }
 
-    /// A record read back is held to the bounds whoever wrote it, and one of another version or
-    /// that does not parse is no record at all.
+    /// A record read back is held to the bounds whoever wrote it, one of another version or that
+    /// does not parse is no record at all, and one that cannot be read is an error.
     #[gtest]
     fn a_record_read_back_is_bounded_and_versioned() -> Result<()> {
         let dir = tempfile::tempdir().or_fail()?;
         let path = dir.path().join("left-running.json");
-        assert_that!(LeftRunning::read(&path), none());
+        assert_that!(LeftRunning::read(&path).or_fail()?, none());
+
+        // A directory where the record belongs reads as an error, never as no record.
+        std::fs::create_dir(&path).or_fail()?;
+        assert_that!(LeftRunning::read(&path), err(anything()));
+        std::fs::remove_dir(&path).or_fail()?;
 
         std::fs::write(&path, "{").or_fail()?;
-        assert_that!(LeftRunning::read(&path), none());
+        assert_that!(LeftRunning::read(&path).or_fail()?, none());
 
         let mut record = LeftRunning::of(vec![process(1, ProcessFate::StillRunning)]).or_fail()?;
         record.version = 2;
         std::fs::write(&path, serde_json::to_string(&record).or_fail()?).or_fail()?;
-        assert_that!(LeftRunning::read(&path), none());
+        assert_that!(LeftRunning::read(&path).or_fail()?, none());
 
         record.version = super::VERSION;
         record.processes = (0..70)
@@ -390,7 +410,7 @@ mod tests {
             })
             .collect();
         std::fs::write(&path, serde_json::to_string(&record).or_fail()?).or_fail()?;
-        let read = LeftRunning::read(&path).or_fail()?;
+        let read = LeftRunning::read(&path).or_fail()?.or_fail()?;
         assert_that!(read.processes.len(), eq(MAX_PROCESSES));
         assert_that!(read.omitted.still_running, eq(20));
         assert_that!(

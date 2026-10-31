@@ -241,8 +241,9 @@ pub fn drive(plan_path: &Path) -> i32 {
 /// complete or finds none, ever.
 /// A cancelled turn's leftovers are the cancellation's doing, and its transcript never shows
 /// them, so nothing is kept for one.
-/// The `cancelling` marker is looked at last: `cancel` creates it only while the turn has not
-/// ended, before the cancellation it records, so a turn whose record is kept never gains one.
+/// The `cancelling` marker is looked at last, which spares a turn already being cancelled a
+/// record nobody reads; a record kept just before `cancel` marks the turn is left to the fold,
+/// which reads no record once the marker exists.
 /// Only Unix gets a record: on Windows the job object stops what is left, and nothing is read.
 fn keep_left_running(plan: &DriverPlan, left_running: Option<LeftRunning>) {
     let Some(left_running) = left_running else {
@@ -261,8 +262,8 @@ fn keep_left_running(plan: &DriverPlan, left_running: Option<LeftRunning>) {
             "agentmux: {} already exists, so what this turn left running is not kept",
             path.display()
         ),
-        Err(error) => eprintln!(
-            "agentmux: cannot keep what this turn left running in {}: {error}",
+        Err(err) => eprintln!(
+            "agentmux: cannot keep what this turn left running in {}: {err}",
             path.display()
         ),
     }
@@ -1163,10 +1164,11 @@ fn stop_server(
     // The server is stopped and waited for through `child`; once waited for, its pid is free
     // for another process, which a start time to the second cannot tell apart.
     let server_pid = child.id();
-    // Read with each process's parent, which is what tells the server's own children — its MCP
-    // servers and command shells — from what the turn left below them.
+    // Read with each process's parent, which is what tells what runs below the server — its MCP
+    // servers and command shells, which codex stops itself — from what had already left its
+    // tree.
     let before_eof = process_tree(driver_pid);
-    let mut cohort = Cohort::new(server_pid, &before_eof);
+    let mut cohort = Cohort::new(server_pid, &before_eof, &recorded_descendants);
     let mut known_descendants = recorded_descendants;
     add_unseen(
         &mut known_descendants,

@@ -83,10 +83,11 @@ error, because a consultation has nobody available to answer them.
 **What the turn left running is stopped, within a budget, and reported.** Cleanup is bounded and
 best effort: the driver reads its descendants with their parents and closes the server's input to
 allow session saving, then signals and rescans surviving descendants within its cleanup budget
-(`appserver::STOP_BUDGET`), and looks once more after its last signal. What survived the server,
-less the server's own direct children, is kept in the turn's `left-running.json` and reported in
-the transcript and `status` ([0032](0032-leftover-processes-reported.md)). The store allows that
-budget plus a margin before falling back to signalling the driver. The platform mechanisms —
+(`appserver::STOP_BUDGET`), and looks once more after its last signal. What survived the server
+from outside its process tree, as it stood before the server was asked to leave, is kept in the
+turn's `left-running.json` and reported in the transcript and `status`
+([0032](0032-leftover-processes-reported.md)). The store allows that budget plus a margin before
+falling back to signalling the driver. The platform mechanisms —
 adopting orphans on Linux, a once-a-second record elsewhere, a job object on Windows — are
 documented in `crates/agentmux/src/appserver/mod.rs`.
 

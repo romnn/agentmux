@@ -66,15 +66,22 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
 }
 
 impl Harness {
-    /// Keep `record` as what turn `number` left running, as its driver does before it exits.
-    fn keep_left_running(&self, run_id: &RunId, number: u32, record: &str) -> Result<()> {
-        let path = self
-            .store
+    /// The directory of turn `number`, counted from 1 as the directories are named.
+    fn turn_dir(&self, run_id: &RunId, number: u32) -> PathBuf {
+        self.store
             .root()
             .join("runs")
             .join(run_id.as_str())
-            .join(format!("turns/{number:04}/left-running.json"));
-        std::fs::write(path, record).or_fail()
+            .join(format!("turns/{number:04}"))
+    }
+
+    /// Keep `record` as what turn `number` left running, as its driver does before it exits.
+    fn keep_left_running(&self, run_id: &RunId, number: u32, record: &str) -> Result<()> {
+        std::fs::write(
+            self.turn_dir(run_id, number).join("left-running.json"),
+            record,
+        )
+        .or_fail()
     }
 
     fn transcript(&self, run_id: &RunId) -> Result<String> {
@@ -101,7 +108,7 @@ fn three_left() -> Result<LeftRunning> {
 const THREE_LEFT_NOTE: &str = indoc::indoc! {"
 
     > [!WARNING]
-    > **When this turn ended, 3 processes below the delegate were still running after its CLI exited**: `python3` (pid 123), `sh` (pid 120) and `sleep` (pid 130).
+    > **When this turn ended, 3 processes outside the delegate CLI's process tree were still running after the CLI exited**: `python3` (pid 123), `sh` (pid 120) and `sleep` (pid 130).
     > agentmux signalled them to stop; 2 are no longer running and 1 still is.
     > Work in them may be incomplete.
 "};
@@ -153,9 +160,9 @@ fn what_a_turn_left_running_is_said_once_its_delegate_has_gone() -> Result<()> {
     assert_that!(
         agentmux::report::left_running_line(&expected),
         eq(
-            "turn 1 left 3 processes running after the delegate's CLI exited; agentmux signalled \
-             them to stop, and 2 are no longer running and 1 still is — work in them may be \
-             incomplete"
+            "turn 1 left 3 processes running outside the delegate CLI's process tree after the CLI \
+             exited; agentmux signalled them to stop, and 2 are no longer running and 1 still is \
+             — work in them may be incomplete"
         )
     );
     let json = serde_json::to_value(&status).or_fail()?;
@@ -217,10 +224,89 @@ async fn a_cancelled_turn_never_says_what_it_left_running() -> Result<()> {
     Ok(())
 }
 
-/// A record that cannot be read is no record: the turn reads as if it left nothing, and reading
+/// A turn being cancelled says nothing of what it left running from the moment `cancel` marks
+/// it, before the cancellation is recorded: a read in between, after the driver finished and
+/// left, must not publish a note that the cancellation's record would then take back.
+#[gtest]
+fn a_turn_marked_for_cancelling_never_says_what_it_left_running() -> Result<()> {
+    let harness = harness([Script::running(indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial"}}
+    "#})])?;
+    let started = harness.store.start(&request()?)?;
+    let dir = harness.turn_dir(&started.run_id, 1);
+
+    // `cancel` found the turn running and marked it; then, before it could record anything, the
+    // driver ended the turn, kept what it left running, and exited.
+    std::fs::write(dir.join("cancelling"), "").or_fail()?;
+    let mut events = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("events.jsonl"))
+        .or_fail()?;
+    std::io::Write::write_all(
+        &mut events,
+        b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n",
+    )
+    .or_fail()?;
+    harness.keep_left_running(
+        &started.run_id,
+        1,
+        &serde_json::to_string(&three_left()?).or_fail()?,
+    )?;
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+
+    // A read in between settles the turn from its terminal event, and says nothing of the
+    // record.
+    let between = harness.store.status(&started.run_id)?;
+    assert_that!(between.settled, eq(true));
+    assert_that!(between.left_running, is_empty());
+    let published = harness.transcript(&started.run_id)?;
+    assert_that!(published, not(contains_substring("[!WARNING]")));
+
+    // The cancellation's record arrives, as `cancel` writes it, and the transcript stays as
+    // published.
+    let events_len = std::fs::metadata(dir.join("events.jsonl")).or_fail()?.len();
+    std::fs::write(
+        dir.join("exit.json"),
+        serde_json::json!({ "kind": "cancelled", "events_len": events_len }).to_string(),
+    )
+    .or_fail()?;
+    assert_that!(harness.transcript(&started.run_id)?, eq(&published));
+    assert_that!(
+        harness.store.status(&started.run_id)?.left_running,
+        is_empty()
+    );
+    Ok(())
+}
+
+/// A record that is there but cannot be read fails the read rather than publishing the turn
+/// without the note an earlier read may have published.
+#[gtest]
+fn a_record_that_cannot_be_read_fails_the_read() -> Result<()> {
+    let harness = harness([Script::running(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request()?)?;
+    std::fs::create_dir(
+        harness
+            .turn_dir(&started.run_id, 1)
+            .join("left-running.json"),
+    )
+    .or_fail()?;
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+    assert_that!(
+        harness.store.status(&started.run_id),
+        err(displays_as(contains_substring("left-running.json")))
+    );
+    Ok(())
+}
+
+/// A record that does not parse is no record: the turn reads as if it left nothing, and reading
 /// the consultation does not fail.
 #[gtest]
-fn an_unreadable_record_is_no_record() -> Result<()> {
+fn a_corrupt_record_is_no_record() -> Result<()> {
     let harness = harness([Script::running(fixtures::CODEX_HAPPY)])?;
     let started = harness.store.start(&request()?)?;
     harness.keep_left_running(&started.run_id, 1, "{not json")?;

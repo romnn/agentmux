@@ -559,7 +559,7 @@ async fn what_a_finished_turn_left_running_is_stopped_and_reported() -> Result<(
         page.text,
         ends_with(
             indoc::formatdoc! {"
-                > **When this turn ended, 1 process below the delegate was still running after its CLI exited**: `codex` (pid {job}).
+                > **When this turn ended, 1 process outside the delegate CLI's process tree was still running after the CLI exited**: `codex` (pid {job}).
                 > agentmux signalled it to stop; it is no longer running.
                 > Work in it may be incomplete.
             "}

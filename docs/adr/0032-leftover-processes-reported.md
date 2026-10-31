@@ -13,11 +13,14 @@ transcript, `status` or `settled.json` says so; an orchestrator waits for output
 come.
 
 Only the delegate can avoid starting such a job, and only agentmux's driver sees what was still
-running when the server had gone. What the driver sees is not all the turn's: codex starts its MCP
-servers as direct children of the server, at any time during the turn (its MCP clients start
-asynchronously, possibly after `turn/start`), and runs each command in a shell that is a direct
-child of the server too, which codex stops itself on shutdown. So a start-time cutoff cannot tell
-the turn's work from codex's own processes, and the parent the process table records can.
+running when the server had gone. What the driver sees is not all the turn's. Codex starts its MCP
+servers below the server, at any time during the turn (its MCP clients start asynchronously,
+possibly after `turn/start`), and stops them by signalling their process group without waiting,
+so one started through a wrapper can outlive codex for a moment. It runs each command in a shell
+below the server too, whose session it stops itself on shutdown. So a start-time cutoff cannot
+tell the turn's work from codex's own processes, and neither can "alive after the server exited".
+What can is where a process sat before the server was asked to leave: the job the issue was about
+had already left codex's process tree, orphaned when the shell that started it exited.
 
 ## Decision
 
@@ -35,12 +38,14 @@ user's own configured value.
 **The app-server driver reports what the turn left running, on Unix.** In `stop_server`
 (`crates/agentmux/src/appserver/driver.rs`):
 
-- Before closing the server's input, it reads its descendants with each one's parent, so the
-  server's direct children are known.
-- The cohort is every process found alive — pid and start time matching, not a zombie — by the
-  sweep's reads after the server has exited, less the server itself and less the processes that
-  were its direct children in that read; a process the sweep meets later, forked meanwhile, joins
-  it too (`appserver::leftovers::Cohort`).
+- Before closing the server's input, it reads its descendants with each one's parent.
+- The cohort (`appserver::leftovers::Cohort`) is every process the driver knew of then — that
+  live tree, and the identities the once-a-second record saw while the turn ran — that was not the
+  server or below it in that tree, and that one of the sweep's reads after the server exited found
+  alive, pid and start time matching and not a zombie. On Linux these are orphans the driver
+  adopted; on macOS, recorded processes the system took when their parent exited. A process first
+  seen once the server's input has closed is swept but never joins: it cannot be told from what
+  codex started while shutting down.
 - Once the sweep ends, nothing left or its deadline passed after `SIGKILL`, the driver waits
   briefly (`REPORT_SETTLE`, part of `STOP_BUDGET`) and looks once more: each member is
   `no_longer_running` or `still_running`. Who stopped one that is gone is not claimed.
@@ -49,17 +54,23 @@ user's own configured value.
   are counted by fate under `omitted`.
 - When the cohort is not empty, the driver writes the record once, atomically, to the turn's
   `left-running.json` (`left_running::LeftRunning`, `version` 1), before it exits, on every path
-  that started the server. It writes nothing for a cancelled turn, nor once the `cancelling` marker
-  exists: `cancel` creates the marker only while the turn has not ended, before it records the
-  cancellation, so a turn whose record exists never gains an `ExitRecord::Cancelled`.
+  that started the server. It writes nothing for a turn it saw cancelled, nor once the
+  `cancelling` marker exists; that spares a record nobody reads, and the fold below is what keeps
+  a record from reaching a cancelled turn's transcript.
 
 **The fold reads it like the recovered reply.** `Turn::left_running` is read only for a turn
-whose outcome is terminal and whose delegate has gone, and never for a turn with an
-`ExitRecord::Cancelled`, even one whose terminal event supplied the outcome: a cancelled turn's
-leftovers are the cancellation's doing. The driver writes the record before it exits and never
+whose outcome is terminal and whose delegate has gone, and never for a turn being cancelled: one
+with an `ExitRecord::Cancelled`, even one whose terminal event supplied the outcome, or with a
+`cancelling` marker. The marker decides it, not only the record, because `cancel` creates the
+marker under the run lock after a fold under that same hold found the turn running, and records
+the cancellation only once the delegate is stopped; a fold in between must already leave the note
+out, or the record's arrival would take back what it published. A turn any fold found over is
+never marked, so a published note stays. The driver writes the record before it exits and never
 again, so every later fold of the turn, committed or not, reads the same file, and `settled.json`
-needs nothing new ([0009](0009-append-only-transcript.md)). A record that cannot be read, does not
-parse or has another version is treated as absent and logged at debug; it never fails a fold.
+needs nothing new ([0009](0009-append-only-transcript.md)). A record that does not parse or has
+another version is treated as absent and logged at debug, which every fold does alike; one that
+is there but cannot be read fails the fold (`RunError::Io`) rather than publishing the turn
+without a note an earlier fold may have published.
 
 **It is said after everything else the turn renders.** The transcript's epilogue, a warning note
 naming the processes, how many still ran and that work in them may be incomplete, renders after
@@ -78,7 +89,9 @@ that event. `RunStatus::left_running` carries every turn's report, serialised fo
 - On macOS the driver cannot adopt orphans, so a process started and orphaned between two of its
   once-a-second records — a backgrounded job whose shell exits at once — is neither stopped nor
   reported.
-- A process whose parent the pre-EOF read records as the server is never reported, whatever it
-  runs; when the server crashes, its children are reported only once the system has moved them to
-  the driver, which a read in the moment of the crash may not yet see.
+- A job still below a live command shell when the turn ends is stopped, by codex or by the sweep,
+  but not reported: it cannot be told from an MCP server's child that codex had signalled and that
+  had not yet gone. So is anything first seen while the server shuts down. When the server crashes,
+  its children are reported only once the system has moved them out of its tree, which a read in
+  the moment of the crash may not yet see.
 - A delegate may still ignore the notice; the report is what tells the caller then.

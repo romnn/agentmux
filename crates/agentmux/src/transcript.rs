@@ -528,8 +528,9 @@ pub struct Turn {
     /// What the turn left running when it ended, once its delegate has gone, when its driver
     /// found anything.
     ///
-    /// Read only for a turn that ended without a cancellation, whose delegate has gone: the
-    /// driver writes its record before it exits, so every later read finds the same one.
+    /// Read only for a turn that ended with no cancellation marked or recorded, whose delegate
+    /// has gone: the driver writes its record before it exits, so every later read finds the
+    /// same one.
     /// It renders after [`Self::recovered`], last of all, because it exists only once the
     /// delegate has gone, which is after everything else the turn renders is final.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -981,8 +982,8 @@ fn render_left_running(rendered_turn: &mut String, left_running: &LeftRunning) {
         "
 
         > [!WARNING]
-        > **When this turn ended, {processes} below the delegate {were} still running after its \
-        CLI exited**{listed}.
+        > **When this turn ended, {processes} outside the delegate CLI's process tree {were} still \
+        running after the CLI exited**{listed}.
         > agentmux signalled {them} to stop; {fates}.
         > Work in {them} may be incomplete.
     ",

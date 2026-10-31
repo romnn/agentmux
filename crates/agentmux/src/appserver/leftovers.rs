@@ -4,13 +4,20 @@
 //! Kept apart from the reads and signals themselves, which need real processes, so the decision
 //! can be tested on its own.
 //!
-//! The server's direct children are codex's own: the MCP servers it starts, at any time during
-//! the turn, and the shells it runs commands in, which it stops itself as it shuts down.
-//! What a delegate leaves behind sits below one of those shells, or was orphaned when the shell
-//! exited.
-//! So the turn's leftovers are what is still alive once the server has exited, less what was a
-//! direct child of the server just before it was asked to leave.
+//! Everything below the server is codex's to stop: its MCP servers, which it may start at any
+//! time during the turn, and the shells it runs commands in, whose sessions it stops as it shuts
+//! down.
+//! Codex signals an MCP server's process group without waiting for it, so a server started
+//! through a wrapper can outlive codex for a moment, and is no leftover of the turn's.
+//! What a delegate leaves behind that nothing stops is a job whose shell exited: an orphan,
+//! already out of codex's process tree.
+//! So the turn's leftovers are the processes the driver knew of before the server's input was
+//! closed — its live descendants then, and what the once-a-second record saw — that were not
+//! below the server then, and that were still alive after the server exited.
 //! A start time cannot draw that line instead: codex may start an MCP server after the turn has.
+//!
+//! A job still below a live command shell when the turn ends is stopped, by codex or by the
+//! sweep, and not reported; nor is a process first seen once the server is shutting down.
 
 use crate::left_running::{LeftProcess, LeftRunning, ProcessFate};
 
@@ -35,37 +42,66 @@ pub(super) struct SeenProcess {
 /// The processes a turn left running, gathered as the sweep meets them.
 #[derive(Debug)]
 pub(super) struct Cohort {
-    server_pid: u32,
-    /// What ran directly below the server just before its input was closed.
-    server_children: Vec<ProcessIdentity>,
+    /// What the driver knew of before the server's input closed that was not below the server
+    /// then: the processes that may join.
+    candidates: Vec<ProcessIdentity>,
     /// What the turn left running, in the order the sweep first met it.
     members: Vec<SeenProcess>,
 }
 
 impl Cohort {
-    /// A cohort for the server `server_pid`, whose direct children are read from `before_eof`,
-    /// the driver's descendants as they stood while the server's input was still open.
-    pub(super) fn new(server_pid: u32, before_eof: &[SeenProcess]) -> Self {
+    /// A cohort for the server `server_pid`, from what the driver knew of before the server's
+    /// input closed: `before_eof`, its live descendants then, with their parents, and
+    /// `recorded`, what the once-a-second record saw while the turn ran.
+    ///
+    /// Everything below the server in `before_eof`, and the server itself, is codex's.
+    pub(super) fn new(
+        server_pid: u32,
+        before_eof: &[SeenProcess],
+        recorded: &[ProcessIdentity],
+    ) -> Self {
+        // The server's subtree, grown from the server down through the recorded parents.
+        let mut below_server: Vec<u32> = vec![server_pid];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for process in before_eof {
+                let pid = process.identity.pid;
+                if !below_server.contains(&pid)
+                    && process
+                        .parent_pid
+                        .is_some_and(|parent| below_server.contains(&parent))
+                {
+                    below_server.push(pid);
+                    grew = true;
+                }
+            }
+        }
+        let mut candidates: Vec<ProcessIdentity> = Vec::new();
+        for identity in before_eof
+            .iter()
+            .map(|process| process.identity)
+            .chain(recorded.iter().copied())
+        {
+            if !below_server.contains(&identity.pid) && !candidates.contains(&identity) {
+                candidates.push(identity);
+            }
+        }
         Self {
-            server_pid,
-            server_children: before_eof
-                .iter()
-                .filter(|process| process.parent_pid == Some(server_pid))
-                .map(|process| process.identity)
-                .collect(),
+            candidates,
             members: Vec::new(),
         }
     }
 
-    /// Take in what one read after the server's exit found alive: every process that is not
-    /// the server and was not one of its direct children joins the cohort.
+    /// Take in what one read after the server's exit found alive: each candidate it met joins
+    /// the cohort.
     ///
-    /// A process forked after an earlier read joins when a later one meets it.
+    /// A process the driver first meets after the server's input closed never joins: it is
+    /// swept, but it cannot be told from what codex started while shutting down.
     pub(super) fn observe(&mut self, alive: &[SeenProcess]) {
         for process in alive {
             let identity = process.identity;
-            let joins = identity.pid != self.server_pid
-                && !self.server_children.contains(&identity)
+            let joins = self.candidates.contains(&identity)
                 && !self
                     .members
                     .iter()
@@ -150,58 +186,53 @@ mod tests {
         }
     }
 
-    /// The server's own children — an MCP server, a shell running a command — are codex's, and
-    /// never reported, though they survived the server; a job backgrounded below that shell, and
-    /// one orphaned to the driver, are the turn's, and so is one forked during the sweep.
+    /// Everything below the server before its input closed is codex's — an MCP server and the
+    /// node it wraps, a shell and the job still running below it — and never reported, though it
+    /// survived the server; an orphan the driver adopted is the turn's, and a process first met
+    /// during the sweep is swept but not reported.
     #[gtest]
-    fn the_cohort_is_what_survives_the_server_less_its_direct_children() {
-        // Before the server's input closed: the server, its MCP server and shell, a job running
-        // below the shell, and an orphan the driver adopted.
+    fn the_cohort_is_what_was_already_outside_the_servers_tree() {
+        // Before the server's input closed: the server, a wrapper and the MCP server it runs, a
+        // shell with a job below it, and an orphan the driver adopted.
         let before_eof = [
             seen(SERVER, DRIVER, "codex"),
-            seen(20, SERVER, "node"),
-            seen(21, SERVER, "bash"),
-            seen(30, 21, "python3"),
+            seen(20, SERVER, "sh"),
+            seen(21, 20, "node"),
+            seen(22, SERVER, "bash"),
+            seen(30, 22, "python3"),
             seen(40, DRIVER, "sleep"),
         ];
-        let mut cohort = Cohort::new(SERVER, &before_eof);
+        let mut cohort = Cohort::new(SERVER, &before_eof, &[]);
 
-        // The first read after the server exited, with the shell's and MCP server's parents now
-        // the driver, then a later read meeting a process forked meanwhile.
+        // The first read after the server exited, with everything that was below it now the
+        // driver's, then a later read meeting a process forked meanwhile.
         cohort.observe(&[
-            seen(20, DRIVER, "node"),
-            seen(21, DRIVER, "bash"),
-            seen(30, 21, "python3"),
+            seen(21, DRIVER, "node"),
+            seen(22, DRIVER, "bash"),
+            seen(30, 22, "python3"),
             seen(40, DRIVER, "sleep"),
         ]);
-        cohort.observe(&[seen(30, 21, "python3"), seen(50, 30, "worker")]);
+        cohort.observe(&[seen(40, DRIVER, "sleep"), seen(50, 40, "worker")]);
         assert_that!(cohort.is_empty(), eq(false));
-        assert_that!(
-            cohort.identities(),
-            elements_are![eq(&identity(30)), eq(&identity(40)), eq(&identity(50))]
-        );
+        assert_that!(cohort.identities(), elements_are![eq(&identity(40))]);
 
-        // The last look after the last signal found only the forked worker alive.
-        let report = cohort.report(&[identity(50), identity(21)]);
+        // The last look after the last signal found the orphan still alive.
+        let report = cohort.report(&[identity(40), identity(21)]);
         assert_that!(
             report,
             some(eq(&LeftRunning {
                 version: crate::left_running::VERSION,
-                processes: vec![
-                    left(50, "worker", ProcessFate::StillRunning),
-                    left(30, "python3", ProcessFate::NoLongerRunning),
-                    left(40, "sleep", ProcessFate::NoLongerRunning),
-                ],
+                processes: vec![left(40, "sleep", ProcessFate::StillRunning)],
                 omitted: OmittedProcesses::default(),
             }))
         );
     }
 
-    /// A process whose pid a direct child of the server held before is a different process, and
-    /// joins the cohort.
+    /// A process whose pid something below the server held before is a different process: the
+    /// pid is codex's, so it is not reported, though it is swept.
     #[gtest]
-    fn a_reused_pid_is_not_the_server_child_it_replaced() {
-        let mut cohort = Cohort::new(SERVER, &[seen(20, SERVER, "node")]);
+    fn a_reused_pid_below_the_server_is_not_reported() {
+        let mut cohort = Cohort::new(SERVER, &[seen(20, SERVER, "node")], &[]);
         let reused = SeenProcess {
             identity: ProcessIdentity {
                 pid: 20,
@@ -211,28 +242,33 @@ mod tests {
             name: "sh".to_owned(),
         };
         cohort.observe(&[reused]);
-        assert_that!(cohort.identities(), len(eq(1)));
+        assert_that!(cohort.is_empty(), eq(true));
     }
 
     /// A turn that left nothing, or only codex's own processes, has no report.
     #[gtest]
     fn nothing_left_is_no_report() {
-        let mut cohort = Cohort::new(SERVER, &[seen(20, SERVER, "node")]);
+        let mut cohort = Cohort::new(SERVER, &[seen(20, SERVER, "node")], &[]);
         cohort.observe(&[seen(SERVER, DRIVER, "codex"), seen(20, DRIVER, "node")]);
         assert_that!(cohort.is_empty(), eq(true));
         assert_that!(cohort.report(&[]), none());
     }
 
-    /// A process with no recorded parent before the server's input closed — one only the
-    /// once-a-second record saw — is not known to be the server's, so it is reported.
+    /// A process only the once-a-second record saw, and no longer below the driver before the
+    /// server's input closed — an orphan the system took, where the driver cannot adopt — is
+    /// reported once a read finds it alive; one the record saw below the server is not.
     #[gtest]
-    fn a_process_of_unknown_parentage_is_reported() {
-        let mut cohort = Cohort::new(SERVER, &[]);
-        cohort.observe(&[SeenProcess {
-            identity: identity(60),
-            parent_pid: None,
-            name: "python3".to_owned(),
-        }]);
+    fn a_recorded_process_reparented_away_is_reported() {
+        let before_eof = [seen(20, SERVER, "bash")];
+        let mut cohort = Cohort::new(SERVER, &before_eof, &[identity(60), identity(20)]);
+        cohort.observe(&[
+            SeenProcess {
+                identity: identity(60),
+                parent_pid: Some(1),
+                name: "python3".to_owned(),
+            },
+            seen(20, 1, "bash"),
+        ]);
         assert_that!(
             cohort.report(&[identity(60)]),
             some(field!(
@@ -245,8 +281,8 @@ mod tests {
     /// Past the cap the report counts what it does not name, by fate.
     #[gtest]
     fn a_large_cohort_is_capped() -> Result<()> {
-        let mut cohort = Cohort::new(SERVER, &[]);
         let alive: Vec<SeenProcess> = (100..170).map(|pid| seen(pid, DRIVER, "sh")).collect();
+        let mut cohort = Cohort::new(SERVER, &alive, &[]);
         cohort.observe(&alive);
         let still: Vec<ProcessIdentity> = (100..110).map(identity).collect();
         let report = cohort.report(&still).or_fail()?;

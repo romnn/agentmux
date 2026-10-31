@@ -935,7 +935,7 @@ fn what_a_turn_left_running_is_a_warning() -> Result<()> {
     assert_that!(
         agentmux_mcp::render::warnings(&status),
         contains_substring(indoc::indoc! {"
-            warning:    turn 2 left 2 processes running after the delegate's CLI exited; agentmux signalled them to stop, and 1 is no longer running and 1 still is — work in them may be incomplete.
+            warning:    turn 2 left 2 processes running outside the delegate CLI's process tree after the CLI exited; agentmux signalled them to stop, and 1 is no longer running and 1 still is — work in them may be incomplete.
                         The transcript names them at the end of that turn: do not rely on work the
                         delegate left running there having finished.
         "})

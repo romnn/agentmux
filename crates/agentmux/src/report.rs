@@ -133,16 +133,16 @@ impl RunStatus {
     }
 }
 
-/// What a turn left running, in one line, such as `turn 2 left 3 processes running after the
-/// delegate's CLI exited; agentmux signalled them to stop, and 1 is still running — work in them
-/// may be incomplete`.
+/// What a turn left running, in one line, such as `turn 2 left 3 processes running outside the
+/// delegate CLI's process tree after the CLI exited; agentmux signalled them to stop, and 2 are no
+/// longer running and 1 still is — work in them may be incomplete`.
 #[must_use]
 pub fn left_running_line(left_running: &TurnLeftRunning) -> String {
     let TurnLeftRunning { turn, report } = left_running;
     let them = report.pronoun();
     format!(
-        "turn {turn} left {} running after the delegate's CLI exited; agentmux signalled {them} \
-         to stop, and {} — work in {them} may be incomplete",
+        "turn {turn} left {} running outside the delegate CLI's process tree after the CLI \
+         exited; agentmux signalled {them} to stop, and {} — work in {them} may be incomplete",
         report.processes_phrase(),
         report.fates(),
     )
