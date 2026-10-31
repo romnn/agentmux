@@ -15,7 +15,7 @@ use std::path::Path;
 
 use chrono::Utc;
 
-use crate::accounting::{Spend, Tokens};
+use crate::accounting::{Spend, Tokens, Totals};
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
 use crate::run::{AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, describe_delegate};
@@ -271,27 +271,35 @@ const MAX_SPEND_LINES: usize = 10;
 #[must_use]
 pub fn usage_line(status: &RunStatus) -> String {
     let spend = &status.spend;
-    let tokens = tokens_text(&status.usage);
+    // Each total says for itself whether it is all that was spent: a price that could not be
+    // attributed says nothing about the tokens beside it.
+    let tokens = tokens_text(&status.usage)
+        .map(|tokens| format!("{}{tokens}", at_least(spend.tokens_incomplete)));
     // Labelled because the figure is token counts priced at list: on a subscription account
     // nothing of the sort is charged, and a bare dollar amount reads as money that was billed.
-    let price = match status.cost_usd {
-        Some(cost) => Some(format!("${cost:.4} list price")),
-        None if !spend.unpriced_turns.is_empty() => Some("price unknown".to_owned()),
-        None => None,
-    };
-    let at_least = at_least(spend.incomplete);
+    let price = price_text(status.cost_usd, spend.price_incomplete, |cost| {
+        format!("${cost:.4} list price")
+    });
     match (tokens, price) {
         (None, None) if status.is_terminal() => "nothing reported".to_owned(),
         (None, None) => "nothing reported yet".to_owned(),
-        (Some(tokens), Some(price)) => {
-            format!("run total, all turns: {at_least}{tokens} · {price}")
-        }
-        (Some(tokens), None) => {
-            format!("run total, all turns: {at_least}{tokens} · no price reported")
-        }
-        (None, Some(price)) => {
-            format!("run total, all turns: no tokens reported · {at_least}{price}")
-        }
+        (Some(tokens), Some(price)) => format!("run total, all turns: {tokens} · {price}"),
+        (Some(tokens), None) => format!("run total, all turns: {tokens} · no price reported"),
+        (None, Some(price)) => format!("run total, all turns: no tokens reported · {price}"),
+    }
+}
+
+/// A price total as `priced` writes it, qualified when it is not all that was spent, or
+/// `price unknown` when a price was reported and none could be counted.
+fn price_text(
+    cost_usd: Option<f64>,
+    incomplete: bool,
+    priced: impl Fn(f64) -> String,
+) -> Option<String> {
+    match cost_usd {
+        Some(cost) => Some(format!("{}{}", at_least(incomplete), priced(cost))),
+        None if incomplete => Some("price unknown".to_owned()),
+        None => None,
     }
 }
 
@@ -444,10 +452,19 @@ fn parenthesised(parts: impl IntoIterator<Item = Option<String>>) -> String {
     }
 }
 
-/// A consultation's run total in the few characters a `list` line has room for, such as
+/// A consultation's run totals in the few characters a `list` line has room for, such as
 /// `12.3M in / 45k out · $0.12`, or `-` when nothing was reported.
+///
+/// Qualified as [`usage_line`] qualifies them: `at least` before a total that is not all that was
+/// spent, and `price unknown` for a price that could not be counted.
 #[must_use]
-pub fn usage_column(usage: &Tokens, cost_usd: Option<f64>) -> String {
+pub fn usage_column(totals: &Totals) -> String {
+    let Totals {
+        usage,
+        cost_usd,
+        tokens_incomplete,
+        price_incomplete,
+    } = totals;
     let mut parts = Vec::new();
     let tokens: Vec<String> = [
         usage
@@ -461,11 +478,15 @@ pub fn usage_column(usage: &Tokens, cost_usd: Option<f64>) -> String {
     .flatten()
     .collect();
     if !tokens.is_empty() {
-        parts.push(tokens.join(" / "));
+        parts.push(format!(
+            "{}{}",
+            at_least(*tokens_incomplete),
+            tokens.join(" / ")
+        ));
     }
-    if let Some(cost) = cost_usd {
-        parts.push(format!("${cost:.2}"));
-    }
+    parts.extend(price_text(*cost_usd, *price_incomplete, |cost| {
+        format!("${cost:.2}")
+    }));
     if parts.is_empty() {
         "-".to_owned()
     } else {

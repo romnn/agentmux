@@ -756,6 +756,75 @@ fn usage_is_broken_down_by_turn() -> Result<()> {
     Ok(())
 }
 
+/// A price that could not be counted qualifies the price alone, never the tokens beside it.
+///
+/// A Claude upgraded across 2.1.277 mid-consultation reports a running price total that
+/// includes the turns it already priced one by one, so that one total is left out, while every
+/// turn's tokens are exact.
+#[gtest]
+fn an_uncounted_price_qualifies_the_price_alone() -> Result<()> {
+    let claude_turn = |release: &str, cost: f64| {
+        Script::completed(indoc::formatdoc! {r#"
+            {{"type":"system","subtype":"init","session_id":"850f440b-be0f-411e-aaf3-bc8fdcc6b6b8","claude_code_version":"{release}"}}
+            {{"type":"assistant","message":{{"model":"claude-opus-5","id":"m","type":"message","role":"assistant","content":[{{"type":"text","text":"done"}}]}},"parent_tool_use_id":null,"session_id":"850f440b-be0f-411e-aaf3-bc8fdcc6b6b8"}}
+            {{"type":"result","subtype":"success","is_error":false,"session_id":"850f440b-be0f-411e-aaf3-bc8fdcc6b6b8","usage":{{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}},"total_cost_usd":{cost}}}
+        "#})
+    };
+    let dir = tempfile::tempdir().or_fail()?;
+    let store = RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([
+            claude_turn("2.1.261", 0.10),
+            claude_turn("2.1.277", 0.30),
+            claude_turn("2.1.277", 0.45),
+        ])),
+        BTreeMap::new(),
+    )
+    .or_fail()?;
+    let started = store
+        .start(&StartRequest {
+            delegate: Delegate::Claude {
+                permissions: ClaudePermissions::default(),
+                model: ModelId::parse("claude-opus-5").or_fail()?,
+                effort: Some(Effort::parse("high").or_fail()?),
+                account: AccountChoice::Default,
+                isolation: None,
+            },
+            question: "Review the diff for correctness bugs.".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })
+        .or_fail()?;
+    for question in ["again", "once more"] {
+        store.follow_up(&started.run_id, question).or_fail()?;
+    }
+    let status = store.status(&started.run_id).or_fail()?;
+
+    // Turn 2's total is left out and only taken apart against by turn 3, so the price is at
+    // least turn 1's and turn 3's, and the tokens stay exact.
+    assert_that!(
+        agentmux_mcp::render::status(&status),
+        contains_substring(indoc::indoc! {"
+            usage:      run total, all turns: 300 in / 3 out · at least $0.2500 list price
+                        turn 1: 100 in / 1 out · $0.1000
+                        turn 2: 100 in / 1 out · price unknown
+                        turn 3: 100 in / 1 out · $0.1500
+        "})
+    );
+    let listed = store
+        .list(10, &agentmux::run::ListFilter::default())
+        .or_fail()?;
+    assert_that!(
+        agentmux_mcp::render::list(&listed, false),
+        contains_substring("  300 in / 3 out · at least $0.25\n")
+    );
+    Ok(())
+}
+
 /// A failure the stream leaves unexplained quotes the delegate CLI's stderr.
 ///
 /// The resume refusal the claude CLI emits carries nothing but `is_error`; the reason is on

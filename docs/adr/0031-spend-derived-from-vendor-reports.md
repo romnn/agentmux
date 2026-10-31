@@ -34,15 +34,20 @@ is the one place that derives what each turn spent from them.**
   counted. Figures are normalised into `Tokens`, whose input counts every prompt token with the
   cached ones as a part of it, and whose output counts reasoning as a part of it.
 - `Accounting::of` reads the turns in order, tokens and price as independent measures with their
-  own baselines. A report of nothing at all is no report and moves nothing. A turn that broke
+  own baselines, kept count by count so a count one report leaves out is taken apart against its
+last known value when it returns. A report of nothing at all is no report and moves nothing. A turn that broke
   continuity starts a new session and clears every baseline. A running total is taken apart
   against the baseline; one that fell below it is a restarted counter, counted as the new figure
   and marked incomplete. A running total covers every turn since that measure's previous report, so
   spends are spans of turns. A running price after per-turn prices in the same session is not
   counted, only adopted as the baseline. Turns no report covers are listed as unreported.
-- `status` reports the run total across all turns under `usage` and `cost_usd`, and the spans,
-  unpriced and unreported turns under `spend`; `list` carries the run totals too, computed by the
-  same derivation over a full fold of each listed consultation.
+- Tokens and price are each marked incomplete on their own, so a price that could not be counted
+  never qualifies the tokens. `status` reports the run total across all turns under `usage` and
+  `cost_usd`, and the spans, unpriced and unreported turns and both marks under `spend`; `list`
+  carries the totals and both marks (`Totals`), computed by the same derivation over a full fold
+  of each listed consultation, and both say "at least" or "price unknown" the same way.
+- A settled turn's capture is read only up to the length its record froze, so a fold of every turn
+  never reads what was appended after a freeze.
 
 ## Consequences
 

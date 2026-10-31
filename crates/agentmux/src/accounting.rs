@@ -38,6 +38,8 @@
 //!   Either way the total becomes the baseline, and what it counted covers every turn since the
 //!   measure's previous report, so a turn that reported nothing is covered by the next one that
 //!   does.
+//!   A count a report leaves out keeps its last known baseline until a restart or a new session,
+//!   so the report that brings it back is taken apart against that.
 //! - A running total that follows figures for single turns in the same session, as a Claude
 //!   upgraded across 2.1.277 mid-consultation reports, would count those turns again, so it is
 //!   not counted; it only becomes the baseline.
@@ -167,6 +169,11 @@ trait Measure: Copy {
     fn fell_below(&self, baseline: &Self) -> bool;
     /// What this running total added to `baseline`.
     fn since(&self, baseline: &Self) -> Self;
+    /// This running total as the next baseline, keeping from `baseline` what it does not report.
+    ///
+    /// A count one report leaves out has not stopped running, so the next report of it is taken
+    /// apart against the last value known, and covers the reports that left it out.
+    fn kept_over(&self, baseline: &Self) -> Self;
 }
 
 impl Measure for Tokens {
@@ -185,6 +192,10 @@ impl Measure for Tokens {
             count.map(|count| count.saturating_sub(base.unwrap_or(0)))
         })
     }
+
+    fn kept_over(&self, baseline: &Self) -> Self {
+        self.zip_with(*baseline, Option::or)
+    }
 }
 
 /// A price in US dollars.
@@ -199,6 +210,10 @@ impl Measure for f64 {
 
     fn since(&self, baseline: &Self) -> Self {
         self - baseline
+    }
+
+    fn kept_over(&self, _baseline: &Self) -> Self {
+        *self
     }
 }
 
@@ -303,29 +318,37 @@ impl<T: Measure> Ledger<T> {
                 })
             }
             Scope::Session => {
-                let baseline = self.baseline.replace(amount);
                 let unaccounted = std::mem::replace(&mut self.unaccounted, false);
-                match baseline {
-                    // Restarted inside the session
-                    Some(baseline) if amount.fell_below(&baseline) => Some(Spend {
-                        first_turn,
-                        last_turn: turn,
-                        amount,
-                        incomplete: true,
-                    }),
-                    Some(baseline) => Some(Spend {
-                        first_turn,
-                        last_turn: turn,
-                        amount: amount.since(&baseline),
-                        incomplete: false,
-                    }),
-                    None if unaccounted => None,
-                    None => Some(Spend {
-                        first_turn,
-                        last_turn: turn,
-                        amount,
-                        incomplete: false,
-                    }),
+                match self.baseline {
+                    // Restarted inside the session, so no earlier value is a baseline any more,
+                    // not even of a count this report leaves out.
+                    Some(baseline) if amount.fell_below(&baseline) => {
+                        self.baseline = Some(amount);
+                        Some(Spend {
+                            first_turn,
+                            last_turn: turn,
+                            amount,
+                            incomplete: true,
+                        })
+                    }
+                    Some(baseline) => {
+                        self.baseline = Some(amount.kept_over(&baseline));
+                        Some(Spend {
+                            first_turn,
+                            last_turn: turn,
+                            amount: amount.since(&baseline),
+                            incomplete: false,
+                        })
+                    }
+                    None => {
+                        self.baseline = Some(amount);
+                        (!unaccounted).then_some(Spend {
+                            first_turn,
+                            last_turn: turn,
+                            amount,
+                            incomplete: false,
+                        })
+                    }
                 }
             }
         };
@@ -348,8 +371,27 @@ pub struct Accounting {
     pub unpriced_turns: Vec<u32>,
     /// The turns no report covers, such as one still running.
     pub unreported_turns: Vec<u32>,
-    /// Whether the totals are less than was spent, because a report could not be counted whole.
-    pub incomplete: bool,
+    /// Whether the token total is less than was spent, because a report could not be counted
+    /// whole.
+    pub tokens_incomplete: bool,
+    /// Whether the price total is less than was spent, because a report could not be counted
+    /// whole or a turn's price could not be attributed.
+    pub price_incomplete: bool,
+}
+
+/// What a consultation spent across all its turns, and whether that is all it spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Totals {
+    /// The run total across all turns, in tokens.
+    pub usage: Tokens,
+    /// The run total across all turns, in US dollars at list price, or `None` when no price was
+    /// counted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// As [`Accounting::tokens_incomplete`] says.
+    pub tokens_incomplete: bool,
+    /// As [`Accounting::price_incomplete`] says.
+    pub price_incomplete: bool,
 }
 
 impl Accounting {
@@ -359,7 +401,7 @@ impl Accounting {
         let mut tokens = Ledger::<Tokens>::new();
         let mut prices = Ledger::<f64>::new();
         let mut unpriced_turns = Vec::new();
-        let mut incomplete = false;
+        let mut tokens_incomplete = false;
         // Turns with a report that could not be attributed, which are reported all the same.
         let mut unattributed = BTreeSet::new();
 
@@ -385,7 +427,7 @@ impl Accounting {
                 && !tokens.record(number, reported_tokens, token_scope(vendor))
             {
                 unattributed.insert(number);
-                incomplete = true;
+                tokens_incomplete = true;
             }
 
             if let Some(price) = cost_usd.filter(|price| !price.is_nothing()) {
@@ -397,7 +439,6 @@ impl Accounting {
                 };
                 if !attributed {
                     unpriced_turns.push(number);
-                    incomplete = true;
                 }
             }
         }
@@ -412,15 +453,28 @@ impl Accounting {
             .map(|turn| turn.index.saturating_add(1))
             .filter(|number| !covered.contains(number))
             .collect();
-        incomplete |= tokens.spends.iter().any(|spend| spend.incomplete)
-            || prices.spends.iter().any(|spend| spend.incomplete);
+        tokens_incomplete |= tokens.spends.iter().any(|spend| spend.incomplete);
+        let price_incomplete =
+            !unpriced_turns.is_empty() || prices.spends.iter().any(|spend| spend.incomplete);
 
         Self {
             tokens: tokens.spends,
             prices: prices.spends,
             unpriced_turns,
             unreported_turns,
-            incomplete,
+            tokens_incomplete,
+            price_incomplete,
+        }
+    }
+
+    /// The run totals across all turns, and whether each is all that was spent.
+    #[must_use]
+    pub fn totals(&self) -> Totals {
+        Totals {
+            usage: self.total(),
+            cost_usd: self.total_cost_usd(),
+            tokens_incomplete: self.tokens_incomplete,
+            price_incomplete: self.price_incomplete,
         }
     }
 
@@ -544,7 +598,7 @@ mod tests {
         assert_that!(accounting.total().input_tokens, some(eq(160)));
         assert_that!(accounting.total_cost_usd(), none());
         assert_that!(accounting.unreported_turns, is_empty());
-        assert_that!(accounting.incomplete, eq(false));
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// A failed turn that reported nothing is covered by the next running total, as one span.
@@ -587,7 +641,7 @@ mod tests {
             elements_are![eq(&(1, 1, Some(100))), eq(&(2, 3, Some(100)))]
         );
         assert_that!(accounting.total().input_tokens, some(eq(200)));
-        assert_that!(accounting.incomplete, eq(false));
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// A turn that opened a new session counts from zero again, even when it reports nothing
@@ -619,7 +673,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             elements_are![eq(&(1, 1, Some(100))), eq(&(2, 3, Some(40)))]
         );
-        assert_that!(accounting.incomplete, eq(false));
+        assert_that!(accounting.tokens_incomplete, eq(false));
+    }
+
+    /// A count one running total leaves out keeps its baseline, so its next report is taken
+    /// apart against the last value known rather than counted whole.
+    #[gtest]
+    fn a_count_left_out_of_one_report_keeps_its_baseline() {
+        let report = |input: u64, cached: Option<u64>, output: u64| {
+            Some(SpendReport {
+                usage: Usage {
+                    input_tokens: Some(input),
+                    cached_input_tokens: cached,
+                    cache_write_input_tokens: None,
+                    output_tokens: Some(output),
+                    reasoning_output_tokens: None,
+                },
+                cost_usd: None,
+                cli_version: None,
+            })
+        };
+        let accounting = Accounting::of(
+            Vendor::Codex,
+            &turns([
+                report(100, Some(90), 10),
+                report(150, None, 15),
+                report(200, Some(180), 20),
+            ]),
+        );
+
+        // The cached count's 180 covers turns 2 and 3 against turn 1's 90, so it stays a part of
+        // the input.
+        assert_that!(
+            accounting.total(),
+            eq(Tokens {
+                input_tokens: Some(200),
+                cached_input_tokens: Some(180),
+                cache_write_input_tokens: None,
+                output_tokens: Some(20),
+                reasoning_output_tokens: None,
+            })
+        );
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// A running total that falls inside one session means the counter restarted, and what came
@@ -643,7 +738,8 @@ mod tests {
             }))
         );
         assert_that!(accounting.total().input_tokens, some(eq(130)));
-        assert_that!(accounting.incomplete, eq(true));
+        assert_that!(accounting.tokens_incomplete, eq(true));
+        assert_that!(accounting.price_incomplete, eq(false));
     }
 
     /// Claude's tokens are per call while a current release's price is the session's running
@@ -672,7 +768,8 @@ mod tests {
             elements_are![approx_eq(0.10), approx_eq(0.15)]
         );
         assert_that!(accounting.total_cost_usd(), some(approx_eq(0.25)));
-        assert_that!(accounting.incomplete, eq(false));
+        assert_that!(accounting.tokens_incomplete, eq(false));
+        assert_that!(accounting.price_incomplete, eq(false));
     }
 
     /// An older release's price covers the one call, so it adds up turn by turn.
@@ -707,7 +804,8 @@ mod tests {
         assert_that!(accounting.unpriced_turns, elements_are![eq(&1), eq(&2)]);
         assert_that!(accounting.total().input_tokens, some(eq(150)));
         assert_that!(accounting.unreported_turns, is_empty());
-        assert_that!(accounting.incomplete, eq(true));
+        assert_that!(accounting.price_incomplete, eq(true));
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// A Claude upgraded across 2.1.277 mid-consultation reports a running total that includes
@@ -734,7 +832,8 @@ mod tests {
         );
         assert_that!(accounting.total_cost_usd(), some(approx_eq(0.25)));
         assert_that!(accounting.unpriced_turns, elements_are![eq(&2)]);
-        assert_that!(accounting.incomplete, eq(true));
+        assert_that!(accounting.price_incomplete, eq(true));
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// Tokens and price keep their own spans: a turn that reported tokens but no price leaves

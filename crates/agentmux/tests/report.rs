@@ -1,6 +1,6 @@
 //! What both front ends say about a consultation, phrased once in `agentmux::report`.
 
-use agentmux::accounting::Tokens;
+use agentmux::accounting::{Tokens, Totals};
 use agentmux::report::{usage_column, usage_window_line};
 use agentmux::transcript::UsageWindow;
 use chrono::Utc;
@@ -61,17 +61,63 @@ fn a_listed_total_is_compact() {
         output_tokens: Some(45_000),
         ..Tokens::default()
     };
-    assert_that!(usage_column(&usage, None), eq("12.3M in / 45k out"));
     assert_that!(
-        usage_column(
-            &Tokens {
+        usage_column(&Totals {
+            usage,
+            ..Totals::default()
+        }),
+        eq("12.3M in / 45k out")
+    );
+    assert_that!(
+        usage_column(&Totals {
+            usage: Tokens {
                 input_tokens: Some(999),
                 output_tokens: Some(1_999),
                 ..Tokens::default()
             },
-            Some(0.1234)
-        ),
+            cost_usd: Some(0.1234),
+            ..Totals::default()
+        }),
         eq("999 in / 1.9k out · $0.12")
     );
-    assert_that!(usage_column(&Tokens::default(), None), eq("-"));
+    assert_that!(usage_column(&Totals::default()), eq("-"));
+}
+
+/// A listed total that is not all that was spent says so as `status` does, each total for
+/// itself: a counter restart qualifies the tokens alone, and a price that could not be counted
+/// reads as unknown rather than as none.
+#[gtest]
+fn a_listed_total_says_what_it_leaves_out() {
+    let usage = Tokens {
+        input_tokens: Some(130),
+        output_tokens: Some(13),
+        ..Tokens::default()
+    };
+    assert_that!(
+        usage_column(&Totals {
+            usage,
+            cost_usd: Some(0.25),
+            tokens_incomplete: true,
+            price_incomplete: false,
+        }),
+        eq("at least 130 in / 13 out · $0.25")
+    );
+    assert_that!(
+        usage_column(&Totals {
+            usage,
+            cost_usd: Some(0.25),
+            tokens_incomplete: false,
+            price_incomplete: true,
+        }),
+        eq("130 in / 13 out · at least $0.25")
+    );
+    assert_that!(
+        usage_column(&Totals {
+            usage,
+            cost_usd: None,
+            tokens_incomplete: false,
+            price_incomplete: true,
+        }),
+        eq("130 in / 13 out · price unknown")
+    );
 }

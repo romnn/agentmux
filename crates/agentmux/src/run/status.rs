@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::accounting::{Accounting, Tokens};
+use crate::accounting::{Accounting, Tokens, Totals};
 use crate::delegate::{Billing, Delegate, Effort, Isolation, ModelId, Vendor};
 use crate::transcript::{EarlierFailure, Outcome, TurnState, UnrecognisedEvents, UsageWindow};
 
@@ -272,12 +272,10 @@ pub struct RunSummary {
     /// kept it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
-    /// The run total across all turns, in tokens, as [`RunStatus::usage`] counts it.
-    pub usage: Tokens,
-    /// The run total across all turns, in US dollars at list price, as [`RunStatus::cost_usd`]
-    /// counts it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
+    /// The run totals across all turns, as [`RunStatus::usage`] and [`RunStatus::cost_usd`]
+    /// count them, and whether each is all that was spent.
+    #[serde(flatten)]
+    pub totals: Totals,
 }
 
 /// Which consultations `list` shows.

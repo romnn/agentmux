@@ -92,9 +92,11 @@ pub fn header(status: &RunStatus, caller: Caller, page: Option<&TranscriptPage>)
         turns = status.turns,
         messages = status.message_count,
     });
-    let _ = write!(out, "\nusage:      {}", report::usage_line(status));
+    out.push('\n');
+    let _ = write!(out, "usage:      {}", report::usage_line(status));
     for line in report::spend_lines(status) {
-        let _ = write!(out, "\n            {line}");
+        out.push('\n');
+        let _ = write!(out, "            {line}");
     }
     if status.steerable {
         let _ = write!(
@@ -708,7 +710,7 @@ pub fn list(runs: &[RunSummary], filtered: bool) -> String {
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
-            usage = report::usage_column(&run.usage, run.cost_usd),
+            usage = report::usage_column(&run.totals),
         );
         if let Some(label) = &run.label {
             let _ = writeln!(out, "    label: {label}");

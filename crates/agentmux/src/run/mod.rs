@@ -678,8 +678,7 @@ impl RunStore {
             created_at: meta.created_at,
             question,
             billing,
-            usage: spend.total(),
-            cost_usd: spend.total_cost_usd(),
+            totals: spend.totals(),
         })
     }
 

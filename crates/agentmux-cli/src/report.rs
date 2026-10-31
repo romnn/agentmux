@@ -500,7 +500,7 @@ pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
             state = run.outcome.state(),
             turns = run.turns,
             created_at = run.created_at.to_rfc3339(),
-            usage = report::usage_column(&run.usage, run.cost_usd),
+            usage = report::usage_column(&run.totals),
         );
         if let Some(label) = &run.label {
             println!("    label: {label}");

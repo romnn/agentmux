@@ -538,7 +538,7 @@ fn a_codex_running_total_is_counted_once() -> Result<()> {
         elements_are![some(eq(&14_003)), some(eq(&4_997))]
     );
     assert_that!(status.cost_usd, none());
-    assert_that!(status.spend.incomplete, eq(false));
+    assert_that!(status.spend.tokens_incomplete, eq(false));
     // The footers still quote what the vendor reported, as they were published.
     let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
     assert_that!(
@@ -557,7 +557,7 @@ fn a_codex_running_total_is_counted_once() -> Result<()> {
 
     let listed = harness.store.list(10, &ListFilter::default())?;
     assert_that!(
-        listed.first().map(|summary| summary.usage),
+        listed.first().map(|summary| summary.totals.usage),
         some(eq(status.usage))
     );
     Ok(())

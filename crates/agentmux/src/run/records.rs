@@ -566,10 +566,20 @@ pub(super) fn read_complete_records(
     path: &Path,
     limit: Option<u64>,
 ) -> Result<(String, u64), RunError> {
-    let mut bytes = read_if_present(path, std::fs::read)?.unwrap_or_default();
-    if let Some(limit) = limit {
-        bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    }
+    // Read only as far as the limit, rather than reading the whole file and cutting it: a
+    // settled turn's capture can have gained any amount since it was frozen, and every fold of
+    // the consultation reads it again.
+    let read = |path: &Path| -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        match limit {
+            Some(limit) => file.take(limit).read_to_end(&mut bytes)?,
+            None => (&file).read_to_end(&mut bytes)?,
+        };
+        Ok(bytes)
+    };
+    let mut bytes = read_if_present(path, read)?.unwrap_or_default();
     let end = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -628,5 +638,42 @@ pub(super) fn read_if_present<'path, T>(
             context: format!("reading {}", path.display()),
             source,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::read_complete_records;
+
+    /// A frozen length bounds what is read, so what was appended after it, however much, is
+    /// neither returned nor able to move where the records end.
+    #[gtest]
+    fn a_limit_reads_only_the_frozen_prefix() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, "one\ntwo\nthree\n").or_fail()?;
+
+        // Cut mid-record: only the records wholly inside the limit are read.
+        assert_that!(
+            read_complete_records(&path, Some(6)).or_fail()?,
+            eq(&("one\n".to_owned(), 4))
+        );
+        // A limit past the end reads what is there, and none reads everything.
+        assert_that!(
+            read_complete_records(&path, Some(1_000)).or_fail()?,
+            eq(&("one\ntwo\nthree\n".to_owned(), 14))
+        );
+        assert_that!(
+            read_complete_records(&path, None).or_fail()?,
+            eq(&("one\ntwo\nthree\n".to_owned(), 14))
+        );
+        // A file that is not there is an empty capture.
+        assert_that!(
+            read_complete_records(&dir.path().join("absent"), Some(4)).or_fail()?,
+            eq(&(String::new(), 0))
+        );
+        Ok(())
     }
 }
