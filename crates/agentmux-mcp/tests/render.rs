@@ -742,9 +742,10 @@ fn usage_is_broken_down_by_turn() -> Result<()> {
             usage:      run total, all turns: 250 in / 30 out · no price reported
                         turn 1: 100 in / 10 out
                         turns 2–3: 150 in / 20 out
-                        turn 4: nothing reported yet
         "})
     );
+    // Turn 4 is still running, so it has not reported yet rather than reported nothing.
+    assert_that!(rendered, not(contains_substring("turn 4")));
     // The CLI's `list` and the MCP server's carry the same compact total.
     let listed = store
         .list(10, &agentmux::run::ListFilter::default())

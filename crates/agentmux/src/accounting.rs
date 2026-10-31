@@ -38,8 +38,11 @@
 //!   Either way the total becomes the baseline, and what it counted covers every turn since the
 //!   measure's previous report, so a turn that reported nothing is covered by the next one that
 //!   does.
-//!   A count a report leaves out keeps its last known baseline until a restart or a new session,
-//!   so the report that brings it back is taken apart against that.
+//!   A running total that leaves out a count the baseline knows is skipped, as a report of
+//!   nothing is, so the next one covers its turn; a count only the total knows contributes
+//!   nothing until the baseline has it.
+//!   Either way, nothing is counted twice and every count of a contribution covers the same
+//!   turns.
 //! - A running total that follows figures for single turns in the same session, as a Claude
 //!   upgraded across 2.1.277 mid-consultation reports, would count those turns again, so it is
 //!   not counted; it only becomes the baseline.
@@ -165,20 +168,29 @@ impl Tokens {
 trait Measure: Copy {
     /// Whether a report of this amount says nothing was measured.
     fn is_nothing(&self) -> bool;
-    /// Whether this running total is lower than `baseline`, which only a restarted counter is.
+    /// Whether this running total can be taken apart against `baseline`: it knows every count
+    /// the baseline knows.
+    fn comparable_with(&self, baseline: &Self) -> bool;
+    /// Whether this running total is lower than `baseline` in a count both know, which only a
+    /// restarted counter is.
     fn fell_below(&self, baseline: &Self) -> bool;
-    /// What this running total added to `baseline`.
-    fn since(&self, baseline: &Self) -> Self;
-    /// This running total as the next baseline, keeping from `baseline` what it does not report.
+    /// What this running total added to `baseline`, in the counts both know.
     ///
-    /// A count one report leaves out has not stopped running, so the next report of it is taken
-    /// apart against the last value known, and covers the reports that left it out.
-    fn kept_over(&self, baseline: &Self) -> Self;
+    /// A count only this total knows contributes nothing: it has no baseline to be taken apart
+    /// against, so what it says covers spend from before the turns this delta covers.
+    fn since(&self, baseline: &Self) -> Self;
 }
 
 impl Measure for Tokens {
     fn is_nothing(&self) -> bool {
         self.counts().iter().all(|count| count.unwrap_or(0) == 0)
+    }
+
+    fn comparable_with(&self, baseline: &Self) -> bool {
+        self.counts()
+            .iter()
+            .zip(baseline.counts())
+            .all(|(count, base)| count.is_some() || base.is_none())
     }
 
     fn fell_below(&self, baseline: &Self) -> bool {
@@ -189,12 +201,10 @@ impl Measure for Tokens {
 
     fn since(&self, baseline: &Self) -> Self {
         self.zip_with(*baseline, |count, base| {
-            count.map(|count| count.saturating_sub(base.unwrap_or(0)))
+            count
+                .zip(base)
+                .map(|(count, base)| count.saturating_sub(base))
         })
-    }
-
-    fn kept_over(&self, baseline: &Self) -> Self {
-        self.zip_with(*baseline, Option::or)
     }
 }
 
@@ -204,16 +214,16 @@ impl Measure for f64 {
         !self.is_finite() || *self <= 0.0
     }
 
+    fn comparable_with(&self, _baseline: &Self) -> bool {
+        true
+    }
+
     fn fell_below(&self, baseline: &Self) -> bool {
         self < baseline
     }
 
     fn since(&self, baseline: &Self) -> Self {
         self - baseline
-    }
-
-    fn kept_over(&self, _baseline: &Self) -> Self {
-        *self
     }
 }
 
@@ -303,7 +313,21 @@ impl<T: Measure> Ledger<T> {
     }
 
     /// Count what the report at `turn` says, or return `false` when it cannot be attributed.
+    ///
+    /// A running total that leaves out a count the baseline knows is skipped instead, as a
+    /// report of nothing is: it neither counts nor moves the baseline, and the next total that
+    /// can be taken apart covers its turn.
+    /// Carrying the missing count's old value over would let a later report of it, taken apart
+    /// against that, cover turns the rest of its figures did not; skipping it never counts more
+    /// than was spent, and keeps every count of a contribution covering the same turns.
     fn record(&mut self, turn: u32, amount: T, scope: Scope) -> bool {
+        if scope == Scope::Session
+            && self
+                .baseline
+                .is_some_and(|baseline| !amount.comparable_with(&baseline))
+        {
+            return true;
+        }
         let first_turn = std::mem::replace(&mut self.next_turn, turn.saturating_add(1));
         let spend = match scope {
             Scope::Turn => {
@@ -320,8 +344,7 @@ impl<T: Measure> Ledger<T> {
             Scope::Session => {
                 let unaccounted = std::mem::replace(&mut self.unaccounted, false);
                 match self.baseline {
-                    // Restarted inside the session, so no earlier value is a baseline any more,
-                    // not even of a count this report leaves out.
+                    // Restarted inside the session
                     Some(baseline) if amount.fell_below(&baseline) => {
                         self.baseline = Some(amount);
                         Some(Spend {
@@ -332,7 +355,8 @@ impl<T: Measure> Ledger<T> {
                         })
                     }
                     Some(baseline) => {
-                        self.baseline = Some(amount.kept_over(&baseline));
+                        // It knows every count the baseline knows, and maybe more.
+                        self.baseline = Some(amount);
                         Some(Spend {
                             first_turn,
                             last_turn: turn,
@@ -369,7 +393,10 @@ pub struct Accounting {
     pub prices: Vec<Spend<f64>>,
     /// The turns whose reported price could not be attributed to them, and so is not counted.
     pub unpriced_turns: Vec<u32>,
-    /// The turns no report covers, such as one still running.
+    /// The finished turns no report covers, such as a Codex turn that failed after the last
+    /// total its session reported.
+    ///
+    /// A turn still running is not one: it has not reported yet.
     pub unreported_turns: Vec<u32>,
     /// Whether the token total is less than was spent, because a report could not be counted
     /// whole.
@@ -392,6 +419,11 @@ pub struct Totals {
     pub tokens_incomplete: bool,
     /// As [`Accounting::price_incomplete`] says.
     pub price_incomplete: bool,
+    /// How many turns no report covers, as [`Accounting::unreported_turns`] lists them.
+    ///
+    /// Apart from the two marks above, which say a report was not counted whole: a turn that
+    /// reported nothing may have spent anything, and the totals cannot say.
+    pub unreported_turn_count: u32,
 }
 
 impl Accounting {
@@ -450,6 +482,7 @@ impl Accounting {
             .collect();
         let unreported_turns = turns
             .iter()
+            .filter(|turn| turn.outcome.is_terminal())
             .map(|turn| turn.index.saturating_add(1))
             .filter(|number| !covered.contains(number))
             .collect();
@@ -475,6 +508,7 @@ impl Accounting {
             cost_usd: self.total_cost_usd(),
             tokens_incomplete: self.tokens_incomplete,
             price_incomplete: self.price_incomplete,
+            unreported_turn_count: u32::try_from(self.unreported_turns.len()).unwrap_or(u32::MAX),
         }
     }
 
@@ -507,7 +541,7 @@ mod tests {
 
     use super::{Accounting, Spend, Tokens};
     use crate::delegate::Vendor;
-    use crate::transcript::{SpendReport, Turn, Usage};
+    use crate::transcript::{Outcome, SpendReport, Turn, Usage};
 
     /// A Claude release whose price covers the one call.
     const PER_TURN_PRICE: &str = "2.1.261";
@@ -520,7 +554,12 @@ mod tests {
             .into_iter()
             .zip(0..)
             .map(|(report, index)| {
+                // Finished, as every turn these tests account for is unless one says otherwise.
                 let mut turn = Turn::new(index, "q");
+                turn.outcome = Outcome::Completed {
+                    usage: Usage::default(),
+                    cost_usd: None,
+                };
                 turn.spend_report = report;
                 turn
             })
@@ -676,34 +715,75 @@ mod tests {
         assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
-    /// A count one running total leaves out keeps its baseline, so its next report is taken
-    /// apart against the last value known rather than counted whole.
+    /// A Codex running total of input, cached input and output, with cached input possibly
+    /// left out.
+    fn partial(input: u64, cached: Option<u64>, output: u64) -> SpendReport {
+        SpendReport {
+            usage: Usage {
+                input_tokens: Some(input),
+                cached_input_tokens: cached,
+                cache_write_input_tokens: None,
+                output_tokens: Some(output),
+                reasoning_output_tokens: None,
+            },
+            cost_usd: None,
+            cli_version: None,
+        }
+    }
+
+    /// The turns a token spend covers, its input, cached input and output, and whether it is
+    /// incomplete.
+    #[derive(Debug, PartialEq)]
+    struct Shape {
+        turns: std::ops::RangeInclusive<u32>,
+        input: Option<u64>,
+        cached: Option<u64>,
+        output: Option<u64>,
+        incomplete: bool,
+    }
+
+    fn shape(spend: &Spend<Tokens>) -> Shape {
+        Shape {
+            turns: spend.first_turn..=spend.last_turn,
+            input: spend.amount.input_tokens,
+            cached: spend.amount.cached_input_tokens,
+            output: spend.amount.output_tokens,
+            incomplete: spend.incomplete,
+        }
+    }
+
+    /// A running total that leaves out a count the baseline knows is skipped, and the next one
+    /// that knows it covers both turns, every count over the same span.
     #[gtest]
-    fn a_count_left_out_of_one_report_keeps_its_baseline() {
-        let report = |input: u64, cached: Option<u64>, output: u64| {
-            Some(SpendReport {
-                usage: Usage {
-                    input_tokens: Some(input),
-                    cached_input_tokens: cached,
-                    cache_write_input_tokens: None,
-                    output_tokens: Some(output),
-                    reasoning_output_tokens: None,
-                },
-                cost_usd: None,
-                cli_version: None,
-            })
-        };
+    fn a_total_leaving_out_a_known_count_is_skipped() {
         let accounting = Accounting::of(
             Vendor::Codex,
             &turns([
-                report(100, Some(90), 10),
-                report(150, None, 15),
-                report(200, Some(180), 20),
+                Some(partial(100, Some(90), 10)),
+                Some(partial(150, None, 15)),
+                Some(partial(200, Some(180), 20)),
             ]),
         );
 
-        // The cached count's 180 covers turns 2 and 3 against turn 1's 90, so it stays a part of
-        // the input.
+        assert_that!(
+            accounting.tokens.iter().map(shape).collect::<Vec<_>>(),
+            elements_are![
+                eq(&Shape {
+                    turns: 1..=1,
+                    input: Some(100),
+                    cached: Some(90),
+                    output: Some(10),
+                    incomplete: false,
+                }),
+                eq(&Shape {
+                    turns: 2..=3,
+                    input: Some(100),
+                    cached: Some(90),
+                    output: Some(10),
+                    incomplete: false,
+                }),
+            ]
+        );
         assert_that!(
             accounting.total(),
             eq(Tokens {
@@ -713,6 +793,94 @@ mod tests {
                 output_tokens: Some(20),
                 reasoning_output_tokens: None,
             })
+        );
+        assert_that!(accounting.tokens_incomplete, eq(false));
+        assert_that!(accounting.unreported_turns, is_empty());
+    }
+
+    /// A skipped total is not a baseline either, so a restart after it is judged against the
+    /// last comparable total and counted whole, over the turns since that total.
+    #[gtest]
+    fn a_restart_after_a_skipped_total_is_counted_whole() {
+        let accounting = Accounting::of(
+            Vendor::Codex,
+            &turns([
+                Some(partial(100, Some(90), 10)),
+                Some(partial(150, None, 15)),
+                Some(partial(200, Some(20), 20)),
+            ]),
+        );
+
+        assert_that!(
+            accounting.tokens.iter().map(shape).collect::<Vec<_>>(),
+            elements_are![
+                eq(&Shape {
+                    turns: 1..=1,
+                    input: Some(100),
+                    cached: Some(90),
+                    output: Some(10),
+                    incomplete: false,
+                }),
+                eq(&Shape {
+                    turns: 2..=3,
+                    input: Some(200),
+                    cached: Some(20),
+                    output: Some(20),
+                    incomplete: true,
+                }),
+            ]
+        );
+        assert_that!(
+            accounting.total(),
+            eq(Tokens {
+                input_tokens: Some(300),
+                cached_input_tokens: Some(110),
+                cache_write_input_tokens: None,
+                output_tokens: Some(30),
+                reasoning_output_tokens: None,
+            })
+        );
+        assert_that!(accounting.tokens_incomplete, eq(true));
+    }
+
+    /// A count a total gains has no baseline yet, so it contributes nothing to that turn and
+    /// becomes the baseline the next total's count is taken apart against.
+    #[gtest]
+    fn a_count_a_total_gains_counts_from_the_next_total() {
+        let accounting = Accounting::of(
+            Vendor::Codex,
+            &turns([
+                Some(partial(100, None, 10)),
+                Some(partial(150, Some(80), 15)),
+                Some(partial(200, Some(120), 20)),
+            ]),
+        );
+
+        assert_that!(
+            accounting.tokens.iter().map(shape).collect::<Vec<_>>(),
+            elements_are![
+                eq(&Shape {
+                    turns: 1..=1,
+                    input: Some(100),
+                    cached: None,
+                    output: Some(10),
+                    incomplete: false,
+                }),
+                eq(&Shape {
+                    turns: 2..=2,
+                    input: Some(50),
+                    cached: None,
+                    output: Some(5),
+                    incomplete: false,
+                }),
+                eq(&Shape {
+                    turns: 3..=3,
+                    input: Some(50),
+                    cached: Some(40),
+                    output: Some(5),
+                    incomplete: false,
+                }),
+            ]
         );
         assert_that!(accounting.tokens_incomplete, eq(false));
     }
@@ -899,11 +1067,16 @@ mod tests {
         );
     }
 
-    /// A turn nothing reported for and no later total covers, such as a trailing failed or a
-    /// running turn, is listed as unreported, and a Claude crash's zeros are no report either.
+    /// A finished turn nothing reported for and no later total covers, such as a trailing failed
+    /// one, is listed as unreported, a running one is not yet, and a Claude crash's zeros are no
+    /// report either.
     #[gtest]
     fn turns_no_report_covers_are_unreported() {
-        let codex_run = Accounting::of(Vendor::Codex, &turns([Some(codex(100, 10)), None]));
+        let mut codex_turns = turns([Some(codex(100, 10)), None, None]);
+        if let Some(running) = codex_turns.get_mut(2) {
+            running.outcome = Outcome::Running;
+        }
+        let codex_run = Accounting::of(Vendor::Codex, &codex_turns);
         assert_that!(codex_run.unreported_turns, elements_are![eq(&2)]);
 
         let crashed = SpendReport {
@@ -919,6 +1092,12 @@ mod tests {
             &turns([Some(crashed), Some(claude(10, 0.01, Some(PER_TURN_PRICE)))]),
         );
         assert_that!(claude_run.unreported_turns, elements_are![eq(&1)]);
+        // The listed totals say a turn is missing from them rather than read as complete.
+        let totals = claude_run.totals();
+        assert_that!(totals.usage.input_tokens, some(eq(10)));
+        assert_that!(totals.unreported_turn_count, eq(1));
+        assert_that!(totals.tokens_incomplete, eq(false));
+        assert_that!(totals.price_incomplete, eq(false));
         assert_that!(claude_run.total().input_tokens, some(eq(10)));
 
         let empty = Accounting::of(Vendor::Codex, &[]);

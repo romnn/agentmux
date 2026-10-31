@@ -280,12 +280,26 @@ pub fn usage_line(status: &RunStatus) -> String {
     let price = price_text(status.cost_usd, spend.price_incomplete, |cost| {
         format!("${cost:.4} list price")
     });
-    match (tokens, price) {
-        (None, None) if status.is_terminal() => "nothing reported".to_owned(),
-        (None, None) => "nothing reported yet".to_owned(),
+    let totals = match (tokens, price) {
+        (None, None) if status.is_terminal() => return "nothing reported".to_owned(),
+        (None, None) => return "nothing reported yet".to_owned(),
         (Some(tokens), Some(price)) => format!("run total, all turns: {tokens} · {price}"),
         (Some(tokens), None) => format!("run total, all turns: {tokens} · no price reported"),
         (None, Some(price)) => format!("run total, all turns: no tokens reported · {price}"),
+    };
+    let unreported = u32::try_from(spend.unreported_turns.len()).unwrap_or(u32::MAX);
+    match unreported_text(unreported) {
+        Some(unreported) => format!("{totals} · {unreported}"),
+        None => totals,
+    }
+}
+
+/// How many turns the totals leave out because they reported nothing, or `None` for none.
+fn unreported_text(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 turn unreported".to_owned()),
+        count => Some(format!("{count} turns unreported")),
     }
 }
 
@@ -394,15 +408,7 @@ pub fn spend_lines(status: &RunStatus) -> Vec<String> {
             parts.push("price unknown".to_owned());
         }
         if facts.unreported {
-            let running = !status.is_terminal() && span.last_turn == status.turns;
-            parts.push(
-                if running {
-                    "nothing reported yet"
-                } else {
-                    "nothing reported"
-                }
-                .to_owned(),
-            );
+            parts.push("nothing reported".to_owned());
         }
         lines.push(format!("{turns}: {}", parts.join(" · ")));
     }
@@ -456,7 +462,8 @@ fn parenthesised(parts: impl IntoIterator<Item = Option<String>>) -> String {
 /// `12.3M in / 45k out · $0.12`, or `-` when nothing was reported.
 ///
 /// Qualified as [`usage_line`] qualifies them: `at least` before a total that is not all that was
-/// spent, and `price unknown` for a price that could not be counted.
+/// spent, `price unknown` for a price that could not be counted, and how many turns reported
+/// nothing.
 #[must_use]
 pub fn usage_column(totals: &Totals) -> String {
     let Totals {
@@ -464,6 +471,7 @@ pub fn usage_column(totals: &Totals) -> String {
         cost_usd,
         tokens_incomplete,
         price_incomplete,
+        unreported_turn_count,
     } = totals;
     let mut parts = Vec::new();
     let tokens: Vec<String> = [
@@ -487,11 +495,12 @@ pub fn usage_column(totals: &Totals) -> String {
     parts.extend(price_text(*cost_usd, *price_incomplete, |cost| {
         format!("${cost:.2}")
     }));
+    // A consultation that reported nothing at all is a dash, unreported turns or not.
     if parts.is_empty() {
-        "-".to_owned()
-    } else {
-        parts.join(" · ")
+        return "-".to_owned();
     }
+    parts.extend(unreported_text(*unreported_turn_count));
+    parts.join(" · ")
 }
 
 /// A count to one decimal of its thousands, millions or billions, rounded down: `45k`, `12.3M`.

@@ -99,6 +99,7 @@ fn a_listed_total_says_what_it_leaves_out() {
             cost_usd: Some(0.25),
             tokens_incomplete: true,
             price_incomplete: false,
+            unreported_turn_count: 0,
         }),
         eq("at least 130 in / 13 out · $0.25")
     );
@@ -108,6 +109,7 @@ fn a_listed_total_says_what_it_leaves_out() {
             cost_usd: Some(0.25),
             tokens_incomplete: false,
             price_incomplete: true,
+            unreported_turn_count: 0,
         }),
         eq("130 in / 13 out · at least $0.25")
     );
@@ -117,7 +119,43 @@ fn a_listed_total_says_what_it_leaves_out() {
             cost_usd: None,
             tokens_incomplete: false,
             price_incomplete: true,
+            unreported_turn_count: 0,
         }),
         eq("130 in / 13 out · price unknown")
+    );
+}
+
+/// A turn that reported nothing is named beside the totals, so a run missing one does not read
+/// as complete: a Claude turn that crashed before reporting, followed by one that reported.
+#[gtest]
+fn a_listed_total_names_the_turns_that_reported_nothing() {
+    let totals = Totals {
+        usage: Tokens {
+            input_tokens: Some(10),
+            output_tokens: Some(1),
+            ..Tokens::default()
+        },
+        cost_usd: Some(0.01),
+        unreported_turn_count: 1,
+        ..Totals::default()
+    };
+    assert_that!(
+        usage_column(&totals),
+        eq("10 in / 1 out · $0.01 · 1 turn unreported")
+    );
+    assert_that!(
+        usage_column(&Totals {
+            unreported_turn_count: 2,
+            ..totals
+        }),
+        ends_with("· 2 turns unreported")
+    );
+    // Nothing reported at all is still a dash.
+    assert_that!(
+        usage_column(&Totals {
+            unreported_turn_count: 2,
+            ..Totals::default()
+        }),
+        eq("-")
     );
 }
