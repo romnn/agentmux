@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::left_running::LeftRunning;
+
 /// What the vendor reported about the account's usage window as a turn ran.
 ///
 /// A rate limit is the one failure whose right response depends on a number the failure itself does
@@ -520,9 +522,18 @@ pub struct Turn {
     /// Messages render above the outcome footer and the drift note, and this content becomes
     /// available strictly after the terminal event — measured at 228 ms after it, for Codex.
     /// Anything rendered before those would insert bytes above text already handed to a caller as
-    /// a cursor, so this renders last, after everything whose content is final at the terminal
-    /// event.
+    /// a cursor, so this renders after everything whose content is final at the terminal event;
+    /// only [`Self::left_running`], which arrives later still, follows it.
     pub recovered: Option<String>,
+    /// What the turn left running when it ended, once its delegate has gone, when its driver
+    /// found anything.
+    ///
+    /// Read only for a turn that ended without a cancellation, whose delegate has gone: the
+    /// driver writes its record before it exits, so every later read finds the same one.
+    /// It renders after [`Self::recovered`], last of all, because it exists only once the
+    /// delegate has gone, which is after everything else the turn renders is final.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_running: Option<LeftRunning>,
     /// Where the delegate CLI saves its sessions, when it could not write there as this turn was
     /// launched, so the session this turn ran in was never kept.
     ///
@@ -602,6 +613,7 @@ impl Turn {
             resolved_model: None,
             broke_continuity: false,
             recovered: None,
+            left_running: None,
             unsaved_session_store: None,
             billing: None,
             isolation: None,
@@ -930,7 +942,52 @@ pub fn render_turn(turn: &Turn) -> String {
         );
     }
 
+    if let Some(left_running) = &turn.left_running {
+        render_left_running(&mut out, left_running);
+    }
+
     out
+}
+
+/// How many of the processes a turn left running its epilogue names; the record names more.
+const LEFT_RUNNING_NAMED: usize = 10;
+
+/// The note that a turn left processes running, which agentmux then signalled to stop.
+fn render_left_running(rendered_turn: &mut String, left_running: &LeftRunning) {
+    let named: Vec<String> = left_running
+        .processes
+        .iter()
+        .take(LEFT_RUNNING_NAMED)
+        .map(|process| format!("`{}` (pid {})", process.name, process.pid))
+        .collect();
+    let unnamed = left_running
+        .count()
+        .saturating_sub(u64::try_from(named.len()).unwrap_or(u64::MAX));
+    let listed = match (named.split_last(), unnamed) {
+        (None, _) => String::new(),
+        (Some((last, [])), 0) => format!(": {last}"),
+        (Some((last, rest)), 0) => format!(": {} and {last}", rest.join(", ")),
+        (Some(_), more) => format!(": {} and {more} more", named.join(", ")),
+    };
+    let processes = left_running.processes_phrase();
+    let them = left_running.pronoun();
+    let were = if left_running.count() == 1 {
+        "was"
+    } else {
+        "were"
+    };
+    let _ = indoc::writedoc!(
+        rendered_turn,
+        "
+
+        > [!WARNING]
+        > **When this turn ended, {processes} below the delegate {were} still running after its \
+        CLI exited**{listed}.
+        > agentmux signalled {them} to stop; {fates}.
+        > Work in {them} may be incomplete.
+    ",
+        fates = left_running.fates(),
+    );
 }
 
 fn render_messages(rendered_turn: &mut String, messages: &[Message]) {

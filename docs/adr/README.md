@@ -82,3 +82,5 @@ a record names to show where the decision is enforced must be renamed there too.
   schema.
 - [0021](0021-mock-validates-against-codex-schema.md): The mock app-server validates messages
   against codex's schema, independently of the generated types.
+- [0032](0032-leftover-processes-reported.md): A delegate is told its leftovers may be stopped,
+  and what a driven turn left running is reported.

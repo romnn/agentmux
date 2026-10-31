@@ -114,6 +114,10 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
             "  EARLIER     {} — see the transcript",
             report::earlier_failures_line(failures)
         )],
+        Warning::LeftRunning(left_running) => vec![format!(
+            "  WARNING     {}",
+            report::left_running_line(left_running)
+        )],
         Warning::SessionNotSaved {
             store: session_store_path,
         } => vec![format!(

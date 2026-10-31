@@ -27,12 +27,44 @@ use super::retention::Retention;
 use super::status::RunStatus;
 use super::{RunState, RunStore};
 
+/// What agentmux tells every consultation's delegate with its first question: that what it
+/// leaves running when its turn ends may be stopped.
+///
+/// A driver over the app-server stops what its server left behind, and both CLIs stop much of
+/// what they leave themselves, so a job a delegate starts in the background and does not wait
+/// for is cut short, and only the delegate can avoid that or say so.
+/// Said once, with the first question: a follow-up continues the session that already holds it.
+pub const TURN_END_NOTICE: &str = indoc::indoc! {"
+    Note from agentmux: processes still running when your turn ends may be stopped. Run work \
+    you need finished in the foreground, or keep polling its session until it exits, before \
+    you give your final answer; do not leave it running with nohup or &, and say plainly if any \
+    work is unfinished.
+"};
+
+/// `question`, followed by the [`TURN_END_NOTICE`] below a rule, as a consultation's first turn
+/// delivers it.
+///
+/// After the question rather than before it, so the question's first line is still what
+/// `list` shows.
+fn with_turn_end_notice(question: &str) -> String {
+    indoc::formatdoc! {"
+        {question}
+
+        ---
+
+        {TURN_END_NOTICE}",
+        question = question.trim_end(),
+    }
+}
+
 /// What `start` was asked for.
 #[derive(Debug, Clone)]
 pub struct StartRequest {
     /// Who to consult, and on what terms.
     pub delegate: Delegate,
     /// The question, self-contained: the delegate starts with no conversation context.
+    ///
+    /// The delegate is asked it with [`TURN_END_NOTICE`] appended, and the transcript shows both.
     pub question: String,
     /// The directory the delegate reads the project from.
     ///
@@ -281,13 +313,14 @@ impl RunStore {
                 Admission::Continuing(run_id) => Some(run_id.clone()),
             },
         };
+        let question = with_turn_end_notice(&request.question);
         let started = write_json(&dir.join("meta.json"), &meta)
             .and_then(|()| self.lock(&run_id))
             .and_then(|run| {
                 let first = NextTurn {
                     delegate: &meta.delegate,
                     index: 0,
-                    question: &request.question,
+                    question: &question,
                     resume: None,
                     label: request.label.as_ref(),
                 };

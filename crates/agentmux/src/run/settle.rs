@@ -60,6 +60,7 @@ use super::records::{
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
+use crate::left_running::LeftRunning;
 use crate::stream::{self, Fold};
 use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
@@ -547,6 +548,7 @@ impl LockedRun<'_> {
         // depends on it — whether the turn can settle, and so whether a follow-up may continue it,
         // and whether a usage-window miss is final — so no two of them can disagree.
         let delegate_gone = self.delegate_gone(files, record.as_ref(), &turn.outcome);
+        turn.left_running = left_running(files, record.as_ref(), &turn.outcome, delegate_gone);
 
         let pending_rate_limit_lookup = if vendor == Vendor::Codex {
             cached_rate_limit_or_lookup(
@@ -721,6 +723,30 @@ fn cached_rate_limit_or_lookup(
             delegate_has_exited: delegate_gone,
         }),
     }
+}
+
+/// What a turn left running, read like a recovered reply: only once the turn is over and its
+/// delegate has gone, and never for a cancelled turn.
+///
+/// The driver writes the record before it exits and never again, so every fold that reads it
+/// after the delegate has gone reads the same one, a committed turn's included.
+/// A cancelled turn's leftovers are the cancellation's doing, and its transcript is frozen at
+/// the cancellation: a record its driver wrote while stopping must not add to it, even when a
+/// terminal event gave the turn its outcome.
+/// An unreadable record is no record, which only costs the note.
+fn left_running(
+    files: &TurnFiles,
+    record: Option<&ExitRecord>,
+    outcome: &Outcome,
+    delegate_gone: bool,
+) -> Option<LeftRunning> {
+    let cancelled = matches!(
+        record.or(files.exit.as_ref()),
+        Some(ExitRecord::Cancelled { .. })
+    );
+    (outcome.is_terminal() && delegate_gone && !cancelled)
+        .then(|| LeftRunning::read(&files.dir.left_running()))
+        .flatten()
 }
 
 /// Why a supervised turn's delegate never started, when its supervisor left before spawning it.

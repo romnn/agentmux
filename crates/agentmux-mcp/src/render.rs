@@ -30,7 +30,7 @@ use agentmux::report::{
 };
 use agentmux::run::{
     AutoResume, HookReopening, Meta, QuotaReport, RunLabel, RunStatus, RunSummary, SettledTurn,
-    TranscriptPage, describe_delegate,
+    TranscriptPage, TurnLeftRunning, describe_delegate,
 };
 use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
 use chrono::Utc;
@@ -172,6 +172,7 @@ pub fn warnings(status: &RunStatus) -> String {
             // of what the caller should do, and earlier failures on the header's own `earlier:`
             // line, beside the state they must not be read as.
             Warning::AutoResume(_) | Warning::EarlierFailures(_) => {}
+            Warning::LeftRunning(left_running) => out.push_str(&left_running_warning(left_running)),
             Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
                     warning:    this consultation cannot be followed up: {fact}.
@@ -234,6 +235,18 @@ pub fn warnings(status: &RunStatus) -> String {
         }
     }
     out
+}
+
+/// The warning that a turn left processes running, which the caller must not take as still
+/// working.
+fn left_running_warning(left_running: &TurnLeftRunning) -> String {
+    indoc::formatdoc! {"
+        warning:    {line}.
+                    The transcript names them at the end of that turn: do not rely on work the
+                    delegate left running there having finished.
+        ",
+        line = report::left_running_line(left_running),
+    }
 }
 
 /// What a caller should do about the newest turn's failure, or what agentmux is doing about it in

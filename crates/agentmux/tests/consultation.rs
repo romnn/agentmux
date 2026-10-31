@@ -12,7 +12,7 @@ use agentmux::delegate::{
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
     HookReopening, ListFilter, NotResumable, Retention, RunError, RunId, RunLabel, RunStore,
-    StartRequest,
+    StartRequest, TURN_END_NOTICE,
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{FailureKind, Outcome, TurnState};
@@ -1156,14 +1156,27 @@ fn every_turn_owns_its_own_capture_files() -> Result<()> {
     let questions: Vec<String> = (1..=3)
         .map(|number| std::fs::read_to_string(turns.join(format!("{number:04}/question.md"))))
         .collect::<std::result::Result<_, _>>()?;
+    // Only the first question carries agentmux's notice about what a turn leaves running: the
+    // follow-ups continue the session that already holds it.
+    let first = indoc::formatdoc! {"
+        the original brief
+
+        ---
+
+        {TURN_END_NOTICE}"
+    };
     assert_that!(
         questions,
-        elements_are![
-            eq("the original brief"),
-            eq("first follow-up"),
-            eq("second follow-up")
-        ]
+        elements_are![eq(&first), eq("first follow-up"), eq("second follow-up")]
     );
+    // What each child read on its stdin is exactly what its turn's question file holds.
+    let delivered: Vec<String> = harness
+        .launcher
+        .launches()
+        .into_iter()
+        .map(|launch| launch.question)
+        .collect();
+    assert_that!(delivered, eq(&questions));
 
     // Three children, three capture files, no sharing.
     let events: std::collections::BTreeSet<_> = harness

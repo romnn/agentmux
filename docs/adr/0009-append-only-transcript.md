@@ -27,6 +27,9 @@ frozen once something settles it:
 - A Codex reply recovered from `last-message.md` is only ever added to the newest turn and is
   persisted in `recovered.md` before it is published, so it can neither land above a later turn nor
   go missing once rendered. Text that cannot be kept is not rendered.
+- What a driven turn left running is read from the `left-running.json` its driver writes once
+  before it exits, only once the turn's delegate has gone and never for a cancelled turn, so every
+  fold that reads it reads the same record ([0032](0032-leftover-processes-reported.md)).
 - Whatever record settles a turn, the turn is re-folded from exactly the length that record froze,
   so two observers publish the same bytes.
 - Once a turn's outcome is terminal and its delegate has gone, or a record settled it, its
@@ -46,5 +49,5 @@ frozen once something settles it:
 - `every_fixture_renders_monotonically_over_its_prefixes` (`crates/agentmux/tests/capture.rs`)
   checks every fixture at every line cut.
 - Later renders may only append bytes. Recovered text must be persisted before publication and
-  appended after the newest turn's footer; mutable observations such as the stderr snapshot
+  appended after the newest turn's footer, and the note of what the turn left running after that; mutable observations such as the stderr snapshot
   `RunStatus::delegate_stderr` remain outside the transcript.
