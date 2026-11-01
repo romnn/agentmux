@@ -148,10 +148,10 @@ windows-sys = "0.61"
 # testing
 # Builds the fake `codex` a test puts on a driver's `PATH`, which is a target `cargo test` builds
 # only when the test run selects it.
-escargot = "0.5"
+escargot = "1.0.1"
 # Holds the test server's messages, and the driver's, to codex's own JSON Schema rather than to
 # the types generated from it.
 # Without remote references, because the schema is vendored.
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.59.0", default-features = false }
 googletest = "0"
 tempfile = "3"

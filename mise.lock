@@ -26,24 +26,25 @@ url_api = "https://api.github.com/repos/rhysd/actionlint/releases/assets/3849249
 provenance = "github-attestations"
 
 [[tools."aqua:nextest-rs/nextest/cargo-nextest"]]
-version = "0.9.149"
+version = "0.9.150"
 backend = "aqua:nextest-rs/nextest/cargo-nextest"
 specifiers = ["latest"]
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.linux-x64"]
-checksum = "sha256:32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/660814555"
+checksum = "sha256:b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f"
+checksum_source = "mise-versions"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679066447"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.macos-arm64"]
-checksum = "sha256:47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/660825754"
+checksum = "sha256:82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679078149"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.windows-x64"]
-checksum = "sha256:8e7609fffb5a938c9b48d8788a89699fc83c39d07a9d9dbc61554f661b51d9d8"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-pc-windows-msvc.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/660828891"
+checksum = "sha256:b7a8bf567140b8b366716f2dea27b32e088dc12f53597315f976d0dbf7c6ade8"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679074355"
 
 [[tools."aqua:rustsec/rustsec/cargo-audit"]]
 version = "0.22.2"
@@ -152,24 +153,24 @@ url = "https://github.com/romnn/cargo-watchdoc/releases/download/v0.3.10/cargo-w
 url_api = "https://api.github.com/repos/romnn/cargo-watchdoc/releases/assets/392595130"
 
 [[tools."github:romnn/cooldown"]]
-version = "0.0.26"
+version = "0.0.27"
 backend = "github:romnn/cooldown"
 specifiers = ["latest"]
 
 [tools."github:romnn/cooldown"."platforms.linux-x64"]
-checksum = "sha256:791486ad71ef6a174ed2860ed53f6d8f26b74deefd9173f221990a025d4d9fa6"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.26/cooldown_0.0.26_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/661206072"
+checksum = "sha256:061fbbe4bd6f2908237c66910595a37c87b199172272f5d8956a78635cd18113"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.27/cooldown_0.0.27_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/696497729"
 
 [tools."github:romnn/cooldown"."platforms.macos-arm64"]
-checksum = "sha256:4e03fa45a0d1da98821c85bb57776b865d4d215756dae1a0a77dabffb9b6017e"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.26/cooldown_0.0.26_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/661206074"
+checksum = "sha256:8f314829586e93915e7b4772ed8f973bb7a1ee190bd49b0beed06d97d1367307"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.27/cooldown_0.0.27_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/696497686"
 
 [tools."github:romnn/cooldown"."platforms.windows-x64"]
-checksum = "sha256:ab2c417bf7a494afe967ae6504f3ec2c7850b76b2d2f69a857b30b2d6fb9a721"
-url = "https://github.com/romnn/cooldown/releases/download/v0.0.26/cooldown_0.0.26_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/661206125"
+checksum = "sha256:cd039e2d6f8866a5572c346ea58b496a60cdc980b7b0f48dfaf44eecc261bd28"
+url = "https://github.com/romnn/cooldown/releases/download/v0.0.27/cooldown_0.0.27_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/cooldown/releases/assets/696497678"
 
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.24.0"
