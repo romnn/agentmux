@@ -13,7 +13,9 @@ use std::time::Duration;
 use agentmux::delegate::{
     AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
 };
-use agentmux::run::{Retention, RunError, RunId, RunStore, SettledBy, StartRequest, WaitFor};
+use agentmux::run::{
+    Retention, RunError, RunId, RunStore, SettledBy, SettledOrAsked, StartRequest, WaitFor,
+};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{Outcome, TurnState};
 use googletest::prelude::*;
@@ -747,5 +749,254 @@ async fn a_cancellation_the_delegate_survives_still_settles_the_turn() -> Result
             agentmux::run::NotResumable::AwaitingDelegateExit { .. }
         ))))
     );
+    Ok(())
+}
+
+/// A question record as the app-server driver writes it, ending its line.
+fn question_line(id: &str, titles: &[&str]) -> String {
+    let questions: Vec<serde_json::Value> = titles
+        .iter()
+        .map(|title| serde_json::json!({"title": title, "options": ["Yes (Recommended)", "No"]}))
+        .collect();
+    let line = serde_json::json!({
+        "type": "agentmux.question",
+        "id": id,
+        "asked_at": "2026-11-05T03:06:13Z",
+        "questions": questions,
+    });
+    format!("{line}\n")
+}
+
+/// Append `text` to turn 1's capture, as a delegate still running writes to it.
+fn append_to_capture(harness: &Harness, run_id: &RunId, text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut events = std::fs::OpenOptions::new()
+        .append(true)
+        .open(harness.turn_dir(run_id, 1).join("events.jsonl"))
+        .or_fail()?;
+    events.write_all(text.as_bytes()).or_fail()?;
+    Ok(())
+}
+
+/// A running turn's capture, before it has said anything.
+const STARTED: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"01a0"}
+    {"type":"turn.started"}
+"#};
+
+/// A wait that also returns on a question returns once the running turn asks one, with every
+/// question beyond those the caller has seen, and a caller that has seen them hears only of the
+/// next.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_wait_returns_on_a_question_the_running_turn_asks() -> Result<()> {
+    let harness = harness([Script::running(STARTED)])?;
+    let started = harness.store.start(&request("q")?)?;
+    let pinned = harness.store.pin_turn(&started.run_id, None)?;
+    let wait = |delegate_questions_seen: u32| {
+        tokio::spawn({
+            let store = Arc::clone(&harness.store);
+            let pinned = pinned.clone();
+            async move {
+                store
+                    .wait_for_settlement_or_delegate_question(
+                        &pinned,
+                        delegate_questions_seen,
+                        None,
+                    )
+                    .await
+            }
+        })
+    };
+
+    // Nothing asked yet, so nothing returns.
+    let waiting = wait(0);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_that!(waiting.is_finished(), eq(false));
+
+    // One call asks two questions, and both come back, numbered.
+    append_to_capture(
+        &harness,
+        &started.run_id,
+        &question_line("call_1", &["A?", "B?"]),
+    )?;
+    let Some(SettledOrAsked::Asked(asked)) = waiting.await.or_fail()?? else {
+        return fail!("the wait did not return on the question");
+    };
+    assert_that!(asked.target.turn_number(), eq(1));
+    let numbers: Vec<u32> = asked
+        .delegate_questions
+        .iter()
+        .map(|question| question.question.number)
+        .collect();
+    assert_that!(numbers, elements_are![eq(&1), eq(&2)]);
+
+    // Rearmed past both, the wait holds until the third, and returns that one alone.
+    let waiting = wait(2);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_that!(waiting.is_finished(), eq(false));
+    append_to_capture(&harness, &started.run_id, &question_line("call_2", &["C?"]))?;
+    let Some(SettledOrAsked::Asked(asked)) = waiting.await.or_fail()?? else {
+        return fail!("the rearmed wait did not return on the next question");
+    };
+    let titles: Vec<&str> = asked
+        .delegate_questions
+        .iter()
+        .map(|question| question.question.title.as_str())
+        .collect();
+    assert_that!(titles, elements_are![eq(&"C?")]);
+    Ok(())
+}
+
+/// A turn whose stream has ended asks nothing, however recently it asked: it can no longer be
+/// steered, so the wait goes on to its settlement, which lists what it asked.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_question_in_an_ended_turn_waits_for_its_settlement() -> Result<()> {
+    let capture = format!(
+        "{STARTED}{}{}",
+        question_line("call_1", &["A?"]),
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    ) + "\n";
+    let harness = harness([Script::running(capture)])?;
+    let started = harness.store.start(&request("q")?)?;
+    let pinned = harness.store.pin_turn(&started.run_id, None)?;
+    let waiting = tokio::spawn({
+        let store = Arc::clone(&harness.store);
+        let pinned = pinned.clone();
+        async move {
+            store
+                .wait_for_settlement_or_delegate_question(&pinned, 0, None)
+                .await
+        }
+    });
+
+    // The delegate is still saving its session, so the turn has not settled, and asks nothing.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_that!(waiting.is_finished(), eq(false));
+
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+    let Some(SettledOrAsked::Settled(settled)) = waiting.await.or_fail()?? else {
+        return fail!("an ended turn's question returned the wait");
+    };
+    let questions = harness.store.settled_questions(&settled)?;
+    let titles: Vec<&str> = questions
+        .iter()
+        .map(|question| question.question.title.as_str())
+        .collect();
+    assert_that!(titles, elements_are![eq(&"A?")]);
+    Ok(())
+}
+
+/// A turn a cancellation has begun to end asks nothing, even before the cancellation records the
+/// capture length it freezes: a question written past that length is not part of the turn.
+///
+/// The marker is written by hand, standing for the moment between a cancellation marking the
+/// turn and recording its end.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_cancelling_turn_asks_nothing() -> Result<()> {
+    let harness = harness([Script::running(STARTED)])?;
+    let started = harness.store.start(&request("q")?)?;
+    let pinned = harness.store.pin_turn(&started.run_id, None)?;
+    std::fs::File::create(harness.turn_dir(&started.run_id, 1).join("cancelling")).or_fail()?;
+    append_to_capture(&harness, &started.run_id, &question_line("call_1", &["A?"]))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let waited = harness
+        .store
+        .wait_for_settlement_or_delegate_question(&pinned, 0, Some(deadline))
+        .await?;
+    assert_that!(
+        waited.is_none(),
+        eq(true),
+        "a cancelling turn returned {waited:?}"
+    );
+    Ok(())
+}
+
+/// A question record the delegate has only half written is not read, even cut inside a
+/// character, and is read once its line is complete.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_half_written_question_is_read_once_its_line_is_complete() -> Result<()> {
+    let harness = harness([Script::running(STARTED)])?;
+    let started = harness.store.start(&request("q")?)?;
+    let pinned = harness.store.pin_turn(&started.run_id, None)?;
+    let line = question_line("call_1", &["Größe?"]);
+    let bytes = line.as_bytes();
+    // Cut inside the two bytes of `ö`.
+    let cut = line.find('ö').or_fail()? + 1;
+    let (head, rest) = bytes.split_at(cut);
+    {
+        use std::io::Write as _;
+        let mut events = std::fs::OpenOptions::new()
+            .append(true)
+            .open(harness.turn_dir(&started.run_id, 1).join("events.jsonl"))
+            .or_fail()?;
+        events.write_all(head).or_fail()?;
+    }
+    let waiting = tokio::spawn({
+        let store = Arc::clone(&harness.store);
+        let pinned = pinned.clone();
+        async move {
+            store
+                .wait_for_settlement_or_delegate_question(&pinned, 0, None)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_that!(waiting.is_finished(), eq(false));
+
+    {
+        use std::io::Write as _;
+        let mut events = std::fs::OpenOptions::new()
+            .append(true)
+            .open(harness.turn_dir(&started.run_id, 1).join("events.jsonl"))
+            .or_fail()?;
+        events.write_all(rest).or_fail()?;
+    }
+    let Some(SettledOrAsked::Asked(asked)) = waiting.await.or_fail()?? else {
+        return fail!("the completed question did not return the wait");
+    };
+    let titles: Vec<&str> = asked
+        .delegate_questions
+        .iter()
+        .map(|question| question.question.title.as_str())
+        .collect();
+    assert_that!(titles, elements_are![eq(&"Größe?")]);
+    Ok(())
+}
+
+/// A turn that settles after the wait's last regular look but before its deadline is returned
+/// settled, never reported as pending: the last sleep ends at the deadline, and the turn is
+/// looked at once more there.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_question_wait_sees_a_settlement_just_before_its_deadline() -> Result<()> {
+    let harness = harness([Script::running(fixtures::CODEX_HAPPY)])?;
+    let started = harness.store.start(&request("q")?)?;
+    let pinned = harness.store.pin_turn(&started.run_id, None)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let waiting = tokio::spawn({
+        let store = Arc::clone(&harness.store);
+        let pinned = pinned.clone();
+        async move {
+            store
+                .wait_for_settlement_or_delegate_question(&pinned, 0, Some(deadline))
+                .await
+        }
+    });
+
+    // The looks back off to half a second, so the last regular one before the deadline is at
+    // 1.7 seconds and the next would be at 2.2; the delegate leaves in between.
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    harness
+        .launcher
+        .mark_process_gone(harness.launcher.launch_handle(0));
+    let waited = waiting.await.or_fail()??;
+    assert_that!(waited, some(matches_pattern!(SettledOrAsked::Settled(_))));
     Ok(())
 }

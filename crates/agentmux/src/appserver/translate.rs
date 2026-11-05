@@ -18,6 +18,9 @@
 //!   snake-case values.
 //!   Every other kind is left out, as `exec` leaves it out; a `plan` item is remembered, because
 //!   `exec` closes a turn whose only answer is a plan with that plan's text.
+//! - An `agentMessage` that carries `questions`, which is how `request_user_input_async` asks
+//!   the caller something, becomes agentmux's own `agentmux.question` instead: `exec` writes it
+//!   as a plain reply and drops the questions, and a caller cannot tell it was asked anything.
 //! - A `warning`, a `configWarning`, a `deprecationNotice` and a `model/rerouted` become an
 //!   advisory `error` item, which the fold renders as a note.
 //! - An `error` becomes `exec`'s top-level `error`, where it arrived, whether or not the server
@@ -39,6 +42,7 @@
 //! What is written is [`CaptureEvent`], the one model the fold reads too, and its `exec` events
 //! are the [`exec`] mirror of codex's own types.
 
+use chrono::{DateTime, Utc};
 use codex_app_server_protocol::exec::{
     self, ThreadEvent as ExecEvent, ThreadItemDetails as ExecItemDetails,
 };
@@ -47,7 +51,9 @@ use codex_app_server_protocol::{Method as _, RawParams, types as wire};
 use serde_json::Value;
 
 use super::protocol::{ThreadId, TurnId};
-use crate::stream::codex::{CaptureEvent, UndecodedServerOutput};
+use crate::stream::codex::{
+    CaptureEvent, CapturedQuestion, CapturedQuestions, UndecodedServerOutput,
+};
 
 /// How the turn ended, as far as the stream says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +120,29 @@ fn turn_failed_event(message: String) -> CaptureEvent {
             message: Some(message),
         }),
     }))
+}
+
+/// The questions one `request_user_input_async` call asked, which codex carries as an
+/// `agentMessage` item with `questions` and `exec` writes as a plain reply.
+///
+/// They are asked as of the server's own completion time, which a clock here would only read
+/// later; a time the server reports out of range falls back to now.
+fn questions_event(
+    id: String,
+    completed_at_ms: i64,
+    questions: Vec<wire::AsyncUserInputQuestion>,
+) -> CaptureEvent {
+    CaptureEvent::Question(CapturedQuestions {
+        id,
+        asked_at: DateTime::from_timestamp_millis(completed_at_ms).unwrap_or_else(Utc::now),
+        questions: questions
+            .into_iter()
+            .map(|question| CapturedQuestion {
+                title: question.title,
+                options: question.options.unwrap_or_default(),
+            })
+            .collect(),
+    })
 }
 
 /// One `exec` item, as `item.completed` carries it.
@@ -382,7 +411,7 @@ impl Translator {
     ) {
         let params = completed.raw();
         match completed.decode() {
-            Ok(completed) => match self.translate_item(completed.item) {
+            Ok(completed) => match self.translate_item(completed.item, completed.completed_at_ms) {
                 Ok(line) => translated.events.extend(line),
                 Err(unrecognised) => translated.events.push(undecoded_message_event(
                     methods::ItemCompleted::METHOD,
@@ -518,12 +547,21 @@ impl Translator {
     fn translate_item(
         &mut self,
         item: wire::ThreadItem,
+        completed_at_ms: i64,
     ) -> Result<Option<CaptureEvent>, UnknownProtocolValue> {
         use wire::ThreadItem as Item;
         let (id, details) = match item {
             Item::AgentMessage(message) => {
                 if !message.text.trim().is_empty() {
                     self.last_reply = Some(message.text.clone());
+                }
+                if let Some(questions) = message.questions.filter(|questions| !questions.is_empty())
+                {
+                    return Ok(Some(questions_event(
+                        message.id,
+                        completed_at_ms,
+                        questions,
+                    )));
                 }
                 (
                     message.id,
@@ -797,6 +835,55 @@ mod tests {
                 "item": {"id": "i1", "type": "agent_message", "text": "FINDINGS"}}))]
         );
         assert_that!(translator.closing_message(), some(eq("FINDINGS")));
+    }
+
+    /// A reply that carries questions, which is how `request_user_input_async` asks, becomes
+    /// agentmux's own question event, asked when the server completed it.
+    ///
+    /// The item is the one codex's handler emits: its id is the tool call's, its text is the
+    /// questions as codex lays them out, and a question may suggest no options.
+    #[gtest]
+    fn an_agent_message_with_questions_becomes_a_question_event() {
+        let mut translator = Translator::default();
+        let params = json!({
+            "threadId": "th",
+            "turnId": "tu",
+            "completedAtMs": 1_762_351_573_000_i64,
+            "item": {
+                "id": "call_89bd",
+                "type": "agentMessage",
+                "text": "Assume valid names?\n- Yes (Recommended)\n- No\n\nWhich chart?",
+                "phase": "final_answer",
+                "delivery": "async",
+                "questions": [
+                    {"title": "Assume valid names?", "options": ["Yes (Recommended)", "No"]},
+                    {"title": "Which chart?"},
+                ],
+            },
+        });
+
+        assert_that!(
+            translated_events(&mut translator, "item/completed", &params),
+            elements_are![eq(&json!({
+                "type": "agentmux.question",
+                "id": "call_89bd",
+                "asked_at": "2025-11-05T14:06:13Z",
+                "questions": [
+                    {"title": "Assume valid names?", "options": ["Yes (Recommended)", "No"]},
+                    {"title": "Which chart?"},
+                ],
+            }))]
+        );
+
+        // A reply whose `questions` is empty asks nothing, and stays a plain reply.
+        let empty = item_completed_params(&json!({
+            "id": "i2", "type": "agentMessage", "text": "DONE", "questions": [],
+        }));
+        assert_that!(
+            translated_events(&mut translator, "item/completed", &empty),
+            elements_are![eq(&json!({"type": "item.completed",
+                "item": {"id": "i2", "type": "agent_message", "text": "DONE"}}))]
+        );
     }
 
     /// A sub-agent tool call is written as the `collab_tool_call` `codex exec --json` writes,

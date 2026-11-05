@@ -14,11 +14,13 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID};
-use codex_app_server_mock::scenario::{CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode};
+use codex_app_server_mock::scenario::{
+    ASKED_QUESTION, CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode,
+};
 use codex_app_server_mock::{Peer, PeerError, ReceivedRequest};
 use codex_app_server_protocol::envelope::Message;
 use codex_app_server_protocol::methods::{self, AnyClientRequest};
-use codex_app_server_protocol::types::TurnStatus;
+use codex_app_server_protocol::types::{AsyncUserInputQuestion, TurnStatus};
 
 /// How long a command the fake starts runs unless something stops it.
 const COMMAND_SECONDS: u64 = 300;
@@ -91,7 +93,8 @@ fn serve() -> Result<ExitCode, String> {
         logged_line_count: 0,
     };
     let outcome = match &config.scenario {
-        Scenario::Steerable => server.run_steerable_scenario(),
+        Scenario::Steerable => server.run_steerable_scenario(false),
+        Scenario::AsksThenSteerable => server.run_steerable_scenario(true),
         Scenario::ServerExit {
             exit_mode,
             exit_trigger_path,
@@ -157,13 +160,28 @@ impl Server<'_> {
             ))
     }
 
-    fn run_steerable_scenario(&mut self) -> Result<ExitCode, Failure> {
+    /// Run a turn until it is steered or interrupted, first asking the client a question when
+    /// `asks`.
+    fn run_steerable_scenario(&mut self, asks: bool) -> Result<ExitCode, Failure> {
         let start = self.setup_and_expect_turn_start()?;
         self.start_helper(&HelperBehavior::DetachedSleep)?;
         self.peer
             .reply(&start, &fixtures::turn_start_response(TURN_ID))?;
         self.peer
             .notify::<methods::TurnStarted>(&fixtures::turn_started(THREAD_ID, TURN_ID))?;
+        if asks {
+            let question = fixtures::async_question(
+                "call_q1",
+                vec![AsyncUserInputQuestion {
+                    title: ASKED_QUESTION.to_owned(),
+                    options: Some(vec!["Yes (Recommended)".to_owned(), "No".to_owned()]),
+                }],
+            );
+            self.peer
+                .notify::<methods::ItemCompleted>(&fixtures::item_completed(
+                    THREAD_ID, TURN_ID, question,
+                ))?;
+        }
         // Ends once: what names the turn after that is refused, as codex refuses it.
         let mut running = true;
         loop {

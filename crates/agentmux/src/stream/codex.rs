@@ -30,15 +30,17 @@
 //! [`crate::appserver`], which translates the server's notifications as they arrive, so one parser
 //! serves both launch modes.
 //! It writes the same [`CaptureEvent`] this parser reads, and adds what `codex exec` never writes:
-//! an instruction the caller steered into the running turn, and drift it could not read.
+//! an instruction the caller steered into the running turn, the questions the delegate asked the
+//! caller, and drift it could not read.
 
+use chrono::{DateTime, Utc};
 use codex_app_server_protocol::exec::{self, ThreadEvent, ThreadItemDetails};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::delegate::SessionRef;
 use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
-use crate::transcript::{Message, Outcome, Role, SpendReport, Turn, Usage};
+use crate::transcript::{AskedQuestion, Message, Outcome, Role, SpendReport, Turn, Usage};
 
 /// One line of a Codex capture: an event `codex exec --json` writes, or one agentmux adds.
 ///
@@ -53,6 +55,10 @@ pub enum CaptureEvent {
         /// The instruction.
         text: String,
     },
+    /// Questions the delegate asked the caller through `request_user_input_async`, which carries
+    /// on without waiting for an answer.
+    #[serde(rename = "agentmux.question")]
+    Question(CapturedQuestions),
     /// Something `codex app-server` said that the generated types could not read, kept with
     /// what it said.
     #[serde(rename = "agentmux.undecoded")]
@@ -66,6 +72,28 @@ impl From<ThreadEvent> for CaptureEvent {
     fn from(event: ThreadEvent) -> Self {
         Self::Exec(Box::new(event))
     }
+}
+
+/// The questions one `request_user_input_async` call asked, as codex's `agentMessage` item carried
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedQuestions {
+    /// The item's id, which codex sets to the id of the tool call that asked.
+    pub id: String,
+    /// When codex completed the item.
+    pub asked_at: DateTime<Utc>,
+    /// The questions, in the order the delegate asked them.
+    pub questions: Vec<CapturedQuestion>,
+}
+
+/// One question the delegate asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedQuestion {
+    /// The whole question, with the context the delegate gave for it.
+    pub title: String,
+    /// The answers it suggests, its recommendation first; empty for a free-text question.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// What the server said that could not be read.
@@ -160,6 +188,29 @@ fn complete(turn: &mut Turn, completed: &exec::TurnCompletedEvent) {
     });
 }
 
+/// Add the questions one call asked to `turn`, numbered on from those it asked before, and the
+/// message that shows them, in the text codex itself gives that item.
+fn record_questions(turn: &mut Turn, asked: CapturedQuestions) {
+    let mut shown = Vec::with_capacity(asked.questions.len());
+    for CapturedQuestion { title, options } in asked.questions {
+        let mut lines = vec![title.clone()];
+        lines.extend(options.iter().map(|option| format!("- {option}")));
+        shown.push(lines.join("\n"));
+        let number = u32::try_from(turn.delegate_questions.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        turn.delegate_questions.push(AskedQuestion {
+            number,
+            title,
+            options,
+            asked_at: asked.asked_at,
+        });
+    }
+    if !shown.is_empty() {
+        turn.messages.push(Message::question(shown.join("\n\n")));
+    }
+}
+
 /// Fold a Codex `--json` stream into a turn.
 #[must_use]
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
@@ -178,6 +229,10 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             Ok(CaptureEvent::Exec(event)) => *event,
             Ok(CaptureEvent::Steer { text }) => {
                 turn.messages.push(Message::steer(text));
+                continue;
+            }
+            Ok(CaptureEvent::Question(asked)) => {
+                record_questions(&mut turn, asked);
                 continue;
             }
             // Drift the driver recorded, counted as such.

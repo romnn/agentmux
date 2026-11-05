@@ -1048,3 +1048,44 @@ fn a_window_with_room_left_does_not_time_the_retry() -> Result<()> {
     assert_that!(warnings, not(contains_substring("reopen")));
     Ok(())
 }
+
+/// Questions the delegate asked are said above the transcript, numbered, with their options and
+/// the way to reply, and `list` counts them, without ever claiming one was answered.
+#[gtest]
+fn questions_the_delegate_asked_are_said_above_the_transcript() -> Result<()> {
+    let events = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0"}
+        {"type":"turn.started"}
+        {"type":"agentmux.question","id":"call_1","asked_at":"2026-11-05T03:06:13Z","questions":[{"title":"Assume valid namespace names?","options":["Yes (Recommended)","No"]},{"title":"Which chart first?"}]}
+        {"type":"agentmux.steer","text":"Valid names only."}
+        {"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Done."}}
+        {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+    "#};
+    let (store, status, _dir) = consult(events)?;
+
+    let warnings = agentmux_mcp::render::warnings(&status);
+    assert_that!(
+        warnings,
+        contains_substring("asked:      the delegate asked 2 question(s) without waiting")
+    );
+    assert_that!(
+        warnings,
+        contains_substring("agentmux does not track whether one was answered")
+    );
+    assert_that!(warnings, contains_substring("turn 1 question 1, asked"));
+    assert_that!(
+        warnings,
+        contains_substring("options: Yes (Recommended) | No")
+    );
+    assert_that!(warnings, contains_substring("turn 1 question 2, asked"));
+    // The turn has ended, so only a follow-up can reply.
+    assert_that!(warnings, contains_substring("reply with `follow_up`"));
+    assert_that!(warnings, not(contains_substring("Reply with `steer`")));
+
+    let listed = store.list(10, &agentmux::run::ListFilter::default())?;
+    assert_that!(
+        agentmux_mcp::render::list(&listed, false),
+        contains_substring("    asked: 2 question(s); `status` lists them")
+    );
+    Ok(())
+}

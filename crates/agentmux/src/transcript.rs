@@ -94,8 +94,31 @@ pub enum MessageSource {
     /// A genuine user instruction, unlike a hook's, but not the question the turn opened with:
     /// it arrived part-way through, so what the delegate said above it was said without it.
     Steer,
+    /// Questions the delegate asked the caller without stopping.
+    ///
+    /// The delegate's own words, so part of the report, but it carried on once it had asked:
+    /// what it said after them, up to any reply, was said without an answer.
+    Question,
     /// Written by agentmux to record something the event stream implied but did not say.
     Synthetic,
+}
+
+/// A question the delegate asked the caller in the middle of a turn, without waiting for an
+/// answer.
+///
+/// agentmux records that it was asked, never whether it was answered: a reply arrives as an
+/// ordinary steer or follow-up, which names no question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedQuestion {
+    /// Its position among the questions its turn asked, counted from 1.
+    pub number: u32,
+    /// The whole question, with the context the delegate gave for it.
+    pub title: String,
+    /// The answers it suggests, its recommendation first; empty for a free-text question.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// When the delegate asked it, by the delegate CLI's clock.
+    pub asked_at: DateTime<Utc>,
 }
 
 /// One message in a consultation.
@@ -150,6 +173,16 @@ impl Message {
         }
     }
 
+    /// Questions the delegate asked the caller without waiting for an answer.
+    #[must_use]
+    pub fn question(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            text: text.into(),
+            source: MessageSource::Question,
+        }
+    }
+
     /// A note agentmux wrote itself, such as a non-fatal warning the delegate reported.
     #[must_use]
     pub fn synthetic(text: impl Into<String>) -> Self {
@@ -162,11 +195,15 @@ impl Message {
 
     /// Whether this message counts as part of the deliverable.
     ///
-    /// Assistant text the delegate produced is the report.
+    /// Assistant text the delegate produced is the report, the questions it asked included.
     /// Hook injections and agentmux's own notes are context around it.
     #[must_use]
     pub fn is_report_content(&self) -> bool {
-        self.role == Role::Assistant && self.source == MessageSource::Delegate
+        self.role == Role::Assistant
+            && matches!(
+                self.source,
+                MessageSource::Delegate | MessageSource::Question
+            )
     }
 }
 
@@ -477,6 +514,12 @@ pub struct Turn {
     pub question: String,
     /// Everything the delegate said, in order, including hook injections.
     pub messages: Vec<Message>,
+    /// The questions the delegate asked the caller in this turn, in the order it asked them.
+    ///
+    /// Each is also a [`MessageSource::Question`] message where it was asked; this is the same
+    /// questions in a shape a caller can act on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegate_questions: Vec<AskedQuestion>,
     /// How the turn ended.
     pub outcome: Outcome,
     /// Event types the parser met but does not model.
@@ -607,6 +650,7 @@ impl Turn {
             index,
             question: question.into(),
             messages: Vec::new(),
+            delegate_questions: Vec::new(),
             outcome: Outcome::Running,
             unrecognised: UnrecognisedEvents::default(),
             has_undecoded_app_server_messages: false,
@@ -1030,6 +1074,18 @@ fn render_messages(rendered_turn: &mut String, messages: &[Message]) {
                     "
 
                     ### user (steer)
+
+                    {}
+                ",
+                    message.text.trim_end()
+                );
+            }
+            MessageSource::Question => {
+                let _ = indoc::writedoc!(
+                    rendered_turn,
+                    "
+
+                    ### assistant (question)
 
                     {}
                 ",

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::Vendor;
-use agentmux::run::{ListFilter, RunId, RunStore, SettledTurn, StartRequest, TurnRef, parse_since};
+use agentmux::run::{
+    ListFilter, RunError, RunId, RunStore, SettledOrAsked, StartRequest, TurnRef, parse_since,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -258,6 +260,22 @@ pub struct WaitParams {
     #[serde(default)]
     #[schemars(with = "usize")]
     pub max_bytes: Option<usize>,
+
+    /// Also return while the turn is still running, as soon as the delegate has asked more
+    /// questions than `delegate_questions_seen`.
+    ///
+    /// A Codex delegate can ask the caller something and carry on without waiting; set this to
+    /// hear of it while a reply can still reach the turn through `steer`.
+    /// A turn that settles first is returned as settled.
+    #[serde(default)]
+    pub or_delegate_question: bool,
+
+    /// With `or_delegate_question`, how many of the turn's questions you have already seen, so a
+    /// wait that returned on question 2 is rearmed with `2`.
+    /// Defaults to 0.
+    #[serde(default)]
+    #[schemars(with = "u32")]
+    pub delegate_questions_seen: Option<u32>,
 }
 
 /// Arguments for `steer`: which running consultation, and what to tell it.
@@ -457,14 +475,18 @@ impl AgentMux {
         description = "Block until a consultation's turn has settled, then return its \
                        transcript. Settled means finished and final: the delegate has exited, \
                        or a cancellation froze the turn although the delegate would not stop, \
-                       and the transcript through that turn is published and will never change. It \
-                       never returns early with a running state, and it has no time limit of its \
-                       own, however long the review takes; while it waits it sends a progress \
+                       and the transcript through that turn is published and will never change. \
+                       Unless `or_delegate_question` is set it never returns early with a running \
+                       state, and it has no time limit of its own, however long the review takes; \
+                       while it waits it sends a progress \
                        notification every 30 seconds to a caller that asked for progress. Use it \
                        after `start` instead of polling. A host may still end a long call: Codex \
                        stops one after its `tool_timeout_sec`, and progress does not extend that, \
                        so there wait with the `agentmux wait` command in a shell instead. \
-                       Cancelling the call stops the wait, never the consultation."
+                       Cancelling the call stops the wait, never the consultation. With \
+                       `or_delegate_question`, it also returns while the turn is still running, as \
+                       soon as a Codex delegate asks a question beyond `delegate_questions_seen`, \
+                       so a reply can still reach it through `steer`."
     )]
     async fn wait(
         &self,
@@ -476,7 +498,31 @@ impl AgentMux {
             .store
             .pin_turn(&id, params.turn)
             .map_err(|error| run_error(&error))?;
-        let settled = wait_reporting_progress(&self.store, &target, &context).await?;
+        let settled = if params.or_delegate_question {
+            let waiting = self.store.wait_for_settlement_or_delegate_question(
+                &target,
+                params.delegate_questions_seen.unwrap_or(0),
+                None,
+            );
+            match wait_reporting_progress(&target, &context, waiting).await? {
+                Some(SettledOrAsked::Settled(settled)) => *settled,
+                Some(SettledOrAsked::Asked(asked)) => return Ok(text(render::asked(&asked))),
+                // Only a wait with a deadline can end without either.
+                None => {
+                    return Err(ErrorData::internal_error(
+                        "the wait ended with the turn neither settled nor asking",
+                        None,
+                    ));
+                }
+            }
+        } else {
+            wait_reporting_progress(&target, &context, self.store.wait_for_settlement(&target))
+                .await?
+        };
+        let questions = self
+            .store
+            .settled_questions(&settled)
+            .map_err(|error| run_error(&error))?;
         let page = settled
             .page(
                 params.offset.unwrap_or_else(|| settled.section_offset()),
@@ -505,15 +551,15 @@ impl AgentMux {
             .store
             .auto_resume(&id, settled.turn_number())
             .map_err(|error| run_error(&error))?;
-        Ok(text(render::settled(
-            &settled,
-            &meta,
-            &delegate,
-            turn_label.as_ref(),
+        let context = render::SettledContext {
+            meta: &meta,
+            delegate: &delegate,
+            label: turn_label.as_ref(),
             newest,
-            auto_resume.as_ref(),
-            &page,
-        )))
+            auto_resume: auto_resume.as_ref(),
+            questions: &questions,
+        };
+        Ok(text(render::settled(&settled, &context, &page)))
     }
 
     #[tool(
@@ -593,7 +639,8 @@ impl AgentMux {
                        `status` shows as `steerable: yes`; anything else is refused with the \
                        reason, and a finished consultation takes `follow_up` instead. Returns \
                        once the delegate has accepted the message, which the transcript then \
-                       records as a `### user (steer)` section where it arrived."
+                       records as a `### user (steer)` section where it arrived. It is also how \
+                       to reply to a question the delegate asked mid-turn, which `status` lists."
     )]
     async fn steer(
         &self,
@@ -690,19 +737,19 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 /// reading cannot hold back the wait it is about.
 const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Wait for `target` to settle, sending progress while it does when the request asked for it.
+/// Drive `waiting`, a wait on `target`, sending progress while it runs when the request asked for
+/// it.
 ///
-/// Returns the settlement, or an error when the wait fails or the caller cancels the request; the
-/// consultation itself is never touched.
-async fn wait_reporting_progress(
-    store: &RunStore,
+/// Returns what the wait returned, or an error when it fails or the caller cancels the request;
+/// the consultation itself is never touched.
+async fn wait_reporting_progress<T>(
     target: &TurnRef,
     context: &RequestContext<RoleServer>,
-) -> Result<SettledTurn, ErrorData> {
+    waiting: impl Future<Output = Result<T, RunError>>,
+) -> Result<T, ErrorData> {
     let progress_token = context.meta.get_progress_token();
     let started = tokio::time::Instant::now();
     let mut ticks = tokio::time::interval_at(started + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
-    let waiting = store.wait_for_settlement(target);
     tokio::pin!(waiting);
     loop {
         tokio::select! {
@@ -1048,7 +1095,8 @@ detached, surviving a restart of this server; a review at high effort takes five
 Collect it by waiting for its turn to settle rather than by polling. Settled means final: the
 delegate has exited, or a cancellation froze the turn although the delegate would not stop, and
 the transcript through that turn is published and will never change. Two
-waits return exactly then, never earlier, and have no time limit of their own:
+waits return exactly then, never earlier unless asked to return on a delegate's question (below),
+and have no time limit of their own:
 
 - The `wait` tool blocks the call until the turn settles, and sends a progress notification every
   30 seconds to a caller that asked for progress. Under Claude Code a `wait` the host moved to the
@@ -1076,6 +1124,16 @@ only a turn `status` reports as `steerable: yes` takes one, which today means a 
 consultation that inherits its account's settings, because only those are launched over Codex's
 app-server.
 
+A `codex` delegate over the app-server can ask you a question mid-turn, and does not wait for the
+answer: it carries on under an assumption of its own, or polls for a reply. The
+transcript shows each as `### assistant (question)`, and `status`, `list` and `wait` say what was
+asked. agentmux does not track whether a question was answered; reply with `steer` while the turn
+runs, or `follow_up` once it has settled. To hear of one while a reply can still reach the turn,
+pass `or_delegate_question: true` to `wait`, or `--or-delegate-question` to `agentmux wait`,
+which then also returns when the running turn asks something, exiting 12; rearm it with
+`delegate_questions_seen` (or `--delegate-questions-seen`) set to the number of the last question
+it returned.
+
 A turn that fails because the vendor's model is overloaded is resumed by agentmux itself: after a
 short wait it sends "continue" in the same session as the next turn, waiting longer each time the
 model is still overloaded, and gives up after a dozen tries. The failed turn says when, and which
@@ -1099,8 +1157,9 @@ how an expensive question reaches a cheap model. Pin the effort too for anything
 out, the machine's configured default for that model is used, or the CLI's own when it has none, and
 the result says which effort ran.
 
-Write the question for a stranger. The delegate shares no conversation with you and cannot ask you
-anything: name the paths it should read and the shape of the answer you want. It reads your project
+Write the question for a stranger. The delegate shares no conversation with you, and a question it
+asks you mid-turn goes on without your answer: name the paths it should read and the shape of the
+answer you want. It reads your project
 from `cwd`, is offered no editing tools unless its permissions say otherwise, and never inherits
 your session's identity. Unless this machine's agentmux.toml or your request says otherwise, it
 does load this machine's own CLI settings, hooks and MCP servers; `quota` reports what this machine

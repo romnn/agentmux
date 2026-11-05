@@ -159,3 +159,89 @@ fn a_listed_total_names_the_turns_that_reported_nothing() {
         eq("-")
     );
 }
+
+/// Questions handed over are handed over whole, every one of them, because the caller
+/// acknowledges them by number; a header a caller polls shows only the newest few, clipped, and
+/// says where the rest are.
+#[gtest]
+fn questions_handed_over_are_whole_and_summaries_are_bounded() {
+    use agentmux::run::TurnQuestion;
+    use agentmux::transcript::AskedQuestion;
+
+    let long_title = format!("Should the gate run? {}", "context ".repeat(200));
+    let questions: Vec<TurnQuestion> = (1..=4)
+        .map(|number| TurnQuestion {
+            turn: 1,
+            question: AskedQuestion {
+                number,
+                title: if number == 1 {
+                    long_title.clone()
+                } else {
+                    format!("Question {number}?")
+                },
+                options: vec!["Yes (Recommended)".to_owned(), "No".to_owned()],
+                asked_at: Utc::now(),
+            },
+        })
+        .collect();
+
+    // Handed over: all four, the first with its whole title.
+    let handed_over = agentmux::report::asked_lines(&questions).join("\n");
+    for number in 1..=4 {
+        expect_that!(
+            handed_over,
+            contains_substring(format!("turn 1 question {number}, asked"))
+        );
+    }
+    expect_that!(handed_over, contains_substring(long_title.trim_end()));
+
+    // Summarised: the newest three, after a line naming where the first is.
+    let summary = agentmux::report::asked_summary_lines(&questions).join("\n");
+    expect_that!(
+        summary,
+        contains_substring("1 earlier question(s) not shown; the transcript has every one")
+    );
+    expect_that!(summary, not(contains_substring("turn 1 question 1, asked")));
+    for number in 2..=4 {
+        expect_that!(
+            summary,
+            contains_substring(format!("turn 1 question {number}, asked"))
+        );
+    }
+}
+
+/// Questions handed over keep the delegate's own whitespace: two options that differ only in
+/// spacing stay distinct, and code inside a title keeps its indentation.
+#[gtest]
+fn questions_handed_over_keep_their_whitespace() {
+    use agentmux::run::TurnQuestion;
+    use agentmux::transcript::AskedQuestion;
+
+    let questions = [TurnQuestion {
+        turn: 2,
+        question: AskedQuestion {
+            number: 1,
+            title: "Which match should the parser use?\n    if a  b {\n        x\n    }".to_owned(),
+            options: vec!["match `a b`".to_owned(), "match `a  b`".to_owned()],
+            asked_at: Utc::now(),
+        },
+    }];
+    let lines = agentmux::report::asked_lines(&questions);
+    let (heading, rest) = lines
+        .split_first()
+        .map_or(("", &[][..]), |(heading, rest)| (heading.as_str(), rest));
+
+    assert_that!(heading, starts_with("turn 2 question 1, asked"));
+    assert_that!(
+        rest,
+        elements_are![
+            eq("  Which match should the parser use?"),
+            eq("      if a  b {"),
+            eq("          x"),
+            eq("      }"),
+            eq("  options:"),
+            eq("  - match `a b`"),
+            eq("  - match `a  b`"),
+        ]
+    );
+}

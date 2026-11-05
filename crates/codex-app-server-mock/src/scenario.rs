@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 /// The file in codex's home holding the fake's [`Config`], as JSON.
 pub const CONFIG_FILE: &str = "app-server-mock.json";
 
+/// The question a [`Scenario::AsksThenSteerable`] turn asks.
+pub const ASKED_QUESTION: &str = "Should inferred schemas assume valid Kubernetes namespace names?";
+
 /// The first argument of the fake run in a helper role, which every command the fake starts
 /// carries, so a test can tell those commands from anything else.
 pub const HELPER: &str = "__codex-app-server-mock-helper";
@@ -43,6 +46,9 @@ pub enum Scenario {
     /// The command is left running however the turn ends, as codex-cli 0.159.3 was seen to leave
     /// one on an interrupt.
     Steerable,
+    /// As [`Scenario::Steerable`], except that once the turn has started the delegate asks the
+    /// client a question, as `request_user_input_async` does, and carries on running.
+    AsksThenSteerable,
     /// The server answers setup; on `turn/start` it starts a command, waits for
     /// `exit_trigger_path` to exist, and then exits as `exit_mode` says.
     ServerExit {

@@ -29,8 +29,8 @@ use agentmux::report::{
     quota_block, quota_report, summarise,
 };
 use agentmux::run::{
-    AutoResume, HookReopening, Meta, QuotaReport, RunLabel, RunStatus, RunSummary, SettledTurn,
-    TranscriptPage, TurnLeftRunning, describe_delegate,
+    Asked, AutoResume, HookReopening, Meta, QuotaReport, RunLabel, RunStatus, RunSummary,
+    SettledTurn, TranscriptPage, TurnLeftRunning, TurnQuestion, describe_delegate,
 };
 use agentmux::transcript::{FailureKind, UsageWindow, describe_unsaved_session_store};
 use chrono::Utc;
@@ -172,6 +172,11 @@ pub fn warnings(status: &RunStatus) -> String {
             // of what the caller should do, and earlier failures on the header's own `earlier:`
             // line, beside the state they must not be read as.
             Warning::AutoResume(_) | Warning::EarlierFailures(_) => {}
+            Warning::Asked {
+                questions,
+                steerable,
+                resumable,
+            } => out.push_str(&status_asked_warning(questions, steerable, resumable)),
             Warning::LeftRunning(left_running) => out.push_str(&left_running_warning(left_running)),
             Warning::SessionNotSaved { store: session_store_path } => {
                 out.push_str(&indoc::formatdoc! {"
@@ -233,6 +238,87 @@ pub fn warnings(status: &RunStatus) -> String {
                 );
             }
         }
+    }
+    out
+}
+
+/// How a reply to the delegate's questions can reach it, as far as the result can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyPath {
+    /// The turn is running and takes a steer.
+    Steer,
+    /// The turn has ended and the consultation takes a follow-up.
+    FollowUp,
+    /// The turn has ended, and whether a follow-up is possible is for `status` to say: a settled
+    /// turn alone does not tell, because a cancellation or a newer turn rules one out.
+    FollowUpIfResumable,
+    /// Nothing can reach the delegate now.
+    Nowhere,
+}
+
+impl ReplyPath {
+    /// The way a status says a reply can go: the running turn first, then a follow-up.
+    fn of(steerable: bool, resumable: bool) -> Self {
+        if steerable {
+            Self::Steer
+        } else if resumable {
+            Self::FollowUp
+        } else {
+            Self::Nowhere
+        }
+    }
+}
+
+/// The `asked:` block of a status, which summarises the questions and names the way a reply can
+/// go.
+fn status_asked_warning(questions: &[TurnQuestion], steerable: bool, resumable: bool) -> String {
+    asked_warning(
+        questions,
+        ReplyPath::of(steerable, resumable),
+        QuestionDetail::Summary,
+    )
+}
+
+/// How much of each question an `asked:` block shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuestionDetail {
+    /// Every question, whole, for a result that hands them over.
+    Full,
+    /// The newest few, clipped, for a header a caller may poll.
+    Summary,
+}
+
+/// The warning that the delegate asked questions, and how a reply reaches it.
+///
+/// It never says whether a question was answered, because agentmux cannot tell: the delegate went
+/// on without waiting, and a reply is an ordinary steer or follow-up.
+fn asked_warning(questions: &[TurnQuestion], reply: ReplyPath, detail: QuestionDetail) -> String {
+    let reply = match reply {
+        ReplyPath::Steer => {
+            "Reply with `steer` while the turn runs; the delegate reads it before its next model \
+             call."
+        }
+        ReplyPath::FollowUp => {
+            "The turn has ended; reply with `follow_up` if an answer still matters."
+        }
+        ReplyPath::FollowUpIfResumable => {
+            "The turn has ended; only a `follow_up` can reply now, where `status` reports the \
+             consultation resumable."
+        }
+        ReplyPath::Nowhere => "No reply can reach the delegate now.",
+    };
+    let mut out = format!(
+        "asked:      the delegate asked {} question(s) without waiting for an answer, carrying on\n\
+         \x20           meanwhile. agentmux does not track whether one was answered.\n\
+         \x20           {reply}\n",
+        questions.len()
+    );
+    let lines = match detail {
+        QuestionDetail::Full => report::asked_lines(questions),
+        QuestionDetail::Summary => report::asked_summary_lines(questions),
+    };
+    for line in lines {
+        let _ = writeln!(out, "            {line}");
     }
     out
 }
@@ -596,24 +682,45 @@ pub fn transcript(status: &RunStatus, page: &TranscriptPage) -> String {
     out
 }
 
-/// What `wait` returns: a settled turn's transcript, under a header built from the settlement,
-/// from what the consultation recorded when it began, and from `delegate` and `label`, who that
-/// turn ran as and what it was for.
+/// What a settled turn's header is built from, besides its settlement and its page.
 ///
 /// Nothing in it depends on a later turn, so a follow-up that is running, or one whose records
-/// cannot be read, neither delays nor fails a wait for a turn that has settled; `newest` is the
-/// newest turn's number where it could be read, and names a follow-up that has begun since.
+/// cannot be read, neither delays nor fails a wait for a turn that has settled.
+#[derive(Debug, Clone, Copy)]
+pub struct SettledContext<'a> {
+    /// What the consultation recorded when it began.
+    pub meta: &'a Meta,
+    /// Who the settled turn ran as.
+    pub delegate: &'a Delegate,
+    /// What the settled turn was for, when it was given a label.
+    pub label: Option<&'a RunLabel>,
+    /// The newest turn's number where it could be read, which names a follow-up that has begun
+    /// since.
+    pub newest: Option<u32>,
+    /// What agentmux does about the settled turn having failed overloaded, when it does anything.
+    pub auto_resume: Option<&'a AutoResume>,
+    /// The questions the settled turn asked, from the capture its settlement froze.
+    pub questions: &'a [TurnQuestion],
+}
+
+/// What `wait` returns: a settled turn's transcript, under a header built from the settlement
+/// and its [`SettledContext`].
+///
 /// The page is the settlement's own, ending where the settled turn does.
 #[must_use]
 pub fn settled(
     settled: &SettledTurn,
-    meta: &Meta,
-    delegate: &Delegate,
-    label: Option<&RunLabel>,
-    newest: Option<u32>,
-    auto_resume: Option<&AutoResume>,
+    context: &SettledContext<'_>,
     page: &TranscriptPage,
 ) -> String {
+    let SettledContext {
+        meta,
+        delegate,
+        label,
+        newest,
+        auto_resume,
+        questions,
+    } = *context;
     let id = settled.run_id();
     let turn = settled.turn_number();
     // Its own line under the id, ending in a newline, or nothing.
@@ -651,6 +758,15 @@ pub fn settled(
     if let Some(resume) = auto_resume {
         let _ = writeln!(out, "resume:     {}", auto_resume_advice(resume));
     }
+    if !questions.is_empty() {
+        // A settled turn takes no steer, and whether it takes a follow-up depends on more than
+        // this settlement.
+        out.push_str(&asked_warning(
+            questions,
+            ReplyPath::FollowUpIfResumable,
+            QuestionDetail::Summary,
+        ));
+    }
     if let Some(newest) = newest.filter(|newest| *newest > turn) {
         out.push_str(&indoc::formatdoc! {r#"
             newer:      turn {newest} has begun since;
@@ -669,6 +785,36 @@ pub fn settled(
             read the transcript from the file named above with your own file tools.]
         "#});
     }
+    out
+}
+
+/// What `wait` with `or_delegate_question` returns when the running turn asked something first.
+///
+/// The turn has not settled, so there is no final transcript to return; the questions and the way
+/// to reply are the whole result.
+#[must_use]
+pub fn asked(asked: &Asked) -> String {
+    let id = asked.target.run_id();
+    let turn = asked.target.turn_number();
+    let seen = asked
+        .delegate_questions
+        .last()
+        .map_or(0, |question| question.question.number);
+    let mut out = indoc::formatdoc! {"
+        run_id:     {id}
+        state:      running — turn {turn} has not settled; this wait returned because the
+                    delegate asked a question
+        "};
+    out.push_str(&asked_warning(
+        &asked.delegate_questions,
+        ReplyPath::Steer,
+        QuestionDetail::Full,
+    ));
+    out.push_str(&indoc::formatdoc! {r#"
+        next:       steer {{"run_id": "{id}", "message": "…"}} — reply to the question
+                    wait {{"run_id": "{id}", "turn": {turn}, "or_delegate_question": true, "delegate_questions_seen": {seen}}} — keep waiting, and hear of the next question
+                    tail {{"run_id": "{id}", "from_end": true}} — what the delegate said around it
+    "#});
     out
 }
 
@@ -727,6 +873,13 @@ pub fn list(runs: &[RunSummary], filtered: bool) -> String {
         );
         if let Some(label) = &run.label {
             let _ = writeln!(out, "    label: {label}");
+        }
+        if run.delegate_questions > 0 {
+            let _ = writeln!(
+                out,
+                "    asked: {} question(s); `status` lists them",
+                run.delegate_questions
+            );
         }
         let _ = writeln!(out, "    {}", run.delegate);
         let _ = writeln!(out, "    {}", run.question);

@@ -9,7 +9,9 @@ use serde::Serialize;
 use crate::accounting::{Accounting, Tokens, Totals};
 use crate::delegate::{Billing, Delegate, Effort, Isolation, ModelId, Vendor};
 use crate::left_running::LeftRunning;
-use crate::transcript::{EarlierFailure, Outcome, TurnState, UnrecognisedEvents, UsageWindow};
+use crate::transcript::{
+    AskedQuestion, EarlierFailure, Outcome, TurnState, UnrecognisedEvents, UsageWindow,
+};
 
 use super::id::RunId;
 use super::label::RunLabel;
@@ -104,6 +106,11 @@ pub struct RunStatus {
     /// and leave the failure visible only deep inside the transcript body.
     /// Kept apart from [`RunStatus::outcome`], which describes the newest turn alone.
     pub earlier_failures: Vec<EarlierFailure>,
+    /// Every question the delegate asked the caller, across every turn, oldest first.
+    ///
+    /// A question stays listed whatever follows it, because agentmux cannot tell whether a later
+    /// steer or follow-up answered it: the delegate went on without an answer either way.
+    pub delegate_questions: Vec<TurnQuestion>,
     /// What each turn that left processes running when it ended left, oldest first.
     ///
     /// Work in those processes may be incomplete, which nothing the delegate said tells.
@@ -189,6 +196,31 @@ impl RunStatus {
         self.settled
             && self.continued_by.is_none()
             && self.content_flagged_in_a_row >= super::CONTENT_FLAGGED_STREAK
+    }
+}
+
+/// A question the delegate asked, with the turn it asked it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TurnQuestion {
+    /// The turn's number, counted from 1.
+    pub turn: u32,
+    /// The question.
+    #[serde(flatten)]
+    pub question: AskedQuestion,
+}
+
+impl TurnQuestion {
+    /// The questions every turn in `turns` asked, oldest first.
+    pub(crate) fn of_turns(turns: &[crate::transcript::Turn]) -> Vec<Self> {
+        turns.iter().flat_map(Self::of_turn).collect()
+    }
+
+    /// The questions one turn asked.
+    pub(crate) fn of_turn(turn: &crate::transcript::Turn) -> impl Iterator<Item = Self> + '_ {
+        turn.delegate_questions.iter().map(|question| Self {
+            turn: turn.index.saturating_add(1),
+            question: question.clone(),
+        })
     }
 }
 
@@ -294,6 +326,9 @@ pub struct RunSummary {
     pub last_activity: Option<DateTime<Utc>>,
     /// How many turns the consultation has, which is also the newest turn's number.
     pub turns: u32,
+    /// How many questions the delegate asked the caller, across every turn, as
+    /// [`RunStatus::delegate_questions`] lists them.
+    pub delegate_questions: usize,
     /// When `start` was called.
     pub created_at: DateTime<Utc>,
     /// The first line of the question, truncated.
