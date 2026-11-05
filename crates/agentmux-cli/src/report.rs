@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use agentmux::report::{self, Warning};
 use agentmux::run::{
-    AutoResume, HookReopening, RunError, RunId, RunLabel, RunStatus, RunStore, RunSummary,
-    SettledTurn, TranscriptPage, TurnRef, WaitFor,
+    Asked, AutoResume, HookReopening, RunError, RunId, RunLabel, RunStatus, RunStore, RunSummary,
+    SettledOrAsked, SettledTurn, TranscriptPage, TurnQuestion, TurnRef, WaitFor, Waited,
 };
 use agentmux::transcript::{Outcome, TurnState};
 use color_eyre::eyre::Result;
@@ -114,6 +114,20 @@ fn warning_lines(warning: &Warning<'_>) -> Vec<String> {
             "  EARLIER     {} — see the transcript",
             report::earlier_failures_line(failures)
         )],
+        // How to reply is the `steer` or `follow up` line at the end of the block.
+        Warning::Asked { questions, .. } => {
+            let mut lines = vec![format!(
+                "  ASKED       {} question(s), each asked without waiting for an answer; agentmux \
+                 does not track replies",
+                questions.len()
+            )];
+            lines.extend(
+                report::asked_summary_lines(questions)
+                    .into_iter()
+                    .map(|line| format!("                {line}")),
+            );
+            lines
+        }
         Warning::LeftRunning(left_running) => vec![format!(
             "  WARNING     {}",
             report::left_running_line(left_running)
@@ -283,6 +297,8 @@ pub enum WaitStatus {
     Failed,
     /// A turn returned cancelled, and none failed.
     Cancelled,
+    /// The turn, still running, asked a question first, under `--or-delegate-question`.
+    Asked,
     /// The timeout passed first.
     TimedOut,
     /// An argument named a consultation or a turn there is not.
@@ -300,6 +316,7 @@ impl WaitStatus {
             Self::Completed => 0,
             Self::Failed => 10,
             Self::Cancelled => 11,
+            Self::Asked => 12,
             Self::TimedOut => 124,
             Self::Unusable => 2,
         }
@@ -345,8 +362,94 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
             Err(err) => return Err(err.into()),
         }
     }
+    if args.or_delegate_question {
+        return wait_or_delegate_question(store, args, targets, deadline, json).await;
+    }
     let until = if args.any { WaitFor::Any } else { WaitFor::All };
     let waited = store.wait_for(&targets, until, deadline).await?;
+    report_waited(store, &waited, json)
+}
+
+/// `agentmux wait --or-delegate-question`: wait on one turn until it settles or, while it still
+/// runs, asks more than `--delegate-questions-seen` questions.
+///
+/// # Errors
+///
+/// As [`wait`].
+async fn wait_or_delegate_question(
+    store: &RunStore,
+    args: &WaitArgs,
+    targets: Vec<TurnRef>,
+    deadline: Option<tokio::time::Instant>,
+    json: bool,
+) -> Result<WaitStatus> {
+    let Ok([target]) = <[TurnRef; 1]>::try_from(targets) else {
+        eprintln!("agentmux: --or-delegate-question waits on one consultation at a time");
+        return Ok(WaitStatus::Unusable);
+    };
+    let waited = store
+        .wait_for_settlement_or_delegate_question(&target, args.delegate_questions_seen, deadline)
+        .await?;
+    match waited {
+        Some(SettledOrAsked::Settled(settled)) => {
+            let waited = Waited {
+                settled: vec![*settled],
+                pending: Vec::new(),
+                timed_out: false,
+            };
+            report_waited(store, &waited, json)
+        }
+        Some(SettledOrAsked::Asked(asked)) => {
+            if json {
+                let report = AskedJson {
+                    result: "asked",
+                    asked: &asked,
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_asked(&asked);
+            }
+            Ok(WaitStatus::Asked)
+        }
+        None => {
+            let waited = Waited {
+                settled: Vec::new(),
+                pending: vec![target],
+                timed_out: true,
+            };
+            report_waited(store, &waited, json)
+        }
+    }
+}
+
+/// Print a question a running turn asked, and how to reply and carry on waiting.
+fn print_asked(asked: &Asked) {
+    let id = asked.target.run_id();
+    let turn = asked.target.turn_number();
+    let seen = asked
+        .delegate_questions
+        .last()
+        .map_or(0, |question| question.question.number);
+    println!(
+        "{id}  turn {turn} asked a question; it is still running and did not wait for an answer"
+    );
+    for line in report::asked_lines(&asked.delegate_questions) {
+        println!("  {line}");
+    }
+    println!("  reply       agentmux steer {id} '…'");
+    println!(
+        "  keep going  agentmux wait {id} --turn {turn} --or-delegate-question \
+         --delegate-questions-seen {seen}"
+    );
+}
+
+/// Report what a wait returned with, and how it ended.
+///
+/// # Errors
+///
+/// Returns an error when a settled turn's records or transcript cannot be read, or the JSON form
+/// cannot be serialised.
+fn report_waited(store: &RunStore, waited: &Waited, json: bool) -> Result<WaitStatus> {
     let status = if waited.timed_out {
         WaitStatus::TimedOut
     } else {
@@ -362,6 +465,7 @@ pub async fn wait(store: &RunStore, args: &WaitArgs, json: bool) -> Result<WaitS
             label: store.turn_label(settled)?,
             // Decided before the settlement was committed, so it is there for a turn that has one.
             auto_resume: store.auto_resume(settled.run_id(), settled.turn_number())?,
+            delegate_questions: store.settled_questions(settled)?,
             text_offset: offset,
             text: page.text,
         });
@@ -433,12 +537,26 @@ fn print_settled(settled_report: &SettledJson<'_>) -> Result<()> {
             )?;
         }
     }
+    // Its own lines under the state, ending in a newline each, or nothing.
+    let mut asked = String::new();
+    if !settled_report.delegate_questions.is_empty() {
+        writeln!(
+            asked,
+            "  asked       {} question(s), each asked without waiting for an answer; only a \
+             follow-up can reply now, where `agentmux status {}` says one is possible",
+            settled_report.delegate_questions.len(),
+            settled.run_id()
+        )?;
+        for line in report::asked_summary_lines(&settled_report.delegate_questions) {
+            writeln!(asked, "                {line}")?;
+        }
+    }
     print!(
         "{}",
         indoc::formatdoc! {"
             {id}  turn {turn} settled
             {label}  state       {state}
-            {resume}  transcript  {transcript}
+            {resume}{asked}  transcript  {transcript}
               settled     {marker}
 
             ---
@@ -466,8 +584,18 @@ struct SettledJson<'a> {
     /// What agentmux does about the turn having failed because the model was overloaded.
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_resume: Option<AutoResume>,
+    /// The questions the turn asked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    delegate_questions: Vec<TurnQuestion>,
     text_offset: u64,
     text: String,
+}
+
+/// `wait --or-delegate-question --json` when the running turn asked first.
+#[derive(Serialize)]
+struct AskedJson<'a> {
+    result: &'static str,
+    asked: &'a Asked,
 }
 
 /// `wait --json`: whether the wait ended in settlement or a timeout, what settled, and what did
@@ -508,6 +636,12 @@ pub fn list(runs: &[RunSummary], filtered: bool, json: bool) -> Result<()> {
         );
         if let Some(label) = &run.label {
             println!("    label: {label}");
+        }
+        if run.delegate_questions > 0 {
+            println!(
+                "    asked: {} question(s); `agentmux status {}` lists them",
+                run.delegate_questions, run.run_id
+            );
         }
         println!("    {}", run.delegate);
         println!("    {}", run.question);

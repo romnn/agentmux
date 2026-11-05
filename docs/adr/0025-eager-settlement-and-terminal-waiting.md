@@ -105,6 +105,10 @@ observation of the stream.
 - `agentmux wait <run>... [--turn N] [--any | --all] [--timeout D]` blocks with no deadline by
   default and exits 0 completed, 10 failed, 11 cancelled, 124 timed out, 1 for an agentmux
   failure and 2 for arguments naming nothing. Under `--all`, a failure outweighs a cancellation.
+- The one exception is opted into: MCP `wait` with `or_delegate_question`, and
+  `agentmux wait --or-delegate-question`, which exits 12, also return while the turn runs once its
+  delegate has asked a question beyond the ones the caller has seen
+  ([0033](0033-delegate-questions-surfaced.md)).
 
 ## Consequences
 

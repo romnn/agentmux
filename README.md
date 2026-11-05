@@ -116,7 +116,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 | `follow_up`      | Ask one more question, resuming the delegate's own session so the brief is retained        |
 | `continue_fresh` | Continue in a new session that reads the old transcript, when the old session cannot go on |
 | `steer`          | Add an instruction to a turn that is still running, read before its next model call        |
-| `wait`           | Block until a turn has settled, then return it — never earlier, with no time limit         |
+| `wait`           | Block until a turn has settled, with no time limit, or on request when the delegate asks   |
 | `cancel`         | Stop a running consultation or a pending automatic resume, keeping what was collected      |
 | `list`           | Recent consultations with their ids, labels and totals, by `label`, `state` or `since`     |
 | `quota`          | What each configured account has left, in the vendor's own numbers — free, no tokens       |
@@ -738,13 +738,32 @@ the hidden `agentmux supervise`, which starts the delegate itself and settles th
 leaves — so the settlement is on disk within moments whether or not anything is asking, and a file
 watch on `settled.json` sees it.
 
-Two waits return exactly then, never earlier, and have no deadline of their own:
+Two waits return exactly then, never earlier unless asked to return on a question (below), and
+have no deadline of their own:
 
 - the `wait` tool, which sends a progress notification every 30 seconds to a caller that asked for
   progress, and
 - `agentmux wait <run-id>... [--turn N] [--any | --all] [--timeout D] [--json]`, which prints the
   turn and exits 0 completed, 10 failed, 11 cancelled, 124 when `--timeout` passed first, 1 when
   agentmux itself failed and 2 for an id or a turn there is not.
+
+A Codex delegate can ask you a question mid-turn, through Codex's `request_user_input_async`, and
+carry on without waiting for the answer. The transcript shows each under `### assistant (question)`,
+`status` lists every one with its turn, number, options and age, and `list` counts them. agentmux
+does not track whether one was answered: reply with `steer` while the turn runs, or `follow_up`
+once it has settled. To hear of a question while a reply can still reach the turn, wait with
+`--or-delegate-question` (`or_delegate_question: true` on the tool), which also returns, exiting
+12, as soon as the running turn has asked more than `--delegate-questions-seen N` questions; rearm
+it with the number of the last question it returned:
+
+```bash
+# Exits 12 on question 1.
+agentmux wait <run-id> --or-delegate-question
+# Reply, if you want to.
+agentmux steer <run-id> 'Assume valid namespace names.'
+# The next question, or the settled turn.
+agentmux wait <run-id> --or-delegate-question --delegate-questions-seen 1
+```
 
 A wait is pinned to one turn — the newest when it starts, or `--turn N`, counted from 1 — and a
 follow-up started meanwhile is not returned in its place. `ask`, `result` with `wait_seconds`, and

@@ -5,14 +5,14 @@
 //! the least a client can rely on.
 
 use codex_app_server_protocol::types::{
-    AgentMessageThreadItem, ApprovalsReviewer, AskForApproval,
-    CommandExecutionRequestApprovalParams, CommandExecutionStatus, CommandExecutionThreadItem,
-    ErrorNotification, InitializeResponse, ItemCompletedNotification, PlanThreadItem,
-    ReadOnlySandboxPolicy, ReasoningThreadItem, SandboxPolicy, SessionSource, Thread, ThreadItem,
-    ThreadResumeResponse, ThreadStartResponse, ThreadStatus, ThreadTokenUsage,
-    ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn, TurnCompletedNotification,
-    TurnError, TurnInterruptParams, TurnInterruptResponse, TurnStartResponse,
-    TurnStartedNotification, TurnStatus, TurnSteerResponse, WarningNotification,
+    AgentMessageDelivery, AgentMessageThreadItem, ApprovalsReviewer, AskForApproval,
+    AsyncUserInputQuestion, CommandExecutionRequestApprovalParams, CommandExecutionStatus,
+    CommandExecutionThreadItem, ErrorNotification, InitializeResponse, ItemCompletedNotification,
+    MessagePhase, PlanThreadItem, ReadOnlySandboxPolicy, ReasoningThreadItem, SandboxPolicy,
+    SessionSource, Thread, ThreadItem, ThreadResumeResponse, ThreadStartResponse, ThreadStatus,
+    ThreadTokenUsage, ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn,
+    TurnCompletedNotification, TurnError, TurnInterruptParams, TurnInterruptResponse,
+    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnSteerResponse, WarningNotification,
 };
 
 /// The thread a fake server opens, unless a test names another.
@@ -200,6 +200,35 @@ pub fn agent_message(id: &str, text: &str) -> ThreadItem {
         phase: None,
         questions: None,
         text: text.to_owned(),
+    }))
+}
+
+/// The item `request_user_input_async` emits for `questions`: a reply carrying them, whose id is
+/// the tool call's and whose text lays them out as codex does.
+#[must_use]
+pub fn async_question(call_id: &str, questions: Vec<AsyncUserInputQuestion>) -> ThreadItem {
+    let text = questions
+        .iter()
+        .map(|question| {
+            let mut lines = vec![question.title.clone()];
+            lines.extend(
+                question
+                    .options
+                    .iter()
+                    .flatten()
+                    .map(|option| format!("- {option}")),
+            );
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    ThreadItem::AgentMessage(Box::new(AgentMessageThreadItem {
+        delivery: Some(AgentMessageDelivery::Async),
+        id: call_id.to_owned(),
+        memory_citation: None,
+        phase: Some(MessagePhase::FinalAnswer),
+        questions: Some(questions),
+        text,
     }))
 }
 

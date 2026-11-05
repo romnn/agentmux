@@ -84,3 +84,5 @@ a record names to show where the decision is enforced must be renamed there too.
   against codex's schema, independently of the generated types.
 - [0032](0032-leftover-processes-reported.md): A delegate is told its leftovers may be stopped,
   and what a driven turn left running is reported.
+- [0033](0033-delegate-questions-surfaced.md): A delegate's questions are surfaced as asked, never
+  as answered, and a wait can return on one.

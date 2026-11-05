@@ -83,6 +83,11 @@ struct CliTestHarness {
 /// Each turn runs until steered, which completes it, or interrupted, and starts a command in a
 /// session of its own that it leaves running however it ends, as codex's sandbox does.
 fn cli_harness() -> Result<CliTestHarness> {
+    cli_harness_playing(Scenario::Steerable)
+}
+
+/// As [`cli_harness`], with the fake playing `scenario`.
+fn cli_harness_playing(scenario: Scenario) -> Result<CliTestHarness> {
     let root = tempfile::tempdir().or_fail()?;
     let home = root.path().join("home");
     let project_dir = root.path().join("project");
@@ -95,7 +100,7 @@ fn cli_harness() -> Result<CliTestHarness> {
     configure(
         &home.join(".codex"),
         &Config {
-            scenario: Scenario::Steerable,
+            scenario,
             client_messages_path: Some(client_messages_path.clone()),
             environment_dump_path: Some(server_env_path.clone()),
             command_pids_path: command_pids_path.clone(),
@@ -135,9 +140,14 @@ fn cli_harness() -> Result<CliTestHarness> {
 impl CliTestHarness {
     /// Run `agentmux steer` on the consultation, as a caller in a shell would.
     async fn run_steer_command(&self, id: &str, message: &str) -> Result<std::process::Output> {
+        self.run_agentmux(&["steer", id, message]).await
+    }
+
+    /// Run `agentmux` with `args`, as a caller in a shell would.
+    async fn run_agentmux(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agentmux"));
         command
-            .args(["steer", id, message])
+            .args(args)
             .env_clear()
             .envs(&self.host_env)
             .env("AGENTMUX_STATE_DIR", &self.state_dir);
@@ -912,5 +922,111 @@ async fn a_driver_reaps_adopted_children_before_the_turn_ends() -> Result<()> {
     std::fs::write(&release, "").or_fail()?;
     let status = wait_for_driver_exit(&mut driver.child).await?;
     assert_that!(status.code(), some(eq(0)));
+    Ok(())
+}
+
+/// A caller waiting in a shell with `agentmux wait --or-delegate-question` hears of a question the running
+/// turn asks, exits 12 with the question in its JSON, waits past it once rearmed, and still gets
+/// the settled turn, which lists what was asked, once a steer has finished it.
+#[gtest]
+#[tokio::test(flavor = "multi_thread")]
+async fn agentmux_wait_returns_on_a_question_and_exits_12() -> Result<()> {
+    let harness = cli_harness_playing(Scenario::AsksThenSteerable)?;
+    let started = harness.store.start(&StartRequest {
+        delegate: Delegate::Codex {
+            model: ModelId::parse("gpt-6-astra").or_fail()?,
+            effort: Some(Effort::parse("high").or_fail()?),
+            permissions: CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            },
+            account: AccountChoice::Default,
+            isolation: Some(Isolation::Inherit),
+        },
+        question: "Infer the chart schemas.".to_owned(),
+        cwd: harness.project_dir.clone(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let id = started.run_id.clone();
+
+    // The turn asks once it has started, and the wait returns on it with the question's number.
+    let asked = harness
+        .run_agentmux(&[
+            "--json",
+            "wait",
+            id.as_str(),
+            "--or-delegate-question",
+            "--timeout",
+            "60s",
+        ])
+        .await?;
+    assert_that!(asked.status.code(), some(eq(12)), "{asked:?}");
+    let report: serde_json::Value = serde_json::from_slice(&asked.stdout).or_fail()?;
+    assert_that!(report["result"], eq(&serde_json::json!("asked")));
+    assert_that!(report["asked"]["turn"], eq(&serde_json::json!(1)));
+    assert_that!(
+        report["asked"]["delegate_questions"],
+        eq(&serde_json::json!([{
+            "turn": 1,
+            "number": 1,
+            "title": codex_app_server_mock::scenario::ASKED_QUESTION,
+            "options": ["Yes (Recommended)", "No"],
+            "asked_at": "1970-01-01T00:00:00.001Z",
+        }]))
+    );
+
+    // `status` lists it too, while the turn still runs.
+    let status = harness.store.status(&id)?;
+    assert_that!(status.delegate_questions.len(), eq(1));
+    assert_that!(status.steerable, eq(true));
+
+    // Rearmed past it, the wait holds until its timeout: nothing else was asked.
+    let rearmed = harness
+        .run_agentmux(&[
+            "wait",
+            id.as_str(),
+            "--or-delegate-question",
+            "--delegate-questions-seen",
+            "1",
+            "--timeout",
+            "2s",
+        ])
+        .await?;
+    assert_that!(rearmed.status.code(), some(eq(124)), "{rearmed:?}");
+
+    // A steer finishes the turn, and the rearmed wait returns it settled, with what it asked.
+    let steered = harness
+        .run_steer_command(id.as_str(), "Assume valid namespace names.")
+        .await?;
+    assert_that!(steered.status.success(), eq(true), "{steered:?}");
+    let settled = harness
+        .run_agentmux(&[
+            "--json",
+            "wait",
+            id.as_str(),
+            "--or-delegate-question",
+            "--delegate-questions-seen",
+            "1",
+            "--timeout",
+            "60s",
+        ])
+        .await?;
+    assert_that!(settled.status.code(), some(eq(0)), "{settled:?}");
+    let report: serde_json::Value = serde_json::from_slice(&settled.stdout).or_fail()?;
+    assert_that!(report["result"], eq(&serde_json::json!("settled")));
+    assert_that!(
+        report["settled"][0]["delegate_questions"][0]["title"],
+        eq(&serde_json::json!(
+            codex_app_server_mock::scenario::ASKED_QUESTION
+        ))
+    );
+    assert_that!(
+        report["settled"][0]["text"].as_str().unwrap_or_default(),
+        contains_substring("### assistant (question)")
+    );
     Ok(())
 }

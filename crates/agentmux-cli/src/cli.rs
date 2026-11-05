@@ -110,8 +110,9 @@ pub enum Command {
     ///
     /// Returns only once each turn's transcript is published and final, never on a transcript
     /// that merely looks finished, and as long as that takes unless `--timeout` says otherwise.
-    /// The exit status says how it ended: 0 completed, 10 failed, 11 cancelled, 124 when the
-    /// timeout passed first, 1 when agentmux itself failed and 2 for arguments it cannot act on.
+    /// The exit status says how it ended: 0 completed, 10 failed, 11 cancelled, 12 when the
+    /// delegate asked a question first under `--or-delegate-question`, 124 when the timeout passed
+    /// first, 1 when agentmux itself failed and 2 for arguments it cannot act on.
     /// Run it in a background shell and its exit is the completion notice.
     Wait(WaitArgs),
 
@@ -701,6 +702,25 @@ pub struct WaitArgs {
     /// Give up after this long, such as `90s` or `2h`, and exit 124; the consultations carry on.
     #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
     pub timeout: Option<std::time::Duration>,
+
+    /// Also return, and exit 12, while the turn is still running, as soon as the delegate has
+    /// asked more than `--delegate-questions-seen` questions.
+    ///
+    /// A Codex delegate can ask the caller something and carry on without waiting; this is how a
+    /// caller hears of it while a reply can still reach the turn through `steer`.
+    /// Takes one consultation.
+    #[arg(long, conflicts_with_all = ["any", "all"])]
+    pub or_delegate_question: bool,
+
+    /// With `--or-delegate-question`, how many of the turn's questions the caller has already
+    /// seen, so a wait that returned on question 2 is rearmed with `2`.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        requires = "or_delegate_question"
+    )]
+    pub delegate_questions_seen: u32,
 }
 
 /// Arguments for `agentmux list`: how many consultations to show, and which.

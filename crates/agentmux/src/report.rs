@@ -19,7 +19,8 @@ use crate::accounting::{Spend, Tokens, Totals};
 use crate::delegate::{AccountAlias, Billing, Vendor};
 use crate::quota::{AccountQuota, Observation, Origin, Refresh};
 use crate::run::{
-    AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, TurnLeftRunning, describe_delegate,
+    AUTO_RESUME_QUESTION, AutoResume, HookReopening, RunStatus, TurnLeftRunning, TurnQuestion,
+    describe_delegate,
 };
 use crate::transcript::{EarlierFailure, FailureKind, Outcome, UsageWindow};
 
@@ -41,6 +42,15 @@ pub enum Warning<'a> {
     AutoResume(&'a AutoResume),
     /// Turns before the newest failed, whatever the newest is doing.
     EarlierFailures(&'a [EarlierFailure]),
+    /// The delegate asked the caller questions, each without waiting for an answer.
+    Asked {
+        /// Every question, oldest first.
+        questions: &'a [TurnQuestion],
+        /// Whether a reply can still reach the running turn, through `steer`.
+        steerable: bool,
+        /// Whether a reply can reach the delegate in a new turn, through a follow-up.
+        resumable: bool,
+    },
     /// A turn left processes running when it ended, which agentmux signalled to stop, so work in
     /// them may be incomplete.
     LeftRunning(&'a TurnLeftRunning),
@@ -91,6 +101,13 @@ impl RunStatus {
         }
         if !self.earlier_failures.is_empty() {
             warnings.push(Warning::EarlierFailures(&self.earlier_failures));
+        }
+        if !self.delegate_questions.is_empty() {
+            warnings.push(Warning::Asked {
+                questions: &self.delegate_questions,
+                steerable: self.steerable,
+                resumable: self.resumable,
+            });
         }
         warnings.extend(self.left_running.iter().map(Warning::LeftRunning));
         if let Some(store) = &self.unsaved_session_store {
@@ -146,6 +163,77 @@ pub fn left_running_line(left_running: &TurnLeftRunning) -> String {
         report.processes_phrase(),
         report.fates(),
     )
+}
+
+/// How many questions [`asked_summary_lines`] shows at most, newest kept.
+const MAX_SUMMARISED_QUESTIONS: usize = 3;
+
+/// Every one of `questions`, whole and exactly as the delegate wrote it.
+///
+/// For handing questions over, as a wait that returned on them does: the caller acknowledges
+/// them by number, so none may be left out, cut short or reflowed.
+/// Each opens with where it was asked and how long ago, such as `turn 1 question 2, asked 3m
+/// ago:`, then gives the title line by line and each option on a line of its own, all indented
+/// alike so that whitespace inside them is kept.
+#[must_use]
+pub fn asked_lines(questions: &[TurnQuestion]) -> Vec<String> {
+    let now = Utc::now();
+    let mut lines = Vec::new();
+    for TurnQuestion { turn, question } in questions {
+        let age = (now - question.asked_at).to_std().unwrap_or_default();
+        lines.push(format!(
+            "turn {turn} question {}, asked {} ago:",
+            question.number,
+            duration(age),
+        ));
+        lines.extend(question.title.lines().map(|line| format!("  {line}")));
+        if !question.options.is_empty() {
+            lines.push("  options:".to_owned());
+            for option in &question.options {
+                let mut option_lines = option.lines();
+                lines.push(format!("  - {}", option_lines.next().unwrap_or_default()));
+                lines.extend(option_lines.map(|line| format!("    {line}")));
+            }
+        }
+    }
+    lines
+}
+
+/// The newest few of `questions`, each on one line, clipped, followed by a line of its options,
+/// after a line saying how many earlier ones were left out.
+///
+/// For the header of every `status` and `tail`, which a caller may poll; the transcript has every
+/// question whole.
+#[must_use]
+pub fn asked_summary_lines(questions: &[TurnQuestion]) -> Vec<String> {
+    let shown = questions.len().min(MAX_SUMMARISED_QUESTIONS);
+    let earlier = questions.len() - shown;
+    let mut lines = Vec::new();
+    if earlier > 0 {
+        lines.push(format!(
+            "{earlier} earlier question(s) not shown; the transcript has every one under \
+             `### assistant (question)`"
+        ));
+    }
+    let now = Utc::now();
+    for TurnQuestion { turn, question } in questions.get(earlier..).unwrap_or_default() {
+        let age = (now - question.asked_at).to_std().unwrap_or_default();
+        lines.push(format!(
+            "turn {turn} question {}, asked {} ago: {}",
+            question.number,
+            duration(age),
+            summarise(&question.title, 600),
+        ));
+        if !question.options.is_empty() {
+            let options: Vec<String> = question
+                .options
+                .iter()
+                .map(|option| summarise(option, 200))
+                .collect();
+            lines.push(format!("  options: {}", options.join(" | ")));
+        }
+    }
+    lines
 }
 
 /// A one-line state, with the failure reason inline when there is one.

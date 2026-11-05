@@ -60,10 +60,13 @@ struct Connected {
 }
 
 async fn connected() -> Result<Connected> {
+    connected_to(fixtures::CODEX_HAPPY).await
+}
+
+/// As [`connected`], with the consultation's delegate having written `events` and still there.
+async fn connected_to(events: &str) -> Result<Connected> {
     let dir = tempfile::tempdir().or_fail()?;
-    let launcher = Arc::new(ScriptedLauncher::new([Script::running(
-        fixtures::CODEX_HAPPY,
-    )]));
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running(events)]));
     let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
         .into_iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -109,11 +112,123 @@ async fn connected() -> Result<Connected> {
 }
 
 fn wait_request(run_id: &str) -> Result<ClientRequest> {
-    let arguments = serde_json::json!({ "run_id": run_id });
+    tool_request("wait", &serde_json::json!({ "run_id": run_id }))
+}
+
+fn tool_request(tool: &'static str, arguments: &serde_json::Value) -> Result<ClientRequest> {
     Ok(ClientRequest::CallToolRequest(Request::new(
-        CallToolRequestParams::new("wait")
-            .with_arguments(arguments.as_object().cloned().or_fail()?),
+        CallToolRequestParams::new(tool).with_arguments(arguments.as_object().cloned().or_fail()?),
     )))
+}
+
+/// The text of a tool's answer.
+fn answer_text(response: ServerResult) -> Result<String> {
+    let ServerResult::CallToolResult(result) = response else {
+        return fail!("the tool answered with something other than a tool result")
+            .map(|()| String::new());
+    };
+    assert_that!(result.is_error, not(some(eq(true))));
+    result
+        .content
+        .first()
+        .and_then(|block| block.as_text())
+        .map(|text| text.text.clone())
+        .or_fail()
+}
+
+/// A running turn that asked one question, as the app-server driver writes it.
+const ASKED: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"01a0"}
+    {"type":"turn.started"}
+    {"type":"agentmux.question","id":"call_1","asked_at":"2026-11-05T03:06:13Z","questions":[{"title":"Assume valid namespace names?","options":["Yes (Recommended)","No"]}]}
+"#};
+
+/// `wait` with `or_delegate_question` answers while the turn still runs, once the delegate has asked
+/// something: the question, and the calls that reply to it and keep waiting past it.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn wait_or_delegate_question_answers_on_a_question_the_running_turn_asks() -> Result<()> {
+    let connected = connected_to(ASKED).await?;
+    let request = tool_request(
+        "wait",
+        &serde_json::json!({ "run_id": connected.run_id, "or_delegate_question": true }),
+    )?;
+    let handle = connected
+        .client
+        .send_cancellable_request(request, PeerRequestOptions::no_options())
+        .await
+        .or_fail()?;
+    let response = tokio::time::timeout(Duration::from_secs(10), handle.await_response())
+        .await
+        .or_fail()?
+        .or_fail()?;
+    let text = answer_text(response)?;
+
+    assert_that!(
+        text,
+        contains_substring("this wait returned because the\n            delegate asked a question")
+    );
+    assert_that!(text, contains_substring("turn 1 question 1, asked"));
+    assert_that!(text, contains_substring("Assume valid namespace names?"));
+    assert_that!(
+        text,
+        contains_substring("options:\n              - Yes (Recommended)\n              - No")
+    );
+    assert_that!(text, contains_substring("Reply with `steer`"));
+    assert_that!(
+        text,
+        contains_substring(r#""or_delegate_question": true, "delegate_questions_seen": 1"#)
+    );
+    // The consultation was only observed.
+    assert_that!(
+        connected
+            .store
+            .status(&agentmux::run::RunId::parse(&connected.run_id).or_fail()?)?
+            .outcome,
+        eq(&Outcome::Running)
+    );
+    Ok(())
+}
+
+/// A settled turn's `wait` says what it asked above its transcript, and that only a follow-up
+/// can reply now.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_settled_wait_says_what_the_turn_asked() -> Result<()> {
+    let events = format!(
+        "{ASKED}{}\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#
+    );
+    let connected = connected_to(&events).await?;
+    connected
+        .launcher
+        .mark_process_gone(connected.launcher.launch_handle(0));
+    let handle = connected
+        .client
+        .send_cancellable_request(
+            wait_request(&connected.run_id)?,
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .or_fail()?;
+    let response = tokio::time::timeout(Duration::from_secs(10), handle.await_response())
+        .await
+        .or_fail()?
+        .or_fail()?;
+    let text = answer_text(response)?;
+
+    let (header, transcript) = text.split_once("\n---\n").or_fail()?;
+    assert_that!(
+        header,
+        contains_substring("asked:      the delegate asked 1 question(s)")
+    );
+    assert_that!(header, contains_substring("Assume valid namespace names?"));
+    assert_that!(
+        header,
+        contains_substring("only a `follow_up` can reply now, where `status` reports")
+    );
+    assert_that!(transcript, contains_substring("### assistant (question)"));
+    Ok(())
 }
 
 /// `wait` holds the call for as long as the turn takes — well past the 540 seconds every bounded
@@ -205,5 +320,54 @@ async fn cancelling_a_wait_leaves_the_consultation_running() -> Result<()> {
     let status = connected.store.status(&run_id)?;
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(status.settled, eq(false));
+    Ok(())
+}
+
+/// A wait that returns on several questions at once hands over every one, whole, and the rearm it
+/// names acknowledges exactly those.
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn a_wait_hands_over_every_question_it_returns_on() -> Result<()> {
+    let long_title = format!("Should the gate run? {}", "context ".repeat(200));
+    let questions: Vec<serde_json::Value> = [long_title.as_str(), "B?", "C?", "D?"]
+        .iter()
+        .map(|title| serde_json::json!({"title": title}))
+        .collect();
+    let question = serde_json::json!({
+        "type": "agentmux.question", "id": "call_1", "asked_at": "2026-11-05T03:06:13Z",
+        "questions": questions,
+    });
+    let events = format!(
+        "{}{question}\n",
+        indoc::indoc! {r#"
+            {"type":"thread.started","thread_id":"01a0"}
+            {"type":"turn.started"}
+        "#}
+    );
+    let connected = connected_to(&events).await?;
+    let request = tool_request(
+        "wait",
+        &serde_json::json!({ "run_id": connected.run_id, "or_delegate_question": true }),
+    )?;
+    let handle = connected
+        .client
+        .send_cancellable_request(request, PeerRequestOptions::no_options())
+        .await
+        .or_fail()?;
+    let response = tokio::time::timeout(Duration::from_secs(10), handle.await_response())
+        .await
+        .or_fail()?
+        .or_fail()?;
+    let text = answer_text(response)?;
+
+    for number in 1..=4 {
+        expect_that!(
+            text,
+            contains_substring(format!("turn 1 question {number}, asked"))
+        );
+    }
+    expect_that!(text, contains_substring(long_title.trim_end()));
+    expect_that!(text, contains_substring(r#""delegate_questions_seen": 4"#));
+    expect_that!(text, not(contains_substring("not shown")));
     Ok(())
 }

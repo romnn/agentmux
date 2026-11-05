@@ -133,10 +133,10 @@ pub use retention::Retention;
 pub use spawn::{StartRequest, TURN_END_NOTICE};
 pub use status::{
     HookReopening, InvalidSince, ListFilter, RunStatus, RunSummary, TranscriptPage,
-    TurnLeftRunning, describe_delegate, parse_since,
+    TurnLeftRunning, TurnQuestion, describe_delegate, parse_since,
 };
 pub use supervise::{SUBCOMMAND as SUPERVISE_SUBCOMMAND, supervise};
-pub use wait::{TurnRef, WaitFor, Waited};
+pub use wait::{Asked, SettledOrAsked, TurnRef, WaitFor, Waited};
 
 /// The run store: one directory per consultation under a state directory.
 pub struct RunStore {
@@ -548,6 +548,7 @@ impl RunStore {
                 meta.delegate.isolation(),
             ),
             earlier_failures: state.transcript.earlier_failures(),
+            delegate_questions: TurnQuestion::of_turns(&state.transcript.turns),
             left_running: TurnLeftRunning::of_turns(&state.transcript.turns),
             quota,
             // The newest window wins: an earlier turn's reading is stale the moment another
@@ -679,6 +680,12 @@ impl RunStore {
             outcome,
             last_activity: state.last_activity.map(DateTime::<Utc>::from),
             turns: newest_index.map_or(0, |index| index.saturating_add(1)),
+            delegate_questions: state
+                .transcript
+                .turns
+                .iter()
+                .map(|turn| turn.delegate_questions.len())
+                .sum(),
             created_at: meta.created_at,
             question,
             billing,

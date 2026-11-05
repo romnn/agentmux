@@ -498,26 +498,121 @@ fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
 #[gtest]
 fn every_fixture_renders_monotonically_over_its_prefixes() {
     for (vendor, name, fixture) in fixtures::all() {
-        let lines: Vec<&str> = fixture.lines().collect();
-        let mut previous = String::new();
-        for cut in 0..=lines.len() {
-            let prefix: String = lines
-                .get(..cut)
-                .unwrap_or_default()
-                .iter()
-                .flat_map(|line| [*line, "\n"])
-                .collect();
-            let Fold { turn, .. } = stream::fold(vendor, 0, "q", &prefix);
-            let rendered = agentmux::transcript::render_turn(&turn);
-            assert_that!(
-                rendered.starts_with(&previous),
-                eq(true),
-                "fixture {name}: the render of {cut} lines does not extend the render of {} lines",
-                cut.saturating_sub(1)
-            );
-            previous = rendered;
-        }
+        expect_monotonic_render(vendor, name, fixture);
     }
+    // What the app-server driver writes and `codex exec` never does: questions and a steer.
+    expect_monotonic_render(Vendor::Codex, "driven question capture", DRIVEN_QUESTIONS);
+}
+
+/// Check that the render of `stream` at every line cut extends the render of the cut before it.
+fn expect_monotonic_render(vendor: Vendor, name: &str, stream: &str) {
+    let lines: Vec<&str> = stream.lines().collect();
+    let mut previous = String::new();
+    for cut in 0..=lines.len() {
+        let prefix: String = lines
+            .get(..cut)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|line| [*line, "\n"])
+            .collect();
+        let Fold { turn, .. } = stream::fold(vendor, 0, "q", &prefix);
+        let rendered = agentmux::transcript::render_turn(&turn);
+        expect_that!(
+            rendered.starts_with(&previous),
+            eq(true),
+            "{name}: the render of {cut} lines does not extend the render of {} lines",
+            cut.saturating_sub(1)
+        );
+        previous = rendered;
+    }
+}
+
+/// A turn driven over `codex app-server` in which the delegate asked twice, was steered, and
+/// answered, as the driver writes it.
+const DRIVEN_QUESTIONS: &str = indoc::indoc! {r#"
+    {"type":"thread.started","thread_id":"01a1a800-7700-70b2-846b-0ac1e34ddaa7"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"msg_1","type":"agent_message","text":"A probe found a boundary."}}
+    {"type":"agentmux.question","id":"call_1","asked_at":"2026-11-05T03:06:13Z","questions":[{"title":"Assume valid names?","options":["Yes (Recommended)","No"]},{"title":"Which chart?"}]}
+    {"type":"item.completed","item":{"id":"exec-1","type":"command_execution","command":"ls","aggregated_output":"","exit_code":0,"status":"completed"}}
+    {"type":"agentmux.question","id":"call_2","asked_at":"2026-11-05T03:09:00Z","questions":[{"title":"May I run a Cargo gate?","options":["Allow (Recommended)","Keep the limit"]}]}
+    {"type":"agentmux.steer","text":"Assume valid names; keep the limit."}
+    {"type":"item.completed","item":{"id":"msg_2","type":"agent_message","text":"Recorded the contract."}}
+    {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
+"#};
+
+/// Questions a delegate asked are kept twice over: as messages where they were asked, in the
+/// report, and as numbered questions a caller can act on.
+///
+/// Numbering runs across every call in the turn, so the second call's question is the turn's
+/// third, and a steer after them changes neither: agentmux cannot tell what it answered.
+#[gtest]
+fn a_codex_question_is_numbered_kept_in_the_report_and_rendered() -> Result<()> {
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", DRIVEN_QUESTIONS);
+
+    // Every question, numbered in the order asked, with its options and when it was asked.
+    let asked: Vec<(u32, &str, usize)> = turn
+        .delegate_questions
+        .iter()
+        .map(|question| {
+            (
+                question.number,
+                question.title.as_str(),
+                question.options.len(),
+            )
+        })
+        .collect();
+    assert_that!(
+        asked,
+        elements_are![
+            eq(&(1, "Assume valid names?", 2)),
+            eq(&(2, "Which chart?", 0)),
+            eq(&(3, "May I run a Cargo gate?", 2)),
+        ]
+    );
+    assert_that!(
+        turn.delegate_questions
+            .first()
+            .map(|question| question.asked_at.to_rfc3339()),
+        some(eq("2026-11-05T03:06:13+00:00"))
+    );
+
+    // Each call is one message, in codex's own layout, between the replies around it, and part
+    // of the report.
+    let sources: Vec<MessageSource> = turn.messages.iter().map(|message| message.source).collect();
+    assert_that!(
+        sources,
+        elements_are![
+            eq(&MessageSource::Delegate),
+            eq(&MessageSource::Question),
+            eq(&MessageSource::Question),
+            eq(&MessageSource::Steer),
+            eq(&MessageSource::Delegate),
+        ]
+    );
+    let first = turn.messages.get(1).or_fail()?;
+    assert_that!(
+        first.text,
+        eq("Assume valid names?\n- Yes (Recommended)\n- No\n\nWhich chart?")
+    );
+    assert_that!(first.is_report_content(), eq(true));
+    assert_that!(turn.unrecognised.summary(), none());
+
+    // The transcript marks each as a question, where it was asked.
+    let rendered = agentmux::transcript::render_turn(&turn);
+    assert_that!(
+        rendered,
+        contains_substring(indoc::indoc! {"
+            ### assistant (question)
+
+            Assume valid names?
+            - Yes (Recommended)
+            - No
+
+            Which chart?
+        "})
+    );
+    Ok(())
 }
 
 /// A top-level Codex `error` is a note where it arrived, not the end of the turn.

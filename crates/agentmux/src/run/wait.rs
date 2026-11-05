@@ -14,13 +14,16 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::transcript::turn_number;
+use crate::stream::{self, Fold};
+use crate::transcript::{Turn, turn_number};
 
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
-use super::records::SettledTurn;
-use super::status::{TranscriptPage, page_of};
+use super::records::{
+    SettledRecord, SettledTurn, read_complete_records, read_if_present, read_json,
+};
+use super::status::{TranscriptPage, TurnQuestion, page_of};
 
 /// One turn of one consultation, chosen once.
 ///
@@ -75,6 +78,31 @@ pub struct Waited {
     /// Whether the deadline passed first.
     pub timed_out: bool,
 }
+
+/// What a wait that also returns on a question returned with.
+#[derive(Debug, Clone)]
+pub enum SettledOrAsked {
+    /// The turn settled first, or had settled by the time its question was looked at.
+    Settled(Box<SettledTurn>),
+    /// The turn, still running, asked questions beyond those the caller had seen.
+    Asked(Asked),
+}
+
+/// Questions a running turn asked beyond those a caller had seen.
+#[derive(Debug, Clone, Serialize)]
+pub struct Asked {
+    /// The turn that asked them.
+    #[serde(flatten)]
+    pub target: TurnRef,
+    /// The questions, oldest first, numbered among every question the turn asked.
+    pub delegate_questions: Vec<TurnQuestion>,
+}
+
+/// How often a wait that also returns on a question looks for one.
+///
+/// Less often than for a settlement, because each look folds the turn's whole capture; a
+/// question that waited unseen for hours is not made worse by two seconds more.
+const QUESTION_POLL: Duration = Duration::from_secs(2);
 
 /// First interval between looks for a settlement.
 const MIN_POLL: Duration = Duration::from_millis(100);
@@ -135,6 +163,110 @@ impl RunStore {
             tokio::time::sleep(interval).await;
             interval = (interval * 2).min(MAX_POLL);
         }
+    }
+
+    /// Wait until `target` has settled, or, while it is still running, has asked more than
+    /// `delegate_questions_seen` questions, or until `deadline`.
+    ///
+    /// A settlement found on the same look wins, so a question never stands in for a turn that
+    /// has ended: its delegate can no longer be steered, and what it asked is in the settled
+    /// transcript.
+    /// The last sleep before `deadline` ends at it, and the turn is looked at once more there,
+    /// so a turn that settled before the deadline is never reported as pending.
+    /// Returns `None` once `deadline` has passed first, which without one it never does.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunStore::wait_for_settlement`].
+    pub async fn wait_for_settlement_or_delegate_question(
+        &self,
+        target: &TurnRef,
+        delegate_questions_seen: u32,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<SettledOrAsked>, RunError> {
+        let mut interval = MIN_POLL;
+        let mut next_question_look = tokio::time::Instant::now();
+        loop {
+            if let Some(settled) = self.look_for_settlement(target)? {
+                return Ok(Some(SettledOrAsked::Settled(Box::new(settled))));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= next_question_look {
+                if let Some(asked) =
+                    self.look_for_delegate_questions(target, delegate_questions_seen)?
+                {
+                    return Ok(Some(SettledOrAsked::Asked(asked)));
+                }
+                next_question_look = now + QUESTION_POLL;
+            }
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Ok(None);
+            }
+            let sleep = deadline.map_or(interval, |deadline| interval.min(deadline - now));
+            tokio::time::sleep(sleep).await;
+            interval = (interval * 2).min(MAX_POLL);
+        }
+    }
+
+    /// The questions beyond `delegate_questions_seen` that `target` asked, while it still runs.
+    ///
+    /// Read without the run's lock, so a waiter never holds up a turn being settled or
+    /// cancelled, nor waits on one.
+    /// A turn that anything has begun to end — its stream, a settlement, an exit record or a
+    /// cancellation — asks nothing here, and is looked at again after the capture is read:
+    /// a cancellation chooses the length it freezes before it records it, and a question
+    /// written past that length is not part of the turn.
+    fn look_for_delegate_questions(
+        &self,
+        target: &TurnRef,
+        delegate_questions_seen: u32,
+    ) -> Result<Option<Asked>, RunError> {
+        let dir = self.turn_dir(&target.run_id, target.turn_index);
+        let ending = || dir.settled().exists() || dir.exit().exists() || dir.cancelling().exists();
+        if ending() {
+            return Ok(None);
+        }
+        let turn = self.fold_capture(target, None)?;
+        if turn.outcome.is_terminal() || ending() {
+            return Ok(None);
+        }
+        let questions: Vec<TurnQuestion> = TurnQuestion::of_turn(&turn)
+            .filter(|asked| asked.question.number > delegate_questions_seen)
+            .collect();
+        Ok((!questions.is_empty()).then(|| Asked {
+            target: target.clone(),
+            delegate_questions: questions,
+        }))
+    }
+
+    /// The questions a settled turn asked, from exactly the capture its settlement froze.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotFound`] when the consultation has gone, and [`RunError::Io`] when
+    /// the turn's records cannot be read.
+    pub fn settled_questions(&self, settled: &SettledTurn) -> Result<Vec<TurnQuestion>, RunError> {
+        let target = TurnRef {
+            run_id: settled.run_id().clone(),
+            turn_index: settled.turn_index(),
+        };
+        let dir = self.turn_dir(&target.run_id, target.turn_index);
+        let frozen_len =
+            read_json::<SettledRecord>(&dir.settled())?.map(|record| record.events_len);
+        let turn = self.fold_capture(&target, frozen_len)?;
+        Ok(TurnQuestion::of_turn(&turn).collect())
+    }
+
+    /// Fold one turn's capture, as far as `limit` bytes of it, with no side effect: nothing is
+    /// settled, observed or published.
+    fn fold_capture(&self, target: &TurnRef, limit: Option<u64>) -> Result<Turn, RunError> {
+        let dir = self.turn_dir(&target.run_id, target.turn_index);
+        let vendor = self.meta(&target.run_id)?.delegate.vendor();
+        let question =
+            read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
+        let (events, _) = read_complete_records(&dir.events(), limit)?;
+        let Fold { turn, .. } = stream::fold(vendor, target.turn_index, &question, &events);
+        Ok(turn)
     }
 
     /// Wait until `targets` have settled, as `until` says, or until `deadline`.
