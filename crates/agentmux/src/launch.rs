@@ -569,12 +569,10 @@ mod identity {
 
     use super::{Launched, Liveness};
 
-    /// The process table entry for one pid, freshly read.
+    /// The process table entry for one pid, freshly read, or `None` where the table cannot be
+    /// read at all.
     pub(super) fn lookup(pid: u32) -> Option<System> {
-        if !sysinfo::IS_SUPPORTED_SYSTEM {
-            return None;
-        }
-        let mut system = System::new();
+        let mut system = System::new().ok()?;
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
             false,

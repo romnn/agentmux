@@ -1,14 +1,13 @@
 [package]
 name = "agentmux-cli"
-license-file = "../../LICENSE"
-readme = "../../README.md"
+license-file.workspace = true
+readme.workspace = true
 publish = false
 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 [[bin]]

@@ -24,7 +24,6 @@ authors = ["romnn <contact@romnn.com>"]
 description = "agentmux delegates a question to another vendor's coding agent and captures the whole transcript"
 license-file = "LICENSE"
 readme = "README.md"
-homepage = "https://github.com/romnn/agentmux"
 repository = "https://github.com/romnn/agentmux"
 
 [workspace.lints.rust]
@@ -141,7 +140,7 @@ nix = "0.31.3"
 # Process start time and liveness by pid, on every release target and without `unsafe` of our
 # own. A delegate outlives the agentmux that started it, so a pid on disk needs a start time
 # beside it before it can be trusted not to have been recycled.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 # A kill-on-close job object holds everything a driven Codex turn starts on Windows, where a
 # process's recorded parent cannot be trusted once that parent has exited.
 win32job = "2.0.3"
@@ -156,6 +155,6 @@ escargot = "1.0.1"
 # Holds the test server's messages, and the driver's, to codex's own JSON Schema rather than to
 # the types generated from it.
 # Without remote references, because the schema is vendored.
-jsonschema = { version = "0.59.0", default-features = false }
+jsonschema = { version = "0.60.2", default-features = false }
 googletest = "0"
 tempfile = "3"

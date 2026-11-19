@@ -177,7 +177,7 @@ struct ProcessSnapshot {
 /// The process `pid`, or `None` when there is none.
 fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     let pid = sysinfo::Pid::from_u32(pid);
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().ok()?;
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
         true,
@@ -201,7 +201,7 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
 #[cfg(target_os = "linux")]
 fn parent_pid(pid: u32) -> Option<u32> {
     let pid = sysinfo::Pid::from_u32(pid);
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().ok()?;
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system
         .process(pid)
@@ -742,7 +742,9 @@ impl Drop for DriverProcess {
             if process_snapshot(pid)
                 .is_some_and(|process| process.running && process.command_line.contains(HELPER))
             {
-                let mut system = sysinfo::System::new();
+                let Ok(mut system) = sysinfo::System::new() else {
+                    continue;
+                };
                 let pid = sysinfo::Pid::from_u32(pid);
                 system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
                 if let Some(process) = system.process(pid) {

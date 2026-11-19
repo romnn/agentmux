@@ -1,14 +1,13 @@
 [package]
 name = "codex-app-server-mock"
 description = "A scriptable stand-in for codex app-server, in-process or as a process, for testing a client of its protocol"
-license-file = "../../LICENSE"
-readme = "../../README.md"
+license-file.workspace = true
+readme.workspace = true
 publish = false
 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 [lints]

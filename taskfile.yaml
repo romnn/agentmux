@@ -94,9 +94,15 @@ tasks:
       - cargo fc check --all-targets {{.CLI_ARGS}}
 
   clean:
-    desc: "clean cargo workspace"
+    desc: "remove all build output: every cargo workspace, the protocol oracle's included, and goreleaser's dist"
+    dir: "{{.ROOT_DIR}}"
     cmds:
       - cargo clean {{.CLI_ARGS}}
+      # The oracle is a workspace of its own, with its own target directory.
+      - cargo clean --manifest-path crates/codex-app-server-codegen/oracle/Cargo.toml {{.CLI_ARGS}}
+      # The `dist` directory `.goreleaser.yaml` names.
+      - rm -rf goreleaser-dist
+      - task: clean:build
 
   clean:build:
     desc: "remove zigbuild/cc probe garbage object files"

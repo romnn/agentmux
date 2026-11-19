@@ -76,7 +76,9 @@ impl Drop for MockServerProcess {
             .into_iter()
             .map(sysinfo::Pid::from_u32)
             .collect();
-        let mut system = sysinfo::System::new();
+        let Ok(mut system) = sysinfo::System::new() else {
+            return;
+        };
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
         for pid in pids {
             if let Some(process) = system.process(pid) {

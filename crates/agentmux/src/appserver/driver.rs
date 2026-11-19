@@ -1368,10 +1368,12 @@ fn contain_descendants() {
 /// A fresh read of the process table, with each process's parent and start time: of `pids`, or
 /// of every process when `pids` is `None`.
 ///
+/// `None` where the table cannot be read at all, which reads as no process found.
+///
 /// Threads are left out: Linux lists each as a child of its process, and a signal to one is a
 /// signal to the whole process — the driver's own included.
-fn process_table(pids: Option<&[sysinfo::Pid]>) -> sysinfo::System {
-    let mut system = sysinfo::System::new();
+fn process_table(pids: Option<&[sysinfo::Pid]>) -> Option<sysinfo::System> {
+    let mut system = sysinfo::System::new().ok()?;
     system.refresh_processes_specifics(
         pids.map_or(
             sysinfo::ProcessesToUpdate::All,
@@ -1380,7 +1382,7 @@ fn process_table(pids: Option<&[sysinfo::Pid]>) -> sysinfo::System {
         true,
         sysinfo::ProcessRefreshKind::nothing().without_tasks(),
     );
-    system
+    Some(system)
 }
 
 /// Every process below `root`, with the start time that tells it apart from a later holder of
@@ -1394,7 +1396,9 @@ fn process_tree(root: u32) -> Vec<SeenProcess> {
     if cfg!(windows) {
         return Vec::new();
     }
-    let system = process_table(None);
+    let Some(system) = process_table(None) else {
+        return Vec::new();
+    };
     let Some(root_started) = system
         .process(sysinfo::Pid::from_u32(root))
         .map(sysinfo::Process::start_time)
@@ -1464,7 +1468,9 @@ fn observe_and_signal(
         .iter()
         .map(|process| sysinfo::Pid::from_u32(process.pid))
         .collect();
-    let system = process_table(Some(&pids));
+    let Some(system) = process_table(Some(&pids)) else {
+        return Vec::new();
+    };
     let mut alive = Vec::new();
     for &identity in tree {
         let Some(process) = system.process(sysinfo::Pid::from_u32(identity.pid)) else {

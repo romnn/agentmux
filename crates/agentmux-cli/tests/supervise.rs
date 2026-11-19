@@ -625,7 +625,9 @@ fn supervisor_pid(machine: &Machine, run_id: &str) -> Result<u32> {
 /// Whether `pid` is a running process, rather than gone or exited and not yet waited for.
 fn is_running(pid: u32) -> bool {
     let pid = sysinfo::Pid::from_u32(pid);
-    let mut system = sysinfo::System::new();
+    let Ok(mut system) = sysinfo::System::new() else {
+        return false;
+    };
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some_and(|process| {
         !matches!(
@@ -651,7 +653,7 @@ fn a_dead_supervisor_leaves_its_turn_to_the_next_observer() -> Result<()> {
     assert_that!(until_exists(&launch, Duration::from_secs(10)), eq(true));
 
     let supervisor = supervisor_pid(&machine, &run_id)?;
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().or_fail()?;
     let pid = sysinfo::Pid::from_u32(supervisor);
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     assert_that!(
