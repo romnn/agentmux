@@ -64,7 +64,7 @@ pub struct AutoResumePolicy {
 }
 
 impl AutoResumePolicy {
-    /// The policy every store starts with, which `docs/adr/0027` explains: thirty seconds,
+    /// The policy every store starts with, which `adr/0027` explains: thirty seconds,
     /// doubling up to fifteen minutes, twelve attempts.
     pub const DEFAULT: Self = Self {
         first_delay: Duration::from_secs(30),

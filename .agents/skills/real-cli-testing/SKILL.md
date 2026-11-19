@@ -27,7 +27,7 @@ against recorded fixtures.
 ## Live tests
 
 Run live tests where the delegates can write their session stores, normally from an unsandboxed
-terminal; see ADR [0016](../../../docs/adr/0016-unsaved-session-store.md). Both CLIs must be logged
+terminal; see ADR [0016](../../../adr/0016-unsaved-session-store.md). Both CLIs must be logged
 in, and the tests spend money; they are `#[ignore]`d, and CI passes without them. Use the operator's
 chosen accounts: the library suite uses the configured default accounts, and
 `AGENTMUX_LIVE_CODEX_ACCOUNT` selects an account only for the CLI steering test.
@@ -73,7 +73,7 @@ asked before the launch with the child's environment) and the agentmux release t
   `app-server-mock.json` in the turn's codex home, because the driver's environment is an allowlist.
 
 Both check messages against codex's own schema; see ADR
-[0021](../../../docs/adr/0021-mock-validates-against-codex-schema.md).
+[0021](../../../adr/0021-mock-validates-against-codex-schema.md).
 
 ## Fixture tests
 

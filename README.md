@@ -433,7 +433,7 @@ of 12)`), and the
 turn to wait for next can be waited for once that time has passed. The transcript notes under the
 automatic turn's `continue` that agentmux sent it, and with which attempt, and its
 `invocation.json` records the same as `auto_resume`. `cancel` stops a pending resume and leaves the turn failed. Why it
-works this way is in [ADR 0027](docs/adr/0027-automatic-resume-after-overload.md).
+works this way is in [ADR 0027](adr/0027-automatic-resume-after-overload.md).
 
 ### Sessions a content filter keeps refusing
 
@@ -448,7 +448,7 @@ its uncommitted work, and then asks the new question. The new consultation's `me
 `continues`, the old one's `continued-by.json` names its successor, and each one's `status` points
 at the other. A Claude delegate is given `--add-dir` for the old consultation's directory, so it
 can read the transcript. Why it works this way is in
-[ADR 0029](docs/adr/0029-continue-in-a-fresh-session.md).
+[ADR 0029](adr/0029-continue-in-a-fresh-session.md).
 
 ### Environment
 
@@ -652,7 +652,7 @@ The child environment is built as an **allowlist from empty**, never by filterin
 gets `PATH`, `HOME`, locale, proxy and CA settings, and the credential variables its own vendor
 reads, less the API keys [Billing safety](#billing-safety) removes — and nothing else. None of the
 launching agent's session identity reaches it
-([ADR 0022](docs/adr/0022-delegate-env-from-allowlist.md)).
+([ADR 0022](adr/0022-delegate-env-from-allowlist.md)).
 
 What it loads besides depends on `ignore_user_config`. By default both vendors load the user's own
 configuration, so its settings, hooks and MCP servers are part of the run. An isolated Claude
@@ -717,7 +717,7 @@ and `cancel` asks the server to interrupt the turn before it signals anything. W
 commands it left running are stopped too, within a time budget and on a best-effort basis; on
 macOS, a command started by a crashed server's command after the driver's last once-a-second check
 is out of reach.
-[ADR 0018](docs/adr/0018-codex-app-server-driver.md) explains why it is built this way, and
+[ADR 0018](adr/0018-codex-app-server-driver.md) explains why it is built this way, and
 `crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn

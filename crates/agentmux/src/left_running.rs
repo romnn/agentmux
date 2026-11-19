@@ -5,7 +5,7 @@
 //!
 //! A command a delegate starts in the background and does not wait for outlives the turn, and
 //! agentmux stops it once the turn is over (ADR 0032,
-//! `docs/adr/0032-leftover-processes-reported.md`).
+//! `adr/0032-leftover-processes-reported.md`).
 //! Its work is then incomplete, and nothing the delegate said tells the caller so.
 //! This record says which processes were still running once the server had exited, outside the
 //! server's process tree, and whether each still was after agentmux had signalled it, so the

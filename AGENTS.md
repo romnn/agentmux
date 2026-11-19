@@ -69,6 +69,7 @@ names:
 
 ## Architecture decisions
 
-Design decisions and their rationale are indexed in [docs/adr/README.md](docs/adr/README.md). Read
-the relevant records before changing an area, and update affected records and references in the
-same change.
+Design decisions and their rationale are recorded in [`adr/`](adr/README.md). Read the relevant
+records before changing an area. A change that alters a recorded decision adds a new ADR that
+supersedes the old one, in the same change; fix an existing record's facts and code pointers in
+place.

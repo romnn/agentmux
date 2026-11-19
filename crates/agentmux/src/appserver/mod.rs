@@ -143,7 +143,7 @@
 //! app-server has no such flag; its own source keeps that loader override to `exec` and the TUI.
 //! Running it with a private `CODEX_HOME` holding only the login instead was rejected, because
 //! none of its hazards can be contained from outside codex; ADR 0018
-//! (`docs/adr/0018-codex-app-server-driver.md`) gives the reasons.
+//! (`adr/0018-codex-app-server-driver.md`) gives the reasons.
 //! So isolation is never traded for steering silently: an isolated consultation runs over `exec`
 //! and `steer` refuses it, naming `ignore_user_config: false`, which runs it with the account's
 //! configuration and is what a consultation gets unless the machine file or the caller chooses

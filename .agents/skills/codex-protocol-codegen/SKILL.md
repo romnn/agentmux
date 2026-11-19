@@ -13,7 +13,7 @@ description:
 
 The design — why the protocol is generated, what the `surface!` table and the oracle guarantee, and
 which parts are hand-written — is ADR
-[0019](../../../docs/adr/0019-generated-app-server-protocol.md). This skill holds the steps.
+[0019](../../../adr/0019-generated-app-server-protocol.md). This skill holds the steps.
 
 ## Never edit the generated files
 
@@ -49,7 +49,7 @@ The `codegen` workflow (`.github/workflows/codegen.yaml`) runs `check`, `upstrea
    list, whose response type it does not define, or whose params are not unique: bindings with
    params must have a unique params specification within that stable-schema union.
 3. Run `task codegen:app-server:check`, then `task codegen:app-server:oracle`. See ADR
-   [0019](../../../docs/adr/0019-generated-app-server-protocol.md) for what the two checks prove and
+   [0019](../../../adr/0019-generated-app-server-protocol.md) for what the two checks prove and
    the limits of tying wire methods to upstream Rust variants.
 
 When a schema refresh adds a server-request method, update the exhaustive `decline_response` match
@@ -87,6 +87,6 @@ Moving it is deliberate:
 
 `codex-app-server-codegen refresh` refuses a codex other than the pin, and one whose app-server
 accepts `--ignore-user-config`. Treat the second refusal as a decision to revisit, not something to
-work around: ADR [0019](../../../docs/adr/0019-generated-app-server-protocol.md) explains the gate,
+work around: ADR [0019](../../../adr/0019-generated-app-server-protocol.md) explains the gate,
 and `Delegate::app_server_settings` with ADR
-[0018](../../../docs/adr/0018-codex-app-server-driver.md) governs which delegates are driven.
+[0018](../../../adr/0018-codex-app-server-driver.md) governs which delegates are driven.
