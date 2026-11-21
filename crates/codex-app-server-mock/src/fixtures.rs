@@ -9,10 +9,11 @@ use codex_app_server_protocol::types::{
     AsyncUserInputQuestion, CommandExecutionRequestApprovalParams, CommandExecutionStatus,
     CommandExecutionThreadItem, ErrorNotification, InitializeResponse, ItemCompletedNotification,
     MessagePhase, PlanThreadItem, ReadOnlySandboxPolicy, ReasoningThreadItem, SandboxPolicy,
-    SessionSource, Thread, ThreadItem, ThreadResumeResponse, ThreadStartResponse, ThreadStatus,
-    ThreadTokenUsage, ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn,
-    TurnCompletedNotification, TurnError, TurnInterruptParams, TurnInterruptResponse,
-    TurnStartResponse, TurnStartedNotification, TurnStatus, TurnSteerResponse, WarningNotification,
+    SessionSource, Thread, ThreadItem, ThreadItemVariant, ThreadResumeResponse,
+    ThreadStartResponse, ThreadStatus, ThreadTokenUsage, ThreadTokenUsageUpdatedNotification,
+    TokenUsageBreakdown, Turn, TurnCompletedNotification, TurnError, TurnInterruptParams,
+    TurnInterruptResponse, TurnStartResponse, TurnStartedNotification, TurnStatus,
+    TurnSteerResponse, WarningNotification,
 };
 
 /// The thread a fake server opens, unless a test names another.
@@ -193,14 +194,17 @@ pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> TurnInterruptPar
 /// A reply of the delegate's.
 #[must_use]
 pub fn agent_message(id: &str, text: &str) -> ThreadItem {
-    ThreadItem::AgentMessage(Box::new(AgentMessageThreadItem {
-        delivery: None,
-        id: id.to_owned(),
-        memory_citation: None,
-        phase: None,
-        questions: None,
-        text: text.to_owned(),
-    }))
+    item(ThreadItemVariant::AgentMessage(Box::new(
+        AgentMessageThreadItem {
+            delivery: None,
+            id: id.to_owned(),
+            memory_citation: None,
+            moderation: None,
+            phase: None,
+            questions: None,
+            text: text.to_owned(),
+        },
+    )))
 }
 
 /// The item `request_user_input_async` emits for `questions`: a reply carrying them, whose id is
@@ -222,52 +226,68 @@ pub fn async_question(call_id: &str, questions: Vec<AsyncUserInputQuestion>) -> 
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    ThreadItem::AgentMessage(Box::new(AgentMessageThreadItem {
-        delivery: Some(AgentMessageDelivery::Async),
-        id: call_id.to_owned(),
-        memory_citation: None,
-        phase: Some(MessagePhase::FinalAnswer),
-        questions: Some(questions),
-        text,
-    }))
+    item(ThreadItemVariant::AgentMessage(Box::new(
+        AgentMessageThreadItem {
+            delivery: Some(AgentMessageDelivery::Async),
+            id: call_id.to_owned(),
+            memory_citation: None,
+            moderation: None,
+            phase: Some(MessagePhase::FinalAnswer),
+            questions: Some(questions),
+            text,
+        },
+    )))
 }
 
 /// A plan of the delegate's.
 #[must_use]
 pub fn plan(id: &str, text: &str) -> ThreadItem {
-    ThreadItem::Plan(Box::new(PlanThreadItem {
+    item(ThreadItemVariant::Plan(Box::new(PlanThreadItem {
         id: id.to_owned(),
         text: text.to_owned(),
-    }))
+    })))
 }
 
 /// A reasoning summary.
 #[must_use]
 pub fn reasoning(id: &str, summary: &[&str]) -> ThreadItem {
-    ThreadItem::Reasoning(Box::new(ReasoningThreadItem {
-        content: Some(Vec::new()),
-        id: id.to_owned(),
-        summary: Some(summary.iter().map(|&line| line.to_owned()).collect()),
-    }))
+    item(ThreadItemVariant::Reasoning(Box::new(
+        ReasoningThreadItem {
+            content: Some(Vec::new()),
+            id: id.to_owned(),
+            summary: Some(summary.iter().map(|&line| line.to_owned()).collect()),
+        },
+    )))
 }
 
 /// A command that ran to completion.
 #[must_use]
 pub fn command(id: &str, command: &str, output: &str, exit_code: i32) -> ThreadItem {
-    ThreadItem::CommandExecution(Box::new(CommandExecutionThreadItem {
-        aggregated_output: Some(output.to_owned()),
-        command: command.to_owned(),
-        command_actions: Vec::new(),
-        cwd: "/work".to_owned(),
-        duration_ms: Some(3),
-        exit_code: Some(exit_code),
-        id: id.to_owned(),
-        plugin_id: None,
-        process_id: None,
-        script_path: None,
-        source: None,
-        status: CommandExecutionStatus::Completed,
-    }))
+    item(ThreadItemVariant::CommandExecution(Box::new(
+        CommandExecutionThreadItem {
+            aggregated_output: Some(output.to_owned()),
+            command: command.to_owned(),
+            command_actions: Vec::new(),
+            cwd: "/work".to_owned(),
+            duration_ms: Some(3),
+            exit_code: Some(exit_code),
+            id: id.to_owned(),
+            plugin_id: None,
+            process_id: None,
+            script_path: None,
+            source: None,
+            status: CommandExecutionStatus::Completed,
+        },
+    )))
+}
+
+/// `variant` as a whole item, with no lifecycle times recorded.
+fn item(variant: ThreadItemVariant) -> ThreadItem {
+    ThreadItem {
+        completed_at_ms: None,
+        started_at_ms: None,
+        variant,
+    }
 }
 
 /// `item/completed` for `item`, in turn `turn` of thread `thread`.
@@ -279,6 +299,7 @@ pub fn item_completed(
 ) -> ItemCompletedNotification {
     ItemCompletedNotification {
         completed_at_ms: 1,
+        content_token_count: None,
         item,
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
