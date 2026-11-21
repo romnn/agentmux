@@ -155,6 +155,7 @@ mod tests {
     fn every_other_line_reads_as_passed_over() -> Result<()> {
         let message = line(RolloutItem::EventMsg(codex::EventMsg::AgentMessage(
             codex::AgentMessageEvent {
+                moderation: None,
                 message: "done".to_owned(),
                 phase: None,
                 memory_citation: None,

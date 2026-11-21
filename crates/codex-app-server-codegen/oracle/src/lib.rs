@@ -82,7 +82,7 @@ macro_rules! check {
                 #[allow(
                     unreachable_patterns,
                     reason = "codex may declare no client notification beyond the table's, as \
-                              0.162.1 does; the arm keeps the check compiling when it adds one"
+                              0.171.0 does; the arm keeps the check compiling when it adds one"
                 )]
                 _ => {}
             }
