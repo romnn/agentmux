@@ -28,7 +28,7 @@ use googletest::prelude::*;
 
 /// The cheapest model on each side that still exercises the whole path.
 const CLAUDE_MODEL: &str = "haiku";
-const CODEX_MODEL: &str = "gpt-5.3-codex-spark";
+const CODEX_MODEL: &str = "gpt-6-luna";
 
 /// Start a consultation against the real CLI and wait for it, in a directory that survives the
 /// test so a failure's capture files can be inspected afterwards.

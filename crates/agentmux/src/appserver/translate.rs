@@ -523,13 +523,13 @@ impl Translator {
         let text = |wanted: fn(&wire::ThreadItem) -> Option<&str>| {
             items.iter().rev().find_map(wanted).map(ToOwned::to_owned)
         };
-        if let Some(reply) = text(|item| match item {
-            wire::ThreadItem::AgentMessage(message) => Some(&message.text),
+        if let Some(reply) = text(|item| match &item.variant {
+            wire::ThreadItemVariant::AgentMessage(message) => Some(&message.text),
             _ => None,
         }) {
             self.last_reply = Some(reply);
-        } else if let Some(plan) = text(|item| match item {
-            wire::ThreadItem::Plan(plan) => Some(&plan.text),
+        } else if let Some(plan) = text(|item| match &item.variant {
+            wire::ThreadItemVariant::Plan(plan) => Some(&plan.text),
             _ => None,
         }) {
             self.last_plan = Some(plan);
@@ -549,8 +549,8 @@ impl Translator {
         item: wire::ThreadItem,
         completed_at_ms: i64,
     ) -> Result<Option<CaptureEvent>, UnknownProtocolValue> {
-        use wire::ThreadItem as Item;
-        let (id, details) = match item {
+        use wire::ThreadItemVariant as Item;
+        let (id, details) = match item.variant {
             Item::AgentMessage(message) => {
                 if !message.text.trim().is_empty() {
                     self.last_reply = Some(message.text.clone());

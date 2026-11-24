@@ -39,8 +39,7 @@ pub const BUILT_IN_MAX_SANDBOX: CodexSandbox = CodexSandbox::WorkspaceWrite;
 /// The oldest codex release whose `exec` is known to honour a permission profile defined and
 /// selected with `-c`, as `(major, minor, patch)`.
 ///
-/// Read from the source of codex 0.162.1, the release the app-server protocol is pinned to, and
-/// measured against codex-cli 0.163.0.
+/// Read from the source of codex 0.162.1 and measured against codex-cli 0.163.0.
 pub const PERMISSION_PROFILE_MIN_CODEX: (u64, u64, u64) = (0, 162, 1);
 
 /// Why a consultation's permissions were refused.
