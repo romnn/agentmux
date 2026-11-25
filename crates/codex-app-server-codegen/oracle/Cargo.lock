@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-codegen"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "clap",
  "indoc",
@@ -1914,7 +1914,7 @@ name = "codex-app-server-oracle"
 version = "0.0.0"
 dependencies = [
  "codex-app-server-codegen",
- "codex-app-server-protocol 0.0.12",
+ "codex-app-server-protocol 0.0.13",
  "codex-app-server-protocol 0.171.0",
  "codex-exec",
  "codex-history",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-protocol"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "serde",
  "serde_json",

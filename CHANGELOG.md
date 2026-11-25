@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.13
+
 - **The codex app-server protocol is pinned to codex-cli 0.171.0,** up from 0.162.1.
 
 ## v0.0.12
