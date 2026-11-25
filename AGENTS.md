@@ -73,3 +73,12 @@ Design decisions and their rationale are recorded in [`adr/`](adr/README.md). Re
 records before changing an area. A change that alters a recorded decision adds a new ADR that
 supersedes the old one, in the same change; fix an existing record's facts and code pointers in
 place.
+
+## Changelog
+
+A pull request with a user-facing change (a new feature, a fix users can notice, or a behavior or
+breaking change) adds one bullet under `## Unreleased` in `CHANGELOG.md`: a bold one-line
+statement, optionally followed by one short sentence naming the command, flag, tool or config key.
+A move of the codex pin gets one too. CI, tooling, tests, refactors and dependency bumps get no
+entry. A release moves the Unreleased entries under the new `## vX.Y.Z` heading before the
+bump, which commits `CHANGELOG.md` through `.bumpversion.toml`.

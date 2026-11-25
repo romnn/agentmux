@@ -12,6 +12,7 @@ pre_commit_hooks = [
   "cargo metadata --format-version 1 --manifest-path crates/codex-app-server-codegen/oracle/Cargo.toml >/dev/null"
 ]
 additional_files = [
+  "CHANGELOG.md",
   "Cargo.lock",
   "crates/codex-app-server-codegen/oracle/Cargo.lock"
 ]
