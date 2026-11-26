@@ -19,25 +19,8 @@
 //! A job still below a live command shell when the turn ends is stopped, by codex or by the
 //! sweep, and not reported; nor is a process first seen once the server is shutting down.
 
+use crate::drivers::{ProcessIdentity, SeenProcess};
 use crate::left_running::{LeftProcess, LeftRunning, ProcessFate};
-
-/// A process recognised by its pid and its start time, so a later holder of the pid is told
-/// apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ProcessIdentity {
-    pub(super) pid: u32,
-    pub(super) start_time_secs: u64,
-}
-
-/// A process one read of the process table found alive.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SeenProcess {
-    pub(super) identity: ProcessIdentity,
-    /// Its parent's pid, when the read recorded one.
-    pub(super) parent_pid: Option<u32>,
-    /// Its process name, bounded as a record keeps it.
-    pub(super) name: String,
-}
 
 /// The processes a turn left running, gathered as the sweep meets them.
 #[derive(Debug)]
@@ -150,7 +133,8 @@ impl Cohort {
 mod tests {
     use googletest::prelude::*;
 
-    use super::{Cohort, ProcessIdentity, SeenProcess};
+    use super::Cohort;
+    use crate::drivers::{ProcessIdentity, SeenProcess};
     use crate::left_running::{
         LeftProcess, LeftRunning, MAX_PROCESSES, OmittedProcesses, ProcessFate,
     };

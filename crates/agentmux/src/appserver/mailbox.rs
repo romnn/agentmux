@@ -1,12 +1,15 @@
 //! The files a steered message travels through, between whoever steers and the driver.
 //!
+//! Both drivers serve a mailbox: the app-server driver's and the Claude driver's
+//! ([`crate::claude_stream`]).
 //! One message is one file name stem, and its suffix is its part:
 //!
 //! ```text
 //! <stem>.request.json   written by the caller, whole, by renaming a temporary file into place
-//! <stem>.decision.json  claimed by the driver, which then sends `turn/steer`, or withdrawn by a
+//! <stem>.decision.json  claimed by the driver, which then hands it to the CLI, or withdrawn by a
 //!                       caller that stopped waiting; created exactly once
-//! <stem>.reply.json     written by the driver, whole, once the server has answered
+//! <stem>.reply.json     written by the driver, whole, once the CLI has taken it or the driver
+//!                       knows it never will
 //! ```
 //!
 //! Claiming and withdrawing both create the one decision file, so exactly one of them succeeds:
@@ -49,15 +52,15 @@ pub struct ClaimedSteer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SteerReply {
-    /// The server accepted it into the running turn.
+    /// The CLI took it into the running turn, and the capture records it.
     Accepted,
-    /// The server, or the driver, refused it; it was not delivered.
+    /// The CLI, or the driver, refused it; it was not delivered.
     Rejected {
-        /// Why, in the server's words when it gave any.
+        /// Why, in the CLI's words when it gave any.
         reason: String,
     },
-    /// It was sent, but whether the server took it is unknown: the turn or the server ended
-    /// before the server answered, or the server took it and the transcript could not record it.
+    /// It was sent, but whether the CLI took it is unknown: the turn or the CLI ended before
+    /// the CLI said, or the CLI took it and the transcript could not record it.
     Unconfirmed {
         /// What happened instead of an answer.
         reason: String,
@@ -169,6 +172,21 @@ impl Mailbox {
     /// so its sender is not left waiting on a message nobody will send.
     #[must_use]
     pub fn claim_all(&self) -> Vec<ClaimedSteer> {
+        self.claim_oldest(usize::MAX)
+    }
+
+    /// Claim the oldest waiting request, for a driver that hands its CLI one message at a time
+    /// and leaves the rest to be withdrawn meanwhile.
+    ///
+    /// A request that cannot be read is rejected, as [`Mailbox::claim_all`] rejects one, and
+    /// the next is claimed in its place.
+    #[must_use]
+    pub fn claim_next(&self) -> Option<ClaimedSteer> {
+        self.claim_oldest(1).into_iter().next()
+    }
+
+    /// Claim up to `limit` waiting requests, oldest first.
+    fn claim_oldest(&self, limit: usize) -> Vec<ClaimedSteer> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -187,6 +205,9 @@ impl Mailbox {
 
         let mut claims = Vec::new();
         for stem in stems {
+            if claims.len() >= limit {
+                break;
+            }
             // Decided already, by an earlier claim or by its sender.
             if self.path(&stem, DECISION).exists() {
                 continue;

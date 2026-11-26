@@ -363,6 +363,8 @@ pub enum NotRunningReason {
     NotLaunched,
     /// A cancellation is stopping the turn.
     Cancelling,
+    /// The delegate has reported the turn's result and takes nothing more while it finishes.
+    Finishing,
     /// The turn is over.
     Ended(TurnState),
 }
@@ -372,6 +374,7 @@ impl std::fmt::Display for NotRunningReason {
         match self {
             Self::NotLaunched => f.write_str("not yet launched"),
             Self::Cancelling => f.write_str("cancelling"),
+            Self::Finishing => f.write_str("finishing"),
             Self::Ended(state) => state.fmt(f),
         }
     }
@@ -380,7 +383,8 @@ impl std::fmt::Display for NotRunningReason {
 /// Why a running turn takes no message: its delegate reads its question once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsteerableReason {
-    /// A Claude delegate, which runs in print mode.
+    /// A Claude delegate launched as `claude --print` with its question as its only input: by an
+    /// agentmux that does not drive Claude turns, or one older than driving them.
     ClaudePrint,
     /// An inheriting Codex delegate this agentmux launched with `codex exec`.
     CodexExec,
@@ -392,8 +396,9 @@ impl std::fmt::Display for UnsteerableReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::ClaudePrint => {
-                "its delegate runs as `claude --print`, which reads its question once and offers \
-                 no channel into a turn that has started"
+                "its turn was launched as `claude --print` reading its question once, which offers \
+                 no channel into a turn that has started; only a Claude turn agentmux drives over \
+                 stream-json input takes a steer, as every turn the agentmux command launches is"
             }
             Self::CodexExec => {
                 "this agentmux launched it with `codex exec`, which reads its question once; Codex \

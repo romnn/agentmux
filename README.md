@@ -683,9 +683,10 @@ correction you notice ten minutes into a review; a new question, once the turn h
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 ```
 
-`status` says `steerable: yes` while a turn can take one. Today that is a **Codex delegate that
-loads its account's configuration**, which is the default, because only `codex app-server` accepts
-input for a running turn and only such a delegate can run over it:
+`status` says `steerable: yes` while a turn can take one: a **Claude turn until it has reported
+its result**, and a **Codex turn whose delegate loads its account's configuration**, which is the
+default, because only `codex app-server` accepts input for a running Codex turn and only such a
+delegate can run over it:
 
 - `codex exec`, which reads its prompt once, is what an isolated Codex delegate needs: the
   app-server has no equivalent of `--ignore-user-config` (codex-cli 0.159.3), and a private
@@ -694,8 +695,10 @@ input for a running turn and only such a delegate can run over it:
   would land where your codex cannot find them. So isolation is never traded for steering
   silently: a consultation with `ignore_user_config: true` runs over `codex exec` and cannot be
   steered. The codex release whose app-server takes the flag lifts this.
-- A Claude delegate runs as `claude --print`, which reads its question once and offers no channel
-  into a turn that has started.
+- A Claude turn reads its input as stream-json lines while it runs, and takes a steer once the
+  tool it is running has finished, before its next model call. Once it has reported its result it
+  takes no more; a message sent before then and taken after it is answered as a further turn of
+  its own, and that answer is the turn's.
 
 `steerable: yes` appears once the turn is running; for the first seconds, while the delegate opens
 its thread, a steer is refused with a request to send it again shortly.
@@ -704,8 +707,17 @@ Everything else is refused with the reason, and a refused message is never in th
 consultation that is not running or is being cancelled, a delegate launched another way, a message
 the server rejected, and one the turn ended before picking up (it is withdrawn unsent). A message
 that was sent but never answered — the turn or the server ended first, or no answer came within
-30 seconds — is reported as unconfirmed rather than refused, because codex may have taken it; read
-the transcript before sending it again.
+30 seconds — is reported as unconfirmed rather than refused, because the delegate may have taken
+it, and one Claude did not confirm within those 30 seconds may still arrive; read the transcript
+before sending it again.
+
+**How a driven Claude turn runs.** `agentmux` itself, run as a detached child exactly where
+`claude --print` would be, runs `claude` with the same arguments plus
+`--input-format stream-json --replay-user-messages`, hands it the question and then each steer as
+an input line, and writes what Claude prints to the turn's capture, with each steer where Claude
+took it. Claude's input closes once it has reported its result, and `cancel` has the driver stop
+Claude, and what Claude was running then, before anything is signalled. [ADR 0034](adr/0034-claude-turns-driven-over-stream-json-input.md)
+explains why it is built this way.
 
 **How a driven Codex turn runs.** `agentmux` itself, run as a detached child exactly where
 `codex exec` would be, starts `codex app-server`, runs the one turn with `approvalPolicy: never`,
@@ -786,7 +798,8 @@ server has one.
 `cancel` marks the turn as cancelling, asks the delegate to stop, waits a few seconds, makes it
 stop if it did not, waits a few seconds more, and then records the cancellation. A turn run over
 `codex app-server` is first interrupted through the protocol and given up to about twenty seconds to
-close and clear up after itself. The record freezes the transcript at what the child had written by
+close and clear up after itself, and a Claude turn's driver up to about thirteen seconds to stop
+Claude and what it was running. The record freezes the transcript at what the child had written by
 then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
 that had already finished its turn when the signal landed is reported as having finished. A
 `status` or `tail` that happens to see the child go first records the same cancellation. The record

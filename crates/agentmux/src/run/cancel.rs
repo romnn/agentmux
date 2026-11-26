@@ -4,6 +4,7 @@ use std::fs::File;
 use std::time::Duration;
 
 use crate::launch::{Launched, Liveness};
+use crate::stream::LaunchMode;
 use crate::transcript::{FailureKind, Outcome};
 
 use super::RunStore;
@@ -11,7 +12,7 @@ use super::error::RunError;
 use super::id::RunId;
 use super::layout::TurnDir;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, read_complete_records, read_json, write_json_once,
+    ExitRecord, InvocationRecord, read_complete_records, read_json, write_json_once,
 };
 use super::status::RunStatus;
 
@@ -28,13 +29,9 @@ impl RunStore {
     /// How often a cancellation checks whether the child has gone.
     pub(super) const STOP_POLL: Duration = Duration::from_millis(100);
 
-    /// How long a cancelled turn driven over the app-server is given to interrupt itself and
-    /// leave, before it is signalled like any other child.
-    ///
-    /// The driver takes at most [`crate::appserver::STOP_BUDGET`] to interrupt the turn, let the
-    /// server exit and stop what it left running, so this outlasts all of it.
-    pub(super) const DRIVER_EXIT_GRACE: Duration =
-        crate::appserver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
+    /// How much longer than its driver's own budget a cancelled driven turn is given to stop its
+    /// CLI itself and leave, before it is signalled like any other child.
+    pub(super) const DRIVER_EXIT_MARGIN: Duration = Duration::from_secs(5);
 
     /// Stop a running consultation.
     ///
@@ -126,21 +123,29 @@ impl RunStore {
         self.status(run_id)
     }
 
-    /// Stop a turn's delegate, giving a driven turn the chance to interrupt itself first.
+    /// Stop a turn's delegate, giving a driven turn the chance to stop itself first.
     ///
-    /// A driven turn sees the `cancelling` marker and interrupts itself over the protocol, which
-    /// lets the server close the turn and save it; it is given the chance before any signal.
-    /// A driver whose turn has already ended may still be stopping what its server left running,
-    /// and is given the same chance to finish.
+    /// A driven turn sees the `cancelling` marker and stops its CLI itself: over the app-server
+    /// it interrupts the turn, which lets the server close and save it, and a Claude turn's driver
+    /// stops Claude and what it started.
+    /// It is given its driver's whole budget and [`Self::DRIVER_EXIT_MARGIN`] before any signal,
+    /// so a driver is not signalled while it is still stopping its CLI.
+    /// A driver whose turn has already ended may still be stopping what its CLI left running, and
+    /// is given the same chance to finish.
     pub(super) async fn stop_delegate(
         &self,
         dir: &TurnDir,
         launched: Launched,
     ) -> Result<(), RunError> {
-        let uses_app_server = read_json::<InvocationRecord>(&dir.invocation())?
-            .is_some_and(|invocation| invocation.launch_mode == LaunchMode::AppServer);
-        if uses_app_server {
-            self.wait_for_delegate_exit(launched, Self::DRIVER_EXIT_GRACE)
+        let driver_budget = read_json::<InvocationRecord>(&dir.invocation())?.and_then(
+            |invocation| match invocation.launch_mode {
+                LaunchMode::DirectCli => None,
+                LaunchMode::AppServer => Some(crate::appserver::STOP_BUDGET),
+                LaunchMode::ClaudeStream => Some(crate::claude_stream::STOP_BUDGET),
+            },
+        );
+        if let Some(budget) = driver_budget {
+            self.wait_for_delegate_exit(launched, budget.saturating_add(Self::DRIVER_EXIT_MARGIN))
                 .await;
         }
         self.stop(launched).await;

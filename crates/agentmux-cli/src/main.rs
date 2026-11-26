@@ -40,8 +40,7 @@ fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<Sta
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
     // stdout is the JSON-RPC channel under `agentmux mcp`; anything else on it corrupts the
@@ -55,13 +54,24 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // The driver is a delegate, not a front end: it opens no store and serves nobody, and its
-    // exit status is what the store reads when the turn's stream says nothing.
+    // A driver is a delegate, not a front end: it opens no store and serves nobody, and its exit
+    // status is what the store reads when the turn's stream says nothing.
+    // It runs on threads of its own, so no runtime is built for it.
     if let Command::CodexAppServer(args) = &cli.command {
         std::process::exit(agentmux::appserver::drive(&args.plan_path));
     }
-    // So is the supervisor: the store it opens is the one its plan names, and the environment it
-    // was started with is its delegate's, which it hands on.
+    if let Command::ClaudeStream(args) = &cli.command {
+        std::process::exit(agentmux::claude_stream::drive(&args.plan_path));
+    }
+    tokio::runtime::Runtime::new()
+        .wrap_err("starting the async runtime")?
+        .block_on(run(cli))
+}
+
+/// Run every command but a driver's.
+async fn run(cli: Cli) -> Result<()> {
+    // The supervisor is a front end to nothing either: the store it opens is the one its plan
+    // names, and the environment it was started with is its delegate's, which it hands on.
     if let Command::Supervise(args) = &cli.command {
         std::process::exit(agentmux::run::supervise(&args.plan_path, agentmux::host_env()).await);
     }
@@ -141,7 +151,7 @@ async fn main() -> Result<()> {
             report::list(&runs, filter.filters(), cli.json)
         }
         // Dispatched before the store was opened.
-        Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
+        Command::CodexAppServer(_) | Command::ClaudeStream(_) | Command::Supervise(_) => Ok(()),
         Command::Prune(args) => {
             if let Some(run_id) = args.run_id {
                 store.remove(run_id.id())?;
@@ -169,10 +179,12 @@ fn open_store(cli: &Cli) -> Result<RunStore> {
     // This executable is the supervisor of every turn and the driver of a driven one, so a turn
     // it starts is run and settled by the same build that will read it back.
     // The store refuses to launch once an upgrade replaces the file under a running server.
+    // Every Claude turn is driven, whatever `--codex-launch` says, which is about Codex alone.
     let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
-        .with_supervisor(&executable);
+        .with_supervisor(&executable)
+        .with_claude_driver(&executable);
     if let Some(first_delay) = cli.auto_resume_delay {
         store = store.with_auto_resume(Some(AutoResumePolicy {
             first_delay,

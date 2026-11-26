@@ -6,7 +6,11 @@
 
 `steer` adds an instruction to a turn that is still running. `codex exec` reads its prompt once, and
 `claude --print` offers no channel into a turn that has started; only `codex app-server` accepts
-input for a running turn. A JSON-RPC server needs a client holding its stdin for as long as the turn
+input for a running turn.
+That statement about Claude is superseded by
+[0034](0034-claude-turns-driven-over-stream-json-input.md): given its input as stream-json,
+`claude --print` takes more.
+A JSON-RPC server needs a client holding its stdin for as long as the turn
 runs, and a consultation must survive the CLI or MCP server that started it. The run store and the
 transcript interface — the fold, `status`, `tail`, `result`, a restarted agentmux — must keep
 working unchanged for a driven turn.

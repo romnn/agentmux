@@ -21,7 +21,7 @@ use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
 use super::records::{
-    SettledRecord, SettledTurn, read_complete_records, read_if_present, read_json,
+    InvocationRecord, SettledRecord, SettledTurn, read_complete_records, read_if_present, read_json,
 };
 use super::status::{TranscriptPage, TurnQuestion, page_of};
 
@@ -262,10 +262,13 @@ impl RunStore {
     fn fold_capture(&self, target: &TurnRef, limit: Option<u64>) -> Result<Turn, RunError> {
         let dir = self.turn_dir(&target.run_id, target.turn_index);
         let vendor = self.meta(&target.run_id)?.delegate.vendor();
+        let mode = read_json::<InvocationRecord>(&dir.invocation())?
+            .unwrap_or_default()
+            .launch_mode;
         let question =
             read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
         let (events, _) = read_complete_records(&dir.events(), limit)?;
-        let Fold { turn, .. } = stream::fold(vendor, target.turn_index, &question, &events);
+        let Fold { turn, .. } = stream::fold(vendor, mode, target.turn_index, &question, &events);
         Ok(turn)
     }
 

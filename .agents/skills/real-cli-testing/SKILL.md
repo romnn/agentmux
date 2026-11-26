@@ -16,13 +16,14 @@ against recorded fixtures.
 
 ## Choosing a harness
 
-| What needs verification               | Harness                                  |
-| -------------------------------------- | ---------------------------------------- |
-| Stream folding and rendering           | Recorded fixtures                        |
-| Run-store behavior                     | `agentmux::testing::ScriptedLauncher`    |
-| Driver protocol ordering and deadlines | A scripted `Peer`                        |
-| Driver process launch and teardown     | The CLI against the mock `codex` binary  |
-| Compatibility with the installed CLIs  | Live tests                               |
+| What needs verification                       | Harness                                          |
+| --------------------------------------------- | ------------------------------------------------ |
+| Stream folding and rendering                  | Recorded fixtures                                |
+| Run-store behavior                            | `agentmux::testing::ScriptedLauncher`            |
+| Codex driver protocol ordering and deadlines  | A scripted `Peer`                                |
+| Claude driver protocol ordering and deadlines | An in-process Claude on pipes                    |
+| Driver process launch and teardown            | The CLI against the mock `codex` or a fake shell |
+| Compatibility with the installed CLIs         | Live tests                                       |
 
 ## Live tests
 
@@ -42,18 +43,18 @@ cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
 The library helper retains its store after startup, waiting, and status retrieval succeed,
 including when later assertions fail. Earlier errors may remove it.
 
-A steered turn over `codex app-server` has a live test of its own in the crate that builds the
-driver, `crates/agentmux-cli/tests/live.rs`, which runs the `agentmux` built with the test as the
-delegate:
+A steered turn of each vendor, over `codex app-server` and over Claude's stream-json input, has a
+live test of its own in the crate that builds the drivers, `crates/agentmux-cli/tests/live.rs`,
+which runs the `agentmux` built with the test as the delegate:
 
 ```bash
-AGENTMUX_LIVE_CODEX_ACCOUNT=<chosen-account> \
+AGENTMUX_LIVE_CODEX_ACCOUNT=<chosen-account> AGENTMUX_LIVE_CLAUDE_ACCOUNT=<chosen-account> \
   cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
 ```
 
-`AGENTMUX_LIVE_CODEX_ACCOUNT` names an account from the machine's `agentmux.toml`; without it the
-file's default, or the CLI's own login, is used. The CLI steering test retains its directory before
-launch and prints the transcript's path.
+Each variable names that vendor's account from the machine's `agentmux.toml`; without it the
+file's default, or the CLI's own login, is used. The CLI steering tests retain their directory
+before launch and print the transcript's path.
 
 When a capture reads differently than expected, trace it to what wrote it: each turn's
 `invocation.json` records what the delegate's CLI printed for `--version` (`Launcher::version`,
@@ -75,6 +76,11 @@ asked before the launch with the child's environment) and the agentmux release t
 Both check messages against codex's own schema; see ADR
 [0021](../../../adr/0021-mock-validates-against-codex-schema.md).
 
+The Claude driver has no mock: `crates/agentmux/src/claude_stream/tests.rs` plays Claude
+in-process over OS pipes behind the driver's `drive_with`, and
+`crates/agentmux-cli/tests/claude_stream.rs` runs the real `agentmux` against a fake `claude` shell
+script on the delegate's `PATH`.
+
 ## Fixture tests
 
 The recorded streams live under `crates/agentmux/fixtures/{claude,codex}/`, registered in
@@ -92,7 +98,8 @@ recorded expectations. If the vendor's output did change:
    (under `runs/<id>/turns/<NNNN>/` in the store a live test keeps) is the CLI's stdout verbatim,
    launched with the argv recorded in that turn's `invocation.json`. For Codex, record an `exec`
    turn; a turn driven over `codex app-server` holds the driver's translation, not codex's own
-   output.
+   output. A driven Claude turn holds Claude's own lines, launched with the arguments in its
+   `claude-stream.json`, but for the replays the driver leaves out or replaces.
 2. Scrub the capture (below).
 3. Add or replace the fixture, and register a new one in `agentmux::testing::fixtures`: its
    constants and `fixtures::all()`.

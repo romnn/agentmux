@@ -513,6 +513,15 @@ pub mod fixtures {
     /// from.
     pub const CLAUDE_RATE_LIMITED: &str = include_str!("../fixtures/claude/rate-limited.jsonl");
 
+    /// A Claude turn driven over stream-json input and steered while its command ran.
+    ///
+    /// Claude's own lines, as [`crate::claude_stream`] captures them: the question's replay left
+    /// out, the steer's replay replaced by `agentmux.steer` where Claude took it, and the driver's
+    /// `agentmux.end` last.
+    /// It carries the `command_lifecycle` events the CLI writes for each input message, before
+    /// and after its `result`.
+    pub const CLAUDE_STEERED: &str = include_str!("../fixtures/claude/steered.jsonl");
+
     /// A short Codex consultation that answered and finished cleanly.
     pub const CODEX_HAPPY: &str = include_str!("../fixtures/codex/happy.jsonl");
 
@@ -531,29 +540,67 @@ pub mod fixtures {
     pub const CODEX_UNSUPPORTED_MODEL: &str =
         include_str!("../fixtures/codex/unsupported-model.jsonl");
 
-    /// Every committed fixture, paired with the vendor that produced it.
+    /// A committed fixture, with what recorded it.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Fixture {
+        /// The vendor whose CLI wrote it.
+        pub vendor: crate::delegate::Vendor,
+        /// How that CLI was launched, which is how the stream folds.
+        pub mode: crate::stream::LaunchMode,
+        /// Its path under `fixtures/`, without the extension.
+        pub name: &'static str,
+        /// The recorded stream.
+        pub stream: &'static str,
+    }
+
+    /// Every committed fixture.
     #[must_use]
-    pub fn all() -> Vec<(crate::delegate::Vendor, &'static str, &'static str)> {
-        use crate::delegate::Vendor::{Claude, Codex};
+    pub fn all() -> Vec<Fixture> {
+        use crate::delegate::Vendor::{self, Claude, Codex};
+        use crate::stream::LaunchMode::{self, ClaudeStream, DirectCli};
+        let fixture = |vendor: Vendor, mode: LaunchMode, name, stream| Fixture {
+            vendor,
+            mode,
+            name,
+            stream,
+        };
         vec![
-            (Claude, "claude/happy", CLAUDE_HAPPY),
-            (Claude, "claude/rate-limited", CLAUDE_RATE_LIMITED),
-            (Claude, "claude/tool-use", CLAUDE_TOOL_USE),
-            (Claude, "claude/resume", CLAUDE_RESUME),
-            (
+            fixture(Claude, DirectCli, "claude/happy", CLAUDE_HAPPY),
+            fixture(
                 Claude,
+                DirectCli,
+                "claude/rate-limited",
+                CLAUDE_RATE_LIMITED,
+            ),
+            fixture(Claude, DirectCli, "claude/tool-use", CLAUDE_TOOL_USE),
+            fixture(Claude, DirectCli, "claude/resume", CLAUDE_RESUME),
+            fixture(
+                Claude,
+                DirectCli,
                 "claude/stop-hook-reopens-the-turn",
                 CLAUDE_STOP_HOOK,
             ),
-            (Claude, "claude/unknown-model", CLAUDE_UNKNOWN_MODEL),
-            (Codex, "codex/happy", CODEX_HAPPY),
-            (Codex, "codex/tool-use", CODEX_TOOL_USE),
-            (
+            fixture(
+                Claude,
+                DirectCli,
+                "claude/unknown-model",
+                CLAUDE_UNKNOWN_MODEL,
+            ),
+            fixture(Claude, ClaudeStream, "claude/steered", CLAUDE_STEERED),
+            fixture(Codex, DirectCli, "codex/happy", CODEX_HAPPY),
+            fixture(Codex, DirectCli, "codex/tool-use", CODEX_TOOL_USE),
+            fixture(
                 Codex,
+                DirectCli,
                 "codex/resume-with-model-mismatch-warning",
                 CODEX_RESUME_WARNING,
             ),
-            (Codex, "codex/unsupported-model", CODEX_UNSUPPORTED_MODEL),
+            fixture(
+                Codex,
+                DirectCli,
+                "codex/unsupported-model",
+                CODEX_UNSUPPORTED_MODEL,
+            ),
         ]
     }
 }

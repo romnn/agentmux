@@ -30,7 +30,8 @@
 //!     supervisor.json          the supervisor's own pid and start time, and how far it got
 //!     supervisor.log           what the supervisor printed
 //!     app-server.json          the plan a turn driven over `codex app-server` runs under
-//!     steer/                   messages steered into such a turn, and the driver's replies
+//!     claude-stream.json       the plan a Claude turn driven over stream-json input runs under
+//!     steer/                   messages steered into a driven turn, and the driver's replies
 //!     left-running.json        what such a turn left running once its server had exited, and
 //!                              whether each still ran after being signalled; written once by
 //!                              the driver before it exits, and only when it found anything
@@ -112,6 +113,7 @@ use chrono::{DateTime, Utc};
 use crate::accounting::Accounting;
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
+use crate::stream::TurnInput;
 use crate::transcript::{Outcome, Transcript};
 
 use executable::Executable;
@@ -122,13 +124,14 @@ use records::{
 };
 use status::{STATUS_STDERR_TAIL, elapsed_since, first_line, last_page_of, page_of};
 
+pub use crate::stream::LaunchMode;
 pub use auto_resume::{AutoResume, AutoResumePolicy, CONTINUE as AUTO_RESUME_QUESTION};
 pub use continue_fresh::CONTENT_FLAGGED_STREAK;
 pub use error::{NotResumable, NotRunningReason, RunError, SteerError, UnsteerableReason};
 pub use id::{RunId, RunIdError};
 pub use label::{RunLabel, RunLabelError};
 pub use quota::QuotaReport;
-pub use records::{LaunchMode, Meta, SettledTurn};
+pub use records::{Meta, SettledTurn};
 pub use retention::Retention;
 pub use spawn::{StartRequest, TURN_END_NOTICE};
 pub use status::{
@@ -152,6 +155,9 @@ pub struct RunStore {
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
     /// launches such turns that way.
     codex_driver: Option<Executable>,
+    /// The agentmux executable that drives a Claude turn over stream-json input, when this store
+    /// launches Claude turns that way.
+    claude_driver: Option<Executable>,
     /// The agentmux executable that supervises each turn this store launches, when it launches
     /// them that way.
     supervisor: Option<Executable>,
@@ -203,9 +209,11 @@ impl RunStore {
             // Every vendor reachable until an operator says otherwise: a terminal denies none.
             denied: BTreeSet::new(),
             inside_delegate: OnceLock::new(),
-            // `exec` for every Codex turn until a caller names a driver: embedding this library
-            // must not start an executable the embedder did not provide.
+            // `exec` for every Codex turn, and `--print` for every Claude turn, until a caller
+            // names a driver: embedding this library must not start an executable the embedder
+            // did not provide.
             codex_driver: None,
+            claude_driver: None,
             // Unsupervised for the same reason.
             supervisor: None,
             // Resumed only by a supervisor, so nothing runs until one is named.
@@ -221,8 +229,8 @@ impl RunStore {
     /// its delegate leaving, whether or not anything is asking about the consultation.
     /// Without one, the delegate is launched directly and its turn settles when something next
     /// reads it.
-    /// Independent of [`RunStore::with_codex_app_server`]: a driven turn's driver is the delegate
-    /// the supervisor starts.
+    /// Independent of [`RunStore::with_codex_app_server`] and [`RunStore::with_claude_driver`]: a
+    /// driven turn's driver is the delegate the supervisor starts.
     ///
     /// The file is remembered as it is now, and once it changes, as an upgrade changes it under a
     /// running server, every launch is refused with [`RunError::ExecutableReplaced`].
@@ -258,6 +266,21 @@ impl RunStore {
     #[must_use]
     pub fn with_codex_app_server(mut self, driver: impl Into<PathBuf>) -> Self {
         self.codex_driver = Some(Executable::new(driver.into()));
+        self
+    }
+
+    /// Drive every Claude turn over stream-json input through `driver`, so it can be steered
+    /// until Claude reports its result.
+    ///
+    /// `driver` is an `agentmux` executable: the run store launches it as
+    /// `<driver> claude-stream <plan>`, and it runs [`crate::claude_stream::drive`].
+    /// Every Claude turn runs this way, isolated or not, with exactly the arguments
+    /// `claude --print` would have had; without a driver every Claude turn runs as that.
+    /// Like the supervisor, the file is remembered as it is now, and a launch is refused once it
+    /// changes.
+    #[must_use]
+    pub fn with_claude_driver(mut self, driver: impl Into<PathBuf>) -> Self {
+        self.claude_driver = Some(Executable::new(driver.into()));
         self
     }
 
@@ -577,7 +600,7 @@ impl RunStore {
             // this into a recommendation and a caller that takes it pays for the turn.
             resumable: Self::resumable_session(run_id, &state).is_ok(),
             steerable: state.newest.as_ref().is_some_and(|newest| {
-                Self::accepts_steers(&outcome, newest.launch_mode, newest.turn_started, &turn)
+                Self::accepts_steers(&outcome, newest.launch_mode, newest.input, &turn)
             }),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
@@ -822,8 +845,8 @@ pub(super) struct NewestTurn {
     pub(super) settled_by: Option<SettledBy>,
     /// How its delegate was launched.
     pub(super) launch_mode: LaunchMode,
-    /// Whether its capture says the turn itself began.
-    pub(super) turn_started: bool,
+    /// Whether it takes an instruction now, as its capture says.
+    pub(super) input: TurnInput,
     /// Whether it is settled, committed by this fold or an earlier one, which a follow-up waits
     /// for.
     pub(super) settled: bool,

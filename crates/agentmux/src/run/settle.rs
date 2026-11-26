@@ -54,14 +54,14 @@ use super::id::RunId;
 use super::layout::TurnDir;
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, Meta, SettledRecord, SettledTurn, SupervisorPhase,
-    TurnFiles, read_complete_records, read_if_present, read_json, tail_of_file, write_json_once,
+    ExitRecord, InvocationRecord, Meta, SettledRecord, SettledTurn, SupervisorPhase, TurnFiles,
+    read_complete_records, read_if_present, read_json, tail_of_file, write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::left_running::LeftRunning;
-use crate::stream::{self, Fold};
+use crate::stream::{self, Fold, LaunchMode, TurnInput};
 use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
 /// How many bytes of a departed child's stderr are kept with its exit record.
@@ -83,8 +83,8 @@ pub(super) struct FoldedTurn {
     pub(super) settled_by: Option<SettledBy>,
     /// How the turn's delegate was launched.
     pub(super) launch_mode: LaunchMode,
-    /// Whether the turn's capture says the turn itself began.
-    pub(super) turn_started: bool,
+    /// Whether the turn takes an instruction now, as its capture says.
+    pub(super) input: TurnInput,
     /// Where its usage window is still to be read from, when its stream carried none.
     pub(super) pending_rate_limit_lookup: Option<RateLimitLookup>,
     /// Whether its settlement is committed, can be, or cannot be yet.
@@ -390,7 +390,7 @@ impl LockedRun<'_> {
                 index: files.index,
                 settled_by: folded.settled_by,
                 launch_mode: folded.launch_mode,
-                turn_started: folded.turn_started,
+                input: folded.input,
                 settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
                 delegate_gone: folded.delegate_gone,
             });
@@ -461,6 +461,11 @@ impl LockedRun<'_> {
         let dir = &files.dir;
         let question =
             read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
+        // What the launch recorded before the spawn: how the delegate was run, which decides
+        // what its capture holds, which session it asked to resume, and whether the child was
+        // ever going to be able to save its own.
+        let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
+        let launch_mode = invocation.launch_mode;
         // A settled turn's capture is read only up to the length its records froze: the
         // marker's, which agrees with an exit record's wherever both exist.
         let frozen_len = files
@@ -469,7 +474,7 @@ impl LockedRun<'_> {
             .map(|settled| settled.events_len)
             .or_else(|| files.exit.as_ref().map(ExitRecord::events_len));
         let (events, mut folded_len) = read_complete_records(&dir.events(), frozen_len)?;
-        let mut fold = stream::fold(vendor, files.index, &question, &events);
+        let mut fold = stream::fold(vendor, launch_mode, files.index, &question, &events);
 
         // Reaping goes through the handle this process retained, whatever the turn's state: it
         // costs a lookup, cannot mistake another process for the child, and is what keeps a
@@ -494,7 +499,7 @@ impl LockedRun<'_> {
         }) = &evidence
         {
             if final_events.len() != events.len() {
-                fold = stream::fold(vendor, files.index, &question, final_events);
+                fold = stream::fold(vendor, launch_mode, files.index, &question, final_events);
             }
             folded_len = departure.events_len;
         }
@@ -513,14 +518,14 @@ impl LockedRun<'_> {
         {
             let (frozen, frozen_len) =
                 read_complete_records(&dir.events(), Some(record.events_len()))?;
-            fold = stream::fold(vendor, files.index, &question, &frozen);
+            fold = stream::fold(vendor, launch_mode, files.index, &question, &frozen);
             folded_len = frozen_len;
         }
 
         let Fold {
             mut turn,
             session: turn_session,
-            turn_started,
+            input,
         } = fold;
         let settled_by = match &record {
             Some(record) => {
@@ -533,11 +538,7 @@ impl LockedRun<'_> {
                 .then_some(SettledBy::TerminalEvent),
         };
 
-        // What the launch recorded before the spawn: which session it asked to resume, and
-        // whether the child was ever going to be able to save its own.
-        let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
         note_launch_record(&mut turn, &invocation, &meta.delegate);
-        let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),
             turn_session.as_ref(),
@@ -582,7 +583,7 @@ impl LockedRun<'_> {
             last_activity: last_write(dir),
             settled_by,
             launch_mode,
-            turn_started,
+            input,
             pending_rate_limit_lookup,
             finality,
         })

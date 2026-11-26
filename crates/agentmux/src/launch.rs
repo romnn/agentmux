@@ -356,25 +356,26 @@ impl Launcher for ProcessLauncher {
         // after the CLI itself has exited, and reading it would then outlast the deadline, where
         // a file is read for what it holds.
         let mut version_output_file = tempfile::tempfile().ok()?;
-        let spawn = |program: &str| {
-            std::process::Command::new(program)
-                .arg("--version")
-                .current_dir(cwd)
-                .env_clear()
-                .envs(&env)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(version_output_file.try_clone()?))
-                .stderr(Stdio::null())
-                .spawn()
-        };
-        keep_std_handles_from_children();
-        let program = invocation.program();
-        let spawned = spawn(program);
-        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
-        // bare name.
-        #[cfg(windows)]
-        let spawned = spawned.or_else(|_| spawn(&format!("{program}.cmd")));
-        let mut child = spawned.ok()?;
+        let mut child = spawn_program(invocation.program(), |program| {
+            version_output_file
+                .try_clone()
+                .and_then(|output| {
+                    std::process::Command::new(program)
+                        .arg("--version")
+                        .current_dir(cwd)
+                        .env_clear()
+                        .envs(&env)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(output))
+                        .stderr(Stdio::null())
+                        .spawn()
+                })
+                .map_err(|source| LaunchError::Spawn {
+                    program: program.to_owned(),
+                    source,
+                })
+        })
+        .ok()?;
 
         let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
         loop {
@@ -458,23 +459,7 @@ impl Launcher for ProcessLauncher {
             })
         };
 
-        keep_std_handles_from_children();
-        let program = spec.invocation.program();
-        let child = match spawn(program) {
-            Ok(child) => child,
-            // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find
-            // by its bare name.
-            #[cfg(windows)]
-            Err(LaunchError::Spawn { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                spawn(&format!("{program}.cmd")).map_err(|_| LaunchError::Spawn {
-                    program: program.to_owned(),
-                    source,
-                })?
-            }
-            Err(error) => return Err(error),
-        };
+        let child = spawn_program(spec.invocation.program(), spawn)?;
         let pid = child.id();
         // Read before the handle is put away, so a child that has already exited is still a
         // zombie holding its pid and its start time is still on record.
@@ -620,6 +605,30 @@ mod identity {
             Some(_) => Liveness::Gone,
             None => Liveness::Unknown,
         }
+    }
+}
+
+/// Start `program` with `spawn`, as every process agentmux starts is started.
+///
+/// This process's standard handles are first kept from the child
+/// ([`keep_std_handles_from_children`]).
+/// On Windows a program that is not found by its bare name is tried once more as its `.cmd`
+/// shim, which is what an npm-installed CLI is and what `Command` does not find by its bare name;
+/// when that fails too, the first failure is the one returned.
+pub(crate) fn spawn_program<T>(
+    program: &str,
+    spawn: impl Fn(&str) -> Result<T, LaunchError>,
+) -> Result<T, LaunchError> {
+    keep_std_handles_from_children();
+    match spawn(program) {
+        #[cfg(windows)]
+        Err(LaunchError::Spawn { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            spawn(&format!("{program}.cmd")).map_err(|_| LaunchError::Spawn {
+                program: program.to_owned(),
+                source,
+            })
+        }
+        spawned => spawned,
     }
 }
 

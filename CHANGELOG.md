@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A running Claude turn can be steered.** Every Claude turn is driven over stream-json input,
+  so `steer` reaches it until Claude reports its result.
+- **Breaking: agentmux v0.0.13 and older cannot read a steerable Claude turn.** Restart every MCP
+  server started before upgrading.
+
 ## v0.0.13
 
 - **The codex app-server protocol is pinned to codex-cli 0.171.0,** up from 0.162.1.

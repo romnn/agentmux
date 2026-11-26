@@ -4,9 +4,10 @@
 //!
 //! The same twelve verbs the MCP server exposes, plus `mcp` to serve them, `accounts` to show what
 //! this machine defines, and `prune` to remove consultations by hand.
-//! Two more are hidden: `supervise`, the process the run store launches for every turn to start
-//! its delegate and settle it, and `codex-app-server`, the driver it launches as the delegate of a
-//! Codex turn it runs over `codex app-server`.
+//! Three more are hidden: `supervise`, the process the run store launches for every turn to start
+//! its delegate and settle it, and the drivers it launches as the delegate of a driven turn:
+//! `codex-app-server` for a Codex turn it runs over `codex app-server`, and `claude-stream` for a
+//! Claude turn, which it runs over stream-json input.
 //! A human debugging a delegation and an agent calling the tool are exercising exactly the same
 //! code path, which is the point: if `agentmux ask` works from a terminal, the tool works.
 
@@ -102,8 +103,8 @@ pub enum Command {
     /// Add an instruction to a consultation's running turn, which the delegate sees before its
     /// next model call.
     ///
-    /// Only a turn launched over `codex app-server` takes one; `status` says whether the running
-    /// turn is steerable.
+    /// A Codex turn launched over `codex app-server` takes one, and a Claude turn until it has
+    /// reported its result; `status` says whether the running turn is steerable.
     Steer(SteerArgs),
 
     /// Block until consultations' turns have settled, then print them.
@@ -139,7 +140,13 @@ pub enum Command {
     ///
     /// Launched by the run store as a consultation's delegate, never by hand.
     #[command(name = "codex-app-server", hide = true)]
-    CodexAppServer(CodexAppServerArgs),
+    CodexAppServer(DriverArgs),
+
+    /// Drive one Claude turn over stream-json input.
+    ///
+    /// Launched by the run store as a consultation's delegate, never by hand.
+    #[command(name = "claude-stream", hide = true)]
+    ClaudeStream(DriverArgs),
 
     /// Start one turn's delegate, wait for it, and settle the turn.
     ///
@@ -157,9 +164,9 @@ pub enum CodexLaunchArg {
     Exec,
 }
 
-/// The plan a driven Codex turn runs under.
+/// The plan a driven turn runs under.
 #[derive(Debug, Args)]
-pub struct CodexAppServerArgs {
+pub struct DriverArgs {
     /// The plan the run store wrote into the turn's directory.
     #[arg(value_name = "PLAN")]
     pub plan_path: PathBuf,

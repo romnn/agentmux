@@ -19,14 +19,17 @@
 //! - [`left_running`] — what a turn left running when it ended.
 //! - [`appserver`] — the driver that runs a Codex turn over `codex app-server`, so the turn can
 //!   be steered while it runs.
+//! - [`claude_stream`] — the driver that runs a Claude turn over stream-json input, so the turn
+//!   can be steered until Claude reports its result.
 //! - [`run`] — run directories, ids, lifecycle, retention and resume state.
 //! - [`testing`] — a scripted launcher and the recorded vendor fixtures, so the whole pipeline
 //!   runs with no credentials and no network.
 //!
 //! The dependency direction is one way: `transcript`, `left_running` and `delegate` import
-//! nothing heavy; `stream` imports `transcript`; `accounting` imports `transcript` and
-//! `delegate`; `appserver` imports `stream` and `delegate`; `run` imports `launch`, `stream`,
-//! `appserver`, `accounting` and `delegate`.
+//! nothing heavy; `stream` imports `transcript`, and `launch` for an exit status; `accounting`
+//! imports `transcript` and `delegate`; `appserver` and `claude_stream` import `stream` and
+//! `delegate`, and `claude_stream` the mailbox of `appserver`; `run` imports `launch`, `stream`,
+//! both drivers, `accounting` and `delegate`.
 //! Nothing here knows about MCP, which is what makes the whole pipeline testable without a client.
 //!
 //! # Example
@@ -72,8 +75,10 @@
 pub mod accounting;
 pub mod appserver;
 mod atomic_file;
+pub mod claude_stream;
 pub mod config;
 pub mod delegate;
+mod drivers;
 pub mod launch;
 pub mod left_running;
 pub mod quota;

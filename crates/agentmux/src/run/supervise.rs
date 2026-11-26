@@ -17,6 +17,8 @@
 //!    └─ claude --print | codex exec               launch.json, events.jsonl, stderr.log
 //!       or agentmux codex-app-server app-server.json
 //!          └─ codex app-server
+//!       or agentmux claude-stream claude-stream.json
+//!          └─ claude --print --input-format stream-json
 //! ```
 //!
 //! Nothing depends on the supervisor surviving.
@@ -112,13 +114,16 @@ pub async fn supervise(
     // supervised, by the same executables, under the same policy.
     store = match &plan.auto_resume {
         Some(resume) => {
-            let configured = store
+            let mut configured = store
                 .with_supervisor(&resume.supervisor)
                 .with_auto_resume(Some(resume.policy));
-            match &resume.codex_driver {
-                Some(driver) => configured.with_codex_app_server(driver),
-                None => configured,
+            if let Some(driver) = &resume.codex_driver {
+                configured = configured.with_codex_app_server(driver);
             }
+            if let Some(driver) = &resume.claude_driver {
+                configured = configured.with_claude_driver(driver);
+            }
+            configured
         }
         None => store.with_auto_resume(None),
     };

@@ -5,13 +5,13 @@ use std::time::Duration;
 use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Delegate, Isolation};
 use crate::launch::Launched;
+use crate::stream::{LaunchMode, TurnInput};
 use crate::transcript::Outcome;
 
 use super::RunStore;
 use super::error::{NotRunningReason, RunError, SteerError, UnsteerableReason};
 use super::id::RunId;
 use super::layout::TurnDir;
-use super::records::LaunchMode;
 use super::status::RunStatus;
 
 impl RunStore {
@@ -30,10 +30,12 @@ impl RunStore {
     /// Add an instruction to a consultation's running turn, for the delegate to see before its
     /// next model call.
     ///
-    /// Only a turn driven over `codex app-server` takes one; the message travels through the
-    /// turn's mailbox to its driver, which hands it to the server as `turn/steer` and records it
-    /// in the capture once the server has accepted it.
-    /// Returns once the delegate CLI has accepted the message, so a transcript read after a
+    /// Only a driven turn takes one: a Codex turn over `codex app-server`, or a Claude turn over
+    /// stream-json input until Claude reports its result.
+    /// The message travels through the turn's mailbox to its driver, which hands it to the CLI
+    /// and records it in the capture once the CLI has taken it: once codex has accepted its
+    /// `turn/steer`, and once Claude has echoed it as the input it consumed.
+    /// Returns once the delegate CLI has taken the message, so a transcript read after a
     /// successful steer holds it, as a `### user (steer)` section.
     ///
     /// # Errors
@@ -50,6 +52,7 @@ impl RunStore {
             mailbox,
             steer_id,
             driver_process,
+            launch_mode,
         } = self.submit_steer(run_id, message)?;
         let submitted = tokio::time::Instant::now();
         let mut claimed_at: Option<tokio::time::Instant> = None;
@@ -78,16 +81,21 @@ impl RunStore {
             let gone = self.child_has_gone(driver_process);
             match claimed_at {
                 // Claimed and then never answered: the driver went, or the CLI is silent.
+                // Claude takes a message only between its model calls, and its driver keeps
+                // looking for it, so one it has not taken yet may still arrive.
                 Some(at) if gone || at.elapsed() >= Self::STEER_CONFIRM_TIMEOUT => {
+                    let waited = Self::STEER_CONFIRM_TIMEOUT.as_secs();
                     return Err(SteerError::Unconfirmed {
                         run_id: run_id.clone(),
                         why: if gone {
                             "the turn's driver left without answering".to_owned()
-                        } else {
+                        } else if launch_mode == LaunchMode::ClaudeStream {
                             format!(
-                                "the delegate did not confirm it within {}s",
-                                Self::STEER_CONFIRM_TIMEOUT.as_secs()
+                                "Claude did not confirm delivery within {waited}s, and it may \
+                                 still arrive"
                             )
+                        } else {
+                            format!("the delegate did not confirm it within {waited}s")
                         },
                     }
                     .into());
@@ -140,7 +148,7 @@ impl RunStore {
         if outcome.is_terminal() {
             return Err(not_running(NotRunningReason::Ended(outcome.state())).into());
         }
-        if folded.launch_mode != LaunchMode::AppServer {
+        if !folded.launch_mode.is_driven() {
             // The running turn's own isolation, which a follow-up may have changed.
             let current = self.current_delegate(&meta, Some(newest.index))?;
             return Err(SteerError::NotSteerable {
@@ -152,12 +160,10 @@ impl RunStore {
         if newest.dir.cancelling().exists() {
             return Err(not_running(NotRunningReason::Cancelling).into());
         }
-        if !Self::accepts_steers(
-            &outcome,
-            folded.launch_mode,
-            folded.turn_started,
-            &newest.dir,
-        ) {
+        if folded.input == TurnInput::Closed {
+            return Err(not_running(NotRunningReason::Finishing).into());
+        }
+        if !Self::accepts_steers(&outcome, folded.launch_mode, folded.input, &newest.dir) {
             return Err(SteerError::Starting {
                 run_id: run_id.clone(),
             }
@@ -174,26 +180,27 @@ impl RunStore {
             mailbox,
             steer_id,
             driver_process,
+            launch_mode: folded.launch_mode,
         })
     }
 
-    /// Whether the newest turn takes a steer: it runs, over the app-server, its driver is
-    /// following the turn, and nobody has asked it to stop.
+    /// Whether the newest turn takes a steer: it runs, driven, its driver serves its mailbox, and
+    /// nobody has asked it to stop.
     ///
     /// The one answer both `status` and `steer` give, so a turn advertised as steerable is one
     /// `steer` will not refuse.
-    /// `started` is whether the turn's capture says the turn began, which the driver writes once
-    /// it knows the turn and is about to serve its mailbox: until then a steer would only wait
-    /// there, for as long as opening a long thread or starting the turn takes.
+    /// `input` is whether the turn takes an instruction, as its capture says: the driver serves
+    /// its mailbox exactly while it does, and before then a steer would only wait there, for as
+    /// long as starting the turn takes.
     pub(super) fn accepts_steers(
         outcome: &Outcome,
         mode: LaunchMode,
-        started: bool,
+        input: TurnInput,
         turn: &TurnDir,
     ) -> bool {
         !outcome.is_terminal()
-            && mode == LaunchMode::AppServer
-            && started
+            && mode.is_driven()
+            && input == TurnInput::Open
             && !turn.cancelling().exists()
     }
 }
@@ -203,9 +210,10 @@ struct SubmittedSteer {
     mailbox: Mailbox,
     steer_id: SteerId,
     driver_process: Launched,
+    launch_mode: LaunchMode,
 }
 
-/// Why a turn of this delegate that was not driven over the app-server offers no way in.
+/// Why a turn of this delegate that was not driven offers no way in.
 pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
     match delegate {
         Delegate::Claude { .. } => UnsteerableReason::ClaudePrint,

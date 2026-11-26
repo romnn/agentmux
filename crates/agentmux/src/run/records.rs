@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::delegate::{Billing, Delegate, ModelId, SessionRef};
 use crate::launch::{ExitStatus, Launched};
+use crate::stream::LaunchMode;
 use crate::transcript::{Outcome, ResumeAttempt, turn_index_of_number, turn_number};
 
 use super::SettledBy;
@@ -19,24 +20,6 @@ use super::id::RunId;
 use super::label::RunLabel;
 use super::layout::TurnDir;
 use super::retention::Retention;
-
-/// How a turn's delegate was launched.
-///
-/// Recorded per turn, because the mode is decided at each launch: a consultation begun from a
-/// store that runs every Codex turn over `exec` can be followed up by one that drives it over the
-/// app-server, and the thread carries over either way.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchMode {
-    /// The delegate CLI was run with the question on stdin: `claude --print` or `codex exec`.
-    ///
-    /// Nothing can reach the turn once it has started.
-    #[default]
-    #[serde(rename = "exec")]
-    DirectCli,
-    /// The turn is driven over `codex app-server` by [`crate::appserver`], and can be steered.
-    AppServer,
-}
 
 /// What agentmux recorded about a consultation when it began.
 #[derive(Debug, Clone, Serialize, Deserialize)]

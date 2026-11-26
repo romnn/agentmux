@@ -8,13 +8,16 @@
 //! arguments are the vendor's.
 //!
 //! Asked for `--version` it says so and exits.
-//! Otherwise it reads its question from stdin, writes the configured stream and stderr, waits
-//! until the configured release file exists, its directory has gone or [`LONGEST_WAIT`] has
-//! passed, writes what it was told to write last, and exits with the configured status.
+//! Otherwise it reads its question from stdin: to its end, or as its first line when its
+//! arguments say `--input-format stream-json`, as Claude's do once agentmux drives it and keeps its
+//! input open.
+//! It then writes the configured stream and stderr, waits until the configured release file
+//! exists, its directory has gone or [`LONGEST_WAIT`] has passed, writes what it was told to write
+//! last, and exits with the configured status.
 //! A configuration can give later runs, such as a resumed turn, something else to do.
 //! It is portable, so the same scenario runs on every platform agentmux supports.
 
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -120,10 +123,17 @@ fn run() -> Result<u8, String> {
     let number = record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
     let config = config.run(number);
 
+    let streamed = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair == ["--input-format", "stream-json"]);
     let mut question = String::new();
-    std::io::stdin()
-        .read_to_string(&mut question)
-        .map_err(|err| format!("cannot read the question: {err}"))?;
+    let read = if streamed {
+        std::io::stdin().lock().read_line(&mut question)
+    } else {
+        std::io::stdin().read_to_string(&mut question)
+    };
+    read.map_err(|err| format!("cannot read the question: {err}"))?;
     let mut stdout = std::io::stdout();
     write!(stdout, "{}", config.stdout).map_err(|err| format!("cannot write stdout: {err}"))?;
     stdout
