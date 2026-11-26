@@ -17,9 +17,10 @@ use googletest::prelude::*;
 use serde_json::{Value, json};
 
 use super::DriverPlan;
-use super::driver::{ClaudeProcess, DriverOutcome, DriverTimeouts, drive_with};
+use super::driver::{ClaudeProcess, DriverOutcome, DriverTimeouts, STOP_BUDGET, drive_with};
 use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Billing, Vendor};
+use crate::drivers::SWEEP_BUDGET;
 use crate::launch::ExitStatus;
 use crate::stream::{self, LaunchMode, TurnInput};
 use crate::transcript::{Message, MessageSource, Outcome, Usage};
@@ -527,50 +528,109 @@ fn a_result_already_read_closes_the_input_before_a_steer_is_claimed() -> Result<
     Ok(())
 }
 
-/// The driver goes on looking for a cancellation while it records a backlog of output, so a
-/// cancelled turn's Claude is asked to stop long before the backlog is through.
+/// A cancelled turn reaches its teardown within the driver's budget, with the sweep's share of it
+/// left over, however far Claude's output has run ahead of a slow capture: the driver holds only
+/// a few of Claude's lines, records every line it read before its cutoff, and leaves the rest
+/// unread.
 #[gtest]
-fn a_cancellation_is_seen_while_a_backlog_is_recorded() -> Result<()> {
+fn a_cancelled_turn_reaches_teardown_in_time_behind_a_slow_capture() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
-    let (backlogged, backlog_said) = channel::<()>();
-    let (cancelled, was_cancelled) = channel::<Instant>();
+    let (ahead, far_ahead) = channel::<()>();
     let stopped = ExitStatus {
         code: None,
         signal: Some(15),
     };
+    let mut cancelled_at = None;
     let driven = run(
         dir.path(),
         DriverTimeouts::default(),
-        // Two seconds to record the backlog below.
         Capture::slow(Duration::from_millis(5)),
         move |claude, process| {
             claude.next_input()?.or_fail()?;
             claude.say(&init())?;
-            for line in 0..400 {
+            // Far more than the driver queues, or Claude's pipe holds.
+            for line in 0..3000 {
+                if process.terminated() {
+                    break;
+                }
                 claude.say(&assistant(&format!("LINE {line}")))?;
+                if line == 300 {
+                    ahead.send(()).or_fail()?;
+                }
             }
-            backlogged.send(()).or_fail()?;
-            let cancelled_at = was_cancelled
-                .recv_timeout(Duration::from_secs(10))
-                .or_fail()?;
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !process.terminated() {
-                verify_that!(cancelled_at.elapsed() < Duration::from_secs(10), eq(true))?;
+                verify_that!(Instant::now() < deadline, eq(true))?;
                 std::thread::sleep(Duration::from_millis(5));
             }
-            verify_that!(cancelled_at.elapsed() < Duration::from_secs(1), eq(true))?;
             Ok(stopped)
         },
-        move |plan| {
-            backlog_said
-                .recv_timeout(Duration::from_secs(10))
-                .or_fail()?;
-            // Long enough for the driver to be well into the backlog.
-            std::thread::sleep(Duration::from_millis(300));
+        |plan| {
+            far_ahead.recv_timeout(Duration::from_secs(10)).or_fail()?;
             std::fs::write(plan.cancel_marker_path(), "").or_fail()?;
-            cancelled.send(Instant::now()).or_fail()
+            cancelled_at = Some(Instant::now());
+            Ok(())
         },
     )?;
+
     assert_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
+    // The driver sweeps what Claude left once it returns here.
+    assert_that!(
+        cancelled_at.or_fail()?.elapsed() < STOP_BUDGET.saturating_sub(SWEEP_BUDGET),
+        eq(true)
+    );
+    // Claude's announcement, then each line the driver read, in order and with none missing.
+    let mut lines = driven.capture.lines();
+    assert_that!(
+        lines.next(),
+        some(contains_substring(r#""subtype":"init""#))
+    );
+    let texts: Vec<String> = lines
+        .map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap_or_default();
+            input_text(&value).unwrap_or_default().to_owned()
+        })
+        .collect();
+    let read: Vec<String> = (0..texts.len())
+        .map(|line| format!("LINE {line}"))
+        .collect();
+    assert_that!(texts, eq(&read));
+    Ok(())
+}
+
+/// Claude's last lines, its `result` among them, are in the capture though the driver was still
+/// far behind a slow capture when Claude exited: it reads on for as long as they come.
+#[gtest]
+fn the_last_lines_of_a_claude_that_ran_ahead_are_recorded() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let driven = run(
+        dir.path(),
+        DriverTimeouts::default(),
+        Capture::slow(Duration::from_millis(10)),
+        |claude, _| {
+            claude.next_input()?.or_fail()?;
+            claude.say(&init())?;
+            // A second of recording, far more than the driver queues.
+            for line in 0..100 {
+                claude.say(&assistant(&format!("LINE {line}")))?;
+            }
+            claude.say(&result(100, 0.01))?;
+            Ok(EXITED_CLEANLY)
+        },
+        |_| Ok(()),
+    )?;
+    assert_that!(driven.outcome, eq(&DriverOutcome::Exited(EXITED_CLEANLY)));
+    let folded = stream::fold(
+        Vendor::Claude,
+        LaunchMode::ClaudeStream,
+        0,
+        QUESTION,
+        &driven.capture,
+    );
+    assert_that!(
+        folded.turn.outcome,
+        matches_pattern!(Outcome::Completed { .. })
+    );
     Ok(())
 }
 

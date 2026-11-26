@@ -798,7 +798,7 @@ server has one.
 `cancel` marks the turn as cancelling, asks the delegate to stop, waits a few seconds, makes it
 stop if it did not, waits a few seconds more, and then records the cancellation. A turn run over
 `codex app-server` is first interrupted through the protocol and given up to about twenty seconds to
-close and clear up after itself, and a Claude turn's driver up to about thirteen seconds to stop
+close and clear up after itself, and a Claude turn's driver up to about fifteen seconds to stop
 Claude and what it was running. The record freezes the transcript at what the child had written by
 then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
 that had already finished its turn when the signal landed is reported as having finished. A

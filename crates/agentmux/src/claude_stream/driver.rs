@@ -3,14 +3,14 @@
 //! See [`super`] for where it sits and what it says to Claude.
 //!
 //! Two threads move bytes and the driver's own thread decides everything: one reads Claude's
-//! stdout into a channel, one writes the lines it is handed to Claude's stdin and says when each
-//! is through.
+//! stdout into a channel, a few lines ahead of the driver at most, and one writes the lines it is
+//! handed to Claude's stdin and says when each is through.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::Path;
 use std::process::Child;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -29,11 +29,22 @@ const STREAM_INPUT_ARGS: [&str; 3] = ["--input-format", "stream-json", "--replay
 /// How often the cancel marker, the mailbox and Claude's process are looked at.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long output is still read once Claude is seen to have exited.
+/// How many lines Claude wrote may wait for the driver; the rest wait in Claude's pipe, and Claude
+/// for them.
 ///
-/// What it wrote last may still be on its way through the pipe, while something it started can
-/// hold the pipe open long after it has gone.
+/// A burst between two model calls fits, and even at 50 ms a line they record in under two seconds.
+const QUEUED_LINES: usize = 32;
+
+/// How long Claude's output must have been quiet, once Claude is seen to have exited, before the
+/// driver stops reading it.
+///
+/// What it wrote last may still be on its way through the pipe, or waiting there for the driver
+/// to catch up, while something it started can hold the pipe open long after it has gone.
 const EXIT_DRAIN: Duration = POLL_INTERVAL.saturating_mul(3);
+
+/// The longest the driver goes on reading once Claude is seen to have exited, however much is
+/// still coming: something Claude started can hold its output open and keep writing to it.
+const DRAIN_LIMIT: Duration = Duration::from_secs(2);
 
 /// How long Claude is given to leave once asked to stop, before it is made to.
 const STOP_GRACE: Duration = Duration::from_secs(3);
@@ -47,7 +58,7 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const STOP_BUDGET: Duration = POLL_INTERVAL
     .saturating_add(STOP_GRACE)
     .saturating_add(KILL_GRACE)
-    .saturating_add(EXIT_DRAIN)
+    .saturating_add(DRAIN_LIMIT)
     .saturating_add(drivers::SWEEP_BUDGET);
 
 /// How long the driver waits on Claude where a deadline ends the wait.
@@ -259,9 +270,10 @@ pub(super) fn drive_with(
     timeouts: DriverTimeouts,
 ) -> DriverOutcome {
     let (inbox, events) = channel();
+    let (take_slot, slots) = sync_channel(QUEUED_LINES);
     let reader_inbox = inbox.clone();
     let writer_inbox = inbox.clone();
-    std::thread::spawn(move || read_claude(from_claude, &reader_inbox));
+    std::thread::spawn(move || read_claude(from_claude, &take_slot, &reader_inbox));
     let (outbox, queue) = channel::<String>();
     std::thread::spawn(move || write_claude(to_claude, &queue, &writer_inbox));
 
@@ -275,8 +287,9 @@ pub(super) fn drive_with(
         inbox,
         claim_marked: false,
         end_marked: false,
-        ended: false,
         events,
+        slots,
+        line_at: Instant::now(),
         outbox: Some(outbox),
         writing: None,
         awaiting_replay: HashMap::new(),
@@ -332,8 +345,9 @@ fn fresh_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Hand every line Claude writes to the driver, then say that its output has ended.
-fn read_claude(mut from_claude: impl BufRead, inbox: &Sender<Event>) {
+/// Hand every line Claude writes to the driver, each once it holds one of the slots, then say
+/// that its output has ended.
+fn read_claude(mut from_claude: impl BufRead, take_slot: &SyncSender<()>, inbox: &Sender<Event>) {
     loop {
         let mut line = Vec::new();
         match from_claude.read_until(b'\n', &mut line) {
@@ -342,8 +356,10 @@ fn read_claude(mut from_claude: impl BufRead, inbox: &Sender<Event>) {
                 inbox.send(Event::OutputClosed).ok();
                 return;
             }
+            // Waits while every slot is taken, so a driver that is behind leaves Claude's output
+            // in its pipe.
             Ok(_) => {
-                if inbox.send(Event::Line(line)).is_err() {
+                if take_slot.send(()).is_err() || inbox.send(Event::Line(line)).is_err() {
                     return;
                 }
             }
@@ -434,9 +450,14 @@ struct TurnDriver<'a> {
     claim_marked: bool,
     /// Whether the end's marker is queued.
     end_marked: bool,
-    /// Whether the end's marker has come out.
-    ended: bool,
     events: Receiver<Event>,
+    /// One slot for each line read and not yet handled, which the reader waits for once all
+    /// [`QUEUED_LINES`] are taken.
+    ///
+    /// Only Claude's lines take one, so the driver's markers and the writer's word never wait.
+    slots: Receiver<()>,
+    /// When the driver last handled a line Claude wrote.
+    line_at: Instant,
     /// Lines for Claude's input, until it is closed.
     outbox: Option<Sender<String>>,
     /// What the writer has been handed and is not yet through with.
@@ -480,11 +501,13 @@ impl TurnDriver<'_> {
     /// Follow the turn until Claude has exited and what it wrote before then has been handled,
     /// then end it.
     fn run(mut self) -> DriverOutcome {
-        while !self.ended {
+        loop {
             // The driver holds a sender of its own, so waiting ends only in an event or the
             // timeout.
-            if let Ok(event) = self.events.recv_timeout(POLL_INTERVAL) {
-                self.handle(event);
+            match self.events.recv_timeout(POLL_INTERVAL) {
+                Ok(Event::Marker(Mark::End)) => break,
+                Ok(event) => self.handle(event),
+                Err(_) => {}
             }
             // The files are looked at on a clock rather than per line, so a chatty turn does not
             // stat the cancel marker hundreds of times a second, and between lines, so a backlog
@@ -509,22 +532,27 @@ impl TurnDriver<'_> {
 
     fn handle(&mut self, event: Event) {
         match event {
-            Event::Line(line) if !self.capture_broken => {
-                if let Err(reason) = self.forward(&line) {
+            Event::Line(line) => {
+                if !self.capture_broken
+                    && let Err(reason) = self.forward(&line)
+                {
                     self.capture_broken = true;
                     self.failure.get_or_insert(reason);
                     // A turn whose capture cannot be written has lost its deliverable.
                     self.stop_claude();
                 }
+                self.line_at = Instant::now();
+                // Every line in the queue holds a slot, so one is there to free.
+                self.slots.try_recv().ok();
             }
-            Event::Line(_) => {}
             Event::OutputClosed => self.output_closed = true,
             Event::Written(written) => self.written(written),
             Event::Marker(Mark::Claim) => {
                 self.claim_marked = false;
                 self.serve_next();
             }
-            Event::Marker(Mark::End) => self.ended = true,
+            // `run` stops at it.
+            Event::Marker(Mark::End) => {}
         }
     }
 
@@ -721,7 +749,11 @@ impl TurnDriver<'_> {
     /// to stop and cannot be waited for any longer.
     fn finished(&self) -> bool {
         match self.exited {
-            Some(Exited { at, .. }) => self.output_closed || at.elapsed() >= EXIT_DRAIN,
+            Some(Exited { at, .. }) => {
+                self.output_closed
+                    || self.line_at.max(at).elapsed() >= EXIT_DRAIN
+                    || at.elapsed() >= DRAIN_LIMIT
+            }
             None => self
                 .stopping
                 .as_ref()

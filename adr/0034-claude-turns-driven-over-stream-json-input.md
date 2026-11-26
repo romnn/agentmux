@@ -69,9 +69,14 @@ the app-server driver writes, after which the steer's reply is `Accepted`.
 Once Claude has exited and its output has been drained, the driver writes
 `{"type":"agentmux.end","status":…}` with Claude's exit status, and answers every steer written
 but never replayed as unconfirmed.
-The drain ends at a marker the driver queues behind what it had read when the drain window
-closed, as the app-server driver's does, so a process that inherited Claude's stdout and keeps
+At most 32 of Claude's lines wait for the driver; the rest stays in Claude's pipe, where Claude
+waits for the driver to catch up, so what is queued when a cancellation comes records in moments
+even on slow storage.
+So once Claude has exited the driver reads on until its output closes or has been quiet for
+0.3 seconds, and for 2 seconds at most, so a process that inherited Claude's stdout and keeps
 writing to it cannot hold the turn open.
+The drain ends at a marker the driver queues behind what it had read by then, as the app-server
+driver's does.
 A caller that has heard nothing 30 seconds after the driver claimed its steer is told Claude did
 not confirm delivery and that it may still arrive, so sending it again may deliver it twice.
 
