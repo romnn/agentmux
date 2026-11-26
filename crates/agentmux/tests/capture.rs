@@ -344,13 +344,14 @@ fn a_driven_claude_turn_is_read_through_to_its_end() {
     );
 }
 
-/// A `result` whose body drifted still closes a driven turn's input, as it does for the driver,
-/// so `status` never offers a steer the driver would refuse; the drift is still counted.
+/// A `result` whose body drifted, here with no `is_error` and a `subtype` that is no string,
+/// still closes a driven turn's input, as it does for the driver, so `status` never offers a
+/// steer the driver would refuse; the drift is still counted.
 #[gtest]
 fn a_drifted_result_closes_a_driven_turns_input() {
     let stream = indoc::indoc! {r#"
         {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
-        {"type":"result","subtype":"success"}
+        {"type":"result","subtype":{"kind":"success"}}
     "#};
     let Fold { turn, input, .. } = stream::fold(
         Vendor::Claude,

@@ -4,7 +4,8 @@
 //!
 //! Each driver is the delegate the run store launches, and runs the vendor's CLI as a child of
 //! its own with a pipe at each end.
-//! Both stop what their CLI leaves running by reading the process table ([`sweep`]).
+//! Both stop what their CLI leaves running, below them and in the process group they lead, by
+//! reading the process table ([`sweep`]).
 //! What a driver says to its CLI, and what it makes of the answers, is each driver's own.
 
 use std::io::PipeWriter;
@@ -165,8 +166,8 @@ pub(crate) struct SeenProcess {
     pub(crate) name: String,
 }
 
-/// Stop every process of `known` that is still alive, and whatever is found below the driver,
-/// within [`SWEEP_BUDGET`], showing `observe` what each read found alive.
+/// Stop every process of `known` that is still alive, and whatever the driver owns
+/// ([`owned_by_driver`]), within [`SWEEP_BUDGET`], showing `observe` what each read found alive.
 ///
 /// Each process is asked to stop, made to once [`SWEEP_GRACE`] has passed, and recognised by its
 /// pid and start time, so a pid reused meanwhile is left alone.
@@ -174,12 +175,11 @@ pub(crate) struct SeenProcess {
 /// finds, so a process forked during the sweep is still caught.
 /// Returns whether nothing was left; `false` when the sweep gave up with something just killed.
 pub(crate) fn sweep(known: &[ProcessIdentity], mut observe: impl FnMut(&[SeenProcess])) -> bool {
-    let driver_pid = std::process::id();
     let polite_until = Instant::now() + SWEEP_GRACE;
     let forceful_until = polite_until + KILL_GRACE;
     let mut signalled_processes: Vec<ProcessIdentity> = Vec::new();
     loop {
-        let mut processes_to_check = descendants(driver_pid);
+        let mut processes_to_check = owned_by_driver();
         add_unseen(
             &mut processes_to_check,
             known.iter().chain(&signalled_processes).copied(),
@@ -255,9 +255,66 @@ pub(crate) fn process_tree(root: u32) -> Vec<SeenProcess> {
     if cfg!(windows) {
         return Vec::new();
     }
+    process_table(None).map_or_else(Vec::new, |system| tree_in(&system, root))
+}
+
+/// Every process the driver owns, from one read of the process table: everything below it,
+/// and every other member of the process group it leads.
+///
+/// A process whose parent exited is below nobody, but stays in its group.
+/// Always empty on Windows, as [`process_tree`] is.
+fn owned_by_driver() -> Vec<ProcessIdentity> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let driver_pid = std::process::id();
     let Some(system) = process_table(None) else {
         return Vec::new();
     };
+    let mut owned: Vec<ProcessIdentity> = tree_in(&system, driver_pid)
+        .into_iter()
+        .map(|process| process.identity)
+        .collect();
+    add_unseen(&mut owned, group_members(&system, driver_pid));
+    owned
+}
+
+/// Every process of `system` in the process group `leader` leads, but `leader`; none when it
+/// leads no group, as a driver run by hand from a shell does not.
+#[cfg(unix)]
+fn group_members(system: &sysinfo::System, leader: u32) -> Vec<ProcessIdentity> {
+    use nix::unistd::{Pid, getpgid};
+
+    let Ok(raw) = i32::try_from(leader) else {
+        return Vec::new();
+    };
+    let group = Pid::from_raw(raw);
+    if getpgid(Some(group)) != Ok(group) {
+        return Vec::new();
+    }
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid = pid.as_u32();
+            let raw = i32::try_from(pid).ok()?;
+            (pid != leader && getpgid(Some(Pid::from_raw(raw))) == Ok(group)).then(|| {
+                ProcessIdentity {
+                    pid,
+                    start_time_secs: process.start_time(),
+                }
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn group_members(_: &sysinfo::System, _: u32) -> Vec<ProcessIdentity> {
+    Vec::new()
+}
+
+/// [`process_tree`], read from `system`.
+fn tree_in(system: &sysinfo::System, root: u32) -> Vec<SeenProcess> {
     let Some(root_started) = system
         .process(sysinfo::Pid::from_u32(root))
         .map(sysinfo::Process::start_time)

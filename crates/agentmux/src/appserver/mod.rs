@@ -44,6 +44,8 @@
 //!   effort: on macOS, any process started and orphaned between two records is out of reach,
 //!   whether or not the server crashed — a job a command backgrounds with `nohup … &` is
 //!   orphaned as soon as its shell exits.
+//!   On Unix the sweep also stops whatever is left in the process group the driver leads, where
+//!   an orphan that never left the group stays.
 //!   On Windows the driver holds everything below it in a kill-on-close job object instead, and
 //!   reads no process tree, because a recorded parent pid proves nothing there; a process codex
 //!   deliberately starts outside the job is let go.

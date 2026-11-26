@@ -122,10 +122,19 @@ fn is_running(pid: u32) -> bool {
     })
 }
 
+/// The parent of the process `pid`, while it runs.
+fn parent_of(pid: u32) -> Option<u32> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new().ok()?;
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid)?.parent().map(sysinfo::Pid::as_u32)
+}
+
 /// A cancelled Claude turn's driver stops Claude and waits for it before it leaves, so `cancel`
 /// returns with Claude gone, though Claude takes two seconds to honour its `SIGTERM`, and the
 /// turn is recorded as cancelled.
-/// A tool Claude started and left running in its process group is gone with it.
+/// A helper orphaned in Claude's process group, below neither Claude nor the driver by then, is
+/// gone with it.
 #[gtest]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_claude_turn_is_gone_with_its_driver() -> Result<()> {
@@ -136,8 +145,7 @@ async fn a_cancelled_claude_turn_is_gone_with_its_driver() -> Result<()> {
     let machine = Machine::new(
         &indoc::formatdoc! {r#"
             echo $$ > '{claude_pid}'
-            sleep 120 &
-            echo $! > '{tool_pid}'
+            sh -c "sleep 120 & echo \$! > '{tool_pid}'"
             trap 'sleep 2; exit 143' TERM
             read -r question
             echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'
@@ -150,8 +158,8 @@ async fn a_cancelled_claude_turn_is_gone_with_its_driver() -> Result<()> {
     )?;
     let id = machine.start()?;
 
-    // The turn takes input once Claude has announced its session, by which time Claude has
-    // started its tool.
+    // The turn takes input once Claude has announced its session, by which time the shell that
+    // started the helper has exited.
     let deadline = Instant::now() + Duration::from_secs(20);
     while !machine.store.status(&id)?.steerable {
         assert_that!(Instant::now() < deadline, eq(true), "the turn never opened");
@@ -161,8 +169,9 @@ async fn a_cancelled_claude_turn_is_gone_with_its_driver() -> Result<()> {
     let tool_pid = read_pid(&tool_pid_file)?;
     assert_that!(is_running(claude_pid), eq(true));
     assert_that!(is_running(tool_pid), eq(true));
+    assert_that!(parent_of(tool_pid), not(some(eq(claude_pid))));
 
-    // Claude and its tool are gone by the time `cancel` returns, and the turn is cancelled.
+    // Claude and the helper are gone by the time `cancel` returns, and the turn is cancelled.
     let cancelled = machine.store.cancel(&id).await?;
     assert_that!(is_running(claude_pid), eq(false));
     assert_that!(is_running(tool_pid), eq(false));

@@ -165,7 +165,8 @@ impl ClaudeProcess for Claude {
 /// The question is read from stdin and the capture is written to stdout, which the launcher has
 /// pointed at the turn's files; a turn that breaks says why on stderr.
 /// Nothing is started until the turn's launch record names this process.
-/// A Claude the driver stopped is stopped with whatever it was running then.
+/// A Claude the driver stopped is stopped with whatever it was running then, and with what is
+/// left in the driver's process group.
 /// Returns the process's exit status.
 #[must_use]
 pub fn drive(plan_path: &Path) -> i32 {
@@ -272,6 +273,9 @@ pub(super) fn drive_with(
         timeouts,
         mailbox: Mailbox::new(plan.mailbox_dir()),
         inbox,
+        claim_marked: false,
+        end_marked: false,
+        ended: false,
         events,
         outbox: Some(outbox),
         writing: None,
@@ -369,8 +373,20 @@ enum Event {
     OutputClosed,
     /// The writer is through with the line it was handed: written whole, or why not.
     Written(Result<(), String>),
-    /// Everything queued ahead of it has been handled: see [`TurnDriver::catch_up`].
-    CaughtUp,
+    /// Queued by the driver itself behind what was read so far, so everything read before it has
+    /// been handled once it comes out.
+    Marker(Mark),
+}
+
+/// What the driver does once everything queued ahead of its marker has been handled.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// Claim the next waiting message, if Claude still takes input: a `result` read before the
+    /// marker has closed it by then.
+    Claim,
+    /// End the turn: what was read before the turn was seen over is part of it, and what
+    /// something Claude started keeps writing to its output after that is not.
+    End,
 }
 
 /// The line the writer is writing.
@@ -414,6 +430,12 @@ struct TurnDriver<'a> {
     mailbox: Mailbox,
     /// The driver's own way into its queue, which also keeps the queue from ever disconnecting.
     inbox: Sender<Event>,
+    /// Whether a claim waits on its marker.
+    claim_marked: bool,
+    /// Whether the end's marker is queued.
+    end_marked: bool,
+    /// Whether the end's marker has come out.
+    ended: bool,
     events: Receiver<Event>,
     /// Lines for Claude's input, until it is closed.
     outbox: Option<Sender<String>>,
@@ -438,53 +460,51 @@ struct TurnDriver<'a> {
     question_uuid: String,
 }
 
-/// Whether a line Claude wrote is its echo of an input line, and of which.
+/// The fields of a line Claude wrote that the driver acts on; the rest of the line is skipped
+/// unread.
+///
+/// Each is read as whatever JSON it holds, so one that drifted cannot hide the others.
 #[derive(Debug, Default, Deserialize)]
-struct ReplayProbe {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default, rename = "isReplay")]
-    is_replay: bool,
+struct LineHeader {
+    #[serde(default, rename = "type")]
+    kind: Value,
     #[serde(default)]
-    uuid: Option<String>,
+    subtype: Value,
+    #[serde(default, rename = "isReplay")]
+    is_replay: Value,
+    #[serde(default)]
+    uuid: Value,
 }
 
 impl TurnDriver<'_> {
-    /// Follow the turn until Claude has exited and what it wrote has been read, then end it.
+    /// Follow the turn until Claude has exited and what it wrote before then has been handled,
+    /// then end it.
     fn run(mut self) -> DriverOutcome {
-        while !self.finished() {
+        while !self.ended {
             // The driver holds a sender of its own, so waiting ends only in an event or the
             // timeout.
             if let Ok(event) = self.events.recv_timeout(POLL_INTERVAL) {
                 self.handle(event);
             }
             // The files are looked at on a clock rather than per line, so a chatty turn does not
-            // stat the cancel marker hundreds of times a second.
+            // stat the cancel marker hundreds of times a second, and between lines, so a backlog
+            // of them does not keep the driver from a cancellation.
             if self.controlled_at.elapsed() >= POLL_INTERVAL {
                 self.controlled_at = Instant::now();
                 self.control();
             }
+            if !self.end_marked && self.finished() {
+                self.end_marked = true;
+                self.mark(Mark::End);
+            }
         }
-        // What was read before the turn was seen over is part of it; what something Claude
-        // started keeps writing to its output after that is not.
-        self.catch_up();
         self.finish()
     }
 
-    /// Handle everything already queued, up to a marker queued behind it now.
-    ///
-    /// Bounded by what was queued when it began, however fast Claude, or something it started,
-    /// keeps writing.
-    fn catch_up(&mut self) {
-        if self.inbox.send(Event::CaughtUp).is_err() {
-            return;
-        }
-        while let Ok(event) = self.events.recv() {
-            if matches!(event, Event::CaughtUp) {
-                return;
-            }
-            self.handle(event);
-        }
+    /// Queue `mark` behind everything read so far.
+    fn mark(&self, mark: Mark) {
+        // The driver holds the queue's receiver, so the marker always gets in.
+        self.inbox.send(Event::Marker(mark)).ok();
     }
 
     fn handle(&mut self, event: Event) {
@@ -497,22 +517,26 @@ impl TurnDriver<'_> {
                     self.stop_claude();
                 }
             }
-            Event::Line(_) | Event::CaughtUp => {}
+            Event::Line(_) => {}
             Event::OutputClosed => self.output_closed = true,
             Event::Written(written) => self.written(written),
+            Event::Marker(Mark::Claim) => {
+                self.claim_marked = false;
+                self.serve_next();
+            }
+            Event::Marker(Mark::End) => self.ended = true,
         }
     }
 
     /// Put one line Claude wrote into the capture, or what it stands for, and act on it.
     fn forward(&mut self, line: &[u8]) -> Result<(), String> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let value = serde_json::from_slice::<Value>(line).unwrap_or_default();
-        let probe = ReplayProbe::deserialize(&value).unwrap_or_default();
-        if probe.kind == "user"
-            && probe.is_replay
-            && let Some(uuid) = &probe.uuid
+        let header = serde_json::from_slice::<LineHeader>(line).unwrap_or_default();
+        if header.kind.as_str() == Some("user")
+            && header.is_replay.as_bool() == Some(true)
+            && let Some(uuid) = header.uuid.as_str()
         {
-            if *uuid == self.question_uuid {
+            if uuid == self.question_uuid {
                 return Ok(());
             }
             if let Some(claim) = self.awaiting_replay.remove(uuid) {
@@ -520,7 +544,7 @@ impl TurnDriver<'_> {
             }
         }
         self.record(line)?;
-        match InputBoundary::of(&value) {
+        match InputBoundary::of(header.kind.as_str(), header.subtype.as_str()) {
             Some(InputBoundary::Opens) if matches!(self.input, Input::Waiting) => {
                 self.input = Input::Serving;
             }
@@ -609,7 +633,7 @@ impl TurnDriver<'_> {
         }
         match self.input {
             Input::Waiting => {}
-            Input::Serving => self.serve_next(),
+            Input::Serving => self.mark_claim(),
             Input::Closing { since, why } => {
                 for claim in self.mailbox.claim_all() {
                     self.reply(
@@ -639,17 +663,21 @@ impl TurnDriver<'_> {
         }
     }
 
-    /// Claim the oldest waiting message and hand it to Claude, once the writer is through with
-    /// the one before.
+    /// Queue a claim behind what Claude has written so far, so a `result` already read closes
+    /// the input before another message can be claimed.
     ///
-    /// What Claude has written so far is handled first, so a `result` already read closes the
-    /// input before another message can be claimed.
-    fn serve_next(&mut self) {
-        if self.writing.is_some() {
-            return;
+    /// Nothing is queued while the writer is busy with the message before, or a claim waits.
+    fn mark_claim(&mut self) {
+        if self.writing.is_none() && !self.claim_marked {
+            self.claim_marked = true;
+            self.mark(Mark::Claim);
         }
-        self.catch_up();
-        if !matches!(self.input, Input::Serving) {
+    }
+
+    /// Claim the oldest waiting message and hand it to Claude, if Claude still takes input and
+    /// the writer is through with the one before.
+    fn serve_next(&mut self) {
+        if !matches!(self.input, Input::Serving) || self.writing.is_some() {
             return;
         }
         let Some(claim) = self.mailbox.claim_next() else {

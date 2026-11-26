@@ -29,6 +29,7 @@ use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
 use googletest::prelude::*;
+use serde_json::Value;
 
 /// The cheapest model in codex-cli 0.159.3's own list that still runs a command and follows an
 /// instruction.
@@ -204,7 +205,10 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
     );
     let run_dir = started.transcript_path.parent().or_fail()?.to_path_buf();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !capture_lines(&run_dir)?.iter().any(calls_bash) {
+    while !capture_lines(&run_dir)?
+        .iter()
+        .any(|line| bash_call(line).is_some())
+    {
         assert_that!(Instant::now() < deadline, eq(true), "Claude never ran Bash");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -218,21 +222,22 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
     let (status, page) = store.view(&id, 0, usize::MAX)?;
     assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(page.text, contains_substring("### user (steer)"));
-    // Claude took the steer after its Bash call, and answered after taking it.
+    // Claude took the steer once Bash had finished, and before it reported its result.
     let lines = capture_lines(&run_dir)?;
-    let called = lines.iter().position(calls_bash).or_fail()?;
+    let bash = lines.iter().find_map(bash_call).or_fail()?;
+    let finished = lines
+        .iter()
+        .position(|line| returns(line, bash))
+        .or_fail()?;
     let steered = lines
         .iter()
-        .position(|line| line.get("type") == Some(&serde_json::json!("agentmux.steer")))
+        .position(|line| line_type(line) == Some("agentmux.steer"))
         .or_fail()?;
-    let answered = lines
+    let reported = lines
         .iter()
-        .rposition(|line| {
-            line.get("type") == Some(&serde_json::json!("assistant"))
-                && line.to_string().contains("LIVE_DONE")
-        })
+        .position(|line| line_type(line) == Some("result"))
         .or_fail()?;
-    assert_that!(called < steered && steered < answered, eq(true));
+    assert_that!(finished < steered && steered < reported, eq(true));
     // The closing reply comes after the steer, and so after everything that asked for it.
     let (_, reply) = page.text.rsplit_once("### assistant").or_fail()?;
     assert_that!(reply, not(contains_substring("### user")));
@@ -248,7 +253,7 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
 
 /// The lines of the first turn's capture in the consultation at `run_dir`, as far as they are
 /// written.
-fn capture_lines(run_dir: &Path) -> Result<Vec<serde_json::Value>> {
+fn capture_lines(run_dir: &Path) -> Result<Vec<Value>> {
     let capture = std::fs::read_to_string(run_dir.join("turns/0001/events.jsonl")).or_fail()?;
     Ok(capture
         .lines()
@@ -256,18 +261,38 @@ fn capture_lines(run_dir: &Path) -> Result<Vec<serde_json::Value>> {
         .collect())
 }
 
-/// Whether a capture line is Claude calling Bash.
-fn calls_bash(line: &serde_json::Value) -> bool {
-    line.get("type") == Some(&serde_json::json!("assistant"))
-        && line
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|blocks| {
-                blocks.iter().any(|block| {
-                    block.get("type") == Some(&serde_json::json!("tool_use"))
-                        && block.get("name") == Some(&serde_json::json!("Bash"))
-                })
-            })
+/// A capture line's `type`.
+fn line_type(line: &Value) -> Option<&str> {
+    line.get("type").and_then(Value::as_str)
+}
+
+/// The content blocks of a capture line of the type `kind`; none for a line of another type.
+fn content_blocks<'line>(line: &'line Value, kind: &str) -> &'line [Value] {
+    if line_type(line) != Some(kind) {
+        return &[];
+    }
+    line.pointer("/message/content")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The id of the Bash call a capture line makes, if it makes one.
+fn bash_call(line: &Value) -> Option<&str> {
+    content_blocks(line, "assistant")
+        .iter()
+        .find(|block| {
+            line_type(block) == Some("tool_use") && block.get("name") == Some(&"Bash".into())
+        })?
+        .get("id")?
+        .as_str()
+}
+
+/// Whether a capture line carries the result of the tool call `id`.
+fn returns(line: &Value, id: &str) -> bool {
+    content_blocks(line, "user").iter().any(|block| {
+        line_type(block) == Some("tool_result")
+            && block.get("tool_use_id").and_then(Value::as_str) == Some(id)
+    })
 }
 
 /// The account the variable `name` names, or `None` for the machine's default.

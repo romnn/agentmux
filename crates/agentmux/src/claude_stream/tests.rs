@@ -100,14 +100,24 @@ struct Capture {
     /// Holds the driver once it has recorded a line holding this text, until `release` says
     /// so.
     hold: Option<(&'static str, Receiver<()>)>,
+    /// How long recording each line takes.
+    per_line: Duration,
 }
 
 impl Capture {
     /// A capture that holds the driver once it records a line holding `text`.
     fn holding_at(text: &'static str, release: Receiver<()>) -> Self {
         Self {
-            bytes: Vec::new(),
             hold: Some((text, release)),
+            ..Self::default()
+        }
+    }
+
+    /// A capture that takes `per_line` to record each line.
+    fn slow(per_line: Duration) -> Self {
+        Self {
+            per_line,
+            ..Self::default()
         }
     }
 }
@@ -119,6 +129,7 @@ impl Write for Capture {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        std::thread::sleep(self.per_line);
         if let Some((text, _)) = &self.hold
             && String::from_utf8_lossy(&self.bytes).contains(text)
             && let Some((_, release)) = self.hold.take()
@@ -513,6 +524,53 @@ fn a_result_already_read_closes_the_input_before_a_steer_is_claimed() -> Result<
     )?;
     assert_that!(driven.outcome, eq(&DriverOutcome::Exited(EXITED_CLEANLY)));
     assert_that!(driven.capture, not(contains_substring("Too late.")));
+    Ok(())
+}
+
+/// The driver goes on looking for a cancellation while it records a backlog of output, so a
+/// cancelled turn's Claude is asked to stop long before the backlog is through.
+#[gtest]
+fn a_cancellation_is_seen_while_a_backlog_is_recorded() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let (backlogged, backlog_said) = channel::<()>();
+    let (cancelled, was_cancelled) = channel::<Instant>();
+    let stopped = ExitStatus {
+        code: None,
+        signal: Some(15),
+    };
+    let driven = run(
+        dir.path(),
+        DriverTimeouts::default(),
+        // Two seconds to record the backlog below.
+        Capture::slow(Duration::from_millis(5)),
+        move |claude, process| {
+            claude.next_input()?.or_fail()?;
+            claude.say(&init())?;
+            for line in 0..400 {
+                claude.say(&assistant(&format!("LINE {line}")))?;
+            }
+            backlogged.send(()).or_fail()?;
+            let cancelled_at = was_cancelled
+                .recv_timeout(Duration::from_secs(10))
+                .or_fail()?;
+            while !process.terminated() {
+                verify_that!(cancelled_at.elapsed() < Duration::from_secs(10), eq(true))?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            verify_that!(cancelled_at.elapsed() < Duration::from_secs(1), eq(true))?;
+            Ok(stopped)
+        },
+        move |plan| {
+            backlog_said
+                .recv_timeout(Duration::from_secs(10))
+                .or_fail()?;
+            // Long enough for the driver to be well into the backlog.
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(plan.cancel_marker_path(), "").or_fail()?;
+            cancelled.send(Instant::now()).or_fail()
+        },
+    )?;
+    assert_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
     Ok(())
 }
 

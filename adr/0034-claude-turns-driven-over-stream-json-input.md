@@ -50,11 +50,13 @@ and `"priority":"next"`.
 The mailbox of [0018](0018-codex-app-server-driver.md) is served from Claude's `system`/`init`
 until its first `result`, and the next request is claimed only once the one before has been
 written, so a request not yet claimed can still be withdrawn.
-Before it claims one, the driver handles what Claude has already written, so a `result` it has
-read closes the input before another request is claimed.
-The driver and the fold recognise those two lines the same way, from a line's `type` and
-`subtype` alone (`stream::claude::InputBoundary`), so a `result` whose body drifted closes the
-input for `status` as it does for the driver.
+A claim waits behind a marker the driver queues after what Claude has already written, so a
+`result` it has read closes the input before another request is claimed, while the driver goes on
+handling one line at a time and looking for a cancellation between them.
+The driver and the fold recognise those two lines the same way, from a line's `type`, and a
+`system` line's `subtype`, alone (`stream::claude::InputBoundary`), so a `result` whose body
+drifted closes the input for `status` as it does for the driver; the driver reads only those
+fields and the replay's, and skips the rest of each line unread.
 At the first `result` the driver stops claiming, rejects the requests still waiting, and closes
 stdin once the write in progress is through; a write still in progress ten seconds later is not
 waited for and Claude is stopped, while that message keeps its claim: a replay read before the
@@ -101,8 +103,9 @@ Whenever the driver stops Claude, on a cancellation or otherwise, it first reads
 descendants, and once Claude has gone it stops those still alive, recognised by pid and start
 time, with the app-server driver's sweep (`drivers::sweep`): politely, then by force, within
 three seconds.
-A tool Claude left in its process group is stopped this way, which the store's group signal no
-longer reaches once the driver has gone.
+Each pass of the sweep also stops every other member of the process group the driver leads, the
+launch group, which holds a helper whose parent has exited though it is below nobody; the
+store's group signal no longer reaches that group once the driver has gone.
 `RunStore::stop_delegate` gives each driver its own budget (`claude_stream::STOP_BUDGET` here)
 and five seconds more before it signals anything.
 What the sweep stops is not reported, as nothing is for a direct launch
@@ -117,8 +120,8 @@ What the sweep stops is not reported, as nothing is for a direct launch
   `claude --print` and refuses a steer with `UnsteerableReason::ClaudePrint`.
 - A steer Claude takes after its `result` is run as a further turn of the CLI, whose answer is
   the turn's.
-- A process Claude starts after the driver has read its descendants, while it is stopping, is out
-  of the sweep's reach once Claude has gone.
+- A process Claude starts in a process group of its own after the driver has read its
+  descendants, while it is stopping, is out of the sweep's reach once Claude has gone.
 - agentmux v0.0.13 and older reject the `claude_stream` launch mode as a corrupt record, so they
   cannot read a consultation with a driven Claude turn, which narrows what
   [0030](0030-refuse-to-launch-from-a-replaced-executable.md) promises across an upgrade: restart

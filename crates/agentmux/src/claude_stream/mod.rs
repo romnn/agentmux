@@ -31,7 +31,8 @@
 //!   capture, rejected when it is known unsent, and unconfirmed otherwise.
 //! - [`CaptureEvent::End`] is the capture's last line, written once Claude has exited and what it
 //!   wrote before then has been read, unless the turn was cancelled, whose end the store records.
-//! - A Claude the driver stopped is stopped with what ran below it then.
+//! - A Claude the driver stopped is stopped with what ran below it then, and with what is left
+//!   in the process group the driver leads.
 //!
 //! [`CaptureEvent::Steer`]: crate::stream::claude::CaptureEvent::Steer
 //! [`CaptureEvent::End`]: crate::stream::claude::CaptureEvent::End

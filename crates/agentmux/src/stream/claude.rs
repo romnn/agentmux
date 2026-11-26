@@ -53,9 +53,9 @@ use crate::transcript::{
 /// Where a line a driven Claude writes leaves the turn's input: `system`/`init` opens it, and a
 /// `result` closes it.
 ///
-/// Read from the line's `type` and `subtype` alone, by the driver as it serves its mailbox and by
-/// the fold as it decides whether `status` offers a steer, so a `result` whose body drifted
-/// closes the input for both.
+/// Read from the line's `type` alone, and a `system` line's `subtype`, by the driver as it serves
+/// its mailbox and by the fold as it decides whether `status` offers a steer, so a `result` whose
+/// body drifted closes the input for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputBoundary {
     Opens,
@@ -63,21 +63,25 @@ pub(crate) enum InputBoundary {
 }
 
 impl InputBoundary {
-    /// The boundary `line` marks, if any.
-    pub(crate) fn of(line: &Value) -> Option<Self> {
-        #[derive(Deserialize)]
-        struct Kind {
-            #[serde(rename = "type")]
-            kind: String,
-            #[serde(default)]
-            subtype: Option<String>,
-        }
-        let Kind { kind, subtype } = Kind::deserialize(line).ok()?;
-        match (kind.as_str(), subtype.as_deref()) {
-            ("system", Some("init")) => Some(Self::Opens),
-            ("result", _) => Some(Self::Closes),
+    /// The boundary a line marks, if any, from its `type` and its `subtype` where each is a
+    /// string.
+    pub(crate) fn of(kind: Option<&str>, subtype: Option<&str>) -> Option<Self> {
+        match kind? {
+            "system" if subtype == Some("init") => Some(Self::Opens),
+            "result" => Some(Self::Closes),
             _ => None,
         }
+    }
+}
+
+/// Where a driven turn's input stands once `line` has been read.
+fn input_after(input: TurnInput, line: &Value) -> TurnInput {
+    let kind = line.get("type").and_then(Value::as_str);
+    let subtype = line.get("subtype").and_then(Value::as_str);
+    match InputBoundary::of(kind, subtype) {
+        Some(InputBoundary::Opens) if input == TurnInput::Pending => TurnInput::Open,
+        Some(InputBoundary::Closes) => TurnInput::Closed,
+        _ => input,
     }
 }
 
@@ -556,13 +560,7 @@ pub fn fold(mode: LaunchMode, index: u32, question: &str, events: &str) -> Fold 
             continue;
         };
         if driven {
-            match InputBoundary::of(&value) {
-                Some(InputBoundary::Opens) if input == TurnInput::Pending => {
-                    input = TurnInput::Open;
-                }
-                Some(InputBoundary::Closes) => input = TurnInput::Closed,
-                _ => {}
-            }
+            input = input_after(input, &value);
         }
         // An event this parser names, in a shape it does not.
         let Ok(event) = Event::deserialize(&value) else {
