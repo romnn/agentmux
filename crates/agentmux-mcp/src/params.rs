@@ -102,7 +102,7 @@ pub struct DelegateParams {
     #[schemars(with = "String")]
     pub effort: Option<String>,
 
-    /// Which configured account to authenticate as, for either vendor.
+    /// Which configured account to authenticate as, for any vendor.
     ///
     /// Omit it to use the account `agentmux.toml` names as the default, or the CLI's own login
     /// when it names none, which is right on a machine with one account of that vendor.
@@ -159,6 +159,7 @@ pub struct PermissionParams {
     /// not the answer; the delegate gains the MCP servers the configuration names; and the same
     /// question asked elsewhere may answer differently.
     /// A `codex` consultation with `true` runs over `codex exec` and cannot be steered.
+    /// An `agy` consultation always loads it, so `true` is refused for one.
     #[serde(default)]
     #[schemars(with = "bool")]
     pub ignore_user_config: Option<bool>,
@@ -256,7 +257,7 @@ pub(crate) fn invalid_delegate(error: &DelegateError) -> ErrorData {
         }
         DelegateError::NotForVendor { .. } => {
             " `sandbox` and `network_access` are Codex's; `permission_mode` and the tool lists are \
-             Claude's."
+             Claude's; agy takes none of them."
         }
         _ => "",
     };
@@ -274,7 +275,7 @@ impl DelegateParams {
     ///
     /// Returns an invalid-params error when the model, effort, alias or a tool rule is not
     /// argv-safe, when the two isolation spellings disagree, or when a vendor-specific field was
-    /// set for the other vendor.
+    /// set for another vendor.
     pub fn build(&self) -> Result<Delegate, ErrorData> {
         Delegate::from_parts(
             self.delegate,

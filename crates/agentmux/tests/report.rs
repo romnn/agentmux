@@ -1,7 +1,8 @@
 //! What both front ends say about a consultation, phrased once in `agentmux::report`.
 
 use agentmux::accounting::{Tokens, Totals};
-use agentmux::report::{usage_column, usage_window_line};
+use agentmux::quota::{AccountQuota, Observation, Origin};
+use agentmux::report::{quota_report, usage_column, usage_window_line};
 use agentmux::transcript::UsageWindow;
 use chrono::Utc;
 use googletest::prelude::*;
@@ -244,4 +245,33 @@ fn questions_handed_over_keep_their_whitespace() {
             eq("  - match `a  b`"),
         ]
     );
+}
+
+/// agy's usage reads as one line per window of each group of models, and a window nobody has
+/// used yet is said to be unused rather than to have reset at the Unix epoch.
+#[gtest]
+fn agy_usage_reads_as_its_windows() -> Result<()> {
+    let reply: serde_json::Value =
+        serde_json::from_str(agentmux::testing::fixtures::AGY_USAGE).or_fail()?;
+    let entry = AccountQuota {
+        vendor: agentmux::delegate::Vendor::Agy,
+        account: None,
+        description: None,
+        observation: Observation::Reported {
+            origin: Origin::Live,
+            payload: reply["command"]["data"].clone(),
+        },
+    };
+
+    assert_that!(
+        quota_report(&entry),
+        elements_are![
+            eq("agy (default)"),
+            eq("  live"),
+            eq("  Gemini Models weekly: 0% used, resets 2026-12-03T17:34:15Z"),
+            eq("  Claude and GPT models weekly: 0% used, not used yet"),
+            eq("  Claude and GPT models 5h: 0% used, not used yet"),
+        ]
+    );
+    Ok(())
 }

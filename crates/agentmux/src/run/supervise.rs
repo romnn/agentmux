@@ -308,13 +308,13 @@ impl RunStore {
             self.host_env.clone(),
             plan.producer.billing,
         );
-        let question_file = turn.question();
+        let stdin = turn.stdin();
         let launched = match self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &plan.producer.cwd,
             input: match &stream_input {
                 Some(setup) => LaunchInput::Pipe(&setup.claude_stdin),
-                None => LaunchInput::Question(&question_file),
+                None => LaunchInput::Question(&stdin),
             },
             events: &turn.events(),
             stderr: &turn.stderr(),

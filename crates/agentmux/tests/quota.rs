@@ -718,7 +718,7 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
 fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    for vendor in [Vendor::Claude, Vendor::Codex] {
+    for vendor in Vendor::ALL {
         let root = tempfile::tempdir().or_fail()?;
         let config_dir = root.path().join("config");
         let bin = root.path().join("bin");
@@ -756,6 +756,8 @@ fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
             ("ANTHROPIC_AUTH_TOKEN", "SENTINEL-4".to_owned()),
             ("OPENAI_BASE_URL", "https://SENTINEL-5.example".to_owned()),
             ("CLAUDE_CODE_USE_BEDROCK", "SENTINEL-6".to_owned()),
+            ("GEMINI_API_KEY", "SENTINEL-7".to_owned()),
+            ("AGY_LLM_GATEWAY_HEADERS", "SENTINEL-8".to_owned()),
         ] {
             env.insert(key.to_owned(), value);
         }
@@ -774,6 +776,90 @@ fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
             contains_substring("HTTPS_PROXY=http://proxy.example:3128"),
             "{vendor:?}"
         );
+    }
+    Ok(())
+}
+
+/// What the real agy probe reports when `agy` on `PATH` prints `output` and exits with `status`.
+#[cfg(unix)]
+fn probe_agy_with_fake_cli(output: &str, status: u8) -> Result<Observation> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().or_fail()?;
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).or_fail()?;
+    let printed = root.path().join("printed.json");
+    std::fs::write(&printed, output).or_fail()?;
+    let program = bin.join("agy");
+    std::fs::write(
+        &program,
+        indoc::formatdoc!(
+            "
+                #!/bin/sh
+                cat '{}'
+                exit {status}
+            ",
+            printed.display()
+        ),
+    )
+    .or_fail()?;
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).or_fail()?;
+
+    let mut env = host_env();
+    env.insert(
+        "PATH".to_owned(),
+        format!("{}:/usr/bin:/bin", bin.display()),
+    );
+    Ok(SystemProbe.probe(&ProbeRequest {
+        vendor: Vendor::Agy,
+        target: ProbeTarget::Window { config_dir: None },
+        host_env: &env,
+    }))
+}
+
+/// agy's usage is the `command.data` of its `/usage` reply, passed on as it arrived, fetched live.
+#[cfg(unix)]
+#[gtest]
+fn agy_usage_is_the_data_of_its_usage_command() -> Result<()> {
+    let observation = probe_agy_with_fake_cli(agentmux::testing::fixtures::AGY_USAGE, 0)?;
+
+    let reply: serde_json::Value =
+        serde_json::from_str(agentmux::testing::fixtures::AGY_USAGE).or_fail()?;
+    let Observation::Reported {
+        origin: Origin::Live,
+        payload,
+    } = observation
+    else {
+        return fail!("a usage reply must be reported live");
+    };
+    assert_that!(payload, eq(&reply["command"]["data"]));
+    Ok(())
+}
+
+/// An agy reply that carries no usage is unavailable, never an account with capacity to spare:
+/// a failed run, a reply the model answered instead of the command, and a CLI that failed.
+#[cfg(unix)]
+#[gtest]
+fn an_agy_reply_without_usage_is_unavailable() -> Result<()> {
+    let cases = [
+        (
+            r#"{"conversation_id":"","status":"ERROR","response":"","error":"not signed in"}"#,
+            0,
+            "reported ERROR: not signed in",
+        ),
+        (
+            r#"{"conversation_id":"c1","status":"SUCCESS","response":"Your usage is fine."}"#,
+            0,
+            "did not run its usage command",
+        ),
+        (agentmux::testing::fixtures::AGY_USAGE, 1, "exited with"),
+    ];
+    for (printed, status, reason) in cases {
+        let observation = probe_agy_with_fake_cli(printed, status)?;
+        let Observation::Unavailable { reason: reported } = observation else {
+            return fail!("a reply without usage must be unavailable: {printed}");
+        };
+        expect_that!(reported, contains_substring(reason), "{printed}");
     }
     Ok(())
 }

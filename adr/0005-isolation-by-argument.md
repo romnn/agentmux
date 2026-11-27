@@ -49,6 +49,8 @@ otherwise, and `allow_user_config = false` among a vendor's limits rules loading
   file still reaches a Claude delegate.
 - Because `codex app-server` has no `--ignore-user-config`, only a Codex turn that loads the
   configuration can run over it ([0018](0018-codex-app-server-driver.md)).
+- agy has no argument that skips its user settings, so an agy delegate always loads them and an
+  isolated one is refused ([0035](0035-agy-always-loads-the-users-settings.md)).
 - Account preferences remain subject to the project-selection restrictions in
   [0011](0011-machine-files-define-project-files-select.md): an account a checkout selects runs
   isolated unless the caller explicitly asks to load the configuration.

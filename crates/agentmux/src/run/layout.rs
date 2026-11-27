@@ -23,6 +23,21 @@ impl TurnDir {
     pub(super) fn question(&self) -> PathBuf {
         self.root.join("question.md")
     }
+    /// The question as a CLI that reads it as a record takes it, which only an agy turn's launch
+    /// writes.
+    pub(super) fn encoded_question(&self) -> PathBuf {
+        self.root.join("question.jsonl")
+    }
+    /// What the delegate reads as its stdin: the encoded question when its launch wrote one, and
+    /// the question itself otherwise.
+    pub(super) fn stdin(&self) -> PathBuf {
+        let encoded = self.encoded_question();
+        if encoded.is_file() {
+            encoded
+        } else {
+            self.question()
+        }
+    }
     pub(super) fn events(&self) -> PathBuf {
         self.root.join("events.jsonl")
     }

@@ -4,6 +4,8 @@ ignore-files = true
 extend-exclude = [
   "crates/codex-app-server-codegen/schema/codex_app_server_protocol.schemas.json",
   "crates/codex-app-server-protocol/src/generated/",
+  # agy's recorded streams, whose text arrives in chunks that split words wherever they fall.
+  "crates/agentmux/fixtures/agy/",
 ]
 
 [default]

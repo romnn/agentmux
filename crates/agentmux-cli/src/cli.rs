@@ -184,7 +184,7 @@ pub struct McpArgs {
     /// That harness spawns its own same-vendor subagents natively and supervises them itself, so
     /// a consultation agentmux runs for it is a slower, blinder copy of something it already has;
     /// agentmux is worth paying for across the vendor line, not along it.
-    /// Denying both leaves nothing to consult and is refused.
+    /// Denying every vendor leaves nothing to consult and is refused.
     #[arg(long = "deny", value_enum, value_name = "VENDOR")]
     pub deny: Vec<Vendor>,
 }
@@ -192,7 +192,8 @@ pub struct McpArgs {
 /// Which delegate to consult, and on what terms.
 #[derive(Debug, Args)]
 pub struct DelegateArgs {
-    /// Which CLI to consult: `claude` reaches Anthropic models, `codex` reaches GPT models.
+    /// Which CLI to consult: `claude` reaches Anthropic models, `codex` reaches GPT models, and
+    /// `agy`, Google's Antigravity CLI, reaches Gemini models.
     #[arg(long, value_enum)]
     pub delegate: Vendor,
 
@@ -212,7 +213,7 @@ pub struct DelegateArgs {
     #[arg(long)]
     pub effort: Option<String>,
 
-    /// Which configured account to authenticate as, for either vendor.
+    /// Which configured account to authenticate as, for any vendor.
     ///
     /// Aliases come from `agentmux.toml`; run `agentmux accounts` to see the ones this machine
     /// defines.
@@ -240,7 +241,7 @@ pub struct DelegateArgs {
 #[derive(Debug, Args)]
 pub struct QuotaArgs {
     /// Ask only this vendor.
-    /// Both are asked when omitted.
+    /// Every vendor is asked when omitted.
     #[arg(long, value_enum)]
     pub delegate: Option<Vendor>,
 }
@@ -257,6 +258,7 @@ pub struct PermissionArgs {
     /// `--ignore-user-config` alone means `true`; `--ignore-user-config=false` loads them.
     /// Omitted, the machine's default for the vendor decides, which `agentmux accounts` shows.
     /// With `false`, a hook can reopen the delegate's finished turn.
+    /// `agy` always loads it, so `true` is refused for `--delegate agy`.
     #[arg(
         long,
         num_args = 0..=1,
@@ -346,7 +348,7 @@ impl PermissionArgs {
 }
 
 impl DelegateArgs {
-    /// Build the delegate, rejecting an option that belongs to the other vendor.
+    /// Build the delegate, rejecting an option that belongs to another vendor.
     ///
     /// Existence of the alias is not checked here: which aliases are defined depends on the
     /// working directory the consultation will run in, which `build` does not know.

@@ -22,9 +22,10 @@ fn effort(level: &str) -> Result<Effort> {
     Effort::parse(level).or_fail()
 }
 
-/// Every variant of the closed set, so a third vendor cannot be added without extending this.
+/// Every variant of the closed set, so another vendor cannot be added without extending this.
 ///
-/// Each is pinned isolated, which is what the flags these tests check depend on.
+/// Each is pinned isolated, which is what the flags these tests check depend on, but for agy,
+/// which cannot run isolated.
 fn every_delegate() -> Result<Vec<Delegate>> {
     Ok(vec![
         Delegate::Claude {
@@ -60,6 +61,12 @@ fn every_delegate() -> Result<Vec<Delegate>> {
             },
             account: AccountChoice::Default,
             isolation: Some(Isolation::Isolated),
+        },
+        Delegate::Agy {
+            model: model("gemini-3.8-flash-low")?,
+            effort: Some(effort("low")?),
+            account: AccountChoice::Default,
+            isolation: Some(Isolation::Inherit),
         },
     ])
 }
@@ -225,6 +232,36 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
                     "{label}"
                 );
                 assert_that!(args.contains(&"-".to_owned()), eq(true), "{label}");
+            }
+            agentmux::delegate::Vendor::Agy => {
+                // The question is a record on stdin, never an argument, and every event streams.
+                assert_that!(args.contains(&"--print=".to_owned()), eq(true), "{label}");
+                assert_that!(
+                    has_pair(args, "--input-format", "stream-json"),
+                    eq(true),
+                    "{label}"
+                );
+                assert_that!(
+                    has_pair(args, "--output-format", "stream-json"),
+                    eq(true),
+                    "{label}"
+                );
+                // Read-only: commands, writes, MCP, the browser and downloads are denied.
+                let settings = agy_settings(args)?;
+                assert_that!(
+                    settings["toolPermission"],
+                    eq(&serde_json::json!("request-review"))
+                );
+                assert_that!(
+                    settings["permissions"]["deny"],
+                    eq(&serde_json::json!([
+                        "command(*)",
+                        "write_file(*)",
+                        "mcp(*)",
+                        "execute_url(*)",
+                        "download_url(*)"
+                    ]))
+                );
             }
         }
 
@@ -1247,7 +1284,7 @@ fn config_with_account(account_alias: &str, account: &Account) -> Result<Config>
     Ok(config)
 }
 
-/// A delegate of either vendor on the named account.
+/// A delegate of one vendor on the named account.
 fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
     let account = AccountChoice::Named(AccountAlias::parse(alias).or_fail()?);
     Ok(match vendor {
@@ -1265,6 +1302,12 @@ fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
                 sandbox: Some(CodexSandbox::ReadOnly),
                 network_access: None,
             },
+            account,
+            isolation: None,
+        },
+        Vendor::Agy => Delegate::Agy {
+            model: model("gemini-3.8-flash-low")?,
+            effort: None,
             account,
             isolation: None,
         },
@@ -1330,6 +1373,11 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "CODEX_EXEC_SERVER_URL",
         "ANTHROPIC_AUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
+        "AGY_ACCOUNT",
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_LLM_GATEWAY_MODELS",
+        "AGY_LLM_GATEWAY_API_KEY",
+        "AGY_LLM_GATEWAY_HEADERS",
     ] {
         expect_that!(
             agentmux::delegate::is_billing_env_name(name),
@@ -1624,5 +1672,168 @@ fn a_session_id_read_from_disk_is_checked_like_a_parsed_one() -> Result<()> {
     for refused in [r#""""#, r#""--resume""#, r#""a\nb""#] {
         assert_that!(serde_json::from_str::<SessionRef>(refused), err(anything()));
     }
+    Ok(())
+}
+
+/// The `--settings` object an agy argument vector carries, parsed.
+fn agy_settings(args: &[String]) -> Result<serde_json::Value> {
+    let settings = args
+        .windows(2)
+        .find(|pair| pair.first().is_some_and(|flag| flag == "--settings"))
+        .and_then(|pair| pair.get(1))
+        .or_fail()?;
+    serde_json::from_str(settings).or_fail()
+}
+
+/// An agy turn's arguments, with `settings_json` as the user's own agy settings file when given.
+fn agy_args(
+    settings_json: Option<&str>,
+    resume: Option<&SessionRef>,
+    read_dirs: &[std::path::PathBuf],
+) -> Result<Vec<String>> {
+    Ok(agy_invocation(settings_json, resume, read_dirs)?
+        .or_fail()?
+        .args()
+        .to_vec())
+}
+
+/// An agy turn's launch, or why it was refused, with `settings_json` as the user's own agy
+/// settings file when given.
+fn agy_invocation(
+    settings_json: Option<&str>,
+    resume: Option<&SessionRef>,
+    read_dirs: &[std::path::PathBuf],
+) -> Result<std::result::Result<Invocation, DelegateError>> {
+    let home = tempfile::tempdir().or_fail()?;
+    if let Some(settings_json) = settings_json {
+        let dir = home.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&dir).or_fail()?;
+        std::fs::write(dir.join("settings.json"), settings_json).or_fail()?;
+    }
+    let mut env = host_session_env();
+    env.insert("HOME".to_owned(), home.path().display().to_string());
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
+        resume,
+        extra_env: &BTreeMap::new(),
+        billing: None,
+        read_dirs,
+    };
+    let delegate =
+        delegate_on_account(Vendor::Agy, "unused")?.with_account(AccountChoice::CliLogin);
+    Ok(delegate.invocation(&plan, &env, &Config::default()))
+}
+
+/// The user's own agy deny and ask rules stay in force beside agentmux's, and their allow rules
+/// and their permissive mode do not.
+///
+/// `--settings` replaces agy's whole `permissions` object, so a rule the launch did not carry
+/// over would be lost: measured, a user's deny rule on a file stopped holding under an overlay
+/// that named only agentmux's own.
+#[gtest]
+fn an_agy_launch_keeps_the_users_deny_and_ask_rules_and_drops_their_allow_rules() -> Result<()> {
+    let user = r#"{
+        "agentMode": "accept-edits",
+        "toolPermission": "always-proceed",
+        "permissions": {
+            "allow": ["command(echo)", "write_file(*)"],
+            "deny": ["read_file(/work/project/barred.txt)"],
+            "ask": ["read_url(*)"]
+        },
+        "model": "Gemini 4 Hydrogen (High)"
+    }"#;
+    let args = agy_args(Some(user), None, &[])?;
+    let settings = agy_settings(&args)?;
+
+    // The mode and the tool preset are agentmux's, whatever the user chose.
+    assert_that!(settings["agentMode"], eq(&serde_json::json!("")));
+    assert_that!(
+        settings["toolPermission"],
+        eq(&serde_json::json!("request-review"))
+    );
+    // agentmux's deny rules come first, then the user's, and the user's ask rules are kept.
+    assert_that!(
+        settings["permissions"],
+        eq(&serde_json::json!({
+            "deny": [
+                "command(*)",
+                "write_file(*)",
+                "mcp(*)",
+                "execute_url(*)",
+                "download_url(*)",
+                "read_file(/work/project/barred.txt)"
+            ],
+            "ask": ["read_url(*)"]
+        }))
+    );
+    Ok(())
+}
+
+/// An agy follow-up names the conversation it continues, and a turn that must read outside its
+/// working directory is granted each directory.
+#[gtest]
+fn an_agy_follow_up_names_its_conversation_and_its_read_dirs() -> Result<()> {
+    let session = SessionRef::parse("e4c7ded7-2bf0-480b-9326-24191d51e4ba").or_fail()?;
+    let read_dir = std::path::PathBuf::from("/state/runs/r0");
+    let args = agy_args(None, Some(&session), std::slice::from_ref(&read_dir))?;
+
+    assert_that!(
+        has_pair(&args, "--conversation", session.as_str()),
+        eq(true)
+    );
+    assert_that!(has_pair(&args, "--add-dir", "/state/runs/r0"), eq(true));
+    // No user file holds no rules of the user's to carry over.
+    assert_that!(
+        agy_settings(&args)?["permissions"]["ask"],
+        eq(&serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// A user agy settings file that cannot be parsed refuses the launch, rather than launching
+/// without the rules it may hold.
+#[gtest]
+fn an_unparsable_agy_settings_file_refuses_the_launch() -> Result<()> {
+    let refused = agy_invocation(
+        Some(r#"{"permissions": {"deny": "command(*)"}}"#),
+        None,
+        &[],
+    )?;
+    assert_that!(
+        refused.map(|_| ()),
+        err(displays_as(contains_substring("cannot be read")))
+    );
+    Ok(())
+}
+
+/// An agy delegate asked to run isolated is refused, because agy has no argument that skips the
+/// user's settings, and naming the setting tells the caller what to ask for instead.
+#[gtest]
+fn an_isolated_agy_delegate_is_refused() -> Result<()> {
+    let delegate = Delegate::Agy {
+        model: model("gemini-3.8-flash-low")?,
+        effort: None,
+        account: AccountChoice::CliLogin,
+        isolation: Some(Isolation::Isolated),
+    };
+    let refused = delegate.invocation(
+        &TurnPlan {
+            question_path: Path::new("/runs/r/turns/0001/question.md"),
+            last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
+            resume: None,
+            extra_env: &BTreeMap::new(),
+            billing: None,
+            read_dirs: &[],
+        },
+        &host_session_env(),
+        &Config::default(),
+    );
+    assert_that!(
+        refused,
+        err(displays_as(contains_substring(
+            "Cannot launch agy: ignore_user_config=true cannot be honoured"
+        )))
+    );
     Ok(())
 }

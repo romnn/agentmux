@@ -8,8 +8,8 @@
 //!
 //! # Why every fold counts what it does not recognise
 //!
-//! agentmux wraps two CLIs owned by other people, whose JSON event shapes are versioned by
-//! nobody's promise.
+//! agentmux wraps CLIs owned by other people, whose JSON event shapes are versioned by nobody's
+//! promise.
 //! A parser that silently skips what it does not recognise will one day silently skip the report —
 //! the process still exits zero and still prints something plausible.
 //! So unrecognised event types are **counted** into [`Turn::unrecognised`] and surfaced in `status`
@@ -17,6 +17,7 @@
 //! parser does not name.
 //! Drift becomes loud instead of lossy.
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 
@@ -95,6 +96,7 @@ pub fn fold(vendor: Vendor, index: u32, question: &str, events: &str) -> Fold {
     match vendor {
         Vendor::Claude => claude::fold(index, question, events),
         Vendor::Codex => codex::fold(index, question, events),
+        Vendor::Agy => agy::fold(index, question, events),
     }
 }
 
@@ -115,8 +117,8 @@ pub(crate) fn complete_lines(events: &str) -> impl Iterator<Item = &str> {
 
 /// Classify a vendor's error text into a [`crate::transcript::FailureKind`].
 ///
-/// Both CLIs report failures as prose.
-/// The mapping is a best effort over phrases both vendors have been observed to emit; anything
+/// The CLIs report failures as prose.
+/// The mapping is a best effort over phrases Claude and Codex have been observed to emit; anything
 /// unfamiliar becomes `Unclassified` with the text kept verbatim, because guessing wrong is worse
 /// than admitting ignorance.
 /// Each phrase is a whole word or a specific pairing, because the text this sees is also the tail

@@ -103,6 +103,17 @@ pub enum PermissionRefusal {
         /// Where the limit was set.
         set_by: LimitSource,
     },
+    /// Isolation was asked of a vendor whose CLI has no argument that skips the user's own
+    /// settings.
+    #[error(
+        "Cannot launch {vendor}: ignore_user_config=true cannot be honoured, because {vendor} has \
+         no argument that skips the user's own settings. Request ignore_user_config=false, or \
+         leave it unset."
+    )]
+    IsolationUnavailable {
+        /// The vendor asked for.
+        vendor: Vendor,
+    },
     /// The Claude permission mode is not among `claude.limits.allowed_permission_modes`.
     #[error(
         "Cannot launch claude: permission_mode=\"{mode}\" is not in \
@@ -463,7 +474,7 @@ impl ClaudePolicy {
 
 /// What one vendor's tables say about loading the user's own configuration.
 ///
-/// The part of the policy both vendors share, read through [`super::Config::permissions`].
+/// The part of the policy every vendor shares, read through [`super::Config::permissions`].
 #[derive(Debug, Clone, Copy)]
 pub struct PermissionPolicy<'a> {
     vendor: Vendor,
@@ -627,6 +638,8 @@ pub(super) fn validate(
             .hold(codex.fill(CodexPermissions::default()), Some(path))
             .map(drop),
         Vendor::Claude => claude.hold(&claude.fill(&ClaudePermissions::default()), Some(path)),
+        // Nothing in the file can change what an agy delegate may do.
+        Vendor::Agy => Ok(()),
     }
     .map_err(|refusal| refused(defaults(), refusal))
 }

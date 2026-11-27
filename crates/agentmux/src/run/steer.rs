@@ -330,5 +330,6 @@ pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
             ..
         } => UnsteerableReason::CodexExec,
         Delegate::Codex { .. } => UnsteerableReason::CodexIsolated,
+        Delegate::Agy { .. } => UnsteerableReason::AgyPrint,
     }
 }

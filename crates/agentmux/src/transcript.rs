@@ -226,13 +226,13 @@ impl Message {
 /// categories and over the vendor's own scope.
 ///
 /// They are evidence, not what the turn spent.
-/// Codex reports its thread's running total, so a follow-up's figures include every earlier turn
-/// of the session, while Claude reports the one call.
-/// Codex counts cache reads inside `input_tokens`, and Claude counts them beside it.
+/// Codex and agy report their session's running total, so a follow-up's figures include every
+/// earlier turn of the session, while Claude reports the one call.
+/// Codex counts cache reads inside `input_tokens`, and Claude and agy count them beside it.
 /// [`crate::accounting`] derives what each turn spent from them; the turn's footer quotes them as
 /// they are, because a published footer never changes.
 ///
-/// Every field is optional because neither vendor promises to report all of them, and a missing
+/// Every field is optional because no vendor promises to report all of them, and a missing
 /// count must stay distinguishable from a zero count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -244,13 +244,14 @@ pub struct Usage {
     /// Prompt tokens.
     ///
     /// Codex: every prompt token, those read from the cache included.
-    /// Claude: only the prompt tokens the cache played no part in.
+    /// Claude and agy: only the prompt tokens the cache played no part in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Prompt tokens read from the provider's cache.
     ///
     /// Codex: a part of `input_tokens`.
     /// Claude: its `cache_read_input_tokens`, counted beside `input_tokens`.
+    /// agy: its `cache_read_tokens`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
     /// Prompt tokens written into the provider's cache.
@@ -259,12 +260,13 @@ pub struct Usage {
     /// Claude: its `cache_creation_input_tokens`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_input_tokens: Option<u64>,
-    /// Tokens the model emitted, reasoning included for both vendors.
+    /// Tokens the model emitted, reasoning included for every vendor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     /// Reasoning tokens, a part of `output_tokens`.
     ///
     /// Claude: its `output_tokens_details.thinking_tokens`.
+    /// agy: its `thinking_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
 }

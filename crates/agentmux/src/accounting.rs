@@ -14,10 +14,12 @@
 //!   session's running total across `--resume` since.
 //!   A price whose release cannot be read has no known scope, so it is not counted rather than
 //!   guessed at.
+//! - agy's tokens are its conversation's running total, which `--conversation` carries on from,
+//!   and it reports no price.
 //!
-//! Codex counts cache reads inside its prompt tokens, and Claude counts cache reads and writes
-//! beside them, so a [`Tokens`] figure counts every prompt token, with the cached ones as a part of
-//! it, and counts reasoning as a part of the output, as both vendors do.
+//! Codex counts cache reads inside its prompt tokens, and Claude and agy count cache reads beside
+//! them, Claude cache writes too, so a [`Tokens`] figure counts every prompt token, with the cached
+//! ones as a part of it, and counts reasoning as a part of the output, as every vendor does.
 //!
 //! # Deriving spend
 //!
@@ -104,8 +106,9 @@ impl Tokens {
         } = *usage;
         let input_tokens = match vendor {
             Vendor::Codex => input_tokens,
-            // Claude counts the cached prompt tokens beside its `input_tokens`, not inside it.
-            Vendor::Claude => input_tokens.map(|uncached| {
+            // Claude and agy count the cached prompt tokens beside their `input_tokens`, not
+            // inside it; agy reports no cache writes.
+            Vendor::Claude | Vendor::Agy => input_tokens.map(|uncached| {
                 uncached
                     .saturating_add(cached_input_tokens.unwrap_or(0))
                     .saturating_add(cache_write_input_tokens.unwrap_or(0))
@@ -255,7 +258,7 @@ enum Scope {
 /// What a vendor's token figures cover.
 fn token_scope(vendor: Vendor) -> Scope {
     match vendor {
-        Vendor::Codex => Scope::Session,
+        Vendor::Codex | Vendor::Agy => Scope::Session,
         Vendor::Claude => Scope::Turn,
     }
 }
@@ -263,8 +266,9 @@ fn token_scope(vendor: Vendor) -> Scope {
 /// What a vendor's price covers, or `None` when that cannot be known.
 fn price_scope(vendor: Vendor, cli_version: Option<&str>) -> Option<Scope> {
     match vendor {
-        // Codex reports no price, so a price it did report would be in a scope nothing documents.
-        Vendor::Codex => None,
+        // Neither Codex nor agy reports a price, so a price one did report would be in a scope
+        // nothing documents.
+        Vendor::Codex | Vendor::Agy => None,
         Vendor::Claude => {
             let release = cli_version.and_then(release_of)?;
             Some(if release < CLAUDE_SESSION_COST_SINCE {
@@ -977,6 +981,26 @@ mod tests {
         assert_that!(accounting.total().input_tokens, some(eq(130)));
         assert_that!(accounting.tokens_incomplete, eq(true));
         assert_that!(accounting.price_incomplete, eq(false));
+    }
+
+    /// agy's tokens are its conversation's running total, with cache reads beside the input, so
+    /// a follow-up spent what its total adds to the turn before, cache reads included.
+    #[gtest]
+    fn agy_running_totals_become_per_turn_spend_including_cache_reads() {
+        let turns = [
+            crate::stream::fold(Vendor::Agy, 0, "q", crate::testing::fixtures::AGY_TOOL_USE).turn,
+            crate::stream::fold(Vendor::Agy, 1, "q", crate::testing::fixtures::AGY_RESUME).turn,
+        ];
+        let accounting = Accounting::of(Vendor::Agy, &turns);
+
+        // 13646 + 9425 for the first turn; 15912 + 18986 for both, less the first.
+        assert_that!(
+            accounting.tokens.iter().map(input).collect::<Vec<_>>(),
+            elements_are![some(eq(&23071)), some(eq(&11827))]
+        );
+        assert_that!(accounting.total().input_tokens, some(eq(34898)));
+        assert_that!(accounting.total().cached_input_tokens, some(eq(18986)));
+        assert_that!(accounting.tokens_incomplete, eq(false));
     }
 
     /// Claude's tokens are per call while a current release's price is the session's running

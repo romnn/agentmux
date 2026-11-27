@@ -563,6 +563,88 @@ fn a_codex_running_total_is_counted_once() -> Result<()> {
     Ok(())
 }
 
+/// An agy turn reads its question as the one stream-json record agy takes, while the transcript
+/// shows the question as asked, and a follow-up continues the conversation the first turn opened.
+#[gtest]
+fn an_agy_turn_reads_its_question_as_a_record_and_its_follow_up_resumes() -> Result<()> {
+    let harness = harness([
+        Script::completed(fixtures::AGY_TOOL_USE),
+        Script::completed(fixtures::AGY_RESUME),
+    ])?;
+    let agy = Delegate::Agy {
+        model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: None,
+    };
+    let started = harness
+        .store
+        .start(&request(agy, "Run `echo \"PROBE_B\"`."))?;
+    harness.store.follow_up(&started.run_id, "Again?")?;
+
+    let launches = harness.launcher.launches();
+    let [first, second] = launches.as_slice() else {
+        return fail!("expected two launches, got {}", launches.len());
+    };
+    // Each child's stdin is its question as one record, quotes escaped, then end of input; the
+    // first carries the turn-end notice agentmux adds to a new consultation's question.
+    let record: serde_json::Value = serde_json::from_str(&first.question).or_fail()?;
+    assert_that!(record["event"], eq(&serde_json::json!("user")));
+    assert_that!(
+        record["message"]["content"].as_str(),
+        some(starts_with(
+            "Run `echo \"PROBE_B\"`.\n\n---\n\nNote from agentmux"
+        ))
+    );
+    assert_that!(first.question.lines().count(), eq(1));
+    assert_that!(first.question, ends_with("\n"));
+    assert_that!(
+        second.question,
+        eq(concat!(
+            r#"{"event":"user","message":{"content":"Again?"}}"#,
+            "\n"
+        ))
+    );
+    assert_that!(
+        second.has_flag_with("--conversation", "e4c7ded7-2bf0-480b-9326-24191d51e4ba"),
+        eq(true)
+    );
+    // The transcript shows what was asked, never the record it travelled in.
+    let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
+    assert_that!(
+        transcript,
+        all![
+            contains_substring("Run `echo \"PROBE_B\"`."),
+            not(contains_substring(r#"{"event":"user""#)),
+            contains_substring("settings=inherited")
+        ]
+    );
+    Ok(())
+}
+
+/// An agy consultation asked to run isolated is refused before anything is launched or kept.
+#[gtest]
+fn an_isolated_agy_consultation_is_refused_at_start() -> Result<()> {
+    let harness = harness([Script::completed(fixtures::AGY_TOOL_USE)])?;
+    let agy = Delegate::Agy {
+        model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: Some(Isolation::Isolated),
+    };
+    let refused = harness.store.start(&request(agy, "review this"));
+
+    assert_that!(
+        refused.map(|_| ()),
+        err(displays_as(contains_substring(
+            "ignore_user_config=true cannot be honoured"
+        )))
+    );
+    assert_that!(harness.launcher.launches(), is_empty());
+    assert_that!(harness.store.list(10, &ListFilter::default())?, is_empty());
+    Ok(())
+}
+
 /// A label given at `start` names the consultation everywhere a caller looks, a follow-up's own
 /// label takes over from its turn on, and a follow-up that names none keeps the current one.
 #[gtest]

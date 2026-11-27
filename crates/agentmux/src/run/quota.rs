@@ -55,7 +55,7 @@ impl RunStore {
         reported
     }
 
-    /// Ask each configured account what it has left, for `vendor` or for both.
+    /// Ask each configured account what it has left, for `vendor` or for every vendor.
     ///
     /// The configuration is read afresh for every call, as a launch reads it.
     /// A project file found from agentmux's own directory still decides which identity an

@@ -42,7 +42,7 @@ pub enum RunError {
     #[error(
         "this agentmux server does not launch `{vendor}` delegates: it was started with `--deny \
          {vendor}` because the harness it serves is itself `{vendor}` and spawns same-vendor \
-         subagents natively. Consult the other vendor here, and use your own harness's subagents \
+         subagents natively. Consult another vendor here, and use your own harness's subagents \
          for `{vendor}`."
     )]
     VendorDenied {
@@ -394,6 +394,8 @@ pub enum UnsteerableReason {
     CodexExec,
     /// An isolated Codex delegate, which only `codex exec` can run.
     CodexIsolated,
+    /// An agy delegate, which reads its question once.
+    AgyPrint,
 }
 
 impl std::fmt::Display for UnsteerableReason {
@@ -421,6 +423,10 @@ impl std::fmt::Display for UnsteerableReason {
                  consultation that loads it runs over it: one with `ignore_user_config: false`, \
                  which is the default unless this machine's agentmux.toml says otherwise, and \
                  which a follow-up may also ask for"
+            }
+            Self::AgyPrint => {
+                "its turn was launched as `agy --print`, which reads its question once and offers \
+                 no channel into a turn that has started"
             }
         })
     }

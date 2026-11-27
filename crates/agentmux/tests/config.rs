@@ -1627,3 +1627,86 @@ fn a_project_file_that_blocks_a_model_is_refused() -> Result<()> {
     );
     Ok(())
 }
+
+/// The ways an agy account could claim more than agy offers are refused at load, and the one
+/// shape it can take loads.
+///
+/// agy keeps one login in the operating system's keyring and reads nothing an account could name,
+/// so an account only labels that login: two would report one window twice, one holding a key or
+/// a directory would claim a switch agy never makes, and one that is not the default would leave
+/// the login reported both under its label and unnamed.
+#[gtest]
+fn an_agy_account_only_labels_its_one_login() -> Result<()> {
+    let refused = [
+        (
+            "two accounts",
+            indoc::indoc! {r#"
+                [accounts.agy.personal]
+                description = "mine"
+                [accounts.agy.work]
+                description = "also mine"
+                [defaults.agy]
+                account = "personal"
+            "#},
+            "is a second agy account",
+        ),
+        (
+            "a directory",
+            indoc::indoc! {r#"
+                [accounts.agy.personal]
+                config_dir = "/tmp"
+                [defaults.agy]
+                account = "personal"
+            "#},
+            "sets more than a `description`",
+        ),
+        (
+            "an environment",
+            indoc::indoc! {r#"
+                [accounts.agy.personal]
+                description = "mine"
+                env = { AGY_ACCOUNT = "work" }
+                [defaults.agy]
+                account = "personal"
+            "#},
+            "sets more than a `description`",
+        ),
+        (
+            "not the default",
+            indoc::indoc! {r#"
+                [accounts.agy.personal]
+                description = "mine"
+            "#},
+            "is not the `[defaults.agy]` account",
+        ),
+    ];
+    for (case, file, reason) in refused {
+        let home = tempfile::tempdir().or_fail()?;
+        agentmux::testing::write_config_file(home.path().join("agentmux.toml"), file).or_fail()?;
+        let loaded = Config::load(&env(home.path()), home.path());
+        assert_that!(
+            loaded.map(|_| ()),
+            err(displays_as(contains_substring(reason))),
+            "{case}"
+        );
+    }
+
+    let home = tempfile::tempdir().or_fail()?;
+    agentmux::testing::write_config_file(
+        home.path().join("agentmux.toml"),
+        indoc::indoc! {r#"
+            [accounts.agy.personal]
+            description = "Google AI Pro"
+            [defaults.agy]
+            account = "personal"
+        "#},
+    )
+    .or_fail()?;
+    let config = Config::load(&env(home.path()), home.path()).or_fail()?;
+    assert_that!(
+        config.account_aliases(Vendor::Agy),
+        elements_are![eq("personal")]
+    );
+    assert_that!(config.unknown, is_empty());
+    Ok(())
+}

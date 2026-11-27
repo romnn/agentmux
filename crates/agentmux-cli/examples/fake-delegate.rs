@@ -1,7 +1,7 @@
 //! A stand-in for a delegate CLI, for the tests that run the real `agentmux` against it.
 //!
-//! A test copies it into a directory of its own under the name of the CLI it plays, `claude` or
-//! `codex`, puts that directory on the delegate's `PATH`, and writes beside it the
+//! A test copies it into a directory of its own under the name of the CLI it plays, `claude`,
+//! `codex` or `agy`, puts that directory on the delegate's `PATH`, and writes beside it the
 //! [`FAKE_DELEGATE_CONFIG`] that says what to do.
 //! It reads its configuration from beside its own executable rather than from its environment or
 //! its arguments, because agentmux decides both: the environment is an allowlist and the
@@ -10,7 +10,7 @@
 //! Asked for `--version` it says so and exits.
 //! Otherwise it reads its question from stdin: to its end, or as its first line when its
 //! arguments say `--input-format stream-json`, as a Claude turn's do once its supervisor holds its
-//! input open.
+//! input open and an agy turn's always do.
 //! It then writes the configured stream and stderr, waits until the configured release file
 //! exists, its directory has gone or [`LONGEST_WAIT`] has passed, writes what it was told to write
 //! last, and exits with the configured status.
@@ -30,6 +30,10 @@ const FAKE_DELEGATE_CONFIG: &str = "fake-delegate.json";
 /// Where each run appends the arguments it was started with, as one JSON array per line, beside
 /// the executable, so a test can check what the delegate actually received.
 const FAKE_DELEGATE_ARGV: &str = "fake-delegate-argv.jsonl";
+
+/// Where each run appends the question it read, as one JSON string per line, beside the
+/// executable, so a test can check what the delegate was given on its stdin.
+const FAKE_DELEGATE_STDIN: &str = "fake-delegate-stdin.jsonl";
 
 /// How long the fake waits for its release before it goes on regardless.
 ///
@@ -112,6 +116,18 @@ fn record_argv(path: &std::path::Path) -> Result<usize, String> {
     Ok(recorded.lines().count())
 }
 
+/// Append the question this run read to `path`.
+fn record_question(path: &std::path::Path, question: &str) -> Result<(), String> {
+    let line =
+        serde_json::to_string(question).map_err(|err| format!("cannot encode question: {err}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
 fn run() -> Result<u8, String> {
     let config_path = std::env::current_exe()
         .map_err(|err| format!("cannot locate itself: {err}"))?
@@ -134,6 +150,7 @@ fn run() -> Result<u8, String> {
         std::io::stdin().read_to_string(&mut question)
     };
     read.map_err(|err| format!("cannot read the question: {err}"))?;
+    record_question(&config_path.with_file_name(FAKE_DELEGATE_STDIN), &question)?;
     let mut stdout = std::io::stdout();
     write!(stdout, "{}", config.stdout).map_err(|err| format!("cannot write stdout: {err}"))?;
     stdout

@@ -2,7 +2,7 @@
 //!
 //! A rate limit is the one failure whose remedy depends on information the failure does not carry:
 //! which *other* account could answer this question now.
-//! Both CLIs can be asked, for free and without spending a turn, so this module asks them.
+//! Every CLI can be asked, for free and without spending a turn, so this module asks them.
 //!
 //! # Nothing here is normalised
 //!
@@ -238,7 +238,11 @@ impl ProbeTarget {
         if vendor == Vendor::Claude && env.keys().any(|name| is_billing_env_name(name)) {
             return Ok(Self::NoSubscriptionWindow);
         }
-        let vars = credential_vars(vendor);
+        // agy reads no key or endpoint an account could set, and its gateway variables are
+        // withheld from a subscription identity, so its one login is all there is to read.
+        let Some(vars) = credential_vars(vendor) else {
+            return Ok(Self::Window { config_dir: None });
+        };
         let config_dir = env.get(vars.config_dir).map(PathBuf::from);
         // An endpoint of the identity's own is not the vendor's window whatever the login says,
         // so it answers before the login is consulted at all.
@@ -427,6 +431,7 @@ impl QuotaProbe for SystemProbe {
         match request.vendor {
             Vendor::Claude => probe_claude(request),
             Vendor::Codex => probe_codex(request),
+            Vendor::Agy => probe_agy(request),
         }
     }
 }
@@ -449,8 +454,9 @@ fn probe_command(request: &ProbeRequest<'_>, program: &str) -> std::process::Com
     for (key, value) in env {
         command.env(key, value);
     }
-    if let Some(dir) = request.target.config_dir() {
-        command.env(credential_vars(request.vendor).config_dir, dir);
+    if let (Some(dir), Some(vars)) = (request.target.config_dir(), credential_vars(request.vendor))
+    {
+        command.env(vars.config_dir, dir);
     }
     command
 }
@@ -729,6 +735,105 @@ fn exchange_rate_limits(
         }
     }
     Err("codex app-server ended without answering. That account may not be logged in.".to_owned())
+}
+
+/// Ask agy's `/usage` command, which it answers locally without spending a turn.
+///
+/// What comes back is the reply's `command.data`, passed on verbatim: groups of models, each with
+/// buckets naming a window, the fraction of it left and when it resets, where a window nobody has
+/// used yet resets at the Unix epoch.
+fn probe_agy(request: &ProbeRequest<'_>) -> Observation {
+    match agy_usage(request) {
+        Ok(payload) => Observation::Reported {
+            origin: Origin::Live,
+            payload,
+        },
+        Err(reason) => Observation::Unavailable { reason },
+    }
+}
+
+/// Run `agy --print /usage --output-format json` and read the usage it reports.
+fn agy_usage(request: &ProbeRequest<'_>) -> Result<serde_json::Value, String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut command = probe_command(request, Vendor::Agy.program());
+    command.args(["--print", "/usage", "--output-format", "json"]);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot run `agy --print /usage`: {error}"))?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("`agy --print /usage` did not offer its output".to_owned());
+    };
+
+    // Read on its own thread so a CLI that never finishes cannot hang the caller.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        // A caller that stopped waiting has already reported the timeout.
+        let _ = sender.send(stdout.read_to_string(&mut output).map(|_| output));
+    });
+    let output = receiver.recv_timeout(PROBE_TIMEOUT);
+    // The child is finished with either way; leaving it running would leak a process per probe.
+    let _ = child.kill();
+    let status = child.wait();
+    match output {
+        Ok(Ok(output)) => match status {
+            Ok(status) if status.success() => agy_usage_payload(&output),
+            Ok(status) => Err(format!("`agy --print /usage` exited with {status}")),
+            Err(error) => Err(format!(
+                "`agy --print /usage` could not be waited on: {error}"
+            )),
+        },
+        Ok(Err(error)) => Err(format!("reading `agy --print /usage`: {error}")),
+        Err(_) => Err(format!(
+            "`agy --print /usage` did not answer within {}s",
+            PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// The usage figures in what `agy --print /usage --output-format json` printed.
+///
+/// Only a reply that ran the `usage` command carries them: a prompt that reached the model instead
+/// comes back with a `response` and no `command`.
+fn agy_usage_payload(output: &str) -> Result<serde_json::Value, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        status: String,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        command: Option<Command>,
+    }
+
+    #[derive(Deserialize)]
+    struct Command {
+        name: String,
+        data: serde_json::Value,
+    }
+
+    let reply = serde_json::from_str::<Reply>(output.trim())
+        .map_err(|error| format!("`agy --print /usage` printed no usage reply: {error}"))?;
+    if reply.status != "SUCCESS" {
+        return Err(format!(
+            "`agy --print /usage` reported {}: {}",
+            reply.status,
+            reply.error.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    match reply.command {
+        Some(Command { name, data }) if name == "usage" && data.is_object() => Ok(data),
+        _ => Err(
+            "`agy --print /usage` did not run its usage command. That login may not be \
+                  signed in on this machine."
+                .to_owned(),
+        ),
+    }
 }
 
 /// What a JSON-RPC error said, or that it said nothing.

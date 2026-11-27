@@ -2,7 +2,7 @@
 //!
 //! These are the only tests that spend money and need credentials, so they are `#[ignore]`d and
 //! CI passes without them.
-//! Run them by hand after upgrading either CLI:
+//! Run them by hand after upgrading a CLI:
 //!
 //! ```text
 //! cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
@@ -29,6 +29,7 @@ use googletest::prelude::*;
 /// The cheapest model on each side that still exercises the whole path.
 const CLAUDE_MODEL: &str = "haiku";
 const CODEX_MODEL: &str = "gpt-6-luna";
+const AGY_MODEL: &str = "gemini-3.8-flash-low";
 
 /// Start a consultation against the real CLI and wait for it, in a directory that survives the
 /// test so a failure's capture files can be inspected afterwards.
@@ -204,5 +205,59 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
             detail: contains_substring("does-not-exist-9000"),
         })
     );
+    Ok(())
+}
+
+/// The flags agentmux builds still work against today's agy: the question read as a stream-json
+/// record, a follow-up resuming its conversation, and the pinned permissions refusing a write.
+#[gtest]
+#[tokio::test]
+#[ignore = "spends quota and needs a signed-in agy CLI"]
+async fn a_live_agy_consultation_can_be_followed_up_and_writes_nothing() -> Result<()> {
+    let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-agy-probe");
+    let agy = Delegate::Agy {
+        model: ModelId::parse(AGY_MODEL).or_fail()?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: None,
+    };
+    let (store, status) = consult(
+        agy,
+        "Remember the secret word ZEPPELIN. Try once to create the file agentmux-live-agy-probe \
+         in the working directory, then, whether or not that worked, reply with exactly \
+         LIVE_AGY_OK and nothing else.",
+    )
+    .await?;
+
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(status.resumable, eq(true));
+    assert_that!(
+        status.unrecognised.summary(),
+        none(),
+        "the agy event stream has drifted"
+    );
+    assert_that!(probe.exists(), eq(false), "an agy delegate wrote a file");
+
+    let followed = store
+        .follow_up(
+            &status.run_id,
+            "What was the secret word? Reply with only the word.",
+        )
+        .or_fail()?;
+    store
+        .wait_until_terminal(&followed.run_id, Duration::from_secs(300))
+        .await
+        .or_fail()?;
+    let followed = store.status(&followed.run_id).or_fail()?;
+    assert_that!(followed.turns, eq(2));
+    assert_that!(
+        followed.outcome,
+        matches_pattern!(Outcome::Completed { .. })
+    );
+
+    // The first question names the word once; the follow-up's answer names it again.
+    let page = store.page(&status.run_id, 0, usize::MAX).or_fail()?;
+    assert_that!(page.text, contains_substring("LIVE_AGY_OK"));
+    assert_that!(page.text.matches("ZEPPELIN").count(), ge(2));
     Ok(())
 }
