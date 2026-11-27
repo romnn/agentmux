@@ -35,10 +35,12 @@ const ECHO: &str = r#"echo_input() {
 /// A watchdog the shell script starts first, which kills it after a minute, so a fake whose test
 /// failed before ending it, or whose input is never closed, leaves on its own.
 /// It looks each second whether the script is still there, and leaves with it.
+/// It kills the script's process group, which the launcher made for the script and which the
+/// watchdog belongs to, so the signal never reaches a process that took a reused pid.
 const WATCHDOG: &str = r#"(
   i=0
   while [ "$i" -lt 60 ] && kill -0 $$ 2>/dev/null; do sleep 1; i=$((i + 1)); done
-  [ "$i" -lt 60 ] || kill -KILL $$
+  [ "$i" -lt 60 ] || kill -KILL 0
 ) &"#;
 
 /// A machine of its own: a `bin` for the fake `claude`, a home, a project and a store.
