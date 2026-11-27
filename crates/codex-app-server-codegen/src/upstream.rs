@@ -31,8 +31,8 @@ pub fn export(pinned: &str) -> Result<Vec<u8>, Error> {
     }
 
     // An isolated consultation runs over `codex exec` only because the app-server cannot skip the
-    // user's configuration, so the release that adds the flag is the one to change
-    // `Delegate::app_server_settings` for.
+    // user's configuration, so the release that adds the flag is the one to change agentmux's
+    // `vendor::codex::prepare` for.
     // `--help` writes to either stream, depending on the release, so both are searched.
     let help = run(&["app-server", "--help"])?;
     if help.stdout.contains("--ignore-user-config") || help.stderr.contains("--ignore-user-config")

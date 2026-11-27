@@ -35,11 +35,14 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 use crate::config::{Account, ChosenBy, Config, Secret};
-use crate::vendor::agy::{agy_args, agy_user_rules, use_agy_home};
-use crate::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool, claude_args};
-use crate::vendor::codex::{
-    AppServerSettings, CodexPermissions, CodexSandbox, codex_app_server_args, codex_args,
+use crate::launch::Launcher;
+use crate::run::LaunchMode;
+use crate::run::layout::TurnDir;
+use crate::vendor::agy::{self, agy_args, agy_user_rules};
+use crate::vendor::claude::{
+    self, ClaudePermissionMode, ClaudePermissions, ClaudeTool, claude_args,
 };
+use crate::vendor::codex::{self, CodexPermissions, CodexSandbox, codex_args};
 
 /// A delegate argument that could not be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1167,9 +1170,9 @@ string_newtype_conversions!(SessionRef);
 
 /// A fully prepared child process: what to run, with which arguments, in which environment.
 ///
-/// Produced by [`Delegate::invocation`], or by the run store's automatic resume in the environment
-/// an earlier one built, and its fields are private, so the flags that make capture correct, the
-/// recursion marker and the environment allowlist cannot be left out at a call site.
+/// Produced by [`Delegate::invocation`], or by a run store as each vendor prepares its launch, and
+/// its fields are private, so the flags that make capture correct, the recursion marker and the
+/// environment allowlist cannot be left out at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     program: String,
@@ -1204,6 +1207,29 @@ impl Invocation {
     #[must_use]
     pub fn billing(&self) -> Billing {
         self.billing
+    }
+
+    /// `vendor`'s CLI with `args`, in `env`, marked as a delegate.
+    ///
+    /// The recursion guard is set last, so no layer can change even its value.
+    /// An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
+    /// inheriting one loads the operator's own — and if agentmux is among them, a delegate can
+    /// consult a delegate until something runs out.
+    /// The marker makes the depth visible to the next agentmux, which refuses rather than relying
+    /// on isolation it may not have.
+    pub(crate) fn of_delegate(
+        vendor: Vendor,
+        args: Vec<String>,
+        mut env: BTreeMap<String, String>,
+        billing: Billing,
+    ) -> Self {
+        env.insert(DELEGATE_MARKER.to_owned(), "1".to_owned());
+        Self {
+            program: vendor.program().to_owned(),
+            args,
+            env,
+            billing,
+        }
     }
 
     /// Tell the child where the run store is, so an agentmux it starts opens the same one.
@@ -1432,6 +1458,8 @@ impl Delegate {
     ///
     /// `host_env` is the environment agentmux itself was launched with; only the variables named
     /// in the allowlists above are carried into the child.
+    /// This is the delegate's CLI as a caller with no run store would run it; a store prepares
+    /// its launches with the same arguments, and decides how each runs.
     ///
     /// # Errors
     ///
@@ -1450,17 +1478,49 @@ impl Delegate {
         host_env: &BTreeMap<String, String>,
         config: &Config,
     ) -> Result<Invocation, DelegateError> {
-        self.invocation_in(plan, host_env, config, None)
+        let Admitted {
+            delegate,
+            env,
+            billing,
+        } = self.admitted(plan, host_env, config)?;
+        let isolation = delegate.resolved_isolation(config);
+        let Self { model, effort, .. } = &delegate;
+        let args = match &delegate.permissions {
+            Permissions::Claude(permissions) => {
+                claude_args(model, effort.as_ref(), permissions, plan, isolation)
+            }
+            Permissions::Codex(permissions) => {
+                codex_args(model, effort.as_ref(), *permissions, plan, isolation)
+            }
+            // The home an isolated agy delegate runs in is its run store's; see ADR 0035.
+            Permissions::Agy if !isolation.inherits() => {
+                return Err(DelegateError::AgyHomeUnknown);
+            }
+            // Built from the complete environment, whose home is where agy reads its own settings.
+            Permissions::Agy => agy_args(model, effort.as_ref(), plan, &agy_user_rules(&env)?),
+        };
+        Ok(Invocation::of_delegate(
+            delegate.vendor(),
+            args,
+            env,
+            billing,
+        ))
     }
 
-    /// The same, for a run store, which keeps `agy_home` for an isolated agy delegate to run in.
-    pub(crate) fn invocation_in(
+    /// This delegate, held to the machine file's limits, with the environment and the pricing a
+    /// launch of it starts from: its identity's layers and its request's, and nothing its vendor
+    /// sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Delegate::invocation`] for the account, the limits and the
+    /// request's environment.
+    pub(crate) fn admitted(
         &self,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
         config: &Config,
-        agy_home: Option<&Path>,
-    ) -> Result<Invocation, DelegateError> {
+    ) -> Result<Admitted, DelegateError> {
         let Identity {
             mut env,
             policy,
@@ -1469,8 +1529,7 @@ impl Delegate {
         // Held here, the one step every launch a caller asks for goes through, so no turn runs
         // past a limit the owner set, however it was reached; an automatic resume continues a
         // turn that was held here, in the environment built here.
-        let held = self.held_to_limits(config)?;
-        let isolation = held.resolved_isolation(config);
+        let delegate = self.held_to_limits(config)?;
 
         let allowed: Vec<&str> = config
             .launch
@@ -1484,130 +1543,111 @@ impl Delegate {
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
-
-        // Set over every other layer, so no account or request can move it; see ADR 0035.
-        if let Permissions::Agy = held.permissions
-            && !isolation.inherits()
-        {
-            use_agy_home(&mut env, agy_home.ok_or(DelegateError::AgyHomeUnknown)?)?;
-        }
-
-        // Built from the complete environment, whose home is where agy reads its own settings.
-        let args = held.args(plan, isolation, &env)?;
-
-        // The recursion guard, set last so no layer can change even its value.
-        // An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
-        // inheriting one loads the operator's own — and if agentmux is among them, a delegate can
-        // consult a delegate until something runs out.
-        // The marker makes the depth visible to the next agentmux, which refuses rather than
-        // relying on isolation it may not have.
-        env.insert(DELEGATE_MARKER.to_owned(), "1".to_owned());
-
-        Ok(Invocation {
-            program: self.vendor().program().to_owned(),
-            args,
+        Ok(Admitted {
+            delegate,
             env,
             billing,
         })
     }
 
-    /// Build the child process for a turn that continues one this delegate already ran, in
-    /// `env`, the environment that turn ran in, unchanged.
+    /// The isolation a launch of this delegate runs under once it is pinned: its own, or isolated
+    /// for a record from before isolation was pinned.
+    #[must_use]
+    pub(crate) fn pinned_isolation(&self) -> Isolation {
+        self.isolation.unwrap_or(Isolation::Isolated)
+    }
+
+    /// Prepare one turn's launch for a run store: the delegate's vendor builds all of it and says
+    /// how it runs.
     ///
-    /// For agentmux's own automatic resume, whose supervisor holds the previous turn's resolved
-    /// environment but neither the host environment nor the machine's configuration it was
-    /// resolved from.
-    /// Nothing is resolved again: the identity, the request's environment, the billing scrub and
-    /// the recursion marker are already in `env`, and `billing` is the pricing it was resolved
-    /// for.
-    /// The arguments are this delegate's own, held to the limits the turn it continues was
-    /// admitted under, with its pinned isolation, or isolated for a record from before isolation
-    /// was pinned.
-    ///
-    /// Crate-private, because only the run store holds an environment this method may be given:
-    /// one [`Delegate::invocation`] built, which carries the allowlist and the recursion marker.
+    /// `self` is held to the machine file's limits by whoever admitted the turn, and its
+    /// [pinned isolation](Delegate::pinned_isolation) is the one the turn runs under.
     ///
     /// # Errors
     ///
     /// Returns [`DelegateError::AgySettingsUnreadable`] for an agy delegate whose own settings
-    /// file cannot be read.
-    pub(crate) fn continuation(
+    /// file cannot be read, [`DelegateError::Environment`] when the home an isolated agy delegate
+    /// runs in cannot be made, and [`DelegateError::Permission`] for a `codex exec` turn that
+    /// needs a permission profile from a codex not verified to honour one.
+    pub(crate) fn prepare(
         &self,
-        plan: &TurnPlan<'_>,
-        env: BTreeMap<String, String>,
-        billing: Billing,
-    ) -> Result<Invocation, DelegateError> {
-        let isolation = self.isolation.unwrap_or(Isolation::Isolated);
-        Ok(Invocation {
-            program: self.vendor().program().to_owned(),
-            args: self.args(plan, isolation, &env)?,
-            env,
-            billing,
-        })
-    }
-
-    /// The argument vector for one turn, run under `isolation` in `env`.
-    fn args(
-        &self,
-        plan: &TurnPlan<'_>,
-        isolation: Isolation,
-        env: &BTreeMap<String, String>,
-    ) -> Result<Vec<String>, DelegateError> {
-        let Self { model, effort, .. } = self;
-        Ok(match &self.permissions {
-            Permissions::Claude(permissions) => {
-                claude_args(model, effort.as_ref(), permissions, plan, isolation)
-            }
-            Permissions::Codex(permissions) => {
-                codex_args(model, effort.as_ref(), *permissions, plan, isolation)
-            }
-            Permissions::Agy => agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?),
-        })
-    }
-
-    /// How this delegate's turns run over `codex app-server`, or `None` when they cannot.
-    ///
-    /// Only a Codex delegate that inherits its account's settings qualifies.
-    /// The isolation every other consultation gets rests on `codex exec --ignore-user-config`,
-    /// and `codex app-server` has no equivalent: codex-cli 0.159.3 refuses that flag there, its
-    /// protocol schema has no field that skips `$CODEX_HOME/config.toml`, and a `-c` override
-    /// merges into the user's tables rather than replacing them, as `codex_args` records.
-    /// An isolated delegate therefore always runs over `exec`, where it cannot be steered; why a
-    /// private `CODEX_HOME` is no way round that is in [`crate::appserver`].
-    /// `codex-app-server-codegen refresh` refuses the first codex whose app-server takes the flag,
-    /// which is when to pass it here and let isolated delegates through.
-    ///
-    /// The permissions are this delegate's own, so the run store asks a delegate already held to
-    /// the machine file's limits, as [`Delegate::invocation`] holds it.
-    #[must_use]
-    pub fn app_server_settings(&self, config: &Config) -> Option<AppServerSettings> {
-        self.app_server_settings_under(self.resolved_isolation(config))
-    }
-
-    /// How this delegate's turns run over `codex app-server` under `isolation`, or `None` when
-    /// they cannot.
-    ///
-    /// [`Delegate::app_server_settings`] with the isolation already resolved, for a turn that
-    /// continues one whose isolation was pinned when it was admitted.
-    #[must_use]
-    pub(crate) fn app_server_settings_under(
-        &self,
-        isolation: Isolation,
-    ) -> Option<AppServerSettings> {
-        let Permissions::Codex(permissions) = &self.permissions else {
-            return None;
-        };
-        if !isolation.inherits() {
-            return None;
+        request: LaunchRequest<'_>,
+    ) -> Result<PreparedLaunch, DelegateError> {
+        match &self.permissions {
+            Permissions::Claude(permissions) => Ok(claude::prepare(self, permissions, request)),
+            Permissions::Codex(permissions) => codex::prepare(self, *permissions, request),
+            Permissions::Agy => agy::prepare(self, request),
         }
-        Some(AppServerSettings {
-            program: Vendor::Codex.program().to_owned(),
-            args: codex_app_server_args(self.effort.as_ref(), *permissions),
-            model: self.model.clone(),
-            sandbox: permissions.sandbox(),
-            network_access: permissions.network_access,
-        })
     }
+}
+
+/// A delegate admitted for one launch, and what that launch starts from.
+pub(crate) struct Admitted {
+    /// The delegate, held to the machine file's limits.
+    pub(crate) delegate: Delegate,
+    /// The environment of its identity and its request, which its vendor completes.
+    pub(crate) env: BTreeMap<String, String>,
+    /// The pricing it may run on.
+    pub(crate) billing: Billing,
+}
+
+/// What a run store gives a delegate's vendor to prepare one turn's launch from.
+pub(crate) struct LaunchRequest<'a> {
+    /// The turn: its files, the session it resumes and the directories it reads.
+    pub(crate) plan: &'a TurnPlan<'a>,
+    /// The question, for a CLI that reads it as a record of its own.
+    pub(crate) question: &'a str,
+    /// The turn's directory, where a driver's plan is kept.
+    pub(crate) turn: &'a TurnDir,
+    /// The directory the delegate reads the project from, where its CLI is asked its version too.
+    pub(crate) cwd: &'a Path,
+    /// The environment the launch starts from: its identity's layers and its request's, or the
+    /// one the turn an automatic resume continues ran in.
+    pub(crate) env: BTreeMap<String, String>,
+    /// The pricing the delegate may run on.
+    pub(crate) billing: Billing,
+    /// What asks the delegate's CLI for its version.
+    pub(crate) launcher: &'a dyn Launcher,
+    /// The run store's root, resolved, which the child is told and where agy's isolated home is.
+    ///
+    /// Told rather than left to whatever the host exported: an agentmux started underneath the
+    /// delegate has to open the same store to recognise the delegate as its ancestor, and the
+    /// platform default can differ between the two environments.
+    pub(crate) store_root: &'a Path,
+    /// Whether a supervisor starts the delegate, and so can hold its input.
+    pub(crate) supervisor: bool,
+    /// The agentmux executable that runs a driver in place of the vendor's CLI, when the store
+    /// has one.
+    pub(crate) driver: Option<&'a Path>,
+    /// Whether every Codex turn runs with `codex exec`, as the consultation or the store asks;
+    /// only Codex reads it.
+    pub(crate) codex_exec: bool,
+}
+
+/// One turn's launch, as its vendor prepared it.
+pub(crate) struct PreparedLaunch {
+    /// What to run: the vendor's CLI, or the driver that stands in for it.
+    pub(crate) invocation: Invocation,
+    /// What the delegate reads on stdin.
+    pub(crate) stdin: Stdin,
+    /// The plan a driver runs under, serialised, which the store writes into the turn's directory.
+    pub(crate) plan_file: Option<String>,
+    /// How the delegate runs, which the store records and every later reader goes by.
+    pub(crate) mode: LaunchMode,
+    /// The CLI's version, as it printed it, or `None` when it could not say.
+    pub(crate) cli_version: Option<String>,
+    /// Where the launch keeps its configuration, when it is known.
+    pub(crate) config_dir: Option<PathBuf>,
+    /// Where it saves its session, which the store asks whether the child could write into.
+    pub(crate) session_store: Option<PathBuf>,
+}
+
+/// What a delegate reads on stdin.
+pub(crate) enum Stdin {
+    /// The turn's question, as it was asked.
+    Question,
+    /// A record of the CLI's own carrying the question, which the store writes beside it.
+    Record(String),
 }
 
 impl Delegate {

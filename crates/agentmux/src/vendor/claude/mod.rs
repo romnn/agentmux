@@ -8,10 +8,75 @@ use strum::VariantArray;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    DelegateError, Effort, Isolation, ModelId, TurnPlan, parse_token, release_of,
-    string_newtype_conversions,
+    Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch,
+    Stdin, TurnPlan, Vendor, parse_token, release_of, string_newtype_conversions,
 };
+use crate::run::{LaunchMode, RunStore};
 use crate::transcript::Usage;
+
+/// What a Claude turn whose supervisor holds its input runs with, beside the arguments
+/// `claude --print` has anyway.
+///
+/// - `--input-format stream-json`: the question, and then each steer, arrive as lines of input
+///   for as long as stdin is open.
+/// - `--replay-user-messages`: Claude echoes each input line as it takes it, with the id it was
+///   sent under, which is what places a steer in the transcript and proves it arrived.
+/// - `--permission-prompts none`: nobody is there to answer a permission prompt over the open
+///   input, so anything that would prompt is denied rather than waited for.
+const CLAUDE_STREAM_INPUT_ARGS: [&str; 5] = [
+    "--input-format",
+    "stream-json",
+    "--replay-user-messages",
+    "--permission-prompts",
+    "none",
+];
+
+/// Prepare a Claude turn's launch, as `delegate` with `permissions`.
+///
+/// The turn reads its input as stream-json from its supervisor, when it has one and the CLI
+/// starts as itself rather than through a Windows `.cmd` shim, whose process a cancellation could
+/// not stop the CLI through; otherwise it reads its question once.
+pub(crate) fn prepare(
+    delegate: &Delegate,
+    permissions: &ClaudePermissions,
+    request: LaunchRequest<'_>,
+) -> PreparedLaunch {
+    let LaunchRequest {
+        plan,
+        cwd,
+        env,
+        billing,
+        launcher,
+        store_root,
+        supervisor,
+        ..
+    } = request;
+    let args = claude_args(
+        &delegate.model,
+        delegate.effort.as_ref(),
+        permissions,
+        plan,
+        delegate.pinned_isolation(),
+    );
+    let mut invocation = Invocation::of_delegate(Vendor::Claude, args, env, billing);
+    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
+    let cli_version = launcher.version(&invocation, cwd);
+    let mode = if supervisor && crate::launch::starts_natively(&invocation) {
+        invocation.push_args(&CLAUDE_STREAM_INPUT_ARGS);
+        LaunchMode::ClaudeStreamInput
+    } else {
+        LaunchMode::DirectCli
+    };
+    PreparedLaunch {
+        config_dir: Vendor::Claude.config_dir(invocation.env()),
+        session_store: Vendor::Claude.session_store(invocation.env()),
+        invocation,
+        stdin: Stdin::Question,
+        plan_file: None,
+        mode,
+        cli_version,
+    }
+}
 
 /// The first Claude Code release whose `total_cost_usd` is the session's running total across
 /// `--resume` rather than the one call's, as Anthropic's cost-tracking documentation says.

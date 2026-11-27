@@ -8,8 +8,125 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
-use crate::delegate::{Effort, Isolation, ModelId, TurnPlan, release_of};
+use crate::appserver::DriverPlan;
+use crate::config::PermissionRefusal;
+use crate::delegate::{
+    Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch,
+    Stdin, TurnPlan, Vendor, release_of,
+};
+use crate::run::{LaunchMode, RunStore};
 use crate::transcript::Usage;
+
+/// Prepare a Codex turn's launch, as `delegate` with `permissions`.
+///
+/// It runs over `codex app-server`, driven by agentmux so that it can be steered, when it loads
+/// its account's settings, the store has a driver, and neither the consultation nor the store
+/// asked for `codex exec`.
+/// The isolation every other consultation gets rests on `codex exec --ignore-user-config`, and
+/// `codex app-server` has no equivalent: codex-cli 0.159.3 refuses that flag there, its protocol
+/// schema has no field that skips `$CODEX_HOME/config.toml`, and a `-c` override merges into the
+/// user's tables rather than replacing them, as `codex_args` records.
+/// An isolated delegate therefore always runs over `exec`, where it cannot be steered; why a
+/// private `CODEX_HOME` is no way round that is in [`crate::appserver`].
+/// `codex-app-server-codegen refresh` refuses the first codex whose app-server takes the flag,
+/// which is when to let isolated delegates through here.
+///
+/// # Errors
+///
+/// Returns [`DelegateError::Permission`] for a `codex exec` turn that needs a permission profile
+/// from a codex whose `--version` is not one verified to honour it.
+pub(crate) fn prepare(
+    delegate: &Delegate,
+    permissions: CodexPermissions,
+    request: LaunchRequest<'_>,
+) -> Result<PreparedLaunch, DelegateError> {
+    let LaunchRequest {
+        plan,
+        turn,
+        cwd,
+        env,
+        billing,
+        launcher,
+        store_root,
+        driver,
+        codex_exec,
+        ..
+    } = request;
+    let isolation = delegate.pinned_isolation();
+    let args = codex_args(
+        &delegate.model,
+        delegate.effort.as_ref(),
+        permissions,
+        plan,
+        isolation,
+    );
+    let mut invocation = Invocation::of_delegate(Vendor::Codex, args, env, billing);
+    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
+    // Asked of the CLI itself, before a driver can take its place.
+    let cli_version = launcher.version(&invocation, cwd);
+    let config_dir = Vendor::Codex.config_dir(invocation.env());
+    let session_store = Vendor::Codex.session_store(invocation.env());
+
+    // Driven over the app-server
+    if let Some(driver) = driver
+        && isolation.inherits()
+        && !codex_exec
+    {
+        let driver_plan = DriverPlan {
+            settings: AppServerSettings {
+                program: Vendor::Codex.program().to_owned(),
+                args: codex_app_server_args(delegate.effort.as_ref(), permissions),
+                model: delegate.model.clone(),
+                sandbox: permissions.sandbox(),
+                network_access: permissions.network_access,
+            },
+            cwd: cwd.to_path_buf(),
+            resume_thread_id: plan.resume.cloned(),
+            billing: invocation.billing(),
+            turn_dir: turn.root.clone(),
+        };
+        let plan_file = serde_json::to_string_pretty(&driver_plan).map_err(|err| {
+            DelegateError::Environment(format!("cannot write the app-server driver's plan: {err}"))
+        })?;
+        invocation.set_driver_command(
+            driver,
+            crate::appserver::SUBCOMMAND,
+            &turn.app_server_plan_path(),
+        );
+        return Ok(PreparedLaunch {
+            invocation,
+            stdin: Stdin::Question,
+            plan_file: Some(plan_file),
+            mode: LaunchMode::AppServer,
+            cli_version,
+            config_dir,
+            session_store,
+        });
+    }
+
+    // Run with `codex exec`, which reaches read-only with network only through a permission
+    // profile: a codex that does not honour one would replace it with whatever its configuration
+    // selects.
+    // The app-server sets the same policy as a field of the turn instead, and needs no profile.
+    if permissions.needs_permission_profile()
+        && !codex_supports_permission_profiles(cli_version.as_deref())
+    {
+        return Err(DelegateError::Permission(
+            PermissionRefusal::PermissionProfileUnsupported {
+                version: cli_version,
+            },
+        ));
+    }
+    Ok(PreparedLaunch {
+        invocation,
+        stdin: Stdin::Question,
+        plan_file: None,
+        mode: LaunchMode::DirectCli,
+        cli_version,
+        config_dir,
+        session_store,
+    })
+}
 
 /// What a Codex turn's report says it spent, whichever release wrote it.
 ///
@@ -317,8 +434,8 @@ fn workspace_network_args(permissions: CodexPermissions) -> Vec<String> {
 /// the server handles, and so does a workspace-write delegate's network choice; the model, the
 /// sandbox mode and the approval policy are fields of the `thread/start` or `thread/resume`
 /// request instead, and a read-only delegate's network is the sandbox policy of its `turn/start`.
-/// There is no isolation flag to pass: see [`Delegate::app_server_settings`] for why only an
-/// inheriting delegate runs this way.
+/// There is no isolation flag to pass: see [`prepare`] for why only an inheriting delegate runs
+/// this way.
 pub(crate) fn codex_app_server_args(
     effort: Option<&Effort>,
     permissions: CodexPermissions,

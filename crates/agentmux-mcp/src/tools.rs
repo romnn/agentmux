@@ -1597,7 +1597,7 @@ mod tests {
             .collect();
         let store = RunStore::open(state_directory.path(), launcher.clone(), host_env)
             .or_fail()?
-            .with_codex_app_server("/opt/agentmux");
+            .with_driver("/opt/agentmux");
         let run_status = store.start(&StartRequest {
             delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,

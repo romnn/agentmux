@@ -10,8 +10,68 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
-use crate::delegate::{DelegateError, Effort, ModelId, TurnPlan, Vendor};
+use crate::delegate::{
+    Delegate, DelegateError, Effort, Invocation, LaunchRequest, ModelId, PreparedLaunch, Stdin,
+    TurnPlan, Vendor,
+};
+use crate::run::{LaunchMode, RunStore};
 use crate::transcript::Usage;
+
+/// The home every isolated agy delegate of a run store runs in, under the store's root, which
+/// keeps their conversations for as long as the store is kept.
+///
+/// One for the store, because agy has one login, which its keyring holds.
+/// The store owns it: nothing but agy writes there, and nothing else should.
+const HOME_IN_STORE: &str = "agy-home";
+
+/// Prepare an agy turn's launch, as `delegate`.
+///
+/// An isolated delegate runs in the home its store keeps for it, and every turn reads its
+/// question as the one stream-json record [`agy_input`] writes.
+///
+/// # Errors
+///
+/// Returns [`DelegateError::Environment`] when the home an isolated delegate runs in cannot be
+/// made, and [`DelegateError::AgySettingsUnreadable`] when agy's own settings file in the home
+/// the delegate runs in cannot be read.
+pub(crate) fn prepare(
+    delegate: &Delegate,
+    request: LaunchRequest<'_>,
+) -> Result<PreparedLaunch, DelegateError> {
+    let LaunchRequest {
+        plan,
+        question,
+        cwd,
+        mut env,
+        billing,
+        launcher,
+        store_root,
+        ..
+    } = request;
+    // Set over every other layer, so no account or request can move it; see ADR 0035.
+    if !delegate.pinned_isolation().inherits() {
+        use_agy_home(&mut env, &store_root.join(HOME_IN_STORE))?;
+    }
+    // Built from the complete environment, whose home is where agy reads its own settings.
+    let args = agy_args(
+        &delegate.model,
+        delegate.effort.as_ref(),
+        plan,
+        &agy_user_rules(&env)?,
+    );
+    let mut invocation = Invocation::of_delegate(Vendor::Agy, args, env, billing);
+    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
+    let cli_version = launcher.version(&invocation, cwd);
+    Ok(PreparedLaunch {
+        config_dir: Vendor::Agy.config_dir(invocation.env()),
+        session_store: Vendor::Agy.session_store(invocation.env()),
+        invocation,
+        stdin: Stdin::Record(agy_input(question)),
+        plan_file: None,
+        mode: LaunchMode::DirectCli,
+        cli_version,
+    })
+}
 
 /// What an agy turn's report says it spent, whichever release wrote it.
 ///
@@ -165,10 +225,7 @@ pub(crate) fn agy_user_rules(
 /// Point `env` at `home`, the home an isolated agy delegate runs in, creating it on first use.
 ///
 /// Both spellings are set: `HOME`, and `USERPROFILE`, which is where agy looks on Windows.
-pub(crate) fn use_agy_home(
-    env: &mut BTreeMap<String, String>,
-    home: &Path,
-) -> Result<(), DelegateError> {
+fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), DelegateError> {
     std::fs::create_dir_all(home).map_err(|err| {
         DelegateError::Environment(format!(
             "cannot create the home an isolated agy delegate runs in, {}: {err}",

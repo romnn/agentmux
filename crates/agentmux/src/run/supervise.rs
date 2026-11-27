@@ -216,9 +216,10 @@ impl RunStore {
             Some(resume) => {
                 let configured = self
                     .with_supervisor(&resume.supervisor)
-                    .with_auto_resume(Some(resume.policy));
-                match &resume.codex_driver {
-                    Some(driver) => configured.with_codex_app_server(driver),
+                    .with_auto_resume(Some(resume.policy))
+                    .with_codex_exec(resume.codex_exec);
+                match &resume.driver {
+                    Some(driver) => configured.with_driver(driver),
                     None => configured,
                 }
             }
@@ -305,10 +306,15 @@ impl RunStore {
             }
             Some(_) | None => None,
         };
-        // Which file the delegate reads follows from who it is, which the consultation fixed; one
-        // whose record cannot be read is a turn that never started.
+        // The file the delegate reads is the one its plan names, or for a plan that names none
+        // follows from who it is, which the consultation fixed; a turn whose record cannot be
+        // read never starts.
         let stdin = match self.meta(&plan.run_id) {
-            Ok(meta) => turn.stdin(meta.delegate.vendor()),
+            Ok(meta) => plan
+                .producer
+                .stdin
+                .clone()
+                .unwrap_or_else(|| turn.stdin(meta.delegate.vendor())),
             Err(err) => return never_started(turn, err.to_string()),
         };
 
@@ -433,6 +439,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: dir.path().to_path_buf(),
                 billing: Billing::Subscription,
+                stdin: None,
             },
             auto_resume: None,
         };
@@ -616,24 +623,22 @@ mod tests {
         let open = || RunStore::open(dir.path(), launcher.clone(), env.clone());
 
         // The first turn runs over the app-server, directly, and has not gone yet.
-        let started = open()?
-            .with_codex_app_server("/opt/agentmux")
-            .start(&StartRequest {
-                delegate: Delegate {
-                    model: ModelId::parse("gpt-6-astra").or_fail()?,
-                    effort: None,
-                    account: AccountChoice::Default,
-                    isolation: Some(Isolation::Inherit),
-                    permissions: Permissions::Codex(CodexPermissions::default()),
-                },
-                question: "review this".to_owned(),
-                cwd: PathBuf::from("/work/project"),
-                retention: Retention::Ttl,
-                env: BTreeMap::new(),
-                billing: None,
-                force_codex_exec: false,
-                label: None,
-            })?;
+        let started = open()?.with_driver("/opt/agentmux").start(&StartRequest {
+            delegate: Delegate {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: None,
+                account: AccountChoice::Default,
+                isolation: Some(Isolation::Inherit),
+                permissions: Permissions::Codex(CodexPermissions::default()),
+            },
+            question: "review this".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })?;
         let run_id = started.run_id;
 
         // Its supervisor, this process, ran it under the earlier plan.

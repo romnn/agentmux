@@ -24,13 +24,14 @@ impl TurnDir {
     pub(super) fn question(&self) -> PathBuf {
         self.root.join("question.md")
     }
-    /// The question as a CLI that reads it as a record takes it, which only an agy turn's launch
-    /// writes.
+    /// The question as a CLI that reads it as a record takes it, which only a launch whose vendor
+    /// asks for one writes.
     pub(super) fn encoded_question(&self) -> PathBuf {
         self.root.join("question.jsonl")
     }
-    /// What a `vendor` delegate reads as its stdin: the encoded question for agy, and the question
-    /// itself for the others.
+    /// What a `vendor` delegate read as its stdin under a supervisor plan that names none, as an
+    /// older agentmux wrote them: the encoded question for agy, and the question itself for the
+    /// others.
     pub(super) fn stdin(&self, vendor: Vendor) -> PathBuf {
         match vendor {
             Vendor::Agy => self.encoded_question(),
@@ -89,7 +90,7 @@ impl TurnDir {
         self.root.join("cancelling")
     }
     /// The plan a turn driven over the app-server runs under.
-    pub(super) fn app_server_plan_path(&self) -> PathBuf {
+    pub(crate) fn app_server_plan_path(&self) -> PathBuf {
         self.root.join("app-server.json")
     }
     /// The plan the turn's supervisor runs under.
@@ -141,15 +142,6 @@ impl RunStore {
 
     pub(super) fn run_dir(&self, run_id: &RunId) -> PathBuf {
         self.runs_dir().join(run_id.as_str())
-    }
-
-    /// The home every isolated agy delegate of this store runs in, which keeps their
-    /// conversations for as long as the store is kept.
-    ///
-    /// One for the store, because agy has one login, which its keyring holds.
-    /// The store owns it: nothing but agy writes there, and nothing else should.
-    pub(super) fn agy_home(&self) -> PathBuf {
-        self.root.join("agy-home")
     }
 
     /// The directory of the turn with zero-based `index`, named by its one-based number, as the

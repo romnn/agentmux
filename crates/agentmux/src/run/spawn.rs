@@ -7,12 +7,11 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Billing, Delegate, DelegateError, Isolation, ModelId, Overrides, Permissions,
-    SessionRef, TurnPlan, Vendor,
+    AccountChoice, Admitted, Billing, Delegate, Isolation, LaunchRequest, ModelId, Overrides,
+    Permissions, PreparedLaunch, SessionRef, Stdin, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
-use crate::vendor::codex::{AppServerSettings, codex_supports_permission_profiles};
 
 use super::auto_resume::AutoResumePlan;
 use super::error::{NotResumable, RunError};
@@ -21,7 +20,7 @@ use super::label::RunLabel;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SettledTurn,
+    ExitRecord, InvocationRecord, LaunchRecord, Meta, ProducerCommand, SettledTurn,
     SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
@@ -123,36 +122,49 @@ pub(super) enum Resolution<'a> {
 }
 
 impl Resolution<'_> {
-    /// Build `delegate`'s child for `plan`, from `host_env`, the environment the store was opened
-    /// with, and with `agy_home` as the home an isolated agy delegate runs in.
+    /// What `delegate`'s launch for `plan` starts from, with `host_env` the environment the store
+    /// was opened with.
     fn resolve(
         self,
         delegate: &Delegate,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
-        agy_home: &Path,
     ) -> Result<Resolved, RunError> {
         Ok(match self {
-            Self::Configured(config) => Resolved {
-                invocation: delegate.invocation_in(plan, host_env, config, Some(agy_home))?,
-                app_server_settings: delegate.app_server_settings(config),
-                auto_resume: None,
-            },
+            Self::Configured(config) => {
+                let Admitted {
+                    delegate,
+                    env,
+                    billing,
+                } = delegate.admitted(plan, host_env, config)?;
+                Resolved {
+                    delegate,
+                    env,
+                    billing,
+                    auto_resume: None,
+                }
+            }
+            // Nothing is resolved again: the identity, the request's environment, the billing
+            // scrub and the recursion marker are already in the environment the supervisor holds,
+            // and the delegate is held to the limits the turn it continues was admitted under.
             Self::Inherited(Inherited { billing, attempt }) => Resolved {
-                invocation: delegate.continuation(plan, host_env.clone(), billing)?,
-                app_server_settings: delegate
-                    .app_server_settings_under(delegate.isolation.unwrap_or(Isolation::Isolated)),
+                delegate: delegate.clone(),
+                env: host_env.clone(),
+                billing,
                 auto_resume: Some(attempt),
             },
         })
     }
 }
 
-/// A turn's child as a [`Resolution`] built it.
+/// What a turn's launch starts from, as a [`Resolution`] resolved it.
 struct Resolved {
-    invocation: crate::delegate::Invocation,
-    /// How it runs over `codex app-server`, when it can.
-    app_server_settings: Option<AppServerSettings>,
+    /// The delegate the turn runs as.
+    delegate: Delegate,
+    /// The environment its vendor completes.
+    env: BTreeMap<String, String>,
+    /// The pricing it may run on.
+    billing: Billing,
     /// Which automatic resume it is, when it is one.
     auto_resume: Option<ResumeAttempt>,
 }
@@ -304,9 +316,9 @@ impl RunStore {
             delegate,
             rewritten_from,
             billing: Some(billing),
-            // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
+            // A store that runs Codex with `exec`, or drives nothing, says so for the follow-ups,
             // whichever store continues the consultation.
-            force_codex_exec: request.force_codex_exec || self.codex_driver.is_none(),
+            force_codex_exec: request.force_codex_exec || self.codex_exec || self.driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -686,7 +698,7 @@ impl RunStore {
     fn refuse_replaced_executables(&self) -> Result<(), RunError> {
         self.supervisor
             .iter()
-            .chain(&self.codex_driver)
+            .chain(&self.driver)
             .try_for_each(super::Executable::refuse_if_replaced)
     }
 }
@@ -743,77 +755,12 @@ impl LockedRun<'_> {
     }
 }
 
-/// What a Claude turn whose supervisor holds its input runs with, beside the arguments
-/// `claude --print` has anyway.
-///
-/// - `--input-format stream-json`: the question, and then each steer, arrive as lines of input
-///   for as long as stdin is open.
-/// - `--replay-user-messages`: Claude echoes each input line as it takes it, with the id it was
-///   sent under, which is what places a steer in the transcript and proves it arrived.
-/// - `--permission-prompts none`: nobody is there to answer a permission prompt over the open
-///   input, so anything that would prompt is denied rather than waited for.
-const CLAUDE_STREAM_INPUT_ARGS: [&str; 5] = [
-    "--input-format",
-    "stream-json",
-    "--replay-user-messages",
-    "--permission-prompts",
-    "none",
-];
-
 impl RunStore {
-    /// Decide how a turn runs, and point `invocation` at the driver when it is driven.
-    ///
-    /// Decided per turn, from the delegate's vendor, its app-server `settings` and this store: the
-    /// environment, the refusals and the billing already in `invocation` are the same either way,
-    /// and only what is run differs.
-    /// A Claude turn reads its input as stream-json from its supervisor, when it has one and the
-    /// CLI starts as itself rather than through a Windows `.cmd` shim, whose process a
-    /// cancellation could not stop the CLI through.
-    ///
-    /// Refused once an agentmux executable the turn would run has been replaced.
-    /// Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
-    /// during it would otherwise launch the new build with the plan this one writes; the caller
-    /// gives the claimed turn back.
-    pub(super) fn prepare_launch_mode(
-        &self,
-        turn: &TurnDir,
-        meta: &Meta,
-        settings: Option<AppServerSettings>,
-        resume: Option<&SessionRef>,
-        invocation: &mut crate::delegate::Invocation,
-    ) -> Result<LaunchMode, RunError> {
-        self.refuse_replaced_executables()?;
-        if meta.delegate.vendor() == Vendor::Claude {
-            if self.supervisor.is_none() || !crate::launch::starts_natively(invocation) {
-                return Ok(LaunchMode::DirectCli);
-            }
-            invocation.push_args(&CLAUDE_STREAM_INPUT_ARGS);
-            return Ok(LaunchMode::ClaudeStreamInput);
-        }
-        let (Some(driver), Some(settings), false) =
-            (&self.codex_driver, settings, meta.force_codex_exec)
-        else {
-            return Ok(LaunchMode::DirectCli);
-        };
-        let plan_path = turn.app_server_plan_path();
-        write_json(
-            &plan_path,
-            &crate::appserver::DriverPlan {
-                settings,
-                cwd: meta.cwd.clone(),
-                resume_thread_id: resume.cloned(),
-                billing: invocation.billing(),
-                turn_dir: turn.root.clone(),
-            },
-        )?;
-        invocation.set_driver_command(driver.path(), crate::appserver::SUBCOMMAND, &plan_path);
-        Ok(LaunchMode::AppServer)
-    }
-
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
-    /// [`Delegate::invocation`] holds it once more as it builds the launch.
+    /// [`Delegate::admitted`] holds it once more as it builds the launch's environment, and its
+    /// vendor prepares the rest.
     /// An automatic resume runs as the turn it continues ran, held to the limits that turn was
     /// admitted under, because its supervisor has no configuration to hold it to.
     pub(super) fn launch_into(
@@ -830,7 +777,8 @@ impl RunStore {
             resume,
             label,
         } = *next;
-        write_question(turn, delegate.vendor(), index, question)?;
+        std::fs::write(turn.question(), question)
+            .map_err(RunError::io(format!("writing turn {index} question")))?;
 
         let last_message = turn.last_message();
         // The consultation this one continues holds the transcript its first question points at.
@@ -844,32 +792,46 @@ impl RunStore {
             read_dirs: &read_dirs,
         };
         let Resolved {
-            mut invocation,
-            app_server_settings,
+            delegate: admitted,
+            env,
+            billing,
             auto_resume,
-        } = resolution.resolve(delegate, &plan, &self.host_env, &self.agy_home())?;
-        // The store's own root, resolved, rather than whatever the host exported: an agentmux
-        // started underneath this delegate has to open the same store to recognise the delegate
-        // as its ancestor, and the platform default can differ between the two environments.
-        invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
+        } = resolution.resolve(delegate, &plan, &self.host_env)?;
+        let PreparedLaunch {
+            invocation,
+            stdin,
+            plan_file,
+            mode: launch_mode,
+            cli_version,
+            config_dir,
+            session_store,
+        } = admitted.prepare(LaunchRequest {
+            plan: &plan,
+            question,
+            turn,
+            cwd: &meta.cwd,
+            env,
+            billing,
+            launcher: self.launcher.as_ref(),
+            store_root: &self.root,
+            supervisor: self.supervisor.is_some(),
+            driver: self.driver.as_ref().map(super::Executable::path),
+            codex_exec: meta.force_codex_exec || self.codex_exec,
+        })?;
 
-        // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
-        let cli_version = self.launcher.version(&invocation, &meta.cwd);
-        let launch_mode =
-            self.prepare_launch_mode(turn, meta, app_server_settings, resume, &mut invocation)?;
-        refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
+        // Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
+        // during it would otherwise launch the new build with the plan this one writes; the caller
+        // gives the claimed turn back.
+        self.refuse_replaced_executables()?;
+        let stdin = write_prepared_files(turn, index, stdin, plan_file)?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
         // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
-        let vendor = delegate.vendor();
-        let config_dir = vendor
-            .config_dir(invocation.env())
-            .map(|dir| meta.cwd.join(dir));
-        let unsaved_session_store = vendor
-            .session_store(invocation.env())
+        let config_dir = config_dir.map(|dir| meta.cwd.join(dir));
+        let unsaved_session_store = session_store
             .map(|store| meta.cwd.join(store))
             .filter(|store| !can_create_files_in(store));
         if let Some(store) = &unsaved_session_store {
@@ -920,13 +882,26 @@ impl RunStore {
             "launching delegate",
         );
 
+        self.start_child(turn, meta, index, &invocation, &stdin)
+    }
+
+    /// Start turn `index`'s delegate as `invocation`, reading `stdin`, under its supervisor when
+    /// this store supervises its turns, and record it.
+    fn start_child(
+        &self,
+        turn: &TurnDir,
+        meta: &Meta,
+        index: u32,
+        invocation: &crate::delegate::Invocation,
+        stdin: &Path,
+    ) -> Result<(), RunError> {
         if let Some(supervisor) = &self.supervisor {
-            return self.launch_supervisor(turn, meta, index, &invocation, supervisor.path());
+            return self.launch_supervisor(turn, meta, index, invocation, stdin, supervisor.path());
         }
         let launched = self.launcher.launch(&LaunchSpec {
-            invocation: &invocation,
+            invocation,
             cwd: &meta.cwd,
-            input: LaunchInput::Question(&turn.stdin(delegate.vendor())),
+            input: LaunchInput::Question(stdin),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -961,6 +936,7 @@ impl RunStore {
         meta: &Meta,
         index: u32,
         delegate: &crate::delegate::Invocation,
+        stdin: &Path,
         supervisor: &Path,
     ) -> Result<(), RunError> {
         let launch_id = uuid::Uuid::new_v4().simple().to_string();
@@ -977,14 +953,16 @@ impl RunStore {
                     args: delegate.args().to_vec(),
                     cwd: meta.cwd.clone(),
                     billing: delegate.billing(),
+                    stdin: Some(stdin.to_path_buf()),
                 },
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
                     supervisor: supervisor.to_path_buf(),
-                    codex_driver: self
-                        .codex_driver
+                    driver: self
+                        .driver
                         .as_ref()
                         .map(|driver| driver.path().to_path_buf()),
+                    codex_exec: self.codex_exec,
                 }),
             },
         )?;
@@ -1024,55 +1002,32 @@ impl RunStore {
     }
 }
 
-/// Write turn `index`'s question, and for a CLI that reads it as a record, the record it reads,
-/// which the transcript never shows.
-fn write_question(
-    turn: &TurnDir,
-    vendor: Vendor,
-    index: u32,
-    question: &str,
-) -> Result<(), RunError> {
-    std::fs::write(turn.question(), question)
-        .map_err(RunError::io(format!("writing turn {index} question")))?;
-    match vendor {
-        Vendor::Agy => std::fs::write(
-            turn.encoded_question(),
-            crate::vendor::agy::agy_input(question),
-        )
-        .map_err(RunError::io(format!(
-            "writing turn {index} encoded question"
-        ))),
-        Vendor::Claude | Vendor::Codex => Ok(()),
-    }
-}
-
-/// Refuse a `codex exec` turn that needs a permission profile from a codex whose `--version`,
-/// `cli_version`, is not one verified to honour it.
+/// Write what turn `index`'s prepared launch reads beside its question, and say which file is its
+/// stdin.
 ///
-/// `codex exec` reaches read-only with network only through a permission profile, which a codex
-/// that does not honour it would replace with whatever its configuration selects.
-/// The app-server sets the same policy as a field of the turn instead, and needs no profile.
-fn refuse_an_unverified_profile(
-    launch_mode: LaunchMode,
-    delegate: &Delegate,
-    cli_version: Option<&str>,
-) -> Result<(), RunError> {
-    let needs_profile = match delegate.permissions {
-        Permissions::Codex(permissions) => permissions.needs_permission_profile(),
-        Permissions::Claude(_) | Permissions::Agy => false,
+/// That is the record a CLI reads in place of its question, which the transcript never shows, and
+/// a driver's plan.
+fn write_prepared_files(
+    turn: &TurnDir,
+    index: u32,
+    stdin: Stdin,
+    plan_file: Option<String>,
+) -> Result<PathBuf, RunError> {
+    let stdin = match stdin {
+        Stdin::Question => turn.question(),
+        Stdin::Record(record) => {
+            std::fs::write(turn.encoded_question(), record).map_err(RunError::io(format!(
+                "writing turn {index} encoded question"
+            )))?;
+            turn.encoded_question()
+        }
     };
-    if launch_mode == LaunchMode::DirectCli
-        && needs_profile
-        && !codex_supports_permission_profiles(cli_version)
-    {
-        return Err(DelegateError::Permission(
-            crate::config::PermissionRefusal::PermissionProfileUnsupported {
-                version: cli_version.map(ToOwned::to_owned),
-            },
-        )
-        .into());
+    if let Some(plan_file) = plan_file {
+        let path = turn.app_server_plan_path();
+        crate::atomic_file::write_whole(&path, plan_file.as_bytes())
+            .map_err(RunError::io(format!("writing {}", path.display())))?;
     }
-    Ok(())
+    Ok(stdin)
 }
 
 /// Claim a turn index by creating its directory.

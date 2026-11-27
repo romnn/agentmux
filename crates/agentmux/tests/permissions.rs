@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentmux::appserver::DriverPlan;
 use agentmux::config::{Config, ConfigError, PermissionRefusal};
 use agentmux::delegate::{
     AccountAlias, AccountChoice, Delegate, DelegateError, Effort, Invocation, Isolation, ModelId,
@@ -923,14 +924,36 @@ fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// The plan the app-server driver of `delegate`'s first turn runs under, launched by a store with
+/// a driver on a machine with no configuration, where a consultation loads the user's settings.
+fn driver_plan(delegate: Delegate) -> Result<DriverPlan> {
+    let state = tempfile::tempdir().or_fail()?;
+    let host_env = BTreeMap::from([("HOME".to_owned(), "/home/dev".to_owned())]);
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
+    let store = RunStore::open(state.path(), launcher, host_env)?.with_driver("/opt/agentmux");
+    let started = store.start(&StartRequest {
+        delegate,
+        question: "q".to_owned(),
+        cwd: state.path().to_path_buf(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let turn = state
+        .path()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001");
+    DriverPlan::read(&turn.join("app-server.json")).or_fail()
+}
+
 /// A driven Codex turn is given the same network as `exec`: a read-only one's as the turn's
 /// sandbox policy, which the driver sends, and a workspace-write one's as a server override.
 #[gtest]
 fn the_app_server_gets_the_same_network_as_exec() -> Result<()> {
-    let config = Config::default();
-    let read_only = codex(Some(CodexSandbox::ReadOnly), Some(true))?
-        .app_server_settings(&config)
-        .or_fail()?;
+    let read_only = driver_plan(codex(Some(CodexSandbox::ReadOnly), Some(true))?)?.settings;
     assert_that!(read_only.sandbox, eq(CodexSandbox::ReadOnly));
     assert_that!(read_only.network_access, some(eq(true)));
     assert_that!(
@@ -941,9 +964,7 @@ fn the_app_server_gets_the_same_network_as_exec() -> Result<()> {
         eq(false)
     );
 
-    let workspace = codex(Some(CodexSandbox::WorkspaceWrite), Some(false))?
-        .app_server_settings(&config)
-        .or_fail()?;
+    let workspace = driver_plan(codex(Some(CodexSandbox::WorkspaceWrite), Some(false))?)?.settings;
     assert_that!(
         has_pair(
             &workspace.args,

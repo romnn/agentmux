@@ -6,12 +6,16 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use agentmux::appserver::DriverPlan;
 use agentmux::config::{Account, Config, Defaults, Secret};
 use agentmux::delegate::{
     AccountAlias, AccountChoice, Billing, Delegate, DelegateError, Effort, Invocation, Isolation,
     ModelId, Permissions, SessionRef, TurnPlan, Vendor,
 };
+use agentmux::run::{Retention, RunStore, StartRequest};
+use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::vendor::claude::ClaudePermissions;
 use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
@@ -1599,7 +1603,32 @@ fn a_checkout_cannot_switch_on_api_pricing() -> Result<()> {
 /// equivalent of, and a Claude delegate has no app-server at all.
 #[gtest]
 fn only_an_inheriting_codex_delegate_runs_over_the_app_server() -> Result<()> {
-    let config = Config::default();
+    // The plan the first turn's driver runs under, from a store with a driver, when it drives it.
+    let driven = |delegate: Delegate| -> Result<Option<DriverPlan>> {
+        let state = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
+        let store = RunStore::open(state.path(), launcher, host_session_env())?
+            .with_driver("/opt/agentmux");
+        let started = store.start(&StartRequest {
+            delegate,
+            question: "q".to_owned(),
+            cwd: state.path().to_path_buf(),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })?;
+        let plan = state
+            .path()
+            .join("runs")
+            .join(started.run_id.as_str())
+            .join("turns/0001/app-server.json");
+        plan.exists()
+            .then(|| DriverPlan::read(&plan))
+            .transpose()
+            .or_fail()
+    };
     let isolated_codex = every_delegate()?.swap_remove(2);
     let inheriting_codex = Delegate {
         isolation: Some(Isolation::Inherit),
@@ -1610,10 +1639,10 @@ fn only_an_inheriting_codex_delegate_runs_over_the_app_server() -> Result<()> {
         ..every_delegate()?.swap_remove(0)
     };
 
-    assert_that!(isolated_codex.app_server_settings(&config), none());
-    assert_that!(inheriting_claude.app_server_settings(&config), none());
+    assert_that!(driven(isolated_codex)?, none());
+    assert_that!(driven(inheriting_claude)?, none());
 
-    let settings = inheriting_codex.app_server_settings(&config).or_fail()?;
+    let settings = driven(inheriting_codex)?.or_fail()?.settings;
     // The same model, effort and sandbox `exec` would have been given.
     assert_that!(settings.program, eq("codex"));
     assert_that!(

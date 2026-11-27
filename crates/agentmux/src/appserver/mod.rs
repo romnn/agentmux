@@ -137,8 +137,7 @@
 //!
 //! # What runs this way
 //!
-//! Only a Codex delegate that inherits its account's settings: see
-//! [`crate::delegate::Delegate::app_server_settings`].
+//! Only a Codex delegate that inherits its account's settings: see `vendor::codex::prepare`.
 //! An isolated delegate's isolation is `codex exec --ignore-user-config`, and codex-cli 0.159.3's
 //! app-server has no such flag; its own source keeps that loader override to `exec` and the TUI.
 //! Running it with a private `CODEX_HOME` holding only the login instead was rejected, because
@@ -150,8 +149,8 @@
 //! otherwise.
 //! `codex-app-server-codegen refresh` refuses a codex whose app-server accepts
 //! `--ignore-user-config`, so the release that adds it is the one that changes this.
-//! Everything else, and every Codex turn when the store was opened without a driver, runs over
-//! `codex exec` and refuses `steer` with the reason.
+//! Everything else, and every Codex turn when the store was opened without a driver or with
+//! `codex_exec`, runs over `codex exec` and refuses `steer` with the reason.
 //!
 //! # Where the protocol comes from
 //!

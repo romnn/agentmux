@@ -78,7 +78,7 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
     let launcher = Arc::new(ScriptedLauncher::new(scripts));
     let store = RunStore::open(dir.path(), launcher.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER_PATH);
+        .with_driver(DRIVER_PATH);
     Ok(Harness {
         store: Arc::new(store),
         launcher,
@@ -234,7 +234,7 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
     let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
     let driving = RunStore::open(dir.path(), later.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER_PATH);
+        .with_driver(DRIVER_PATH);
     driving.follow_up(&started.run_id, "And the session code?")?;
 
     assert_that!(
