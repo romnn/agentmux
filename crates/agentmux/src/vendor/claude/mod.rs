@@ -1,5 +1,7 @@
 //! Anthropic's `claude` CLI: its permission mode and tool lists, and the arguments it runs with.
 
+pub mod fold;
+
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 

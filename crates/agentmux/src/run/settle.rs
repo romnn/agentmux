@@ -274,7 +274,9 @@ pub(super) fn fold_events(
     input: Option<&StreamInput>,
 ) -> Fold {
     match input {
-        Some(input) => stream::claude::fold_stream_input(index, question, events, input),
+        Some(input) => {
+            crate::vendor::claude::fold::fold_stream_input(index, question, events, input)
+        }
         None => stream::fold(vendor, index, question, events),
     }
 }
@@ -1140,7 +1142,7 @@ fn keep_unfinished(turn: &mut Turn, unfinished: Option<String>) {
 /// failed.
 fn classify_exit(vendor: Vendor, detail: &str) -> FailureKind {
     let kind = match vendor {
-        Vendor::Agy => stream::agy::classify(detail),
+        Vendor::Agy => crate::vendor::agy::fold::classify(detail),
         Vendor::Claude | Vendor::Codex => stream::classify(detail),
     };
     match kind {

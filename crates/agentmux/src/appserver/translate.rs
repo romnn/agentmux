@@ -1,6 +1,6 @@
 //! Turns `codex app-server` notifications into the events `codex exec --json` writes.
 //!
-//! The capture a turn leaves is folded by [`crate::stream::codex`] whichever way the turn ran, so
+//! The capture a turn leaves is folded by [`crate::vendor::codex::fold`] whichever way the turn ran, so
 //! this is the only place that knows the two shapes differ.
 //! Notifications are decoded into the types generated from codex's own schema; the events written
 //! are the `exec` stream's, which is agentmux's capture format.
@@ -51,7 +51,7 @@ use codex_app_server_protocol::{Method as _, RawParams, types as wire};
 use serde_json::Value;
 
 use super::protocol::{ThreadId, TurnId};
-use crate::stream::codex::{
+use crate::vendor::codex::fold::{
     CaptureEvent, CapturedQuestion, CapturedQuestions, UndecodedServerOutput,
 };
 
@@ -797,7 +797,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{Translator, TurnEndStatus, TurnId};
-    use crate::stream::codex::CaptureEvent;
+    use crate::vendor::codex::fold::CaptureEvent;
 
     fn serialize_capture_events(events: &[CaptureEvent]) -> Vec<Value> {
         events

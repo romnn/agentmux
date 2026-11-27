@@ -1,6 +1,8 @@
 //! Google's Antigravity CLI, `agy`: its fixed permission policy, the home an isolated one runs
 //! in, and the arguments and input it runs with.
 
+pub mod fold;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

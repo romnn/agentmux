@@ -27,7 +27,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::appserver::mailbox::{ClaimedSteer, Mailbox, SteerReply};
-use crate::stream::claude::InputBoundary;
+use crate::vendor::claude::fold::InputBoundary;
 
 use super::RunStore;
 use super::id::RunId;

@@ -30,7 +30,7 @@ use super::translate::{self, Translator, TurnEndStatus};
 use crate::delegate::{Billing, scrub_billing_env};
 use crate::left_running::{LeftRunning, bounded_name};
 use crate::run::layout::TurnDir;
-use crate::stream::codex::CaptureEvent;
+use crate::vendor::codex::fold::CaptureEvent;
 
 /// How often the cancel marker, the mailbox and the server process are looked at while a turn
 /// runs.

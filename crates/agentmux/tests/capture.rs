@@ -291,7 +291,7 @@ fn a_steered_claude_turn_shows_the_steer_where_claude_took_it() {
         last_result,
         steers_taken,
         ..
-    } = stream::claude::fold_stream_input(0, "q", fixtures::CLAUDE_STEERED, &input);
+    } = agentmux::vendor::claude::fold::fold_stream_input(0, "q", fixtures::CLAUDE_STEERED, &input);
 
     assert_that!(
         turn.messages,
@@ -325,7 +325,7 @@ fn a_steered_claude_turn_shows_the_steer_where_claude_took_it() {
 fn a_foreign_echo_is_never_a_steer() {
     let Fold {
         turn, steers_taken, ..
-    } = stream::claude::fold_stream_input(
+    } = agentmux::vendor::claude::fold::fold_stream_input(
         0,
         "q",
         fixtures::CLAUDE_STEERED,
@@ -373,7 +373,8 @@ fn a_steer_taken_after_the_result_is_answered_as_the_turns_answer() -> Result<()
         {{"type":"result","is_error":false,"result":"A story. PELICAN","usage":{{"input_tokens":2,"output_tokens":20}},"total_cost_usd":0.3}}
     "#};
     let input = stream_input()?;
-    let fold = |events: &str| stream::claude::fold_stream_input(0, "q", events, &input);
+    let fold =
+        |events: &str| agentmux::vendor::claude::fold::fold_stream_input(0, "q", events, &input);
 
     // The first `result` closes the input and would stand.
     let answered = fold(&first);
@@ -430,7 +431,7 @@ fn a_superseded_failure_is_kept_and_an_unreadable_result_stands_for_nothing() ->
     let input = stream_input()?;
     let Fold {
         turn, last_result, ..
-    } = stream::claude::fold_stream_input(0, "q", &failed_then_answered, &input);
+    } = agentmux::vendor::claude::fold::fold_stream_input(0, "q", &failed_then_answered, &input);
     assert_that!(
         last_result,
         some(matches_pattern!(Outcome::Completed { .. }))
@@ -453,7 +454,7 @@ fn a_superseded_failure_is_kept_and_an_unreadable_result_stands_for_nothing() ->
         input: turn_input,
         last_result,
         ..
-    } = stream::claude::fold_stream_input(0, "q", &unreadable, &input);
+    } = agentmux::vendor::claude::fold::fold_stream_input(0, "q", &unreadable, &input);
     assert_that!(last_result, none());
     assert_that!(turn_input, eq(TurnInput::Closed));
     assert_that!(turn.unrecognised.summary(), some(anything()));
@@ -476,7 +477,8 @@ fn a_reopening_ends_with_the_cli_turn_it_reopened() -> Result<()> {
         {{"type":"assistant","message":{{"content":[{{"type":"text","text":"The tests pass."}}]}},"parent_tool_use_id":null}}
         {{"type":"result","is_error":false,"result":"The tests pass."}}
     "#};
-    let Fold { turn, .. } = stream::claude::fold_stream_input(0, "q", &events, &stream_input()?);
+    let Fold { turn, .. } =
+        agentmux::vendor::claude::fold::fold_stream_input(0, "q", &events, &stream_input()?);
     let rendered = render_turn(&turn);
     assert_that!(
         rendered,

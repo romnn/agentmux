@@ -606,7 +606,9 @@ pub mod fixtures {
         #[must_use]
         pub fn fold(&self, stream: &str) -> crate::stream::Fold {
             match &self.input {
-                Some(input) => crate::stream::claude::fold_stream_input(0, "q", stream, input),
+                Some(input) => {
+                    crate::vendor::claude::fold::fold_stream_input(0, "q", stream, input)
+                }
                 None => crate::stream::fold(self.vendor, 0, "q", stream),
             }
         }

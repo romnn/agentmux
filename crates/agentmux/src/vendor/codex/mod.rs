@@ -1,6 +1,8 @@
 //! The `codex` CLI: its sandbox and network, and the arguments `codex exec` and
 //! `codex app-server` run with.
 
+pub mod fold;
+
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
