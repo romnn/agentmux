@@ -170,24 +170,78 @@ fn a_rate_limit_with_no_alternative_still_advises_from_the_window() -> Result<()
     Ok(())
 }
 
-/// One account reporting a figure, for building a status by hand.
+/// One account reporting a figure, for building a status by hand, in the shape its vendor reports
+/// it: a weekly window `percent` used.
 ///
 /// The vendor is a parameter because the advice must only ever name an account of the vendor that
 /// failed: an alias from the other vendor's table resolves to nothing but a paid round trip.
 fn reported(vendor: Vendor, alias: &str, percent: i64) -> Result<AccountQuota> {
+    let payload = match vendor {
+        Vendor::Claude => serde_json::json!({
+            "utilization": {"limits": [
+                {"kind": "weekly_all", "percent": percent, "severity": "normal"}
+            ]}
+        }),
+        Vendor::Codex => {
+            let bucket = serde_json::json!({
+                "limitId": "codex",
+                "primary": {"usedPercent": percent, "windowDurationMins": 10080}
+            });
+            serde_json::json!({
+                "rateLimits": bucket,
+                "rateLimitsByLimitId": {"codex": bucket}
+            })
+        }
+        Vendor::Agy => {
+            let left = 1.0 - f64::from(i32::try_from(percent).or_fail()?) / 100.0;
+            serde_json::json!({
+                "groups": [{"name": "Gemini Models", "buckets": [
+                    {"window": "weekly", "remaining_fraction": left}
+                ]}]
+            })
+        }
+    };
     Ok(AccountQuota {
         vendor,
         account: Some(agentmux::delegate::AccountAlias::parse(alias).or_fail()?),
         description: None,
         observation: Observation::Reported {
             origin: Origin::Live,
-            payload: serde_json::json!({
-                "utilization": {"limits": [
-                    {"kind": "weekly_all", "percent": percent, "severity": "normal"}
-                ]}
-            }),
+            payload,
         },
     })
+}
+
+/// Each vendor's figures read as its own windows, and a payload filed under another vendor than
+/// the one that reports in its shape reads as none this build recognises.
+#[gtest]
+fn each_vendor_reads_its_own_windows() -> Result<()> {
+    let rendered = |entry: &AccountQuota| agentmux::report::quota_report(entry).join("\n");
+
+    assert_that!(
+        rendered(&reported(Vendor::Claude, "work", 11)?),
+        contains_substring("weekly_all: 11% used")
+    );
+    assert_that!(
+        rendered(&reported(Vendor::Codex, "work", 11)?),
+        contains_substring("codex: 11% used over 10080m")
+    );
+    assert_that!(
+        rendered(&reported(Vendor::Agy, "work", 25)?),
+        contains_substring("Gemini Models weekly: 25% used")
+    );
+
+    let misfiled = AccountQuota {
+        vendor: Vendor::Codex,
+        ..reported(Vendor::Claude, "work", 11)?
+    };
+    let misfiled = rendered(&misfiled);
+    assert_that!(misfiled, not(contains_substring("11%")));
+    assert_that!(
+        misfiled,
+        contains_substring("no window this build recognises")
+    );
+    Ok(())
 }
 
 /// A window that has already reopened must not send the caller to another subscription.

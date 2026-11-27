@@ -712,8 +712,8 @@ pub fn quota_block(status: &RunStatus) -> Vec<String> {
 /// One account's quota, as lines a reader scans.
 ///
 /// The vendor payloads have nothing in common — Claude reports a `limits` array of percentages,
-/// Codex a map of named buckets, agy groups of buckets — so this reads whichever shape is present
-/// and says nothing when it recognises none.
+/// Codex a map of named buckets, agy groups of buckets — so each vendor's own reader reads its
+/// payload, and nothing is said of windows when it recognises none.
 /// It is presentation only: the payload itself is passed through untouched, so a field this
 /// function has never heard of still reaches a caller reading the JSON.
 #[must_use]
@@ -737,10 +737,12 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
         }
         Observation::Reported { origin, payload } => {
             lines.push(format!("  {}", describe_origin(origin)));
-            let windows = claude::quota::windows(payload)
-                .or_else(|| codex::quota::windows(payload))
-                .or_else(|| agy::quota::windows(payload))
-                .unwrap_or_default();
+            let windows = match entry.vendor {
+                Vendor::Claude => claude::quota::windows(payload),
+                Vendor::Codex => codex::quota::windows(payload),
+                Vendor::Agy => agy::quota::windows(payload),
+            }
+            .unwrap_or_default();
             if windows.is_empty() {
                 lines.push("  no window this build recognises; read the payload".to_owned());
             }
