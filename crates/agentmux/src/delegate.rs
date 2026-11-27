@@ -1588,6 +1588,11 @@ impl Invocation {
             .insert(name.to_owned(), dir.to_string_lossy().into_owned());
     }
 
+    /// Add `args` to the end of the argument vector.
+    pub(crate) fn push_args(&mut self, args: &[&str]) {
+        self.args.extend(args.iter().map(|arg| (*arg).to_owned()));
+    }
+
     /// Run this executable's hidden `subcommand` on `plan_path` in place of the vendor's CLI, with
     /// the same environment and pricing: the app-server driver that is then the delegate, or the
     /// supervisor that starts it.

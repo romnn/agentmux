@@ -8,7 +8,7 @@
 `claude --print` offers no channel into a turn that has started; only `codex app-server` accepts
 input for a running turn.
 That statement about Claude is superseded by
-[0034](0034-claude-turns-driven-over-stream-json-input.md): given its input as stream-json,
+[0034](0034-claude-input-held-by-its-supervisor.md): given its input as stream-json,
 `claude --print` takes more.
 A JSON-RPC server needs a client holding its stdin for as long as the turn
 runs, and a consultation must survive the CLI or MCP server that started it. The run store and the

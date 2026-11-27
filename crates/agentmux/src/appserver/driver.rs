@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, PipeWriter, Read as _, Write};
 use std::path::Path;
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -22,13 +22,14 @@ use codex_app_server_protocol::{ClientRequest, Method as _, TypedParams, TypedRe
 use serde_json::Value;
 
 use super::DriverPlan;
-use super::leftovers::Cohort;
+use super::leftovers::{Cohort, ProcessIdentity, SeenProcess};
 use super::mailbox::{ClaimedSteer, Mailbox, SteerReply};
 use super::protocol;
 use super::protocol::{ThreadId, TurnId, TurnTarget};
 use super::translate::{self, Translator, TurnEndStatus};
-use crate::drivers::{self, PipedChild, ProcessIdentity};
-use crate::left_running::LeftRunning;
+use crate::delegate::{Billing, scrub_billing_env};
+use crate::left_running::{LeftRunning, bounded_name};
+use crate::run::layout::TurnDir;
 use crate::stream::codex::CaptureEvent;
 
 /// How often the cancel marker, the mailbox and the server process are looked at while a turn
@@ -51,6 +52,16 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(8);
 /// to leave by end of input and only then by signal.
 const SERVER_EXIT_GRACE: Duration = Duration::from_secs(5);
 
+/// How long what the server left running is given between the polite signal and the forceful one.
+const SWEEP_GRACE: Duration = Duration::from_secs(2);
+
+/// How long, once the forceful signal is due, what is found below the driver keeps being killed
+/// and looked for again.
+///
+/// A process forked after one read of the process table is only found by the next, and the
+/// driver's exit would not stop it: an adopted orphan is handed on to another parent, not killed.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
 /// How long, once the sweep has given up, what it killed is given before the driver looks at it
 /// a last time to report what became of it.
 const REPORT_SETTLE: Duration = Duration::from_millis(100);
@@ -63,8 +74,20 @@ const REPORT_SETTLE: Duration = Duration::from_millis(100);
 /// honours the cancellation is never killed in the middle of cleaning up.
 pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
     .saturating_add(SERVER_EXIT_GRACE)
-    .saturating_add(drivers::SWEEP_BUDGET)
+    .saturating_add(SWEEP_GRACE)
+    .saturating_add(KILL_GRACE)
     .saturating_add(REPORT_SETTLE);
+
+/// How long a driver waits for its turn's launch record to name it before it gives the turn up.
+///
+/// The caller writes that record as soon as the spawn returns, so a driver normally finds it on
+/// its first look, and one that never comes means the caller died in between.
+/// Generous, because giving up breaks a turn that is otherwise sound, while waiting only delays a
+/// driver whose caller is already gone.
+const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the launch record is looked for while it is not there yet.
+const LAUNCH_RECORD_POLL: Duration = Duration::from_millis(20);
 
 /// How long the driver waits on the server at each point where it waits for an answer.
 ///
@@ -141,7 +164,7 @@ pub fn drive(plan_path: &Path) -> i32 {
     // Confirmed once, before anything starts: once a turn's launch record exists, a
     // follow-up never takes its directory over as an abandoned claim, so every file this
     // driver later opens by path stays its own turn's.
-    if let Err(reason) = drivers::confirm_launch(&plan.turn(), drivers::LAUNCH_RECORD_WAIT) {
+    if let Err(reason) = confirm_launch(&plan.turn(), LAUNCH_RECORD_WAIT) {
         eprintln!("agentmux: {reason}, so codex app-server was not started");
         return 2;
     }
@@ -152,21 +175,17 @@ pub fn drive(plan_path: &Path) -> i32 {
     }
 
     let adopting = adopt_orphans();
-    drivers::contain_descendants("codex app-server");
-    let spawned = drivers::spawn_piped(
-        &plan.settings.program,
-        &plan.settings.args,
-        &plan.cwd,
-        plan.billing,
-    );
-    let PipedChild {
+    contain_descendants();
+    let Server {
         mut child,
-        input: to_server,
-    } = match spawned {
+        to_server,
+    } = match spawn_server(&plan) {
         Ok(spawned) => spawned,
         Err(error) => {
             eprintln!(
-                "agentmux: {error} Otherwise, {}.",
+                "agentmux: cannot run `{} app-server`: {error}. Is it installed and on PATH? \
+                 Otherwise, {}.",
+                plan.settings.program,
                 super::EXEC_FALLBACK_HINT
             );
             return 1;
@@ -247,6 +266,39 @@ fn keep_left_running(plan: &DriverPlan, left_running: Option<LeftRunning>) {
             "agentmux: cannot keep what this turn left running in {}: {err}",
             path.display()
         ),
+    }
+}
+
+/// Wait up to `wait` for the turn's launch record to name this process.
+///
+/// A caller that dies between spawning the driver and recording it leaves a directory that a
+/// follow-up takes over as an abandoned claim and recreates under the same path.
+/// A driver that went on regardless would claim the new turn's steers and overwrite its closing
+/// message, so it stops unless the record names it.
+/// Returns why the turn is not this driver's: the record names another process, cannot be read,
+/// or never appeared.
+fn confirm_launch(turn: &TurnDir, wait: Duration) -> Result<(), String> {
+    let driver_pid = std::process::id();
+    let deadline = Instant::now() + wait;
+    loop {
+        match turn.read_launch_identity() {
+            Ok(Some(launched)) if launched.pid == driver_pid => return Ok(()),
+            Ok(Some(launched)) => {
+                return Err(format!(
+                    "the turn at {} was launched as process {}, not as this driver ({driver_pid})",
+                    turn.root.display(),
+                    launched.pid
+                ));
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(LAUNCH_RECORD_POLL),
+            Ok(None) => {
+                return Err(format!(
+                    "no launch record for the turn at {} appeared within {wait:?}",
+                    turn.root.display()
+                ));
+            }
+            Err(err) => return Err(format!("cannot read the turn's launch record: {err}")),
+        }
     }
 }
 
@@ -1037,6 +1089,53 @@ fn refusal(error: &RpcError) -> String {
     }
 }
 
+struct Server {
+    child: Child,
+    to_server: PipeWriter,
+}
+
+/// Start `codex app-server` for the plan, in the turn's working directory.
+///
+/// Its stderr is the driver's own, which is the turn's `stderr.log`.
+/// The environment is the driver's, which the launcher built; under a subscription it is
+/// scrubbed again here, because this is where the process that could spend money is made.
+/// It stays in the driver's process group, so a driver the store has to signal takes the server
+/// with it.
+/// Returns the server and the write end of its input, a pipe of the driver's own so the driver
+/// can hold the input open through a second handle.
+fn spawn_server(plan: &DriverPlan) -> std::io::Result<Server> {
+    let mut env: std::collections::BTreeMap<String, String> = crate::host_env();
+    if plan.billing == Billing::Subscription {
+        scrub_billing_env(&mut env);
+    }
+    // The driver's own stdio is the turn's capture files, which the server must not hold beyond
+    // what it is given.
+    crate::launch::keep_std_handles_from_children();
+    let spawn = |program: &str| -> std::io::Result<Server> {
+        let (input, to_server) = std::io::pipe()?;
+        let child = std::process::Command::new(program)
+            .args(&plan.settings.args)
+            .current_dir(&plan.cwd)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok(Server { child, to_server })
+    };
+    let program = plan.settings.program.as_str();
+    match spawn(program) {
+        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
+        // bare name.
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            spawn(&format!("{program}.cmd")).map_err(|_| error)
+        }
+        spawned => spawned,
+    }
+}
+
 /// Close the server's input, wait for it to leave, and stop whatever it left running.
 ///
 /// The commands a turn runs are the server's descendants, and codex's sandbox starts each in a
@@ -1047,9 +1146,12 @@ fn refusal(error: &RpcError) -> String {
 /// turn ran, which reaches a command whose server crashed before then.
 /// On Linux the driver adopts the server's orphans (see [`adopt_orphans`]), so such a command, or
 /// one a command started while it was being stopped, is still found below it.
-/// Each process is asked to stop and then made to ([`drivers::sweep`]).
+/// Each process is asked to stop and then made to, recognised by its pid and start time so a pid
+/// reused meanwhile is left alone.
 /// Elsewhere an orphan neither reading saw is out of reach: on macOS, any process started and
 /// orphaned between two of the once-a-second records.
+/// Once the polite signal's grace is over, every read for [`KILL_GRACE`] longer kills what it
+/// finds, so a process forked during the sweep is still caught.
 ///
 /// Returns what the turn left running, as a [`Cohort`] decides it from these reads, and what
 /// became of each once it was signalled; `None` when it left nothing.
@@ -1065,10 +1167,10 @@ fn stop_server(
     // Read with each process's parent, which is what tells what runs below the server — its MCP
     // servers and command shells, which codex stops itself — from what had already left its
     // tree.
-    let before_eof = drivers::process_tree(driver_pid);
+    let before_eof = process_tree(driver_pid);
     let mut cohort = Cohort::new(server_pid, &before_eof, &recorded_descendants);
     let mut known_descendants = recorded_descendants;
-    drivers::add_unseen(
+    add_unseen(
         &mut known_descendants,
         before_eof.iter().map(|process| process.identity),
     );
@@ -1084,8 +1186,43 @@ fn stop_server(
     let _ = child.kill();
     let _ = child.wait();
 
-    if drivers::sweep(&known_descendants, |alive| cohort.observe(alive)) {
-        return cohort.report(&[]);
+    let polite_until = Instant::now() + SWEEP_GRACE;
+    let forceful_until = polite_until + KILL_GRACE;
+    let mut signalled_processes: Vec<ProcessIdentity> = Vec::new();
+    loop {
+        let mut processes_to_check = descendants(driver_pid);
+        add_unseen(
+            &mut processes_to_check,
+            known_descendants
+                .iter()
+                .chain(&signalled_processes)
+                .copied(),
+        );
+        let now = Instant::now();
+        let polite = now < polite_until;
+        // Every pass after the polite one kills all it finds, so what was forked since the last
+        // read is killed by the next one.
+        let alive = observe_and_signal(&processes_to_check, |process| {
+            if !polite {
+                Some(sysinfo::Signal::Kill)
+            } else if signalled_processes.contains(&process) {
+                None
+            } else {
+                Some(sysinfo::Signal::Term)
+            }
+        });
+        cohort.observe(&alive);
+        if alive.is_empty() {
+            return cohort.report(&[]);
+        }
+        if !polite && now >= forceful_until {
+            break;
+        }
+        add_unseen(
+            &mut signalled_processes,
+            alive.iter().map(|process| process.identity),
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     // The sweep gave up with something just killed: one last look says what it became.
@@ -1093,12 +1230,23 @@ fn stop_server(
         return None;
     }
     std::thread::sleep(REPORT_SETTLE);
-    let still_alive: Vec<ProcessIdentity> =
-        drivers::observe_and_signal(&cohort.identities(), |_| None)
-            .into_iter()
-            .map(|process| process.identity)
-            .collect();
+    let still_alive: Vec<ProcessIdentity> = observe_and_signal(&cohort.identities(), |_| None)
+        .into_iter()
+        .map(|process| process.identity)
+        .collect();
     cohort.report(&still_alive)
+}
+
+/// Add to `known` each of `processes` it does not hold yet.
+fn add_unseen(
+    known: &mut Vec<ProcessIdentity>,
+    processes: impl IntoIterator<Item = ProcessIdentity>,
+) {
+    for process in processes {
+        if !known.contains(&process) {
+            known.push(process);
+        }
+    }
 }
 
 /// Make the driver the parent of whatever its descendants orphan, so [`stop_server`] can still
@@ -1151,10 +1299,7 @@ impl DescendantMonitor {
                 if adopting {
                     reap_exited_orphans(server_pid);
                 } else if ticks.is_multiple_of(Self::DESCENDANT_SNAPSHOT_TICKS) {
-                    drivers::add_unseen(
-                        &mut recorded_descendants,
-                        drivers::descendants(driver_pid),
-                    );
+                    add_unseen(&mut recorded_descendants, descendants(driver_pid));
                 }
                 ticks = ticks.wrapping_add(1);
                 std::thread::sleep(POLL_INTERVAL);
@@ -1195,4 +1340,221 @@ fn reap_exited_orphans(server_pid: u32) {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = server_pid;
+}
+
+/// On Windows, put the driver into a job object that kills everything still in it when the
+/// driver exits, so what the server leaves running goes with it.
+///
+/// Every process the driver or its descendants start joins the job, and none is ever looked up
+/// by its parent: Windows keeps the parent pid a process was created with after that parent has
+/// gone, and a pid of ours that reuses it would claim someone else's process.
+/// A process codex deliberately starts outside its own job is let go, as codex intends.
+/// The handle is never closed by hand, so the job outlives everything the driver does and ends
+/// with its process.
+/// A driver that cannot make the job says so on stderr, and stops only the server itself.
+fn contain_descendants() {
+    #[cfg(windows)]
+    {
+        let mut limits = win32job::ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close().limit_breakaway_ok();
+        let contained = win32job::Job::create_with_limit_info(&limits)
+            .and_then(|job| job.assign_current_process().map(|()| job.into_handle()));
+        if let Err(error) = contained {
+            eprintln!("agentmux: cannot hold what codex app-server starts in a job: {error}");
+        }
+    }
+}
+
+/// A fresh read of the process table, with each process's parent and start time: of `pids`, or
+/// of every process when `pids` is `None`.
+///
+/// `None` where the table cannot be read at all, which reads as no process found.
+///
+/// Threads are left out: Linux lists each as a child of its process, and a signal to one is a
+/// signal to the whole process — the driver's own included.
+fn process_table(pids: Option<&[sysinfo::Pid]>) -> Option<sysinfo::System> {
+    let mut system = sysinfo::System::new().ok()?;
+    system.refresh_processes_specifics(
+        pids.map_or(
+            sysinfo::ProcessesToUpdate::All,
+            sysinfo::ProcessesToUpdate::Some,
+        ),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().without_tasks(),
+    );
+    Some(system)
+}
+
+/// Every process below `root`, with the start time that tells it apart from a later holder of
+/// its pid, its parent and its name.
+///
+/// A process counts as a child only if it started no earlier than its parent, so a pid reused
+/// since cannot claim an older process.
+/// Always empty on Windows, where the job object of [`contain_descendants`] stops them instead
+/// and a recorded parent pid proves nothing.
+fn process_tree(root: u32) -> Vec<SeenProcess> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let Some(system) = process_table(None) else {
+        return Vec::new();
+    };
+    let Some(root_started) = system
+        .process(sysinfo::Pid::from_u32(root))
+        .map(sysinfo::Process::start_time)
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<SeenProcess> = Vec::new();
+    let mut parents = vec![ProcessIdentity {
+        pid: root,
+        start_time_secs: root_started,
+    }];
+    while let Some(parent) = parents.pop() {
+        for (pid, process) in system.processes() {
+            let pid = pid.as_u32();
+            let start_time_secs = process.start_time();
+            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent.pid)
+                && start_time_secs >= parent.start_time_secs
+                && pid != root
+                && !found.iter().any(|known| known.identity.pid == pid)
+            {
+                let identity = ProcessIdentity {
+                    pid,
+                    start_time_secs,
+                };
+                found.push(SeenProcess {
+                    identity,
+                    parent_pid: Some(parent.pid),
+                    name: process_name(process),
+                });
+                parents.push(identity);
+            }
+        }
+    }
+    found
+}
+
+/// [`process_tree`], without what only the sweep's report needs.
+fn descendants(root: u32) -> Vec<ProcessIdentity> {
+    process_tree(root)
+        .into_iter()
+        .map(|process| process.identity)
+        .collect()
+}
+
+/// A process's name, bounded as a report keeps it; never its arguments, which can carry secrets.
+fn process_name(process: &sysinfo::Process) -> String {
+    bounded_name(&process.name().to_string_lossy())
+}
+
+/// Returns every process of `tree` that is still alive, after sending each the signal `signal`
+/// chooses for it, if any.
+///
+/// A process counts as alive while its pid still has the start time recorded for it and it has
+/// not exited.
+/// One read decides both, so no process is reported alive that the signal chosen for it missed.
+///
+/// A pid whose start time no longer matches belongs to someone else and is left alone, and a
+/// platform without the polite signal gets the forceful one.
+fn observe_and_signal(
+    tree: &[ProcessIdentity],
+    signal: impl Fn(ProcessIdentity) -> Option<sysinfo::Signal>,
+) -> Vec<SeenProcess> {
+    if tree.is_empty() {
+        return Vec::new();
+    }
+    let pids: Vec<sysinfo::Pid> = tree
+        .iter()
+        .map(|process| sysinfo::Pid::from_u32(process.pid))
+        .collect();
+    let Some(system) = process_table(Some(&pids)) else {
+        return Vec::new();
+    };
+    let mut alive = Vec::new();
+    for &identity in tree {
+        let Some(process) = system.process(sysinfo::Pid::from_u32(identity.pid)) else {
+            continue;
+        };
+        let exited = matches!(
+            process.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        );
+        if process.start_time() != identity.start_time_secs || exited {
+            continue;
+        }
+        if let Some(signal) = signal(identity)
+            && process.kill_with(signal).is_none()
+        {
+            process.kill();
+        }
+        alive.push(SeenProcess {
+            identity,
+            parent_pid: process.parent().map(sysinfo::Pid::as_u32),
+            name: process_name(process),
+        });
+    }
+    alive
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use googletest::prelude::*;
+
+    use super::confirm_launch;
+    use crate::launch::Launched;
+    use crate::run::layout::TurnDir;
+
+    /// Record `pid` as the turn's child, whole, as the store does once the spawn returns.
+    fn record_launch(turn: &TurnDir, pid: u32) -> Result<()> {
+        let record = serde_json::json!({
+            "launched": Launched {
+                pid,
+                process_group: Some(pid),
+                started: None,
+            },
+            "started_at": "2026-10-19T12:00:00Z",
+        });
+        crate::atomic_file::write_whole(&turn.launch(), record.to_string().as_bytes()).or_fail()
+    }
+
+    /// A driver goes on only when its turn's launch record names it: a record naming another
+    /// process, one that cannot be parsed, and one that never appears all stop it.
+    #[gtest]
+    fn a_driver_runs_only_the_turn_its_launch_record_names() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let turn = TurnDir {
+            root: dir.path().to_path_buf(),
+        };
+        let wait = Duration::from_millis(50);
+
+        let missing = confirm_launch(&turn, wait);
+        assert_that!(missing, err(contains_substring("no launch record")));
+
+        record_launch(&turn, std::process::id().wrapping_add(1))?;
+        let other = confirm_launch(&turn, wait);
+        assert_that!(other, err(contains_substring("not as this driver")));
+
+        std::fs::write(turn.launch(), "{").or_fail()?;
+        let unreadable = confirm_launch(&turn, wait);
+        assert_that!(unreadable, err(contains_substring("cannot read")));
+
+        record_launch(&turn, std::process::id())?;
+        assert_that!(confirm_launch(&turn, wait), ok(()));
+
+        // A record written after the driver first looks is still found.
+        std::fs::remove_file(turn.launch()).or_fail()?;
+        let recorder = std::thread::spawn({
+            let turn = turn.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                record_launch(&turn, std::process::id())
+            }
+        });
+        assert_that!(confirm_launch(&turn, Duration::from_secs(10)), ok(()));
+        recorder.join().ok().or_fail()??;
+        Ok(())
+    }
 }

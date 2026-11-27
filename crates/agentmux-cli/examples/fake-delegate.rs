@@ -9,7 +9,7 @@
 //!
 //! Asked for `--version` it says so and exits.
 //! Otherwise it reads its question from stdin: to its end, or as its first line when its
-//! arguments say `--input-format stream-json`, as Claude's do once agentmux drives it and keeps its
+//! arguments say `--input-format stream-json`, as a Claude turn's do once its supervisor holds its
 //! input open.
 //! It then writes the configured stream and stderr, waits until the configured release file
 //! exists, its directory has gone or [`LONGEST_WAIT`] has passed, writes what it was told to write

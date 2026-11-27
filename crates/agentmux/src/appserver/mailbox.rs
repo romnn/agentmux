@@ -1,21 +1,21 @@
-//! The files a steered message travels through, between whoever steers and the driver.
+//! The files a steered message travels through, between whoever steers and the driver: a Codex
+//! turn's driver, or a Claude turn's supervisor, which answers only a message it rejects.
 //!
-//! Both drivers serve a mailbox: the app-server driver's and the Claude driver's
-//! ([`crate::claude_stream`]).
 //! One message is one file name stem, and its suffix is its part:
 //!
 //! ```text
 //! <stem>.request.json   written by the caller, whole, by renaming a temporary file into place
-//! <stem>.decision.json  claimed by the driver, which then hands it to the CLI, or withdrawn by a
+//! <stem>.decision.json  claimed by the driver, which then sends `turn/steer`, or withdrawn by a
 //!                       caller that stopped waiting; created exactly once
-//! <stem>.reply.json     written by the driver, whole, once the CLI has taken it or the driver
-//!                       knows it never will
+//! <stem>.reply.json     written by the driver, whole, once the server has answered
 //! ```
 //!
 //! Claiming and withdrawing both create the one decision file, so exactly one of them succeeds:
 //! a message the caller withdrew is never sent, and a message the driver claimed is answered as
 //! accepted, rejected, or, when it was sent and the server never said, unconfirmed.
 //! Stems sort by the time they were submitted, so the driver sends them in that order.
+//! Each stem ends in the message's own id, a UUID, which a Claude turn's supervisor sends it to
+//! Claude under.
 //!
 //! The decision is created with `atomic_file::create_once`, which says why a rename could not
 //! arbitrate it.
@@ -23,6 +23,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 const REQUEST: &str = "request.json";
 const DECISION: &str = "decision.json";
@@ -40,6 +41,14 @@ pub struct SteerId {
     stem: String,
 }
 
+impl SteerId {
+    /// The message's own id.
+    #[must_use]
+    pub fn uuid(&self) -> Option<Uuid> {
+        id_of(&self.stem)
+    }
+}
+
 /// One message the driver has claimed and must answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedSteer {
@@ -48,19 +57,33 @@ pub struct ClaimedSteer {
     pub text: String,
 }
 
+impl ClaimedSteer {
+    /// The message's own id.
+    #[must_use]
+    pub fn uuid(&self) -> Option<Uuid> {
+        id_of(&self.stem)
+    }
+}
+
+/// The id a message's stem ends in.
+fn id_of(stem: &str) -> Option<Uuid> {
+    let (_, id) = stem.rsplit_once('-')?;
+    Uuid::try_parse(id).ok()
+}
+
 /// What the driver says about a message it claimed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SteerReply {
-    /// The CLI took it into the running turn, and the capture records it.
+    /// The server accepted it into the running turn.
     Accepted,
-    /// The CLI, or the driver, refused it; it was not delivered.
+    /// The server, or the driver, refused it; it was not delivered.
     Rejected {
-        /// Why, in the CLI's words when it gave any.
+        /// Why, in the server's words when it gave any.
         reason: String,
     },
-    /// It was sent, but whether the CLI took it is unknown: the turn or the CLI ended before
-    /// the CLI said, or the CLI took it and the transcript could not record it.
+    /// It was sent, but whether the server took it is unknown: the turn or the server ended
+    /// before the server answered, or the server took it and the transcript could not record it.
     Unconfirmed {
         /// What happened instead of an answer.
         reason: String,
@@ -103,11 +126,7 @@ impl Mailbox {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let unique_suffix = uuid::Uuid::new_v4().simple().to_string();
-        let stem = format!(
-            "{nanos:024}-{}",
-            unique_suffix.get(..8).unwrap_or("00000000")
-        );
+        let stem = format!("{nanos:024}-{}", Uuid::new_v4().simple());
         let body = serde_json::to_string(&Request {
             text: text.to_owned(),
         })
@@ -166,6 +185,43 @@ impl Mailbox {
         self.decide(&steer_id.stem, Decision::Withdrawn)
     }
 
+    /// The stems of every request ever submitted, oldest first.
+    ///
+    /// A mailbox nobody has written to yet has none.
+    fn request_stems(&self) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let suffix = format!(".{REQUEST}");
+        let mut stems = Vec::new();
+        for entry in entries {
+            if let Some(stem) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(&suffix))
+            {
+                stems.push(stem.to_owned());
+            }
+        }
+        stems.sort_unstable();
+        Ok(stems)
+    }
+
+    /// The ids of every message ever submitted, whatever became of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mailbox is there but cannot be listed.
+    pub fn request_ids(&self) -> std::io::Result<Vec<Uuid>> {
+        Ok(self
+            .request_stems()?
+            .iter()
+            .filter_map(|stem| id_of(stem))
+            .collect())
+    }
+
     /// Claim every waiting request, oldest first.
     ///
     /// A request that cannot be read after it was claimed is answered as rejected on the spot,
@@ -176,10 +232,7 @@ impl Mailbox {
     }
 
     /// Claim the oldest waiting request, for a driver that hands its CLI one message at a time
-    /// and leaves the rest to be withdrawn meanwhile.
-    ///
-    /// A request that cannot be read is rejected, as [`Mailbox::claim_all`] rejects one, and
-    /// the next is claimed in its place.
+    /// and leaves the rest waiting, where their senders can still withdraw them.
     #[must_use]
     pub fn claim_next(&self) -> Option<ClaimedSteer> {
         self.claim_oldest(1).into_iter().next()
@@ -187,24 +240,8 @@ impl Mailbox {
 
     /// Claim up to `limit` waiting requests, oldest first.
     fn claim_oldest(&self, limit: usize) -> Vec<ClaimedSteer> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
-        };
-        let suffix = format!(".{REQUEST}");
-        let mut stems: Vec<String> = entries
-            .flatten()
-            .filter_map(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_suffix(&suffix))
-                    .map(ToOwned::to_owned)
-            })
-            .collect();
-        stems.sort_unstable();
-
         let mut claims = Vec::new();
-        for stem in stems {
+        for stem in self.request_stems().unwrap_or_default() {
             if claims.len() >= limit {
                 break;
             }

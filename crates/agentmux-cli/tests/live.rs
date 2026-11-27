@@ -13,7 +13,8 @@
 //! `AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` name each vendor's account from
 //! the machine's `agentmux.toml`; without one the file's default, or the CLI's own login, is
 //! used.
-//! The driver is the `agentmux` built with these tests, never an installed one.
+//! The driver and the supervisor are the `agentmux` built with these tests, never an installed
+//! one.
 //! The store is kept, and its path printed, so a failure's capture can be read afterwards.
 
 use std::collections::BTreeMap;
@@ -37,6 +38,9 @@ const MODEL: &str = "gpt-6-luna";
 
 /// The cheapest Claude model, which still runs a command and follows an instruction.
 const CLAUDE_MODEL: &str = "haiku";
+
+/// What the Claude test steers its turn with.
+const STEER: &str = "Also put the word STEERED at the end of that line.";
 
 /// Start, steer, finish, follow up, and cancel one consultation over the real app-server.
 #[gtest]
@@ -156,9 +160,10 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     Ok(())
 }
 
-/// Steer a real Claude turn while its command runs, over stream-json input, and read the steer and
-/// the answer it produced back from the transcript.
-/// The steer is sent once Claude has called Bash, and lands between that call and the answer.
+/// Steer a real Claude turn while its command runs, through the input its supervisor holds, and
+/// read the steer and the answer it produced back from the transcript.
+/// The steer is sent once Claude has called Bash, and Claude takes it once that call has
+/// returned, before it reports its result.
 ///
 /// Isolated, so no hook or setting of the machine's own changes what Claude does, and allowed to
 /// run `sleep` alone.
@@ -172,7 +177,7 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
     std::fs::create_dir_all(&project).or_fail()?;
     let store = RunStore::open(root.join("state"), Arc::new(ProcessLauncher::new()), env)
         .or_fail()?
-        .with_claude_driver(env!("CARGO_BIN_EXE_agentmux"));
+        .with_supervisor(env!("CARGO_BIN_EXE_agentmux"));
 
     let started = store.start(&StartRequest {
         delegate: Delegate::Claude {
@@ -212,9 +217,7 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
         assert_that!(Instant::now() < deadline, eq(true), "Claude never ran Bash");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    store
-        .steer(&id, "Also put the word STEERED at the end of that line.")
-        .await?;
+    store.steer(&id, STEER).await?;
     store
         .wait_until_terminal(&id, Duration::from_secs(300))
         .await?;
@@ -231,7 +234,7 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
         .or_fail()?;
     let steered = lines
         .iter()
-        .position(|line| line_type(line) == Some("agentmux.steer"))
+        .position(|line| echoes(line, STEER))
         .or_fail()?;
     let reported = lines
         .iter()
@@ -252,13 +255,24 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
 }
 
 /// The lines of the first turn's capture in the consultation at `run_dir`, as far as they are
-/// written.
+/// written, which is none before the supervisor has started Claude.
 fn capture_lines(run_dir: &Path) -> Result<Vec<Value>> {
-    let capture = std::fs::read_to_string(run_dir.join("turns/0001/events.jsonl")).or_fail()?;
+    let capture = match std::fs::read_to_string(run_dir.join("turns/0001/events.jsonl")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.or_fail()?,
+    };
     Ok(capture
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect())
+}
+
+/// Whether a capture line is Claude's echo of the input message `text`, as it takes it.
+fn echoes(line: &Value, text: &str) -> bool {
+    line.get("isReplay") == Some(&Value::Bool(true))
+        && content_blocks(line, "user")
+            .iter()
+            .any(|block| block.get("text").and_then(Value::as_str) == Some(text))
 }
 
 /// A capture line's `type`.

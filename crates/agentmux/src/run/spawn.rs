@@ -10,8 +10,7 @@ use crate::delegate::{
     AccountChoice, AppServerSettings, Billing, Delegate, DelegateError, Isolation, ModelId,
     PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
-use crate::launch::{LaunchSpec, Liveness};
-use crate::stream::LaunchMode;
+use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
 
 use super::auto_resume::AutoResumePlan;
@@ -21,7 +20,7 @@ use super::label::RunLabel;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchRecord, Meta, ProducerCommand, SettledTurn,
+    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SettledTurn,
     SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
@@ -676,7 +675,6 @@ impl RunStore {
         self.supervisor
             .iter()
             .chain(&self.codex_driver)
-            .chain(&self.claude_driver)
             .try_for_each(super::Executable::refuse_if_replaced)
     }
 }
@@ -733,14 +731,32 @@ impl LockedRun<'_> {
     }
 }
 
+/// What a Claude turn whose supervisor holds its input runs with, beside the arguments
+/// `claude --print` has anyway.
+///
+/// - `--input-format stream-json`: the question, and then each steer, arrive as lines of input
+///   for as long as stdin is open.
+/// - `--replay-user-messages`: Claude echoes each input line as it takes it, with the id it was
+///   sent under, which is what places a steer in the transcript and proves it arrived.
+/// - `--permission-prompts none`: nobody is there to answer a permission prompt over the open
+///   input, so anything that would prompt is denied rather than waited for.
+const CLAUDE_STREAM_INPUT_ARGS: [&str; 5] = [
+    "--input-format",
+    "stream-json",
+    "--replay-user-messages",
+    "--permission-prompts",
+    "none",
+];
+
 impl RunStore {
     /// Decide how a turn runs, and point `invocation` at the driver when it is driven.
     ///
     /// Decided per turn, from the delegate's vendor, its app-server `settings` and this store: the
     /// environment, the refusals and the billing already in `invocation` are the same either way,
     /// and only what is run differs.
-    /// A driven Claude turn runs `claude` with exactly the arguments in `invocation`, which its
-    /// driver adds its input to.
+    /// A Claude turn reads its input as stream-json from its supervisor, when it has one and the
+    /// CLI starts as itself rather than through a Windows `.cmd` shim, whose process a
+    /// cancellation could not stop the CLI through.
     ///
     /// Refused once an agentmux executable the turn would run has been replaced.
     /// Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
@@ -756,26 +772,11 @@ impl RunStore {
     ) -> Result<LaunchMode, RunError> {
         self.refuse_replaced_executables()?;
         if meta.delegate.vendor() == Vendor::Claude {
-            let Some(driver) = &self.claude_driver else {
+            if self.supervisor.is_none() || !crate::launch::starts_natively(invocation) {
                 return Ok(LaunchMode::DirectCli);
-            };
-            let plan_path = turn.claude_stream_plan_path();
-            write_json(
-                &plan_path,
-                &crate::claude_stream::DriverPlan {
-                    program: invocation.program().to_owned(),
-                    args: invocation.args().to_vec(),
-                    cwd: meta.cwd.clone(),
-                    billing: invocation.billing(),
-                    turn_dir: turn.root.clone(),
-                },
-            )?;
-            invocation.set_driver_command(
-                driver.path(),
-                crate::claude_stream::SUBCOMMAND,
-                &plan_path,
-            );
-            return Ok(LaunchMode::ClaudeStream);
+            }
+            invocation.push_args(&CLAUDE_STREAM_INPUT_ARGS);
+            return Ok(LaunchMode::ClaudeStreamInput);
         }
         let (Some(driver), Some(settings), false) =
             (&self.codex_driver, settings, meta.force_codex_exec)
@@ -914,7 +915,7 @@ impl RunStore {
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
-            question: &turn.question(),
+            input: LaunchInput::Question(&turn.question()),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -973,10 +974,6 @@ impl RunStore {
                         .codex_driver
                         .as_ref()
                         .map(|driver| driver.path().to_path_buf()),
-                    claude_driver: self
-                        .claude_driver
-                        .as_ref()
-                        .map(|driver| driver.path().to_path_buf()),
                 }),
             },
         )?;
@@ -987,7 +984,7 @@ impl RunStore {
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
-            question: &turn.question(),
+            input: LaunchInput::Question(&turn.question()),
             events: &log,
             stderr: &log,
         })?;

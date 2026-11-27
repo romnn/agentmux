@@ -16,7 +16,9 @@ The rendered transcript is append-only for the life of a consultation, and a tur
 frozen once something settles it:
 
 - A terminal stream event ends the fold. A terminal stream outcome takes precedence over an exit
-  record; process observation settles only a turn that neither has settled.
+  record; process observation settles only a turn that neither has settled. A Claude turn that
+  reads its input from its supervisor has no terminal stream event, and its exit record settles
+  it ([0034](0034-claude-input-held-by-its-supervisor.md)).
 - When no terminal stream event has settled the turn, an observed departure records the capture
   length, exit status and stderr tail once (`ExitRecord::Exited` in
   `crates/agentmux/src/run/records.rs`). Later folds reread only the recorded capture prefix and use

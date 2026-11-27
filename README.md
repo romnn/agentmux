@@ -698,7 +698,8 @@ delegate can run over it:
 - A Claude turn reads its input as stream-json lines while it runs, and takes a steer once the
   tool it is running has finished, before its next model call. Once it has reported its result it
   takes no more; a message sent before then and taken after it is answered as a further turn of
-  its own, and that answer is the turn's.
+  its own, and that answer is the turn's. A `claude` found only as a Windows `.cmd` shim runs as
+  `claude --print`, which reads its question once and cannot be steered.
 
 `steerable: yes` appears once the turn is running; for the first seconds, while the delegate opens
 its thread, a steer is refused with a request to send it again shortly.
@@ -707,17 +708,16 @@ Everything else is refused with the reason, and a refused message is never in th
 consultation that is not running or is being cancelled, a delegate launched another way, a message
 the server rejected, and one the turn ended before picking up (it is withdrawn unsent). A message
 that was sent but never answered — the turn or the server ended first, or no answer came within
-30 seconds — is reported as unconfirmed rather than refused, because the delegate may have taken
-it, and one Claude did not confirm within those 30 seconds may still arrive; read the transcript
-before sending it again.
+30 seconds — is reported as unconfirmed rather than refused, because the delegate may have taken it,
+and one Claude has not taken within those 30 seconds may still arrive; read the transcript before
+sending it again.
 
-**How a driven Claude turn runs.** `agentmux` itself, run as a detached child exactly where
-`claude --print` would be, runs `claude` with the same arguments plus
-`--input-format stream-json --replay-user-messages`, hands it the question and then each steer as
-an input line, and writes what Claude prints to the turn's capture, with each steer where Claude
-took it. Claude's input closes once it has reported its result, and `cancel` has the driver stop
-Claude, and what Claude was running then, before anything is signalled. [ADR 0034](adr/0034-claude-turns-driven-over-stream-json-input.md)
-explains why it is built this way.
+**How a Claude turn takes a steer.** The turn's supervisor starts `claude` with the arguments
+`--print` would have, plus `--input-format stream-json --replay-user-messages`, and holds its input:
+it writes the question, then each steer as a line of its own, and closes the input once Claude has
+reported its result. Claude writes its stream to the turn's capture itself, and echoes each line it
+takes; a steer is delivered once its echo is there, which is also where the transcript shows it.
+[ADR 0034](adr/0034-claude-input-held-by-its-supervisor.md) explains why it is built this way.
 
 **How a driven Codex turn runs.** `agentmux` itself, run as a detached child exactly where
 `codex exec` would be, starts `codex app-server`, runs the one turn with `approvalPolicy: never`,
@@ -733,7 +733,8 @@ is out of reach.
 `crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
-with `codex exec` instead, for a CLI whose app-server cannot run them; nothing is steerable then.
+with `codex exec` instead, for a CLI whose app-server cannot run them; no Codex turn is steerable
+then.
 `codex_exec: true` on `start` or `ask` does the same for one consultation, and its follow-ups keep
 it. When a driven turn fails, or codex sends something agentmux cannot read, the status says so and
 points at these switches: that is what a codex whose app-server protocol has moved looks like.
@@ -798,10 +799,10 @@ server has one.
 `cancel` marks the turn as cancelling, asks the delegate to stop, waits a few seconds, makes it
 stop if it did not, waits a few seconds more, and then records the cancellation. A turn run over
 `codex app-server` is first interrupted through the protocol and given up to about twenty seconds to
-close and clear up after itself, and a Claude turn's driver up to about fifteen seconds to stop
-Claude and what it was running. The record freezes the transcript at what the child had written by
+close and clear up after itself. The record freezes the transcript at what the child had written by
 then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
-that had already finished its turn when the signal landed is reported as having finished. A
+that had already finished its turn when the signal landed is reported as having finished, but for a
+Claude turn, which ends when Claude exits and may still be answering a steer after its result. A
 `status` or `tail` that happens to see the child go first records the same cancellation. The record
 does not prove the child left: one that somehow survives both signals is stopped again by the next
 `cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose process

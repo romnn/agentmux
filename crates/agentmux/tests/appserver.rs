@@ -384,13 +384,7 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
 
     // Folded like any Codex turn: the instruction is a steer between the two replies, and the
     // usage is the server's running total.
-    let Fold { turn, session, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        0,
-        QUESTION,
-        &run.capture,
-    );
+    let Fold { turn, session, .. } = stream::fold(Vendor::Codex, 0, QUESTION, &run.capture);
     assert_that!(
         session.as_ref().map(SessionRef::as_str),
         some(eq(THREAD_ID))
@@ -446,13 +440,7 @@ fn a_steered_turn_records_the_instruction_where_the_server_accepted_it() -> Resu
             .iter()
             .flat_map(|line| [*line, "\n"])
             .collect();
-        let Fold { turn, .. } = stream::fold(
-            Vendor::Codex,
-            stream::LaunchMode::AppServer,
-            0,
-            "q",
-            &prefix,
-        );
+        let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &prefix);
         let rendered = render_turn(&turn);
         assert_that!(rendered.starts_with(&previous), eq(true), "cut at {cut}");
         previous = rendered;
@@ -494,13 +482,7 @@ fn a_steer_the_server_refuses_is_answered_and_not_recorded() -> Result<()> {
     assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
     // Not in the capture under any name, and so in nothing a reader is shown.
     assert_that!(run.capture, not(contains_substring("REFUSED-SENTINEL")));
-    let folded = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        0,
-        "q",
-        &run.capture,
-    );
+    let folded = stream::fold(Vendor::Codex, 0, "q", &run.capture);
     assert_that!(
         render_turn(&folded.turn),
         not(contains_substring("REFUSED-SENTINEL"))
@@ -626,13 +608,7 @@ fn a_follow_up_resumes_its_thread_with_its_settings_pinned() -> Result<()> {
         })))
     );
     // The resumed thread is announced, which is what the fold checks continuity against.
-    let Fold { session, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        1,
-        "q",
-        &run.capture,
-    );
+    let Fold { session, .. } = stream::fold(Vendor::Codex, 1, "q", &run.capture);
     assert_that!(
         session.as_ref().map(SessionRef::as_str),
         some(eq(THREAD_ID))
@@ -678,13 +654,7 @@ fn an_approval_request_is_declined_and_noted() -> Result<()> {
         answer.and_then(|message| message.get("result").cloned()),
         some(eq(&json!({"decision": "decline"})))
     );
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        0,
-        "q",
-        &run.capture,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &run.capture);
     assert_that!(
         render_turn(&turn),
         contains_substring("agentmux declined codex's `item/commandExecution/requestApproval`")
@@ -1350,14 +1320,8 @@ fn an_app_server_turn_reads_like_the_same_turn_from_exec() -> Result<()> {
             |_| {},
         )?;
 
-        let driven = stream::fold(
-            Vendor::Codex,
-            stream::LaunchMode::AppServer,
-            0,
-            "q",
-            &run.capture,
-        );
-        let written = stream::fold(Vendor::Codex, stream::LaunchMode::AppServer, 0, "q", exec);
+        let driven = stream::fold(Vendor::Codex, 0, "q", &run.capture);
+        let written = stream::fold(Vendor::Codex, 0, "q", exec);
         expect_that!(
             render_turn(&driven.turn),
             eq(&render_turn(&written.turn)),
@@ -1755,13 +1719,7 @@ fn a_plan_report_survives_a_closing_message_that_cannot_be_written() -> Result<(
     let run = run(&plan, complete_turn_with_plan, |_| {})?;
 
     assert_that!(run.outcome, eq(&DriverOutcome::TurnEnded));
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        0,
-        "q",
-        &run.capture,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &run.capture);
     assert_that!(render_turn(&turn).matches(PLAN).count(), eq(1));
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
     Ok(())
@@ -1916,13 +1874,7 @@ fn a_plan_fallback_is_recorded_once_if_the_end_cannot_be_written() -> Result<()>
 
     assert_that!(driven.outcome, matches_pattern!(DriverOutcome::Failed(_)));
     let capture = String::from_utf8(driven.capture_writer.capture).or_fail()?;
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        0,
-        "q",
-        &capture,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", &capture);
     assert_that!(render_turn(&turn).matches(PLAN).count(), eq(1));
     Ok(())
 }

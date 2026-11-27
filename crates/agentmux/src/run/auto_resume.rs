@@ -101,11 +101,6 @@ pub(super) struct AutoResumePlan {
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
     /// that launched this turn drives them.
     pub(super) codex_driver: Option<PathBuf>,
-    /// The agentmux executable that drives a Claude turn over stream-json input, when the store
-    /// that launched this turn drives them; absent from a plan an agentmux older than driving them
-    /// wrote.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) claude_driver: Option<PathBuf>,
 }
 
 /// `auto-resume.json`: what was decided as a turn that failed overloaded settled.

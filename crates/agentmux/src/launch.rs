@@ -66,6 +66,15 @@ pub enum LaunchError {
         /// The directory that was asked for.
         path: PathBuf,
     },
+    /// The pipe the child was to read its input from could not be handed to it.
+    #[error("cannot hand `{program}` its input: {source}")]
+    Input {
+        /// The executable that was to read it.
+        program: String,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// The delegate CLI could not be executed.
     #[error("cannot run `{program}`: {source}. Is it installed and on PATH?")]
     Spawn {
@@ -84,13 +93,23 @@ pub struct LaunchSpec<'a> {
     pub invocation: &'a Invocation,
     /// The directory the delegate reads the project from.
     pub cwd: &'a Path,
-    /// File holding the question, opened as the child's stdin.
-    pub question: &'a Path,
+    /// What the child reads as its stdin.
+    pub input: LaunchInput<'a>,
     /// File the child's stdout is redirected to.
     /// This is the event stream.
     pub events: &'a Path,
     /// File the child's stderr is redirected to.
     pub stderr: &'a Path,
+}
+
+/// What a child reads as its stdin.
+#[derive(Debug, Clone, Copy)]
+pub enum LaunchInput<'a> {
+    /// The file holding the question, which the child reads once.
+    Question(&'a Path),
+    /// The read end of a pipe, which the child reads for as long as whoever holds the write end
+    /// writes to it.
+    Pipe(&'a std::io::PipeReader),
 }
 
 /// A started child, identified well enough to check on and to stop later.
@@ -322,6 +341,12 @@ impl ProcessLauncher {
     }
 }
 
+/// A child's stdin, opened once for every attempt to start it.
+enum OpenedInput<'a> {
+    Question { file: File, path: &'a Path },
+    Pipe(&'a std::io::PipeReader),
+}
+
 fn open_read(path: &Path) -> Result<File, LaunchError> {
     File::open(path).map_err(|source| LaunchError::Io {
         path: path.to_owned(),
@@ -356,26 +381,25 @@ impl Launcher for ProcessLauncher {
         // after the CLI itself has exited, and reading it would then outlast the deadline, where
         // a file is read for what it holds.
         let mut version_output_file = tempfile::tempfile().ok()?;
-        let mut child = spawn_program(invocation.program(), |program| {
-            version_output_file
-                .try_clone()
-                .and_then(|output| {
-                    std::process::Command::new(program)
-                        .arg("--version")
-                        .current_dir(cwd)
-                        .env_clear()
-                        .envs(&env)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::from(output))
-                        .stderr(Stdio::null())
-                        .spawn()
-                })
-                .map_err(|source| LaunchError::Spawn {
-                    program: program.to_owned(),
-                    source,
-                })
-        })
-        .ok()?;
+        let spawn = |program: &str| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .current_dir(cwd)
+                .env_clear()
+                .envs(&env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(version_output_file.try_clone()?))
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        keep_std_handles_from_children();
+        let program = invocation.program();
+        let spawned = spawn(program);
+        // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find by its
+        // bare name.
+        #[cfg(windows)]
+        let spawned = spawned.or_else(|_| spawn(&format!("{program}.cmd")));
+        let mut child = spawned.ok()?;
 
         let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
         loop {
@@ -408,7 +432,13 @@ impl Launcher for ProcessLauncher {
                 path: spec.cwd.to_owned(),
             });
         }
-        let stdin = open_read(spec.question)?;
+        let input = match spec.input {
+            LaunchInput::Question(path) => OpenedInput::Question {
+                file: open_read(path)?,
+                path,
+            },
+            LaunchInput::Pipe(pipe) => OpenedInput::Pipe(pipe),
+        };
         let stdout = open_append(spec.events)?;
         let stderr = open_append(spec.stderr)?;
 
@@ -430,7 +460,19 @@ impl Launcher for ProcessLauncher {
             command
                 .args(spec.invocation.args())
                 .current_dir(spec.cwd)
-                .stdin(clone(&stdin, spec.question)?)
+                .stdin(match &input {
+                    OpenedInput::Question { file, path } => {
+                        std::process::Stdio::from(clone(file, path)?)
+                    }
+                    OpenedInput::Pipe(pipe) => {
+                        std::process::Stdio::from(pipe.try_clone().map_err(|source| {
+                            LaunchError::Input {
+                                program: program.to_owned(),
+                                source,
+                            }
+                        })?)
+                    }
+                })
                 .stdout(clone(&stdout, spec.events)?)
                 .stderr(clone(&stderr, spec.stderr)?);
             // env_clear plus the allowlist the delegate built.
@@ -459,7 +501,23 @@ impl Launcher for ProcessLauncher {
             })
         };
 
-        let child = spawn_program(spec.invocation.program(), spawn)?;
+        keep_std_handles_from_children();
+        let program = spec.invocation.program();
+        let child = match spawn(program) {
+            Ok(child) => child,
+            // An npm-installed CLI on Windows is a `.cmd` shim, which `Command` does not find
+            // by its bare name.
+            #[cfg(windows)]
+            Err(LaunchError::Spawn { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                spawn(&format!("{program}.cmd")).map_err(|_| LaunchError::Spawn {
+                    program: program.to_owned(),
+                    source,
+                })?
+            }
+            Err(error) => return Err(error),
+        };
         let pid = child.id();
         // Read before the handle is put away, so a child that has already exited is still a
         // zombie holding its pid and its start time is still on record.
@@ -608,28 +666,37 @@ mod identity {
     }
 }
 
-/// Start `program` with `spawn`, as every process agentmux starts is started.
+/// Whether the launcher starts `invocation`'s program as the process it records, rather than
+/// through a shim.
 ///
-/// This process's standard handles are first kept from the child
-/// ([`keep_std_handles_from_children`]).
-/// On Windows a program that is not found by its bare name is tried once more as its `.cmd`
-/// shim, which is what an npm-installed CLI is and what `Command` does not find by its bare name;
-/// when that fails too, the first failure is the one returned.
-pub(crate) fn spawn_program<T>(
-    program: &str,
-    spawn: impl Fn(&str) -> Result<T, LaunchError>,
-) -> Result<T, LaunchError> {
-    keep_std_handles_from_children();
-    match spawn(program) {
-        #[cfg(windows)]
-        Err(LaunchError::Spawn { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            spawn(&format!("{program}.cmd")).map_err(|_| LaunchError::Spawn {
-                program: program.to_owned(),
-                source,
-            })
-        }
-        spawned => spawned,
+/// On Windows an npm-installed CLI is a `.cmd` shim, which the launcher falls back to when the
+/// bare name finds no executable, and whose process is the command interpreter rather than the
+/// CLI.
+/// Only a `.exe` on the child's `PATH`, or named by its path, is taken to start natively.
+#[cfg(windows)]
+pub(crate) fn starts_natively(invocation: &Invocation) -> bool {
+    let program = Path::new(invocation.program());
+    let executable = match program.extension() {
+        None => program.with_extension("exe"),
+        Some(extension) if extension.eq_ignore_ascii_case("exe") => program.to_path_buf(),
+        Some(_) => return false,
+    };
+    if executable.components().count() > 1 {
+        return executable.is_file();
     }
+    invocation
+        .env()
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .is_some_and(|(_, path)| {
+            std::env::split_paths(path).any(|dir| dir.join(&executable).is_file())
+        })
+}
+
+/// Every program starts natively off Windows.
+#[cfg(not(windows))]
+pub(crate) fn starts_natively(_invocation: &Invocation) -> bool {
+    true
 }
 
 /// Keep this process's own standard handles out of every child it starts.

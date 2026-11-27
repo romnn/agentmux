@@ -12,8 +12,8 @@ use super::records::{LaunchRecord, read_json};
 
 /// Where one turn's files live, and what agentmux knows about its child.
 ///
-/// The one place a turn's file names are spelled; a driven turn's driver reads its files through
-/// this too.
+/// The one place a turn's file names are spelled; the driver of a turn over the app-server reads
+/// its files through this too.
 #[derive(Debug, Clone)]
 pub(crate) struct TurnDir {
     pub(crate) root: PathBuf,
@@ -69,17 +69,14 @@ impl TurnDir {
     ///
     /// Whoever then observes the child gone — this caller, or a concurrent `status` — records
     /// the departure as a cancellation rather than as a death, so the two cannot disagree.
-    /// A driven turn's driver also watches for it, and stops its CLI when it appears.
+    /// A turn driven over the app-server also watches for it, and interrupts its turn when it
+    /// appears.
     pub(crate) fn cancelling(&self) -> PathBuf {
         self.root.join("cancelling")
     }
     /// The plan a turn driven over the app-server runs under.
     pub(super) fn app_server_plan_path(&self) -> PathBuf {
         self.root.join("app-server.json")
-    }
-    /// The plan a Claude turn driven over stream-json input runs under.
-    pub(super) fn claude_stream_plan_path(&self) -> PathBuf {
-        self.root.join("claude-stream.json")
     }
     /// The plan the turn's supervisor runs under.
     pub(super) fn supervisor_plan_path(&self) -> PathBuf {
@@ -113,7 +110,8 @@ impl TurnDir {
             .iter()
             .any(|record| record.exists())
     }
-    /// Where steered messages wait for the driver of a driven turn.
+    /// Where steered messages wait for the driver of a turn driven over the app-server, or for
+    /// the supervisor of a Claude turn that reads its input from it.
     pub(crate) fn steer_dir(&self) -> PathBuf {
         self.root.join("steer")
     }

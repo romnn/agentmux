@@ -23,89 +23,32 @@
 //!   decided by what the delegate was doing when it arrived: after a message that called a
 //!   tool, the turn was still under way; after a message that did not, the turn had ended.
 //!
-//! # The same stream driven over stream-json input
+//! # The stream of a turn that reads its input as stream-json
 //!
-//! A turn [`crate::claude_stream`] drives is the CLI's own stream too, with two changes the
-//! driver makes ([`CaptureEvent`]): a steered instruction is written where Claude took it, in
-//! place of the CLI's replay of it, and the driver ends the capture once the CLI has exited.
-//! Such a CLI runs whatever it was given before its `result` as a further turn of its own, with a
-//! `result` of its own, so under [`LaunchMode::ClaudeStream`] a `result` ends nothing: the
-//! driver's last line does, and the turn's outcome is the last `result`'s, unless the CLI went
-//! on past it or did not exit cleanly.
+//! Such a CLI echoes each input message as it takes it, as a `user` event with `isReplay` and the
+//! id the message was sent under.
+//! [`fold_stream_input`] leaves the question's echo out, since the question renders already, and
+//! shows a steer's as the steer, where Claude took it; any other echo is read for what it says,
+//! as any `user` text is.
+//! The CLI runs whatever it took before its `result` as a further turn of its own, with an `init`
+//! and a `result` of its own, so no `result` ends the turn: its exit does.
 //! Each `result` reports the tokens of its own turn, which are summed, and the running cost of
 //! the CLI's process, of which the latest stands for them all.
 
 use std::fmt::Write as _;
 
 use chrono::DateTime;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::delegate::SessionRef;
-use crate::launch::ExitStatus;
 use crate::stream::{
-    Fold, LaunchMode, MALFORMED_LINE, TurnInput, classify_reported, complete_lines,
+    Fold, MALFORMED_LINE, StreamInput, TurnInput, classify_reported, complete_lines,
 };
 use crate::transcript::{
     FailureKind, Message, Outcome, Role, SpendReport, Turn, Usage, UsageWindow,
 };
-
-/// Where a line a driven Claude writes leaves the turn's input: `system`/`init` opens it, and a
-/// `result` closes it.
-///
-/// Read from the line's `type` alone, and a `system` line's `subtype`, by the driver as it serves
-/// its mailbox and by the fold as it decides whether `status` offers a steer, so a `result` whose
-/// body drifted closes the input for both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputBoundary {
-    Opens,
-    Closes,
-}
-
-impl InputBoundary {
-    /// The boundary a line marks, if any, from its `type` and its `subtype` where each is a
-    /// string.
-    pub(crate) fn of(kind: Option<&str>, subtype: Option<&str>) -> Option<Self> {
-        match kind? {
-            "system" if subtype == Some("init") => Some(Self::Opens),
-            "result" => Some(Self::Closes),
-            _ => None,
-        }
-    }
-}
-
-/// Where a driven turn's input stands once `line` has been read.
-fn input_after(input: TurnInput, line: &Value) -> TurnInput {
-    let kind = line.get("type").and_then(Value::as_str);
-    let subtype = line.get("subtype").and_then(Value::as_str);
-    match InputBoundary::of(kind, subtype) {
-        Some(InputBoundary::Opens) if input == TurnInput::Pending => TurnInput::Open,
-        Some(InputBoundary::Closes) => TurnInput::Closed,
-        _ => input,
-    }
-}
-
-/// A line agentmux writes into the capture of a Claude turn it drives over stream-json input,
-/// beside the CLI's own.
-///
-/// agentmux's own are namespaced, so that no event the CLI writes can be read as one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum CaptureEvent {
-    /// An instruction the caller steered into the running turn, written where Claude took it, in
-    /// place of the CLI's replay of it.
-    #[serde(rename = "agentmux.steer")]
-    Steer {
-        /// The instruction.
-        text: String,
-    },
-    /// The CLI has exited, and everything it wrote is above; the capture's last line.
-    #[serde(rename = "agentmux.end")]
-    End {
-        /// How the CLI exited.
-        status: ExitStatus,
-    },
-}
 
 /// The prefix the CLI puts on a `user` message a blocking hook injected.
 ///
@@ -134,8 +77,7 @@ enum Event {
     ToolProgress {},
     /// Where one input message of a CLI reading stream-json input stands: queued, started, then
     /// completed or cancelled.
-    /// It says nothing the transcript keeps: a steer is shown where its replay says Claude took
-    /// it.
+    /// It says nothing the transcript keeps: a steer is shown where its echo says Claude took it.
     CommandLifecycle {},
     RateLimitEvent(RateLimitEvent),
     Result(ResultEvent),
@@ -247,6 +189,13 @@ struct MessageEvent {
     /// Non-null marks a message from inside a subagent rather than the main conversation.
     #[serde(default)]
     parent_tool_use_id: Option<String>,
+    /// Whether a `user` event echoes an input message the CLI took from its stdin, which it does
+    /// when it reads its input as stream-json.
+    #[serde(default, rename = "isReplay")]
+    is_replay: bool,
+    /// The id the echoed message was sent under.
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -484,23 +433,19 @@ fn fold_rate_limit(turn: &mut Turn, event: RateLimitEvent) {
     }
 }
 
-/// What the CLI has said about itself.
-#[derive(Debug, Default)]
-struct Announced {
-    /// Whether a `system`/`init` has come.
-    init: bool,
-    /// The session, as `init` announced it, or as a `result` named it when no `init` did.
-    session: Option<SessionRef>,
-    /// The CLI's release, which decides what scope the turn's `total_cost_usd` covers.
-    cli_version: Option<String>,
-}
-
 /// Fold one `system` event: the session it announces on `init`, the key it authenticated with,
 /// the CLI's release, and a subtype the parser does not name.
 ///
-/// The key is noted for the first `init` only: a CLI driven over stream-json input announces
-/// itself again for each further turn it runs.
-fn fold_system(event: SystemEvent, line: &Value, turn: &mut Turn, announced: &mut Announced) {
+/// The key is noted at the first `init` only, which `announced` records: a CLI reading
+/// stream-json input announces itself again for each further turn it runs.
+fn fold_system(
+    event: SystemEvent,
+    line: &Value,
+    turn: &mut Turn,
+    session: &mut Option<SessionRef>,
+    cli_version: &mut Option<String>,
+    announced: &mut bool,
+) {
     let init = match event {
         SystemEvent::Init(init) => init,
         SystemEvent::Unknown => {
@@ -516,17 +461,16 @@ fn fold_system(event: SystemEvent, line: &Value, turn: &mut Turn, announced: &mu
         | SystemEvent::TaskUpdated {}
         | SystemEvent::BackgroundTasksChanged {} => return,
     };
-    let first = !announced.init;
-    announced.init = true;
+    let first = !std::mem::replace(announced, true);
     if let Some(parsed) = init
         .session_id
         .as_deref()
         .and_then(|id| SessionRef::parse(id).ok())
     {
-        announced.session = Some(parsed);
+        *session = Some(parsed);
     }
     if init.claude_code_version.is_some() {
-        announced.cli_version = init.claude_code_version;
+        *cli_version = init.claude_code_version;
     }
     // Said in the transcript rather than refused, because by the time the stream says it the CLI
     // has already chosen; a reader comparing it with the turn's billing note sees whether that was
@@ -539,133 +483,204 @@ fn fold_system(event: SystemEvent, line: &Value, turn: &mut Turn, announced: &mu
     }
 }
 
-/// Fold a Claude `stream-json` stream, written as `mode` launched the CLI, into a turn.
+/// Where a line of a Claude turn reading stream-json input leaves the turn's input:
+/// `system`/`init` opens it, and a `result` closes it.
+///
+/// Read from the line's `type` alone, and a `system` line's `subtype`, by the fold as it decides
+/// whether the turn takes a steer and by the turn's supervisor as it decides whether to write
+/// one, so a `result` whose body drifted closes the input for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputBoundary {
+    Opens,
+    Closes,
+}
+
+impl InputBoundary {
+    /// The boundary `line` marks, if any.
+    pub(crate) fn of(line: &Value) -> Option<Self> {
+        match line.get("type").and_then(Value::as_str)? {
+            "system" if line.get("subtype").and_then(Value::as_str) == Some("init") => {
+                Some(Self::Opens)
+            }
+            "result" => Some(Self::Closes),
+            _ => None,
+        }
+    }
+}
+
+/// Fold a Claude `stream-json` stream into a turn.
 #[must_use]
-pub fn fold(mode: LaunchMode, index: u32, question: &str, events: &str) -> Fold {
-    let driven = mode == LaunchMode::ClaudeStream;
+pub fn fold(index: u32, question: &str, events: &str) -> Fold {
+    fold_with(index, question, events, None)
+}
+
+/// Fold the stream of a Claude turn that read its input as stream-json, sent under the ids in
+/// `input`, into a turn.
+///
+/// No `result` ends such a turn: the turn runs on, with the outcome its last `result` reported
+/// in [`Fold::last_result`], for its exit record to settle.
+#[must_use]
+pub fn fold_stream_input(index: u32, question: &str, events: &str, input: &StreamInput) -> Fold {
+    fold_with(index, question, events, Some(input))
+}
+
+/// Fold a Claude stream, read as one that took its input as stream-json under the ids in
+/// `streamed`, when that is given.
+fn fold_with(index: u32, question: &str, events: &str, streamed: Option<&StreamInput>) -> Fold {
     let mut turn = Turn::new(index, question);
-    let mut announced = Announced::default();
+    let mut session = None;
+    let mut cli_version = None;
+    let mut announced = false;
+    // Whether a hook reopened the CLI turn under way, so what the delegate says now is not the
+    // answer.
     let mut reopened = false;
     // What the delegate was doing when a `user` text message arrives decides what that message
     // is: see [`classify_injection`].
     let mut delegate = DelegateActivity::Silent;
     let mut input = TurnInput::Pending;
-    // A driven turn's latest `result`, and whether the CLI took up more after it.
-    let mut reported: Option<Outcome> = None;
-    let mut went_on = false;
+    let mut last_result = None;
+    let mut steers_taken = Vec::new();
 
     for line in complete_lines(events) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             turn.unrecognised.record(MALFORMED_LINE);
             continue;
         };
-        if driven {
-            input = input_after(input, &value);
+        let boundary = InputBoundary::of(&value);
+        if streamed.is_some() {
+            input = match boundary {
+                Some(InputBoundary::Opens) if input == TurnInput::Pending => TurnInput::Open,
+                Some(InputBoundary::Closes) => TurnInput::Closed,
+                _ => input,
+            };
         }
         // An event this parser names, in a shape it does not.
         let Ok(event) = Event::deserialize(&value) else {
             turn.unrecognised.record(unparsable_drift_label(&value));
+            // A `result` that cannot be read may have said anything, so the one before it no
+            // longer says how the turn ended.
+            if boundary == Some(InputBoundary::Closes) {
+                last_result = None;
+            }
             continue;
         };
 
         match event {
-            Event::System(event) => fold_system(event, &value, &mut turn, &mut announced),
+            Event::System(event) => {
+                if matches!(event, SystemEvent::Init(_)) {
+                    went_on(&mut last_result, &mut turn);
+                }
+                fold_system(
+                    event,
+                    &value,
+                    &mut turn,
+                    &mut session,
+                    &mut cli_version,
+                    &mut announced,
+                );
+            }
             Event::Assistant(event) => {
                 if event.parent_tool_use_id.is_some() {
                     continue;
                 }
-                went_on |= reported.is_some();
-                // The first message that names one is kept: later messages in a turn repeat it,
-                // and a subagent's model was skipped above with the rest of its conversation.
-                if turn.resolved_model.is_none() {
-                    turn.resolved_model.clone_from(&event.message.model);
-                }
-                let content_summary = event.message.content.inspect();
-                for kind in content_summary.unrecognised_block_labels {
-                    turn.unrecognised
-                        .record(format!("assistant.content.{kind}"));
-                }
-                delegate = if content_summary.calls_a_tool {
-                    DelegateActivity::CallingATool
-                } else {
-                    DelegateActivity::Finished
-                };
-                for text in content_summary.texts {
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    turn.messages.push(Message::delegate(Role::Assistant, text));
-                }
+                went_on(&mut last_result, &mut turn);
+                delegate = fold_assistant(event, &mut turn, reopened);
             }
             Event::User(event) => {
-                if event.parent_tool_use_id.is_none() {
-                    fold_user(event, &mut turn, delegate, &mut reopened);
+                if event.parent_tool_use_id.is_some() {
+                    continue;
+                }
+                went_on(&mut last_result, &mut turn);
+                let echoed = streamed
+                    .filter(|_| event.is_replay)
+                    .and_then(|input| echoed_input(input, event.uuid.as_deref()));
+                let content_summary = event.message.content.inspect();
+                for kind in &content_summary.unrecognised_block_labels {
+                    turn.unrecognised.record(format!("user.content.{kind}"));
+                }
+                match echoed {
+                    // Rendered already, from the question file.
+                    Some(EchoedInput::Question) => {}
+                    Some(EchoedInput::Steer(id)) => {
+                        let text = content_summary.texts.join("\n\n");
+                        if !text.trim().is_empty() {
+                            turn.messages.push(Message::steer(text));
+                            steers_taken.push(id);
+                        }
+                    }
+                    None => fold_user_text(content_summary, &mut turn, delegate, &mut reopened),
                 }
             }
             Event::ToolProgress {} | Event::CommandLifecycle {} => {}
             Event::RateLimitEvent(event) => fold_rate_limit(&mut turn, event),
             Event::Result(event) => {
-                let outcome = fold_result(&event, &mut turn, &mut announced, reopened);
-                if !driven {
+                let outcome =
+                    fold_result(&event, &mut turn, &mut session, &mut cli_version, reopened);
+                if streamed.is_none() {
                     turn.outcome = outcome;
                     // Nothing may follow a terminal event.
                     // Stopping here keeps the rendered transcript strictly append-only, which is
                     // what `tail`'s byte cursor relies on.
                     break;
                 }
-                reported = Some(outcome);
-                went_on = false;
-                // What a further CLI turn reports is its own: a hook that reopened the last one,
-                // or what the delegate was doing then, says nothing of it.
+                last_result = Some(outcome);
+                // What a further CLI turn reports is its own: a hook that reopened this one, or
+                // what the delegate was doing in it, says nothing of the next.
                 reopened = false;
                 delegate = DelegateActivity::Silent;
             }
-            Event::Unknown => {
-                // Only the driver writes these, and only into a capture it drives.
-                let capture_event = if driven {
-                    CaptureEvent::deserialize(&value).ok()
-                } else {
-                    None
-                };
-                match capture_event {
-                    Some(CaptureEvent::Steer { text }) => {
-                        turn.messages.push(Message::steer(text));
-                        went_on |= reported.is_some();
-                    }
-                    Some(CaptureEvent::End { status }) => {
-                        input = TurnInput::Closed;
-                        if let Some(outcome) = driven_outcome(reported.take(), went_on, status) {
-                            turn.outcome = outcome;
-                        }
-                        // The driver's last line, and terminal as a direct launch's `result` is.
-                        break;
-                    }
-                    None => turn.unrecognised.record(drift_label(&value)),
-                }
-            }
+            Event::Unknown => turn.unrecognised.record(drift_label(&value)),
         }
     }
 
     Fold {
         turn,
-        session: announced.session,
+        session,
         input,
+        last_result,
+        steers_taken,
     }
 }
 
-/// Fold one `user` event of the main conversation: its prose, which is a turn input or an
-/// injection as [`classify_injection`] decides from what the delegate was doing, noting in
-/// `reopened` an injection that reopened a finished turn.
-fn fold_user(
-    event: MessageEvent,
+/// Fold one `assistant` event of the main conversation, which a hook reopened the CLI turn of when
+/// `reopened`, and say what it shows the delegate doing.
+fn fold_assistant(event: MessageEvent, turn: &mut Turn, reopened: bool) -> DelegateActivity {
+    // The first message that names one is kept: later messages in a turn repeat it, and a
+    // subagent's model was skipped with the rest of its conversation.
+    if turn.resolved_model.is_none() {
+        turn.resolved_model.clone_from(&event.message.model);
+    }
+    let content_summary = event.message.content.inspect();
+    for kind in content_summary.unrecognised_block_labels {
+        turn.unrecognised
+            .record(format!("assistant.content.{kind}"));
+    }
+    for text in content_summary.texts {
+        if text.trim().is_empty() {
+            continue;
+        }
+        turn.messages.push(if reopened {
+            Message::after_reopening(text)
+        } else {
+            Message::delegate(Role::Assistant, text)
+        });
+    }
+    if content_summary.calls_a_tool {
+        DelegateActivity::CallingATool
+    } else {
+        DelegateActivity::Finished
+    }
+}
+
+/// Fold the prose of a `user` event of the main conversation that is not an echo of the turn's
+/// input: a turn input, or an injection, as [`classify_injection`] decides from what the
+/// delegate was doing, noting in `reopened` an injection that reopened a finished turn.
+fn fold_user_text(
+    content_summary: ContentSummary,
     turn: &mut Turn,
     delegate: DelegateActivity,
     reopened: &mut bool,
 ) {
-    let content_summary = event.message.content.inspect();
-    for kind in content_summary.unrecognised_block_labels {
-        turn.unrecognised.record(format!("user.content.{kind}"));
-    }
     for text in content_summary.texts {
         if text.trim().is_empty() {
             continue;
@@ -682,32 +697,33 @@ fn fold_user(
     }
 }
 
-/// Fold one `result` into `turn`: the session it names, when nothing announced one, and what the
-/// turn has spent by it, which adds to what an earlier `result` of the same CLI process reported.
+/// Fold one `result`: the session it names, when nothing announced one, and what the turn has
+/// spent by it, which adds to what an earlier `result` of the same CLI process reported.
 ///
 /// Returns the outcome it reports.
 fn fold_result(
     event: &ResultEvent,
     turn: &mut Turn,
-    announced: &mut Announced,
+    session: &mut Option<SessionRef>,
+    cli_version: &mut Option<String>,
     reopened: bool,
 ) -> Outcome {
     // A turn that failed before announcing a session still names one here, and without it the
     // fold reports a turn whose continuity cannot be checked — drift, for a stream that in fact
     // said which conversation it meant.
     // `init` stays authoritative: this only fills a gap it left.
-    if announced.session.is_none()
+    if session.is_none()
         && let Some(id) = event.session_id.as_deref()
         && let Ok(parsed) = SessionRef::parse(id)
     {
-        announced.session = Some(parsed);
+        *session = Some(parsed);
     }
     // Kept whether or not the turn succeeded: an error result reports what the turn spent before
     // it failed, which the failed outcome has no room for.
     let spent = SpendReport {
         usage: event.usage.as_ref().map(Usage::from).unwrap_or_default(),
         cost_usd: event.total_cost_usd,
-        cli_version: announced.cli_version.clone(),
+        cli_version: cli_version.take(),
     };
     let spent = match turn.spend_report.take() {
         Some(earlier) => followed_by(earlier, spent),
@@ -718,10 +734,41 @@ fn fold_result(
     outcome
 }
 
+/// An input message the CLI echoed, by the id it was sent under.
+enum EchoedInput {
+    Question,
+    Steer(Uuid),
+}
+
+/// Which of the turn's own input messages an echo sent under `id` is, if it is one.
+///
+/// Ids are compared as UUIDs, so how either side spells one does not matter.
+fn echoed_input(input: &StreamInput, id: Option<&str>) -> Option<EchoedInput> {
+    let id = Uuid::try_parse(id?).ok()?;
+    if input.question == Some(id) {
+        Some(EchoedInput::Question)
+    } else {
+        input.steers.contains(&id).then_some(EchoedInput::Steer(id))
+    }
+}
+
+/// Note that the delegate went on past its last `result`, which then no longer says how the turn
+/// ended.
+///
+/// A failure that `result` reported stays in the transcript as a note, so a success after it
+/// cannot hide it.
+fn went_on(last_result: &mut Option<Outcome>, turn: &mut Turn) {
+    if let Some(Outcome::Failed { kind, detail }) = last_result.take() {
+        turn.messages.push(Message::synthetic(format!(
+            "the delegate reported a failure here, then went on: {} — {detail}",
+            kind.label()
+        )));
+    }
+}
+
 /// What one CLI process spent by its latest `result`, `later`, which followed `earlier`.
 ///
-/// Each `result` reports the tokens of its own turn, and the running cost of the process —
-/// and, from the release where [`crate::accounting`] says so, of the session it resumed — so the
+/// Each `result` reports the tokens of its own turn, and the running cost of the process, so the
 /// tokens are summed and the latest cost stands for both.
 fn followed_by(earlier: SpendReport, later: SpendReport) -> SpendReport {
     let sum = |earlier: Option<u64>, later: Option<u64>| match (earlier, later) {
@@ -748,32 +795,6 @@ fn followed_by(earlier: SpendReport, later: SpendReport) -> SpendReport {
         cost_usd: later.cost_usd.or(earlier.cost_usd),
         cli_version: later.cli_version.or(earlier.cli_version),
     }
-}
-
-/// How a driven turn ended, once its driver saw the CLI exit with `status`, or `None` when the
-/// CLI reported no `result`, which the turn's exit record explains as it does a direct launch's.
-///
-/// The outcome is the latest `result`'s, `reported`, unless the CLI took up more after it and
-/// left before reporting on that, or reported success and then exited uncleanly: neither may
-/// read as an answered turn.
-fn driven_outcome(reported: Option<Outcome>, went_on: bool, status: ExitStatus) -> Option<Outcome> {
-    let reported = reported?;
-    let failed = |detail: String| Outcome::Failed {
-        kind: FailureKind::Unclassified,
-        detail,
-    };
-    Some(if went_on {
-        failed(format!(
-            "the claude CLI exited with {status} before it reported on what it took up after its \
-             last result, so the turn's answer may be incomplete"
-        ))
-    } else if status.is_success() || matches!(reported, Outcome::Failed { .. }) {
-        reported
-    } else {
-        failed(format!(
-            "the claude CLI exited with {status} after reporting its result"
-        ))
-    })
 }
 
 /// What the delegate was doing when a `user` text message arrived.

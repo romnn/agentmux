@@ -14,15 +14,17 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::stream::{self, Fold};
+use crate::stream::Fold;
 use crate::transcript::{Turn, turn_number};
 
 use super::RunStore;
 use super::error::RunError;
 use super::id::RunId;
 use super::records::{
-    InvocationRecord, SettledRecord, SettledTurn, read_complete_records, read_if_present, read_json,
+    InvocationRecord, SettledRecord, SettledTurn, SupervisorRecord, read_complete_records,
+    read_if_present, read_json,
 };
+use super::settle;
 use super::status::{TranscriptPage, TurnQuestion, page_of};
 
 /// One turn of one consultation, chosen once.
@@ -262,13 +264,21 @@ impl RunStore {
     fn fold_capture(&self, target: &TurnRef, limit: Option<u64>) -> Result<Turn, RunError> {
         let dir = self.turn_dir(&target.run_id, target.turn_index);
         let vendor = self.meta(&target.run_id)?.delegate.vendor();
+        let question =
+            read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
         let mode = read_json::<InvocationRecord>(&dir.invocation())?
             .unwrap_or_default()
             .launch_mode;
-        let question =
-            read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
         let (events, _) = read_complete_records(&dir.events(), limit)?;
-        let Fold { turn, .. } = stream::fold(vendor, mode, target.turn_index, &question, &events);
+        let supervisor = read_json::<SupervisorRecord>(&dir.supervisor())?;
+        let input = settle::stream_input(&dir, mode, supervisor.as_ref())?;
+        let Fold { turn, .. } = settle::fold_events(
+            vendor,
+            target.turn_index,
+            &question,
+            &events,
+            input.as_ref(),
+        );
         Ok(turn)
     }
 

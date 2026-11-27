@@ -553,9 +553,6 @@ fn a_wait_that_times_out_exits_124() -> Result<()> {
 
 /// A delegate the supervisor cannot start is a failed turn kept with the reason, which a wait
 /// returns as a failure.
-///
-/// A Codex turn over `codex exec`, with no `codex` on the machine: the supervisor starts that CLI
-/// itself, where a driven turn's CLI is started by its driver, which the supervisor can start.
 #[gtest]
 fn a_delegate_that_cannot_start_is_a_failed_turn() -> Result<()> {
     let machine = machine(&FakeRun {
@@ -563,19 +560,13 @@ fn a_delegate_that_cannot_start_is_a_failed_turn() -> Result<()> {
         stderr: "",
         exit_code: 0,
     })?;
-    let started = run_in_background(machine.agentmux(&[
-        "start",
-        "--json",
-        "--codex-launch",
-        "exec",
-        "--delegate",
-        "codex",
-        "--model",
-        "gpt-6-astra",
-        "Review it.",
-    ]))?
-    .finish(COMMAND_LIMIT)?;
-    let run_id = started_run(&started)?;
+    std::fs::remove_file(
+        machine
+            .bin
+            .join(format!("claude{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .or_fail()?;
+    let run_id = machine.start()?;
     let waited = machine
         .spawn_wait(&run_id, &[])?
         .finish(Duration::from_secs(20))?;

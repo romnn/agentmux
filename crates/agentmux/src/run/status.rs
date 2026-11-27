@@ -142,9 +142,8 @@ pub struct RunStatus {
     pub transcript_bytes: u64,
     /// Whether a follow-up is possible: the delegate announced a resumable session.
     pub resumable: bool,
-    /// Whether `steer` can reach the newest turn: it is running, driven, and takes an
-    /// instruction now — a Codex turn over `codex app-server`, or a Claude turn until it has
-    /// reported its result.
+    /// Whether `steer` can reach the newest turn: it is running and takes input now, as a Codex
+    /// turn over `codex app-server` does, and a Claude turn until it has reported its result.
     pub steerable: bool,
     /// The pricing the newest turn was launched on, or `None` for a turn recorded before agentmux
     /// kept it.

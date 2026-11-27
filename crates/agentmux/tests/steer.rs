@@ -1,7 +1,8 @@
 //! Steering a consultation through the run store, with the scripted launcher.
 //!
 //! The scripted launcher runs nothing, so where a test needs the driver's half of the mailbox it
-//! plays that half itself, through the same public type the driver uses.
+//! plays that half itself, through the same public type the driver uses, and for a Claude turn it
+//! plays the supervisor's half and Claude's echo.
 //! The driver's protocol with a server is covered by `appserver.rs`, and the two together by the
 //! CLI's own end-to-end test, which runs the real executable.
 
@@ -16,9 +17,10 @@ use agentmux::delegate::{
     AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort,
     Isolation, ModelId,
 };
-use agentmux::launch::Launcher as _;
+use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
-    NotRunningReason, Retention, RunError, RunId, RunStore, StartRequest, SteerError,
+    NotRunningReason, Retention, RunError, RunId, RunStatus, RunStore, StartRequest, SteerError,
+    UnsteerableReason,
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::TurnState;
@@ -718,5 +720,272 @@ async fn a_cancel_after_a_completed_turn_waits_for_driver_cleanup() -> Result<()
     assert_that!(cancel_started_at.elapsed() >= STOP_BUDGET, eq(true));
     assert_that!(harness.launcher.terminated(), is_empty());
     assert_that!(cancelled.outcome.state(), eq(TurnState::Completed));
+    Ok(())
+}
+
+/// Where a test pretends the supervising agentmux executable lives.
+const SUPERVISOR_PATH: &str = "/opt/agentmux/bin/agentmux";
+
+/// What a Claude turn reading stream-json input writes first: the session it announces, which
+/// opens its input.
+const CLAUDE_INIT: &str = indoc::indoc! {r#"
+    {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
+"#};
+
+/// A Claude turn of a store that supervises its turns, whose supervisor and Claude the test plays.
+///
+/// The scripted launcher starts the supervisor, as its launch 0, and runs nothing; the test
+/// records Claude itself, under the handle of launch 1, and writes what Claude writes.
+struct ClaudeTurn {
+    harness: Harness,
+    run_id: RunId,
+    dir: PathBuf,
+}
+
+impl ClaudeTurn {
+    /// Start a Claude consultation whose supervisor, which fares as `supervisor` says, has
+    /// started a Claude that has written `events`.
+    fn start(supervisor: Script, events: &str) -> Result<Self> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([supervisor, Script::running("")]));
+        let store = RunStore::open(dir.path(), launcher.clone(), env())
+            .or_fail()?
+            .with_supervisor(SUPERVISOR_PATH);
+        let harness = Harness {
+            store: Arc::new(store),
+            launcher,
+            dir,
+        };
+        let run_id = harness
+            .store
+            .start(&harness.request(self::claude()?))?
+            .run_id;
+        let turn_dir = harness
+            .dir
+            .path()
+            .join("runs")
+            .join(run_id.to_string())
+            .join("turns/0001");
+        let claude = harness.launcher.launch_handle(1);
+        std::fs::write(
+            turn_dir.join("launch.json"),
+            serde_json::json!({
+                "launched": {"pid": claude.pid},
+                "started_at": "2026-11-27T12:00:00Z",
+            })
+            .to_string(),
+        )
+        .or_fail()?;
+        std::fs::write(turn_dir.join("events.jsonl"), events).or_fail()?;
+        Ok(Self {
+            harness,
+            run_id,
+            dir: turn_dir,
+        })
+    }
+
+    fn supervisor(&self) -> Launched {
+        self.harness.launcher.launch_handle(0)
+    }
+
+    fn claude(&self) -> Launched {
+        self.harness.launcher.launch_handle(1)
+    }
+
+    async fn steer(&self, message: &str) -> std::result::Result<RunStatus, RunError> {
+        self.harness.store.steer(&self.run_id, message).await
+    }
+
+    /// Play the supervisor and Claude for the first steer, on a thread of their own: claim it,
+    /// run `meanwhile` on the turn's directory, and append Claude's echo of it.
+    fn take_first_steer(
+        &self,
+        meanwhile: impl FnOnce(&Path) -> Result<()> + Send + 'static,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        let dir = self.dir.clone();
+        std::thread::spawn(move || {
+            verify_that!(until_submitted(&dir.join("steer")), eq(true))?;
+            let claim = Mailbox::new(dir.join("steer")).claim_next().or_fail()?;
+            meanwhile(&dir)?;
+            append(
+                &dir,
+                &format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": claim.text}],
+                        },
+                        "parent_tool_use_id": null,
+                        "uuid": claim.uuid().or_fail()?.hyphenated().to_string(),
+                        "isReplay": true,
+                    })
+                ),
+            )
+        })
+    }
+}
+
+/// Append `events` to the capture in the turn directory `dir`, as Claude writes them.
+fn append(dir: &Path, events: &str) -> Result<()> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("events.jsonl"))
+        .or_fail()?
+        .write_all(events.as_bytes())
+        .or_fail()
+}
+
+/// A Claude turn takes a steer from its `init` until its `result`, while both its supervisor,
+/// which holds its input, and Claude are alive, and `status` and `steer` agree on it.
+/// Each refusal says why: still starting, finishing once it has reported its result or has gone,
+/// and out of reach once its supervisor has gone.
+#[gtest]
+#[tokio::test]
+async fn a_claude_turn_takes_a_steer_only_while_its_input_is_held_open() -> Result<()> {
+    // Before Claude has announced its session, the turn is still starting.
+    let turn = ClaudeTurn::start(Script::running(""), "")?;
+    assert_that!(
+        turn.harness.store.status(&turn.run_id)?.steerable,
+        eq(false)
+    );
+    assert_that!(
+        turn.steer("x").await,
+        err(matches_pattern!(RunError::Steer(matches_pattern!(
+            SteerError::Starting { .. }
+        ))))
+    );
+
+    // From its `init` it takes one, until its `result`.
+    append(&turn.dir, CLAUDE_INIT)?;
+    assert_that!(turn.harness.store.status(&turn.run_id)?.steerable, eq(true));
+    append(
+        &turn.dir,
+        "{\"type\":\"result\",\"is_error\":false,\"result\":\"done\"}\n",
+    )?;
+    assert_that!(
+        turn.harness.store.status(&turn.run_id)?.steerable,
+        eq(false)
+    );
+    assert_that!(
+        turn.steer("x").await,
+        err(matches_pattern!(RunError::Steer(matches_pattern!(
+            SteerError::NotRunning {
+                state: eq(&NotRunningReason::Finishing),
+                ..
+            }
+        ))))
+    );
+
+    // A Claude that has gone takes nothing more, though its supervisor has yet to settle it.
+    let turn = ClaudeTurn::start(Script::running(""), CLAUDE_INIT)?;
+    turn.harness.launcher.mark_process_gone(turn.claude());
+    assert_that!(
+        turn.harness.store.status(&turn.run_id)?.steerable,
+        eq(false)
+    );
+    assert_that!(
+        turn.steer("x").await,
+        err(matches_pattern!(RunError::Steer(matches_pattern!(
+            SteerError::NotRunning {
+                state: eq(&NotRunningReason::Finishing),
+                ..
+            }
+        ))))
+    );
+
+    // Nor does a turn whose supervisor has gone, or cannot be told apart from another process,
+    // since nothing may then hold Claude's input.
+    let gone = ClaudeTurn::start(Script::running(""), CLAUDE_INIT)?;
+    gone.harness.launcher.mark_process_gone(gone.supervisor());
+    let unidentifiable = ClaudeTurn::start(Script::unidentifiable(""), CLAUDE_INIT)?;
+    for turn in [gone, unidentifiable] {
+        assert_that!(
+            turn.harness.store.status(&turn.run_id)?.steerable,
+            eq(false)
+        );
+        assert_that!(
+            turn.steer("x").await,
+            err(matches_pattern!(RunError::Steer(matches_pattern!(
+                SteerError::NotSteerable {
+                    reason: eq(&UnsteerableReason::ClaudeInputLost),
+                    ..
+                }
+            ))))
+        );
+    }
+    Ok(())
+}
+
+/// A steer is accepted once Claude's echo of it is in the capture, which is the transcript's
+/// proof that it arrived: the supervisor that wrote it need not still be there to say so, since
+/// the caller reads the echo itself.
+#[gtest]
+#[tokio::test]
+async fn a_steer_claude_echoes_is_accepted_whether_or_not_its_supervisor_is_still_there()
+-> Result<()> {
+    for supervisor_dies in [false, true] {
+        let turn = ClaudeTurn::start(Script::running(""), CLAUDE_INIT)?;
+        let supervisor = turn.supervisor();
+        let launcher = Arc::clone(&turn.harness.launcher);
+        // Claude echoes the steer well after its supervisor has gone, by when the caller has
+        // seen it go.
+        let claude = turn.take_first_steer(move |_| {
+            if supervisor_dies {
+                launcher.mark_process_gone(supervisor);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Ok(())
+        });
+
+        let steered = turn.steer("Narrow it to auth.").await;
+        claude.join().ok().or_fail()??;
+        assert_that!(
+            steered,
+            ok(anything()),
+            "supervisor dies: {supervisor_dies}"
+        );
+        assert_that!(
+            turn.harness.transcript(&turn.run_id)?,
+            contains_substring("### user (steer)\n\nNarrow it to auth.")
+        );
+    }
+    Ok(())
+}
+
+/// A steer Claude echoes only past the capture a cancellation froze is not accepted, and is in no
+/// reader's view of the turn: what `steer` says and what the transcript shows stay one fact.
+#[gtest]
+#[tokio::test]
+async fn a_steer_claude_echoes_past_a_frozen_capture_is_not_accepted() -> Result<()> {
+    let turn = ClaudeTurn::start(Script::running(""), CLAUDE_INIT)?;
+    // A cancellation freezes the capture as it stands, and Claude echoes the steer after it.
+    let claude = turn.take_first_steer(|dir| {
+        std::fs::write(dir.join("cancelling"), "").or_fail()?;
+        let events_len = std::fs::metadata(dir.join("events.jsonl")).or_fail()?.len();
+        std::fs::write(
+            dir.join("exit.json"),
+            serde_json::json!({"kind": "cancelled", "events_len": events_len}).to_string(),
+        )
+        .or_fail()
+    });
+
+    let steered = turn.steer("Narrow it to auth.").await;
+    claude.join().ok().or_fail()??;
+    assert_that!(
+        steered,
+        err(matches_pattern!(RunError::Steer(matches_pattern!(
+            SteerError::Unconfirmed {
+                why: contains_substring("ended before Claude took it"),
+                ..
+            }
+        ))))
+    );
+    assert_that!(
+        turn.harness.transcript(&turn.run_id)?,
+        not(contains_substring("Narrow it to auth."))
+    );
     Ok(())
 }

@@ -4,10 +4,14 @@
 //! These are the tests that make the design's claims true.
 
 use agentmux::delegate::Vendor;
-use agentmux::stream::{self, Fold};
+use agentmux::stream::{self, Fold, StreamInput, TurnInput};
 use agentmux::testing::fixtures::{self, Fixture};
-use agentmux::transcript::{FailureKind, Message, MessageSource, Outcome, Role};
+use agentmux::transcript::{
+    FailureKind, Message, MessageSource, Outcome, Role, Usage, render_turn,
+};
 use googletest::prelude::*;
+use indoc::formatdoc;
+use uuid::Uuid;
 
 /// The reason this project exists.
 ///
@@ -24,7 +28,6 @@ use googletest::prelude::*;
 fn a_blocking_stop_hook_does_not_replace_the_report() {
     let Fold { turn, .. } = stream::fold(
         Vendor::Claude,
-        stream::LaunchMode::DirectCli,
         0,
         "Reply with exactly: THE_REPORT_BODY",
         fixtures::CLAUDE_STOP_HOOK,
@@ -68,13 +71,7 @@ fn a_blocking_stop_hook_does_not_replace_the_report() {
 /// The transcript is the deliverable, and nothing stores a single "answer" in its place.
 #[gtest]
 fn the_report_is_recoverable_even_though_the_cli_reported_an_empty_result() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CLAUDE_STOP_HOOK,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_STOP_HOOK);
     let mut transcript = agentmux::transcript::Transcript::default();
     transcript.turns.push(turn);
 
@@ -94,13 +91,7 @@ fn an_unknown_event_type_is_counted_not_skipped() {
         r#"{"type":"a_shape_nobody_has_seen","payload":{"anything":1}}"#,
         fixtures::CLAUDE_HAPPY.trim_end(),
     );
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        &stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", &stream);
 
     assert_that!(turn.unrecognised.total(), ge(1));
     assert_that!(
@@ -118,8 +109,7 @@ fn a_renamed_codex_item_type_is_counted_not_skipped() {
         {"type":"item.completed","item":{"id":"i0","type":"assistant_message","text":"the report"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
 
     assert_that!(
         turn.unrecognised.summary(),
@@ -131,8 +121,7 @@ fn a_renamed_codex_item_type_is_counted_not_skipped() {
 #[gtest]
 fn a_non_json_line_is_counted() {
     let stream = "warning: your CLI is out of date\n{\"type\":\"turn.started\"}\n";
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
     assert_that!(
         turn.unrecognised.summary(),
         some(contains_substring("malformed"))
@@ -143,8 +132,7 @@ fn a_non_json_line_is_counted() {
 #[gtest]
 fn a_partial_trailing_line_is_not_counted_as_drift() {
     let stream = "{\"type\":\"turn.started\"}\n{\"type\":\"item.comp";
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
     assert_that!(turn.unrecognised.is_empty(), eq(true));
 }
 
@@ -158,8 +146,7 @@ fn a_failed_turn_keeps_what_it_collected() {
         {"type":"error","message":"This content was flagged for possible cybersecurity risk"}
         {"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk"}}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
 
     assert_that!(
         turn.outcome,
@@ -181,13 +168,7 @@ fn a_failed_turn_keeps_what_it_collected() {
 /// They fold into one outcome.
 #[gtest]
 fn three_codex_failure_events_fold_into_one_outcome() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CODEX_UNSUPPORTED_MODEL,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", fixtures::CODEX_UNSUPPORTED_MODEL);
 
     assert_that!(
         turn.outcome,
@@ -214,7 +195,6 @@ fn three_codex_failure_events_fold_into_one_outcome() {
 fn a_codex_item_error_is_a_warning_not_a_failure() {
     let Fold { turn, session, .. } = stream::fold(
         Vendor::Codex,
-        stream::LaunchMode::DirectCli,
         1,
         "What was the secret word?",
         fixtures::CODEX_RESUME_WARNING,
@@ -243,13 +223,7 @@ fn a_codex_item_error_is_a_warning_not_a_failure() {
 /// Branch on `is_error`.
 #[gtest]
 fn an_unknown_claude_model_is_a_failure_despite_subtype_success() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "hi",
-        fixtures::CLAUDE_UNKNOWN_MODEL,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "hi", fixtures::CLAUDE_UNKNOWN_MODEL);
     assert_that!(
         turn.outcome,
         matches_pattern!(Outcome::Failed {
@@ -266,8 +240,7 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
         (Vendor::Claude, fixtures::CLAUDE_HAPPY),
         (Vendor::Codex, fixtures::CODEX_HAPPY),
     ] {
-        let Fold { turn, session, .. } =
-            stream::fold(vendor, stream::LaunchMode::DirectCli, 0, "q", fixture);
+        let Fold { turn, session, .. } = stream::fold(vendor, 0, "q", fixture);
         assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
         assert_that!(
             turn.messages
@@ -286,47 +259,40 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
     }
 }
 
-/// A Claude turn driven over stream-json input is read through to the driver's end, past its
-/// `result`: the steer sits where Claude took it, above the answer it produced, and the events the
-/// CLI writes for each input message are named.
-/// Until that end the turn runs on, and only a driven turn's capture may hold the driver's lines.
+/// The session a hand-written Claude stream announces.
+const SESSION: &str = "85ff2d6a-ec24-47cf-a4f8-486a5bb06814";
+
+/// The id a hand-written stream's question is sent under.
+const QUESTION_ID: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+
+/// The id a hand-written stream's steer is sent under.
+const STEER_ID: &str = "bbbbbbbb-2222-4222-8222-222222222222";
+
+/// The ids a hand-written stream's question and steer are sent under, spelled as agentmux
+/// records them.
+fn stream_input() -> Result<StreamInput> {
+    Ok(StreamInput {
+        question: Some(Uuid::try_parse(QUESTION_ID).or_fail()?),
+        steers: vec![Uuid::try_parse(STEER_ID).or_fail()?],
+    })
+}
+
+/// A Claude turn whose supervisor held its input reads through its `result`: the question's echo
+/// is left out, since the question renders already, and the steer is where Claude's echo says it
+/// took it, after the command it waited for and above the answer it changed.
+/// The ids are compared as UUIDs, so agentmux spelling them unhyphenated does not matter.
+/// The turn runs on past the `result`, whose outcome is left for the turn's exit record to settle.
 #[gtest]
-fn a_driven_claude_turn_is_read_through_to_its_end() {
-    let Fold { turn, input, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::ClaudeStream,
-        0,
-        "q",
-        fixtures::CLAUDE_STEERED,
-    );
-    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
-    assert_that!(input, eq(stream::TurnInput::Closed));
-    assert_that!(turn.unrecognised.summary(), none());
-    // Its `result` ends nothing: until the driver's end, the turn runs on.
-    let (before_end, _) = fixtures::CLAUDE_STEERED
-        .trim_end()
-        .rsplit_once('\n')
-        .unwrap_or_default();
-    let Fold { turn: before, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::ClaudeStream,
-        0,
-        "q",
-        &format!("{before_end}\n"),
-    );
-    assert_that!(before.outcome, eq(&Outcome::Running));
-    // Only a driven capture holds the driver's lines: anywhere else they are drift.
-    let Fold { turn: direct, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CLAUDE_STEERED,
-    );
-    assert_that!(
-        direct.unrecognised.summary(),
-        some(contains_substring("agentmux.steer"))
-    );
+fn a_steered_claude_turn_shows_the_steer_where_claude_took_it() {
+    let input = fixtures::claude_steered_input();
+    let Fold {
+        turn,
+        input: turn_input,
+        last_result,
+        steers_taken,
+        ..
+    } = stream::claude::fold_stream_input(0, "q", fixtures::CLAUDE_STEERED, &input);
+
     assert_that!(
         turn.messages,
         elements_are![
@@ -337,62 +303,190 @@ fn a_driven_claude_turn_is_read_through_to_its_end() {
             }),
             matches_pattern!(Message {
                 role: eq(&Role::Assistant),
+                source: eq(&MessageSource::Delegate),
                 text: eq("LIVE_DONE STEERED"),
                 ..
             }),
         ]
     );
-}
-
-/// A `result` whose body drifted, here with no `is_error` and a `subtype` that is no string,
-/// still closes a driven turn's input, as it does for the driver, so `status` never offers a
-/// steer the driver would refuse; the drift is still counted.
-#[gtest]
-fn a_drifted_result_closes_a_driven_turns_input() {
-    let stream = indoc::indoc! {r#"
-        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
-        {"type":"result","subtype":{"kind":"success"}}
-    "#};
-    let Fold { turn, input, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::ClaudeStream,
-        0,
-        "q",
-        stream,
+    assert_that!(steers_taken, eq(&input.steers));
+    assert_that!(turn_input, eq(TurnInput::Closed));
+    assert_that!(turn.outcome, eq(&Outcome::Running));
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
     );
-    assert_that!(input, eq(stream::TurnInput::Closed));
-    assert_that!(turn.unrecognised.summary(), some(anything()));
+    assert_that!(turn.unrecognised.summary(), none());
 }
 
-/// A further CLI turn of a driven Claude turn is judged on its own: a hook that reopened the turn
-/// before it does not cost its `result` the text that says the model was overloaded, which is
-/// what an automatic resume is decided from.
+/// An echo whose id names neither the question nor a steer is not a steer, whatever it says: it
+/// renders by its content, as any `user` text does, and no steer is taken by it.
 #[gtest]
-fn a_hook_that_reopened_an_earlier_cli_turn_does_not_hide_a_later_failure() {
-    let stream = indoc::indoc! {r#"
-        {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
-        {"type":"assistant","message":{"content":[{"type":"text","text":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
-        {"type":"user","message":{"content":[{"type":"text","text":"Reconsider your answer."}]},"parent_tool_use_id":null}
-        {"type":"assistant","message":{"content":[{"type":"text","text":"Summary: looks fine."}]},"parent_tool_use_id":null}
-        {"type":"result","is_error":false,"subtype":"success","result":"Summary: looks fine."}
-        {"type":"agentmux.steer","text":"Check the tests too."}
-        {"type":"result","is_error":true,"subtype":"success","result":"API Error: overloaded_error"}
-        {"type":"agentmux.end","status":{"code":1}}
-    "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::ClaudeStream,
+fn a_foreign_echo_is_never_a_steer() {
+    let Fold {
+        turn, steers_taken, ..
+    } = stream::claude::fold_stream_input(
         0,
         "q",
-        stream,
+        fixtures::CLAUDE_STEERED,
+        &StreamInput::default(),
+    );
+
+    assert_that!(steers_taken, is_empty());
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|message| message.source == MessageSource::Steer)
+            .count(),
+        eq(0)
     );
     assert_that!(
-        turn.outcome,
-        matches_pattern!(Outcome::Failed {
-            kind: eq(&FailureKind::Overloaded),
-            ..
-        })
+        turn.messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![
+            starts_with("Run the shell command `sleep 20`"),
+            eq("Also put the word STEERED at the end of that line.")
+        ]
     );
+}
+
+/// A steer Claude takes after its `result` runs as a further CLI turn, with an `init` and a
+/// `result` of its own: until it is answered no outcome stands, and once it is, its answer is the
+/// turn's, with the tokens of both CLI turns and the process's latest cost.
+#[gtest]
+fn a_steer_taken_after_the_result_is_answered_as_the_turns_answer() -> Result<()> {
+    let first = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"q"}}]}},"parent_tool_use_id":null,"uuid":"{QUESTION_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"A story."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"A story.","usage":{{"input_tokens":1,"output_tokens":10}},"total_cost_usd":0.1}}
+    "#};
+    let went_on = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+    "#};
+    let second = formatdoc! {r#"
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"End it with PELICAN."}}]}},"parent_tool_use_id":null,"uuid":"{STEER_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"A story. PELICAN"}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"A story. PELICAN","usage":{{"input_tokens":2,"output_tokens":20}},"total_cost_usd":0.3}}
+    "#};
+    let input = stream_input()?;
+    let fold = |events: &str| stream::claude::fold_stream_input(0, "q", events, &input);
+
+    // The first `result` closes the input and would stand.
+    let answered = fold(&first);
+    assert_that!(answered.input, eq(TurnInput::Closed));
+    assert_that!(
+        answered.last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
+    );
+    // Claude went on, so it no longer does, and the input stays closed.
+    let going_on = fold(&format!("{first}{went_on}"));
+    assert_that!(going_on.last_result, none());
+    assert_that!(going_on.input, eq(TurnInput::Closed));
+    // The second answers the steer, and stands for both.
+    let Fold {
+        turn, last_result, ..
+    } = fold(&format!("{first}{went_on}{second}"));
+    assert_that!(
+        turn.messages
+            .iter()
+            .map(|message| (message.source, message.text.as_str()))
+            .collect::<Vec<_>>(),
+        elements_are![
+            eq(&(MessageSource::Delegate, "A story.")),
+            eq(&(MessageSource::Steer, "End it with PELICAN.")),
+            eq(&(MessageSource::Delegate, "A story. PELICAN")),
+        ]
+    );
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed {
+            usage: matches_pattern!(Usage {
+                input_tokens: some(eq(&3)),
+                output_tokens: some(eq(&30)),
+                ..
+            }),
+            cost_usd: some(eq(&0.3)),
+        }))
+    );
+    Ok(())
+}
+
+/// A failure Claude reported and then went on past stays in the transcript as a note, so the
+/// success after it cannot hide it; and a `result` that cannot be read leaves no earlier one to
+/// stand, while it still closes the input.
+#[gtest]
+fn a_superseded_failure_is_kept_and_an_unreadable_result_stands_for_nothing() -> Result<()> {
+    let failed_then_answered = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}","apiKeySource":"ANTHROPIC_API_KEY"}}
+        {{"type":"result","is_error":true,"api_error_status":529,"result":"API Error: overloaded_error"}}
+        {{"type":"system","subtype":"init","session_id":"{SESSION}","apiKeySource":"ANTHROPIC_API_KEY"}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"The answer."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"The answer."}}
+    "#};
+    let input = stream_input()?;
+    let Fold {
+        turn, last_result, ..
+    } = stream::claude::fold_stream_input(0, "q", &failed_then_answered, &input);
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
+    );
+    let rendered = render_turn(&turn);
+    assert_that!(
+        rendered,
+        contains_substring("reported a failure here, then went on: model overloaded")
+    );
+    // Each further CLI turn announces itself again, and the key is noted once.
+    assert_that!(rendered.matches("apiKeySource").count(), eq(1));
+
+    let unreadable = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"result","is_error":false,"result":"The answer."}}
+        {{"type":"result","subtype":{{"kind":"success"}}}}
+    "#};
+    let Fold {
+        turn,
+        input: turn_input,
+        last_result,
+        ..
+    } = stream::claude::fold_stream_input(0, "q", &unreadable, &input);
+    assert_that!(last_result, none());
+    assert_that!(turn_input, eq(TurnInput::Closed));
+    assert_that!(turn.unrecognised.summary(), some(anything()));
+    Ok(())
+}
+
+/// A hook that reopened one CLI turn says nothing of the next: what Claude answered after a
+/// steer it took past that turn's `result` is labelled the answer, where what followed the
+/// reopening is not.
+#[gtest]
+fn a_reopening_ends_with_the_cli_turn_it_reopened() -> Result<()> {
+    let events = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"THE_REPORT_BODY"}}]}},"parent_tool_use_id":null}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"Stop hook feedback: reconsider."}}]}},"parent_tool_use_id":null}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"Reconsidered."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"Reconsidered."}}
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"Check the tests too."}}]}},"parent_tool_use_id":null,"uuid":"{STEER_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"The tests pass."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"The tests pass."}}
+    "#};
+    let Fold { turn, .. } = stream::claude::fold_stream_input(0, "q", &events, &stream_input()?);
+    let rendered = render_turn(&turn);
+    assert_that!(
+        rendered,
+        contains_substring("### assistant (after hook reopen — not the answer)\n\nReconsidered.")
+    );
+    assert_that!(
+        rendered,
+        contains_substring("### assistant\n\nThe tests pass.")
+    );
+    Ok(())
 }
 
 /// A rate limit must be classified from the status code, not from the vendor's wording.
@@ -403,13 +497,7 @@ fn a_hook_that_reopened_an_earlier_cli_turn_does_not_hide_a_later_failure() {
 /// `subtype: "success"`, so anything reading the subtype would have called this a clean run.
 #[gtest]
 fn a_rate_limited_run_is_classified_from_the_status_code() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CLAUDE_RATE_LIMITED,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_RATE_LIMITED);
 
     assert_that!(
         turn.outcome,
@@ -434,13 +522,7 @@ fn a_rate_limited_run_is_classified_from_the_status_code() {
 /// hours in the recorded run.
 #[gtest]
 fn a_rate_limited_run_keeps_the_window_reopening_time() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CLAUDE_RATE_LIMITED,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_RATE_LIMITED);
 
     let limit = turn
         .usage_window
@@ -469,18 +551,14 @@ fn a_rate_limited_run_keeps_the_window_reopening_time() {
 /// until the parser names it.
 #[gtest]
 fn no_committed_fixture_contains_an_unnamed_event_type() {
-    for Fixture {
-        vendor,
-        mode,
-        name,
-        stream,
-    } in fixtures::all()
-    {
-        let Fold { turn, .. } = stream::fold(vendor, mode, 0, "q", stream);
+    for fixture in fixtures::all() {
+        let Fold { turn, .. } = fixture.fold(fixture.stream);
         assert_that!(
             turn.unrecognised.summary(),
             none(),
-            "fixture {name} carries an event type the {vendor} parser does not name"
+            "fixture {} carries an event type the {} parser does not name",
+            fixture.name,
+            fixture.vendor
         );
     }
 }
@@ -539,13 +617,7 @@ fn a_reopened_turn_is_detected_without_the_vendors_wording() {
         {"type":"assistant","message":{"content":[{"type":"text","text":"Summary: looks fine."}]},"parent_tool_use_id":null}
         {"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","result":"Summary: looks fine."}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(turn.was_reopened_by_hook(), eq(true));
     assert_that!(
@@ -564,13 +636,7 @@ fn a_reopened_turn_is_detected_without_the_vendors_wording() {
 /// A delegate's own tool results are not injections.
 #[gtest]
 fn tool_results_are_not_mistaken_for_a_reopening() {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CLAUDE_TOOL_USE,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_TOOL_USE);
 
     assert_that!(turn.was_reopened_by_hook(), eq(false));
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
@@ -587,16 +653,9 @@ fn tool_results_are_not_mistaken_for_a_reopening() {
 #[gtest]
 fn the_final_message_is_derived_and_is_not_the_report_when_a_hook_reopened_the_turn() {
     let mut transcript = agentmux::transcript::Transcript::default();
-    transcript.turns.push(
-        stream::fold(
-            Vendor::Claude,
-            stream::LaunchMode::DirectCli,
-            0,
-            "q",
-            fixtures::CLAUDE_STOP_HOOK,
-        )
-        .turn,
-    );
+    transcript
+        .turns
+        .push(stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_STOP_HOOK).turn);
 
     let final_message = transcript.final_message().expect("a final message exists");
     // It is the last thing the delegate said, which after a reopening is not the report.
@@ -606,16 +665,9 @@ fn the_final_message_is_derived_and_is_not_the_report_when_a_hook_reopened_the_t
 
     // On a clean run it is exactly the answer, which is the only case it may be used for.
     let mut clean = agentmux::transcript::Transcript::default();
-    clean.turns.push(
-        stream::fold(
-            Vendor::Claude,
-            stream::LaunchMode::DirectCli,
-            0,
-            "q",
-            fixtures::CLAUDE_HAPPY,
-        )
-        .turn,
-    );
+    clean
+        .turns
+        .push(stream::fold(Vendor::Claude, 0, "q", fixtures::CLAUDE_HAPPY).turn);
     assert_that!(clean.was_reopened_by_hook(), eq(false));
     assert_that!(clean.final_message(), some(eq("FIXTURE_OK")));
 }
@@ -626,14 +678,7 @@ fn the_final_message_is_derived_and_is_not_the_report_when_a_hook_reopened_the_t
 /// scale: a visibly non-empty transcript reporting that the delegate said nothing.
 #[gtest]
 fn the_final_message_falls_back_to_a_recovered_reply() {
-    let mut turn = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        fixtures::CODEX_HAPPY,
-    )
-    .turn;
+    let mut turn = stream::fold(Vendor::Codex, 0, "q", fixtures::CODEX_HAPPY).turn;
     turn.messages.clear();
     turn.recovered = Some("the findings, recovered".to_owned());
 
@@ -656,7 +701,6 @@ fn the_final_message_falls_back_to_a_recovered_reply() {
 fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
     let Fold { turn, session, .. } = stream::fold(
         Vendor::Claude,
-        stream::LaunchMode::DirectCli,
         1,
         "What was the word?",
         fixtures::CLAUDE_RESUME,
@@ -689,26 +733,21 @@ fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
 /// the render of the shorter prefix is a prefix of the render of the longer one.
 #[gtest]
 fn every_fixture_renders_monotonically_over_its_prefixes() {
-    for Fixture {
-        vendor,
-        mode,
-        name,
-        stream,
-    } in fixtures::all()
-    {
-        expect_monotonic_render(vendor, mode, name, stream);
+    for fixture in fixtures::all() {
+        expect_monotonic_render(&fixture);
     }
     // What the app-server driver writes and `codex exec` never does: questions and a steer.
-    expect_monotonic_render(
-        Vendor::Codex,
-        stream::LaunchMode::AppServer,
-        "driven question capture",
-        DRIVEN_QUESTIONS,
-    );
+    expect_monotonic_render(&Fixture {
+        vendor: Vendor::Codex,
+        name: "driven question capture",
+        stream: DRIVEN_QUESTIONS,
+        input: None,
+    });
 }
 
-/// Check that the render of `stream` at every line cut extends the render of the cut before it.
-fn expect_monotonic_render(vendor: Vendor, mode: stream::LaunchMode, name: &str, stream: &str) {
+/// Check that the render of `fixture` at every line cut extends the render of the cut before it.
+fn expect_monotonic_render(fixture: &Fixture) {
+    let Fixture { name, stream, .. } = fixture;
     let lines: Vec<&str> = stream.lines().collect();
     let mut previous = String::new();
     for cut in 0..=lines.len() {
@@ -718,7 +757,7 @@ fn expect_monotonic_render(vendor: Vendor, mode: stream::LaunchMode, name: &str,
             .iter()
             .flat_map(|line| [*line, "\n"])
             .collect();
-        let Fold { turn, .. } = stream::fold(vendor, mode, 0, "q", &prefix);
+        let Fold { turn, .. } = fixture.fold(&prefix);
         let rendered = agentmux::transcript::render_turn(&turn);
         expect_that!(
             rendered.starts_with(&previous),
@@ -751,13 +790,7 @@ const DRIVEN_QUESTIONS: &str = indoc::indoc! {r#"
 /// third, and a steer after them changes neither: agentmux cannot tell what it answered.
 #[gtest]
 fn a_codex_question_is_numbered_kept_in_the_report_and_rendered() -> Result<()> {
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        DRIVEN_QUESTIONS,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", DRIVEN_QUESTIONS);
 
     // Every question, numbered in the order asked, with its options and when it was asked.
     let asked: Vec<(u32, &str, usize)> = turn
@@ -837,13 +870,7 @@ fn a_codex_top_level_error_is_a_note_and_the_turn_goes_on() {
         {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"the answer"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        retried,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", retried);
 
     // The turn completed, the answer is kept, and the retry is said once, before it.
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
@@ -866,13 +893,7 @@ fn a_codex_top_level_error_is_a_note_and_the_turn_goes_on() {
         {"type":"error","message":"stream disconnected before completion"}
         {"type":"turn.failed","error":{"message":"the final word"}}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        failing,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", failing);
     assert_that!(
         turn.outcome,
         matches_pattern!(Outcome::Failed {
@@ -896,8 +917,7 @@ fn a_codex_collab_tool_call_is_recognised_and_an_unknown_kind_is_still_counted()
         {"type":"item.completed","item":{"id":"item_49","type":"agent_message","text":"done"}}
         {"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
 
     assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
     assert_that!(
@@ -917,13 +937,7 @@ fn a_renamed_text_payload_is_counted_not_dropped() {
         {"type":"assistant","message":{"content":[{"type":"text","value":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
         {"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","result":""}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(
         turn.unrecognised.summary(),
@@ -943,13 +957,7 @@ fn a_result_without_its_error_flag_is_drift_not_success() {
         {"type":"assistant","message":{"content":[{"type":"text","text":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
         {"type":"result","subtype":"success","terminal_reason":"completed","result":""}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(turn.outcome, matches_pattern!(Outcome::Running));
     assert_that!(
@@ -974,13 +982,7 @@ fn context_injected_mid_turn_is_not_a_reopening() {
         {"type":"assistant","message":{"content":[{"type":"text","text":"THE_REPORT_BODY"}]},"parent_tool_use_id":null}
         {"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","result":"THE_REPORT_BODY"}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(turn.was_reopened_by_hook(), eq(false));
     assert_that!(
@@ -1005,8 +1007,7 @@ fn an_infrastructure_error_is_not_classified_as_a_refusal() {
         {"type":"thread.started","thread_id":"01a0"}
         {"type":"turn.failed","error":{"message":"connect ECONNREFUSED 127.0.0.1:8080 (request id req_4291)"}}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", stream);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", stream);
 
     assert_that!(
         turn.outcome,
@@ -1031,13 +1032,7 @@ fn a_resume_whose_session_is_gone_still_names_the_session() {
         {"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"9f1c21f8-1b3d-4a7e-9a0c-2d6f4b8e5c10","total_cost_usd":0}
     "#};
 
-    let Fold { turn, session, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        1,
-        "q",
-        stream,
-    );
+    let Fold { turn, session, .. } = stream::fold(Vendor::Claude, 1, "q", stream);
 
     assert_that!(
         session.map(|s| s.as_str().to_owned()),
@@ -1060,13 +1055,7 @@ fn the_announced_session_outranks_the_one_the_result_echoes() {
         {"type":"result","subtype":"success","is_error":false,"session_id":"22222222-2222-4222-8222-222222222222"}
     "#};
 
-    let Fold { session, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { session, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(
         session.map(|s| s.as_str().to_owned()),
@@ -1093,13 +1082,7 @@ fn task_lifecycle_and_progress_events_are_named_and_silent() {
         {"type":"result","subtype":"success","is_error":false}
     "#};
 
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        stream,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", stream);
 
     assert_that!(turn.unrecognised.summary(), none());
     // Named, not merely tolerated: none of them is allowed to become transcript content.
@@ -1124,8 +1107,7 @@ fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
     let keyed = indoc::indoc! {r#"
         {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814","apiKeySource":"ANTHROPIC_API_KEY"}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Claude, stream::LaunchMode::DirectCli, 0, "q", keyed);
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", keyed);
     assert_that!(
         turn.messages
             .iter()
@@ -1139,18 +1121,13 @@ fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
     );
 
     // Every committed fixture ran on a subscription, and none of them carries the note.
-    for Fixture {
-        vendor,
-        mode,
-        name,
-        stream,
-    } in fixtures::all()
-    {
-        let Fold { turn, .. } = stream::fold(vendor, mode, 0, "q", stream);
+    for fixture in fixtures::all() {
+        let Fold { turn, .. } = fixture.fold(fixture.stream);
         assert_that!(
             agentmux::transcript::render_turn(&turn),
             not(contains_substring("apiKeySource")),
-            "{name}"
+            "{}",
+            fixture.name
         );
     }
 }
@@ -1176,13 +1153,7 @@ fn a_capture_an_older_agentmux_wrote_folds_as_it_did() {
         {"type":"item.completed","item":{"id":7,"type":"agent_message","text":"AND THIS"}}
         {"type":"turn.completed","usage":null}
     "#};
-    let Fold { turn, session, .. } = stream::fold(
-        Vendor::Codex,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        completed,
-    );
+    let Fold { turn, session, .. } = stream::fold(Vendor::Codex, 0, "q", completed);
 
     assert_that!(session, some(anything()));
     assert_that!(turn.unrecognised.summary(), none());
@@ -1214,8 +1185,7 @@ fn a_capture_an_older_agentmux_wrote_folds_as_it_did() {
         {"type":"error","message":7}
         {"type":"turn.failed","error":{"message":7}}
     "#};
-    let Fold { turn, .. } =
-        stream::fold(Vendor::Codex, stream::LaunchMode::DirectCli, 0, "q", failed);
+    let Fold { turn, .. } = stream::fold(Vendor::Codex, 0, "q", failed);
     assert_that!(turn.unrecognised.summary(), none());
     assert_that!(
         turn.messages
@@ -1243,13 +1213,7 @@ fn a_rate_limit_warning_leaves_the_window_open() {
     let events = indoc::indoc! {r#"
         {"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1788727800,"rateLimitType":"five_hour"}}
     "#};
-    let Fold { turn, .. } = stream::fold(
-        Vendor::Claude,
-        stream::LaunchMode::DirectCli,
-        0,
-        "q",
-        events,
-    );
+    let Fold { turn, .. } = stream::fold(Vendor::Claude, 0, "q", events);
 
     let window = turn.usage_window.clone();
     assert_that!(

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use agentmux::delegate::{Billing, Invocation};
-use agentmux::launch::{LaunchSpec, Launched, Launcher, Liveness, ProcessLauncher};
+use agentmux::launch::{LaunchInput, LaunchSpec, Launched, Launcher, Liveness, ProcessLauncher};
 use googletest::prelude::*;
 
 struct Fixture {
@@ -54,7 +54,7 @@ impl Fixture {
             .launch(&LaunchSpec {
                 invocation: &invocation,
                 cwd: self.dir.path(),
-                question: &question,
+                input: LaunchInput::Question(&question),
                 events: &self.dir.path().join("events.jsonl"),
                 stderr: &self.dir.path().join("stderr.log"),
             })
@@ -199,7 +199,7 @@ fn a_missing_working_directory_is_named() -> Result<()> {
         .launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &fixture.dir.path().join("nowhere"),
-            question: &question,
+            input: LaunchInput::Question(&question),
             events: &fixture.dir.path().join("events.jsonl"),
             stderr: &fixture.dir.path().join("stderr.log"),
         })

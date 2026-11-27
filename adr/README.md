@@ -112,5 +112,5 @@ A new decision gets a record with the next number.
 
 ## Claude integration
 
-- [0034](0034-claude-turns-driven-over-stream-json-input.md): A Claude turn is driven over
-  stream-json input, so it takes a steer until its result.
+- [0034](0034-claude-input-held-by-its-supervisor.md): A Claude turn reads its input from its
+  supervisor, so it takes a steer until its result.

@@ -363,7 +363,8 @@ pub enum NotRunningReason {
     NotLaunched,
     /// A cancellation is stopping the turn.
     Cancelling,
-    /// The delegate has reported the turn's result and takes nothing more while it finishes.
+    /// The delegate takes nothing more while it finishes: Claude has reported its result, or
+    /// has exited.
     Finishing,
     /// The turn is over.
     Ended(TurnState),
@@ -383,9 +384,12 @@ impl std::fmt::Display for NotRunningReason {
 /// Why a running turn takes no message: its delegate reads its question once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsteerableReason {
-    /// A Claude delegate launched as `claude --print` with its question as its only input: by an
-    /// agentmux that does not drive Claude turns, or one older than driving them.
+    /// A Claude delegate launched with its question as its only input: by a store with no
+    /// supervisor, through a Windows `.cmd` shim, or by an agentmux older than steering Claude.
     ClaudePrint,
+    /// A Claude turn whose supervisor, which holds Claude's input, has gone or cannot be checked
+    /// on.
+    ClaudeInputLost,
     /// An inheriting Codex delegate this agentmux launched with `codex exec`.
     CodexExec,
     /// An isolated Codex delegate, which only `codex exec` can run.
@@ -397,8 +401,13 @@ impl std::fmt::Display for UnsteerableReason {
         f.write_str(match self {
             Self::ClaudePrint => {
                 "its turn was launched as `claude --print` reading its question once, which offers \
-                 no channel into a turn that has started; only a Claude turn agentmux drives over \
-                 stream-json input takes a steer, as every turn the agentmux command launches is"
+                 no channel into a turn that has started; a Claude turn the agentmux command \
+                 launches reads its input as stream-json and takes a steer, unless `claude` is a \
+                 Windows `.cmd` shim"
+            }
+            Self::ClaudeInputLost => {
+                "the agentmux supervisor that holds Claude's input has exited, or cannot be checked \
+                 on, so nothing can reach the turn, which finishes unsteered"
             }
             Self::CodexExec => {
                 "this agentmux launched it with `codex exec`, which reads its question once; Codex \

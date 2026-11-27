@@ -82,6 +82,9 @@ pub enum MessageSource {
     Delegate,
     /// Injected by a hook in the delegate's own environment, reopening a finished turn.
     HookInjection,
+    /// The model's reply in a turn a hook reopened, after the reopening: not the answer, which is
+    /// above it.
+    AfterReopening,
     /// Injected by a hook in the delegate's own environment while the turn was still under way.
     ///
     /// A `PostToolUse` hook adding context, or a `PreToolUse` hook refusing a call with a reason,
@@ -153,6 +156,16 @@ impl Message {
         }
     }
 
+    /// What the delegate said after a hook reopened its finished turn.
+    #[must_use]
+    pub fn after_reopening(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            text: text.into(),
+            source: MessageSource::AfterReopening,
+        }
+    }
+
     /// A `user` message a hook injected while the delegate was still working.
     #[must_use]
     pub fn hook_context(text: impl Into<String>) -> Self {
@@ -195,14 +208,16 @@ impl Message {
 
     /// Whether this message counts as part of the deliverable.
     ///
-    /// Assistant text the delegate produced is the report, the questions it asked included.
+    /// Assistant text the delegate produced is the report, the questions it asked included, and
+    /// so is what it said after a hook reopened its turn, which
+    /// [`Transcript::was_reopened_by_hook`] warns of.
     /// Hook injections and agentmux's own notes are context around it.
     #[must_use]
     pub fn is_report_content(&self) -> bool {
         self.role == Role::Assistant
             && matches!(
                 self.source,
-                MessageSource::Delegate | MessageSource::Question
+                MessageSource::Delegate | MessageSource::AfterReopening | MessageSource::Question
             )
     }
 }
@@ -1036,11 +1051,9 @@ fn render_left_running(rendered_turn: &mut String, left_running: &LeftRunning) {
 }
 
 fn render_messages(rendered_turn: &mut String, messages: &[Message]) {
-    let mut reopened = false;
     for message in messages {
         match message.source {
             MessageSource::HookInjection => {
-                reopened = true;
                 let _ = indoc::writedoc!(
                     rendered_turn,
                     "
@@ -1103,10 +1116,12 @@ fn render_messages(rendered_turn: &mut String, messages: &[Message]) {
                     single_line(&message.text)
                 );
             }
-            MessageSource::Delegate => {
-                let label = match (message.role, reopened) {
-                    (Role::Assistant, false) => "assistant",
-                    (Role::Assistant, true) => "assistant (after hook reopen — not the answer)",
+            MessageSource::Delegate | MessageSource::AfterReopening => {
+                let label = match (message.role, message.source) {
+                    (Role::Assistant, MessageSource::AfterReopening) => {
+                        "assistant (after hook reopen — not the answer)"
+                    }
+                    (Role::Assistant, _) => "assistant",
                     (Role::User, _) => "user",
                     (Role::System, _) => "system",
                 };
