@@ -22,13 +22,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{
-    AccountAlias, ClaudePermissionMode, ClaudePermissions, ClaudeTool, CodexPermissions,
-    CodexSandbox, Delegate, Effort, Isolation, ModelId, Permissions,
-};
+use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 use serde_json::Value;
 

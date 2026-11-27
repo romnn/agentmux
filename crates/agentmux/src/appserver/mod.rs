@@ -179,8 +179,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::{AppServerSettings, Billing, SessionRef};
+use crate::delegate::{Billing, SessionRef};
 use crate::run::layout::TurnDir;
+use crate::vendor::codex::AppServerSettings;
 
 pub use driver::{DriverOutcome, DriverTimeouts, STOP_BUDGET, drive, drive_with};
 pub(crate) use protocol::initialize_params;

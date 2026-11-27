@@ -12,13 +12,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, Billing, CodexPermissions, CodexSandbox, Delegate, Effort, Invocation, ModelId,
-    Permissions,
+    AccountChoice, Billing, Delegate, Effort, Invocation, ModelId, Permissions,
 };
 use agentmux::launch::{LaunchInput, LaunchSpec, Launcher as _};
 use agentmux::run::{AutoResume, Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// A Codex turn that said something in a session it announced, then failed because the model

@@ -16,12 +16,10 @@ use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use agentmux::appserver::{DriverOutcome, DriverPlan, DriverTimeouts, drive_with};
-use agentmux::delegate::{
-    AccountChoice, AppServerSettings, Billing, CodexPermissions, CodexSandbox, ModelId,
-    Permissions, SessionRef, Vendor,
-};
+use agentmux::delegate::{AccountChoice, Billing, ModelId, Permissions, SessionRef, Vendor};
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
+use agentmux::vendor::codex::{AppServerSettings, CodexPermissions, CodexSandbox};
 use codex_app_server_mock::conformance::{self, Side};
 use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID, TokenCounts};
 use codex_app_server_mock::{Peer, PeerError};

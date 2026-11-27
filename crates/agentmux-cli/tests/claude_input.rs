@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{AccountChoice, ClaudePermissions, Delegate, ModelId, Permissions};
+use agentmux::delegate::{AccountChoice, Delegate, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{AutoResumePolicy, Retention, RunId, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::claude::ClaudePermissions;
 use googletest::prelude::*;
 
 /// The session every fake `claude` announces.

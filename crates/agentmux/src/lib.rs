@@ -35,9 +35,8 @@
 //! # // Uses `no_run` because the example spawns a real delegate CLI and writes a run directory.
 //! use std::sync::Arc;
 //!
-//! use agentmux::delegate::{
-//!     AccountChoice, ClaudePermissions, Delegate, Effort, ModelId, Permissions,
-//! };
+//! use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
+//! use agentmux::vendor::claude::ClaudePermissions;
 //! use agentmux::launch::ProcessLauncher;
 //! use agentmux::run::{Retention, RunStore, StartRequest};
 //!
@@ -84,6 +83,7 @@ pub mod run;
 pub mod stream;
 pub mod testing;
 pub mod transcript;
+pub mod vendor;
 
 use std::collections::BTreeMap;
 

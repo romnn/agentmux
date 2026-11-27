@@ -1287,7 +1287,7 @@ impl Config {
         let vendor_rules = match vendor {
             Vendor::Claude => self.claude.describe(),
             Vendor::Codex => self.codex.describe(),
-            Vendor::Agy => format!("deny={}", crate::delegate::AGY_DENY_RULES.join(",")),
+            Vendor::Agy => format!("deny={}", crate::vendor::agy::AGY_DENY_RULES.join(",")),
         };
         format!("{} {vendor_rules}", self.permissions(vendor).describe())
     }

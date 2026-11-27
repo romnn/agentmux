@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use agentmux::config::{Config, ConfigError, PermissionRefusal};
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, ClaudePermissionMode, ClaudePermissions, ClaudeTool,
-    CodexPermissions, CodexSandbox, Delegate, DelegateError, Effort, Invocation, Isolation,
-    ModelId, Overrides, PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
-    codex_supports_permission_profiles,
+    AccountAlias, AccountChoice, Delegate, DelegateError, Effort, Invocation, Isolation, ModelId,
+    Overrides, PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
 };
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox, codex_supports_permission_profiles};
 use googletest::prelude::*;
 
 /// Where every machine file in these tests claims to live, so a refusal can be checked to name it.

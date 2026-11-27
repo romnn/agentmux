@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux::config::{BlockedModel, Config, expand_tilde};
-use agentmux::delegate::{ClaudePermissions, ModelId, Permissions, Vendor};
+use agentmux::delegate::{ModelId, Permissions, Vendor};
+use agentmux::vendor::claude::ClaudePermissions;
 use googletest::prelude::*;
 
 /// A host environment with `HOME` pointing where the test wants it.

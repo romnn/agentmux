@@ -12,12 +12,11 @@
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use agentmux::delegate::{
-    Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, DelegateError, Isolation,
-    PermissionOptions, Vendor,
-};
+use agentmux::delegate::{Billing, Delegate, DelegateError, Isolation, PermissionOptions, Vendor};
 use agentmux::run::{Retention, RunId, RunLabel};
 use agentmux::transcript::TurnState;
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudeTool};
+use agentmux::vendor::codex::CodexSandbox;
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};

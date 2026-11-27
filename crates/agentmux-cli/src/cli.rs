@@ -14,12 +14,11 @@ use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
-use agentmux::delegate::{
-    Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, Isolation,
-    PermissionOptions, Vendor,
-};
+use agentmux::delegate::{Billing, Delegate, Isolation, PermissionOptions, Vendor};
 use agentmux::run::{Retention, RunId, RunLabel};
 use agentmux::transcript::TurnState;
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudeTool};
+use agentmux::vendor::codex::CodexSandbox;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr as _, bail};
 
@@ -797,7 +796,9 @@ impl std::str::FromStr for RunIdArg {
 
 #[cfg(test)]
 mod tests {
-    use agentmux::delegate::{ClaudePermissionMode, CodexSandbox, Isolation, PermissionOptions};
+    use agentmux::delegate::{Isolation, PermissionOptions};
+    use agentmux::vendor::claude::ClaudePermissionMode;
+    use agentmux::vendor::codex::CodexSandbox;
     use clap::Parser as _;
     use googletest::prelude::*;
 

@@ -389,9 +389,7 @@ mod tests {
     use googletest::prelude::*;
 
     use super::Admission;
-    use crate::delegate::{
-        AccountChoice, Billing, CodexPermissions, Delegate, Isolation, ModelId, Permissions,
-    };
+    use crate::delegate::{AccountChoice, Billing, Delegate, Isolation, ModelId, Permissions};
     use crate::launch::Launched;
     use crate::run::auto_resume::AutoResumeRecord;
     use crate::run::records::{
@@ -400,6 +398,7 @@ mod tests {
     };
     use crate::run::{Retention, RunId, RunStore, StartRequest};
     use crate::testing::{Script, ScriptedLauncher};
+    use crate::vendor::codex::CodexPermissions;
 
     /// A supervisor that cannot read its consultation's record settles the turn as never started,
     /// before entering the phase that says a delegate may be running.

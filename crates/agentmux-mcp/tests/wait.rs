@@ -6,12 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use agentmux_mcp::AgentMux;
 use googletest::prelude::*;
 use rmcp::model::{

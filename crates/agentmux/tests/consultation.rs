@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate,
-    Effort, Isolation, ModelId, Overrides, Permissions,
+    AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, Overrides, Permissions,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
@@ -16,6 +15,8 @@ use agentmux::run::{
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{FailureKind, Outcome, TurnState};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 fn env() -> BTreeMap<String, String> {

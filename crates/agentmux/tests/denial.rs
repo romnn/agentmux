@@ -12,12 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
-    Permissions, Vendor,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions, Vendor};
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 use strum::VariantArray as _;
 

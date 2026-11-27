@@ -7,13 +7,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Permissions, Vendor,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions, Vendor};
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, UsageWindow};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use chrono::Utc;
 use googletest::prelude::*;
 

@@ -14,12 +14,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{
-    AccountAlias, Billing, ClaudePermissions, Delegate, Effort, ModelId, Permissions,
-};
+use agentmux::delegate::{AccountAlias, Billing, Delegate, Effort, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{ListFilter, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::fixtures;
+use agentmux::vendor::claude::ClaudePermissions;
 use googletest::prelude::*;
 
 /// Keys a launching agent's shell might well export, for both vendors.

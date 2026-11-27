@@ -23,10 +23,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use strum::VariantArray as _;
 
-use crate::delegate::{
-    ClaudePermissionMode, ClaudePermissions, ClaudeTool, CodexPermissions, CodexSandbox, Isolation,
-    Vendor,
-};
+use crate::delegate::{Isolation, Vendor};
+use crate::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use crate::vendor::codex::{CodexPermissions, CodexSandbox};
 
 use super::{Account, AccountAlias, ConfigError};
 

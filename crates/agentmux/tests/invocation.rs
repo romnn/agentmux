@@ -9,10 +9,11 @@ use std::path::Path;
 
 use agentmux::config::{Account, Config, Defaults, Secret};
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox,
-    Delegate, DelegateError, Effort, Invocation, Isolation, ModelId, Permissions, SessionRef,
-    TurnPlan, Vendor,
+    AccountAlias, AccountChoice, Billing, Delegate, DelegateError, Effort, Invocation, Isolation,
+    ModelId, Permissions, SessionRef, TurnPlan, Vendor,
 };
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 fn model(id: &str) -> Result<ModelId> {

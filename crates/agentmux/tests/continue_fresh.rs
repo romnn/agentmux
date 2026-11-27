@@ -5,12 +5,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
-    Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
 use agentmux::run::{Retention, RunError, RunLabel, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// A Codex turn the content filter refused after the delegate had said something.

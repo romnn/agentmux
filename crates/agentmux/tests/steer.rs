@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 use agentmux::appserver::mailbox::{Mailbox, SteerReply};
 use agentmux::appserver::{DriverPlan, STOP_BUDGET};
 use agentmux::delegate::{
-    AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort,
-    Isolation, ModelId, Permissions,
+    AccountChoice, Billing, Delegate, Effort, Isolation, ModelId, Permissions,
 };
 use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
@@ -24,6 +23,8 @@ use agentmux::run::{
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{Outcome, TurnState};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// Where a test pretends the agentmux executable lives.

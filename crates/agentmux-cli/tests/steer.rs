@@ -18,13 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
-    Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use codex_app_server_mock::scenario::{CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode};
 use googletest::prelude::*;
 
@@ -620,7 +618,8 @@ fn record_launch(turn: &Path, driver: u32) -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> Result<()> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let harness = cli_harness()?;
     let turn = harness.state_dir.join("taken-over");
@@ -671,7 +670,8 @@ async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> 
 #[gtest]
 fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let harness = cli_harness()?;
     for (billing, expect_key) in [(Billing::Subscription, false), (Billing::Api, true)] {
@@ -767,7 +767,8 @@ fn drive_fake(
     release_marker_paths: Vec<PathBuf>,
 ) -> Result<DriverProcess> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let codex_home = dir.join("codex-home");
     let command_pids_path = dir.join("commands.txt");

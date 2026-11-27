@@ -9,14 +9,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
 use agentmux::left_running::{LeftProcess, LeftRunning, ProcessFate};
 use agentmux::report::Warning;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest, TurnLeftRunning};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 fn env() -> BTreeMap<String, String> {

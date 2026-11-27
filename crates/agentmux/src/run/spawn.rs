@@ -7,11 +7,12 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, AppServerSettings, Billing, Delegate, DelegateError, Isolation, ModelId,
-    Overrides, Permissions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    AccountChoice, Billing, Delegate, DelegateError, Isolation, ModelId, Overrides, Permissions,
+    SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
+use crate::vendor::codex::{AppServerSettings, codex_supports_permission_profiles};
 
 use super::auto_resume::AutoResumePlan;
 use super::error::{NotResumable, RunError};
@@ -1036,7 +1037,7 @@ fn write_question(
     match vendor {
         Vendor::Agy => std::fs::write(
             turn.encoded_question(),
-            crate::delegate::agy_input(question),
+            crate::vendor::agy::agy_input(question),
         )
         .map_err(RunError::io(format!(
             "writing turn {index} encoded question"

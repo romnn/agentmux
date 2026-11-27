@@ -1201,12 +1201,10 @@ mod tests {
 
     use agentmux::appserver::DriverPlan;
     use agentmux::appserver::mailbox::{Mailbox, SteerReply};
-    use agentmux::delegate::{
-        AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
-        Permissions,
-    };
+    use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
+    use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
     use googletest::prelude::*;
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::ErrorCode;

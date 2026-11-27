@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, ModelId, Overrides,
-    Permissions, SessionRef, Vendor,
+    AccountChoice, Delegate, ModelId, Overrides, Permissions, SessionRef, Vendor,
 };
 use agentmux::run::{ListFilter, Retention, RunId, RunStore, StartRequest};
 use agentmux::testing::{RecordedLaunch, Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// A machine with one configured Claude account, `work`, and a store that launches every turn

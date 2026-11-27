@@ -9,13 +9,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
-    ModelId, Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::run::{AutoResume, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome, UsageWindow};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use chrono::Utc;
 use googletest::prelude::*;
 

@@ -5,13 +5,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Invocation, ModelId,
-    Permissions,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, Invocation, ModelId, Permissions};
 use agentmux::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 fn env() -> BTreeMap<String, String> {
