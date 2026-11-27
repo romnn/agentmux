@@ -146,6 +146,13 @@ pub enum DelegateError {
         why: &'static str,
     },
 
+    /// An isolated agy delegate was built outside the run store, which keeps the home it runs in.
+    #[error(
+        "an isolated agy delegate runs in the home its run store keeps, so it can only be launched \
+         through the store"
+    )]
+    AgyHomeUnknown,
+
     /// agy's own settings file exists but cannot be read, and its permission rules have to be
     /// carried into the launch.
     #[error(
@@ -1691,16 +1698,6 @@ impl Invocation {
             .insert(name.to_owned(), dir.to_string_lossy().into_owned());
     }
 
-    /// Run the child with `home` as its home directory, in both the spelling Unix reads and the
-    /// one Windows does.
-    pub(crate) fn set_home(&mut self, home: &Path) {
-        let home = home.to_string_lossy().into_owned();
-        for name in ["HOME", "USERPROFILE"] {
-            self.env
-                .insert(crate::config::canonical_env_name(name), home.clone());
-        }
-    }
-
     /// Add `args` to the end of the argument vector.
     pub(crate) fn push_args(&mut self, args: &[&str]) {
         self.args.extend(args.iter().map(|arg| (*arg).to_owned()));
@@ -1949,13 +1946,25 @@ impl Delegate {
     /// endpoint without opting into API pricing, [`DelegateError::Environment`] for an account that
     /// is empty, reads a secret from a host variable that is not set, or is otherwise unusable, and
     /// [`DelegateError::Argument`] or [`DelegateError::Environment`] for a request environment
-    /// entry the configuration does not allow, and [`DelegateError::AgySettingsUnreadable`] for an
-    /// agy delegate whose own settings file cannot be read.
+    /// entry the configuration does not allow, [`DelegateError::AgySettingsUnreadable`] for an
+    /// agy delegate whose own settings file cannot be read, and [`DelegateError::AgyHomeUnknown`]
+    /// for an isolated agy delegate, which only its run store can launch.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
         config: &Config,
+    ) -> Result<Invocation, DelegateError> {
+        self.invocation_in(plan, host_env, config, None)
+    }
+
+    /// The same, for a run store, which keeps `agy_home` for an isolated agy delegate to run in.
+    pub(crate) fn invocation_in(
+        &self,
+        plan: &TurnPlan<'_>,
+        host_env: &BTreeMap<String, String>,
+        config: &Config,
+        agy_home: Option<&Path>,
     ) -> Result<Invocation, DelegateError> {
         let Identity {
             mut env,
@@ -1986,6 +1995,13 @@ impl Delegate {
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
+
+        // Set over every other layer, so no account or request can move it; see ADR 0035.
+        if let Self::Agy { .. } = held
+            && !isolation.inherits()
+        {
+            use_agy_home(&mut env, agy_home.ok_or(DelegateError::AgyHomeUnknown)?)?;
+        }
 
         // Built from the complete environment, whose home is where agy reads its own settings.
         let args = held.args(plan, isolation, &env)?;
@@ -2062,14 +2078,7 @@ impl Delegate {
                 ..
             } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
             Self::Agy { model, effort, .. } => {
-                // An isolated delegate runs in a home of its own, which holds no rules of the
-                // user's; the run store moves it there once this is built.
-                let user_rules = if isolation.inherits() {
-                    agy_user_rules(env)?
-                } else {
-                    AgyPermissionRules::default()
-                };
-                agy_args(model, effort.as_ref(), plan, &user_rules)
+                agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?)
             }
         })
     }
@@ -3037,6 +3046,23 @@ fn agy_user_rules(env: &BTreeMap<String, String>) -> Result<AgyPermissionRules, 
     serde_json::from_str::<AgySettingsFile>(text)
         .map(|settings| settings.permissions)
         .map_err(|err| unreadable(err.to_string()))
+}
+
+/// Point `env` at `home`, the home an isolated agy delegate runs in, creating it on first use.
+///
+/// Both spellings are set: `HOME`, and `USERPROFILE`, which is where agy looks on Windows.
+fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), DelegateError> {
+    std::fs::create_dir_all(home).map_err(|err| {
+        DelegateError::Environment(format!(
+            "cannot create the home an isolated agy delegate runs in, {}: {err}",
+            home.display()
+        ))
+    })?;
+    let home = home.to_string_lossy().into_owned();
+    for name in ["HOME", "USERPROFILE"] {
+        env.insert(crate::config::canonical_env_name(name), home.clone());
+    }
+    Ok(())
 }
 
 /// What an agy turn reads on stdin: its question as the one stream-json record agy takes.

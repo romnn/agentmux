@@ -39,8 +39,10 @@ The run store keeps one, `agy-home` beside `runs`, for every isolated agy delega
 login, so one home serves it.
 agentmux owns that directory: it creates it, and nothing but agy is meant to write there, so a home
 restored over it or linked to another profile is the user's own doing.
-The store sets `HOME`, and `USERPROFILE` where agy looks on Windows, over every other environment
-layer once the launch is built, so no account or request can move it.
+The store hands that home to the launch it builds, which sets `HOME`, and `USERPROFILE` where agy
+looks on Windows, over every other environment layer, so no account or request can move it.
+The public `Delegate::invocation` refuses an isolated agy delegate with
+`DelegateError::AgyHomeUnknown`, since built anywhere else it would run in the user's own home.
 agentmux writes nothing into it: the pinned settings travel in `--settings` on every launch, as for
 an inheriting delegate.
 Its conversations live there, so a follow-up resumes them and the session-store check

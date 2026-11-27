@@ -123,16 +123,17 @@ pub(super) enum Resolution<'a> {
 
 impl Resolution<'_> {
     /// Build `delegate`'s child for `plan`, from `host_env`, the environment the store was opened
-    /// with.
+    /// with, and with `agy_home` as the home an isolated agy delegate runs in.
     fn resolve(
         self,
         delegate: &Delegate,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
+        agy_home: &Path,
     ) -> Result<Resolved, RunError> {
         Ok(match self {
             Self::Configured(config) => Resolved {
-                invocation: delegate.invocation(plan, host_env, config)?,
+                invocation: delegate.invocation_in(plan, host_env, config, Some(agy_home))?,
                 app_server_settings: delegate.app_server_settings(config),
                 auto_resume: None,
             },
@@ -807,22 +808,6 @@ impl RunStore {
         Ok(LaunchMode::AppServer)
     }
 
-    /// Run an isolated agy delegate in the home this store keeps for it, set over every other layer
-    /// of its environment; see ADR 0035.
-    fn place_in_agy_home(
-        &self,
-        delegate: &Delegate,
-        invocation: &mut crate::delegate::Invocation,
-    ) -> Result<(), RunError> {
-        if delegate.vendor() == Vendor::Agy
-            && !delegate.isolation().is_some_and(Isolation::inherits)
-        {
-            create_private_dir(&self.agy_home())?;
-            invocation.set_home(&self.agy_home());
-        }
-        Ok(())
-    }
-
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
@@ -860,12 +845,11 @@ impl RunStore {
             mut invocation,
             app_server_settings,
             auto_resume,
-        } = resolution.resolve(delegate, &plan, &self.host_env)?;
+        } = resolution.resolve(delegate, &plan, &self.host_env, &self.agy_home())?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
         invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
-        self.place_in_agy_home(delegate, &mut invocation)?;
 
         // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);

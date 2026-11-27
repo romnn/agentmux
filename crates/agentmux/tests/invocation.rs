@@ -1837,17 +1837,16 @@ fn an_inheriting_agy_launch_keeps_the_users_deny_and_ask_rules_and_nothing_wider
     Ok(())
 }
 
-/// An isolated agy delegate carries none of the user's rules, which live in a home it does not
-/// run in; the run store moves it to its own.
+/// An isolated agy delegate cannot be built outside its run store, which keeps the home it runs
+/// in: built anywhere else, it would run in the user's own.
 #[gtest]
-fn an_isolated_agy_launch_carries_none_of_the_users_rules() -> Result<()> {
+fn an_isolated_agy_delegate_is_launched_only_through_its_run_store() -> Result<()> {
     let machine = AgyMachine::new()?;
-    machine.user_settings(PERMISSIVE_AGY_SETTINGS)?;
-    let invocation = machine.launch(Isolation::Isolated)?.or_fail()?;
-
     assert_that!(
-        agy_settings(invocation.args())?,
-        eq(&pinned_agy_settings(&[], &[]))
+        machine.launch(Isolation::Isolated)?.map(|_| ()),
+        err(displays_as(contains_substring(
+            "can only be launched through the store"
+        )))
     );
     Ok(())
 }
