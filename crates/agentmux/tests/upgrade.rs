@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use agentmux::delegate::{
     AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Invocation, ModelId,
+    Permissions,
 };
 use agentmux::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
@@ -22,15 +23,15 @@ fn env() -> BTreeMap<String, String> {
 
 fn request() -> Result<StartRequest> {
     Ok(StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "review this".to_owned(),
         cwd: PathBuf::from("/work/project"),

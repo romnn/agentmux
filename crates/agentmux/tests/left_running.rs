@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Permissions,
 };
 use agentmux::left_running::{LeftProcess, LeftRunning, ProcessFate};
 use agentmux::report::Warning;
@@ -28,15 +28,15 @@ fn env() -> BTreeMap<String, String> {
 
 fn request() -> Result<StartRequest> {
     Ok(StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "q".to_owned(),
         cwd: PathBuf::from("/work/project"),

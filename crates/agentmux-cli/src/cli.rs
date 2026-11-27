@@ -362,14 +362,19 @@ impl DelegateArgs {
     /// isolation is spelled twice and the spellings disagree, or when a vendor-specific option
     /// was set for the wrong vendor.
     pub fn build(&self) -> Result<Delegate> {
-        Delegate::from_parts(
-            self.delegate,
-            &self.model,
-            self.effort.as_deref(),
-            self.account.as_deref(),
-            self.permissions.options()?,
-        )
-        .wrap_err("invalid delegate arguments")
+        self.permissions
+            .options()?
+            .for_vendor(self.delegate)
+            .and_then(|overrides| {
+                Delegate::from_parts(
+                    self.delegate,
+                    &self.model,
+                    self.effort.as_deref(),
+                    self.account.as_deref(),
+                    overrides,
+                )
+            })
+            .wrap_err("invalid delegate arguments")
     }
 }
 

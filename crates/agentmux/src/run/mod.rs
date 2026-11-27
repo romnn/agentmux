@@ -549,7 +549,7 @@ impl RunStore {
             unrecognised: state.transcript.unrecognised(),
             hook_reopening: HookReopening::of_turns(
                 &state.transcript.turns,
-                meta.delegate.isolation(),
+                meta.delegate.isolation,
             ),
             earlier_failures: state.transcript.earlier_failures(),
             delegate_questions: TurnQuestion::of_turns(&state.transcript.turns),
@@ -679,8 +679,8 @@ impl RunStore {
             label,
             delegate,
             vendor: current.vendor(),
-            model: current.model().clone(),
-            effort: current.effort().cloned(),
+            model: current.model.clone(),
+            effort: current.effort.clone(),
             cwd: meta.cwd,
             outcome,
             last_activity: state.last_activity.map(DateTime::<Utc>::from),
@@ -715,8 +715,8 @@ impl RunStore {
         })?;
         // Every account is resolved when a consultation starts, so an unresolved one is a record
         // written before agentmux pinned the CLI login, which is what such a record ran on.
-        if *meta.delegate.account() == AccountChoice::Default {
-            meta.delegate = meta.delegate.with_account(AccountChoice::CliLogin);
+        if meta.delegate.account == AccountChoice::Default {
+            meta.delegate.account = AccountChoice::CliLogin;
         }
         Ok(meta)
     }

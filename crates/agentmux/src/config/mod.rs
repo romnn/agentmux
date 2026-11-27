@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use strum::VariantArray as _;
 
 use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
 use trust::refuse_if_untrusted;
@@ -1044,7 +1045,7 @@ impl Config {
     /// Only here: a project file may set neither, and is refused for setting them at all.
     fn read_as_machine(path: &Path) -> Result<Self, ConfigError> {
         let config = Self::read(path)?;
-        for vendor in Vendor::ALL {
+        for &vendor in Vendor::VARIANTS {
             permissions::validate(
                 path,
                 vendor,
@@ -1166,7 +1167,7 @@ impl Config {
             }
         }
         self.validate_agy_accounts(path)?;
-        for vendor in Vendor::ALL {
+        for &vendor in Vendor::VARIANTS {
             self.model_rules(vendor).validate(path)?;
         }
         self.launch.validate(path)

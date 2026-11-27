@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, ModelId,
-    PermissionOptions, SessionRef, Vendor,
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, ModelId, Overrides,
+    Permissions, SessionRef, Vendor,
 };
 use agentmux::run::{ListFilter, Retention, RunId, RunStore, StartRequest};
 use agentmux::testing::{RecordedLaunch, Script, ScriptedLauncher, fixtures};
@@ -136,31 +136,32 @@ fn session_of(vendor: Vendor, capture: &str) -> Result<SessionRef> {
 }
 
 fn claude() -> Result<Delegate> {
-    Ok(Delegate::Claude {
+    Ok(Delegate {
         model: ModelId::parse("opus").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: None,
-        permissions: ClaudePermissions::default(),
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     })
 }
 
 fn codex() -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("sol").or_fail()?,
         effort: None,
-        permissions: CodexPermissions::default(),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions::default()),
     })
 }
 
 fn agy() -> Result<Delegate> {
-    Ok(Delegate::Agy {
+    Ok(Delegate {
         model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Agy,
     })
 }
 
@@ -451,9 +452,12 @@ fn a_partial_override_keeps_a_frozen_network_choice() -> Result<()> {
     machine.store.follow_up_with(
         &run_id,
         "write it out",
-        PermissionOptions {
-            sandbox: Some(CodexSandbox::WorkspaceWrite),
-            ..PermissionOptions::default()
+        Overrides {
+            permissions: Some(Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::WorkspaceWrite),
+                ..CodexPermissions::default()
+            })),
+            ..Overrides::default()
         },
         None,
     )?;

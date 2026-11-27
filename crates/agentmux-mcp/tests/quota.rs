@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Vendor,
+    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId, Permissions, Vendor,
 };
 use agentmux::quota::{AccountQuota, Observation, Origin, Refresh};
 use agentmux::run::{HookReopening, Retention, RunStatus, RunStore, StartRequest};
@@ -32,15 +32,15 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "Review the diff.".to_owned(),
             cwd: PathBuf::from("/work/project"),

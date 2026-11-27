@@ -8,7 +8,7 @@ use chrono::Utc;
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
     AccountChoice, AppServerSettings, Billing, Delegate, DelegateError, Isolation, ModelId,
-    PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    Overrides, Permissions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -140,7 +140,7 @@ impl Resolution<'_> {
             Self::Inherited(Inherited { billing, attempt }) => Resolved {
                 invocation: delegate.continuation(plan, host_env.clone(), billing)?,
                 app_server_settings: delegate
-                    .app_server_settings_under(delegate.isolation().unwrap_or(Isolation::Isolated)),
+                    .app_server_settings_under(delegate.isolation.unwrap_or(Isolation::Isolated)),
                 auto_resume: Some(attempt),
             },
         })
@@ -404,13 +404,12 @@ impl RunStore {
         let fill_defaults = matches!(admission, Admission::New);
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
-        if *pinned.account() == AccountChoice::Default {
+        if pinned.account == AccountChoice::Default {
             // With no default, the CLI's own login, from now on, whatever default is added later.
-            let resolved = match config.default_account(pinned.vendor()) {
+            pinned.account = match config.default_account(pinned.vendor()) {
                 None => AccountChoice::CliLogin,
                 Some(default) => AccountChoice::Named(default.alias.clone()),
             };
-            pinned = pinned.with_account(resolved);
         }
         let vendor = pinned.vendor();
         // Only `start` calls this, so only a new consultation can meet a block.
@@ -418,21 +417,18 @@ impl RunStore {
             launched,
             rewritten_from,
             default_effort,
-        } = config.model_rules(vendor).resolve(pinned.model()).map_err(
+        } = config.model_rules(vendor).resolve(&pinned.model).map_err(
             |RefusedModel { model, blocked }| RunError::ModelBlocked {
                 vendor,
                 model,
                 blocked,
             },
         )?;
-        pinned = pinned.with_model(launched);
-        if fill_defaults
-            && pinned.effort().is_none()
-            && let Some(effort) = default_effort
-        {
-            pinned = pinned.with_effort(effort);
+        pinned.model = launched;
+        if fill_defaults && pinned.effort.is_none() {
+            pinned.effort = default_effort;
         }
-        pinned = pinned.with_isolation(isolation);
+        pinned.isolation = Some(isolation);
         if fill_defaults {
             pinned = pinned.with_default_permissions(config);
         }
@@ -455,7 +451,7 @@ impl RunStore {
     /// [`RunError::NotResumable`] when the previous turn is still running, was cancelled, never
     /// announced a session id, or ended without the delegate saying anything.
     pub fn follow_up(&self, run_id: &RunId, question: &str) -> Result<RunStatus, RunError> {
-        self.follow_up_with(run_id, question, PermissionOptions::default(), None)
+        self.follow_up_with(run_id, question, Overrides::default(), None)
     }
 
     /// Continue a consultation, with the isolation or permissions `overrides` names in place of
@@ -481,7 +477,7 @@ impl RunStore {
         &self,
         run_id: &RunId,
         question: &str,
-        overrides: PermissionOptions,
+        overrides: Overrides,
         label: Option<&RunLabel>,
     ) -> Result<RunStatus, RunError> {
         // Asked before the lock, which would otherwise leave a lock file for a run that is not
@@ -502,20 +498,25 @@ impl RunStore {
             let mut delegate =
                 self.current_delegate(&meta, state.newest.map(|newest| newest.index))?;
             // A record from before isolation was pinned could only have run isolated.
-            if delegate.isolation().is_none() {
-                delegate = delegate.with_isolation(Isolation::Isolated);
+            if delegate.isolation.is_none() {
+                delegate.isolation = Some(Isolation::Isolated);
             }
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
-            let ran_with = delegate.isolation();
-            let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
-            // Isolation decides which home agy runs in, and so where its conversation is kept.
-            if delegate.vendor() == Vendor::Agy && delegate.isolation() != ran_with {
-                return Err(NotResumable::AgyIsolationChange {
-                    run_id: run_id.clone(),
+            let ran_with = delegate.isolation;
+            let delegate = delegate
+                .with_overrides(overrides)?
+                .held_to_limits(&config)?;
+            match delegate.permissions {
+                // Isolation decides which home agy runs in, and so where its conversation is kept.
+                Permissions::Agy if delegate.isolation != ran_with => {
+                    return Err(NotResumable::AgyIsolationChange {
+                        run_id: run_id.clone(),
+                    }
+                    .into());
                 }
-                .into());
+                Permissions::Claude(_) | Permissions::Codex(_) | Permissions::Agy => {}
             }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
@@ -1055,9 +1056,10 @@ fn refuse_an_unverified_profile(
     delegate: &Delegate,
     cli_version: Option<&str>,
 ) -> Result<(), RunError> {
-    let needs_profile = delegate
-        .codex_permissions()
-        .is_some_and(|permissions| permissions.needs_permission_profile());
+    let needs_profile = match delegate.permissions {
+        Permissions::Codex(permissions) => permissions.needs_permission_profile(),
+        Permissions::Claude(_) | Permissions::Agy => false,
+    };
     if launch_mode == LaunchMode::DirectCli
         && needs_profile
         && !codex_supports_permission_profiles(cli_version)

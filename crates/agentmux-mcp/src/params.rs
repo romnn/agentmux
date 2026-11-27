@@ -4,8 +4,9 @@
 //!
 //! # Why the delegate is flat here and an enum inside
 //!
-//! [`agentmux::delegate::Delegate`] is an enum whose variants carry only what that vendor accepts,
-//! so a Codex consultation with a Claude account does not compile.
+//! [`agentmux::delegate::Delegate`] keeps each vendor's permissions in an enum whose variants carry
+//! only what that vendor accepts, so a Codex consultation with a Claude permission mode does not
+//! compile.
 //! A JSON Schema cannot express that without a discriminated union, and a discriminated union is
 //! the shape language models fill in wrong most often.
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
@@ -280,14 +281,19 @@ impl DelegateParams {
     /// argv-safe, when the two isolation spellings disagree, or when a vendor-specific field was
     /// set for another vendor.
     pub fn build(&self) -> Result<Delegate, ErrorData> {
-        Delegate::from_parts(
-            self.delegate,
-            &self.model,
-            self.effort.as_deref(),
-            self.account.as_deref(),
-            self.permissions.options()?,
-        )
-        .map_err(|error| invalid_delegate(&error))
+        self.permissions
+            .options()?
+            .for_vendor(self.delegate)
+            .and_then(|overrides| {
+                Delegate::from_parts(
+                    self.delegate,
+                    &self.model,
+                    self.effort.as_deref(),
+                    self.account.as_deref(),
+                    overrides,
+                )
+            })
+            .map_err(|error| invalid_delegate(&error))
     }
 }
 

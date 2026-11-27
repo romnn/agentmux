@@ -13,7 +13,8 @@ use agentmux::config::{Config, ConfigError, PermissionRefusal};
 use agentmux::delegate::{
     AccountAlias, AccountChoice, ClaudePermissionMode, ClaudePermissions, ClaudeTool,
     CodexPermissions, CodexSandbox, Delegate, DelegateError, Effort, Invocation, Isolation,
-    ModelId, PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    ModelId, Overrides, PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
+    codex_supports_permission_profiles,
 };
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
@@ -50,25 +51,25 @@ fn machine(text: &str) -> Result<Config> {
 }
 
 fn codex(sandbox: Option<CodexSandbox>, network_access: Option<bool>) -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6.1-sol").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox,
-            network_access,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox,
+            network_access,
+        }),
     })
 }
 
 fn claude(permissions: ClaudePermissions) -> Result<Delegate> {
-    Ok(Delegate::Claude {
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
-        permissions,
+        permissions: Permissions::Claude(permissions),
     })
 }
 
@@ -388,7 +389,10 @@ fn the_two_isolation_spellings_must_agree() -> Result<()> {
 #[gtest]
 fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Result<()> {
     let personal = AccountAlias::parse("personal").or_fail()?;
-    let named = |delegate: Delegate| delegate.with_account(AccountChoice::Named(personal.clone()));
+    let named = |delegate: Delegate| Delegate {
+        account: AccountChoice::Named(personal.clone()),
+        ..delegate
+    };
     let config = machine(indoc::indoc! {r#"
         [accounts.codex.personal]
         config_dir = "/tmp"
@@ -410,9 +414,11 @@ fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Re
     );
     // The caller wins over both.
     assert_that!(
-        named(codex(None, None)?)
-            .with_isolation(Isolation::Isolated)
-            .resolved_isolation(&config),
+        Delegate {
+            isolation: Some(Isolation::Isolated),
+            ..named(codex(None, None)?)
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Isolated)
     );
     // With nothing configured, the user's configuration loads.
@@ -429,11 +435,12 @@ fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Re
 #[gtest]
 fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
     let agy = || -> Result<Delegate> {
-        Ok(Delegate::Agy {
+        Ok(Delegate {
             model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
             effort: None,
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Agy,
         })
     };
     let config = machine(indoc::indoc! {r#"
@@ -447,17 +454,19 @@ fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
         ignore_user_config = true
     "#})?;
     assert_that!(
-        agy()?
-            .with_account(AccountChoice::CliLogin)
-            .resolved_isolation(&config),
+        Delegate {
+            account: AccountChoice::CliLogin,
+            ..agy()?
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Isolated)
     );
     assert_that!(
-        agy()?
-            .with_account(AccountChoice::Named(
-                AccountAlias::parse("personal").or_fail()?
-            ))
-            .resolved_isolation(&config),
+        Delegate {
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
+            ..agy()?
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Inherit)
     );
 
@@ -467,10 +476,12 @@ fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
     "})?;
     assert_that!(agy()?.resolved_isolation(&config), eq(Isolation::Isolated));
     assert_that!(
-        agy()?
-            .with_isolation(Isolation::Inherit)
-            .held_to_limits(&config)
-            .map(|_| ()),
+        Delegate {
+            isolation: Some(Isolation::Inherit),
+            ..agy()?
+        }
+        .held_to_limits(&config)
+        .map(|_| ()),
         err(displays_as(contains_substring("allow_user_config")))
     );
     Ok(())
@@ -622,8 +633,10 @@ fn every_exec_turn_pins_unattended_approval() -> Result<()> {
     for resume in [None, Some(&session)] {
         for isolation in [Isolation::Inherit, Isolation::Isolated] {
             for network in [None, Some(true)] {
-                let delegate =
-                    codex(Some(CodexSandbox::ReadOnly), network)?.with_isolation(isolation);
+                let delegate = Delegate {
+                    isolation: Some(isolation),
+                    ..codex(Some(CodexSandbox::ReadOnly), network)?
+                };
                 let invocation = build(&delegate, &Config::default(), resume).or_fail()?;
                 let args = invocation.args();
                 let label = format!("{resume:?} {isolation:?} {network:?}");
@@ -650,7 +663,10 @@ fn a_codex_delegate_that_loads_the_user_config_still_gets_its_sandbox() -> Resul
     let config = Config::default();
     let inheriting = build(&codex(None, None)?, &config, None).or_fail()?;
     let isolated = build(
-        &codex(None, None)?.with_isolation(Isolation::Isolated),
+        &Delegate {
+            isolation: Some(Isolation::Isolated),
+            ..codex(None, None)?
+        },
         &config,
         None,
     )
@@ -730,7 +746,10 @@ fn a_request_beyond_a_limit_is_refused_naming_the_limit_and_the_file() -> Result
         ))
     );
     assert_that!(
-        refusal(codex(None, None)?.with_isolation(Isolation::Inherit))?,
+        refusal(Delegate {
+            isolation: Some(Isolation::Inherit),
+            ..codex(None, None)?
+        })?,
         eq(&format!(
             "Cannot launch codex: ignore_user_config=false is forbidden by \
              codex.limits.allow_user_config=false in {MACHINE_FILE}. Request \
@@ -853,7 +872,8 @@ fn claude_permissions_reach_the_cli() -> Result<()> {
     Ok(())
 }
 
-/// An option of the other vendor is refused rather than ignored, at the start and on a follow-up.
+/// An option of the other vendor is refused rather than ignored: a flat one where a front end maps
+/// it, and another vendor's permissions at the start and on a follow-up.
 #[gtest]
 fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
     let network = PermissionOptions {
@@ -865,26 +885,39 @@ fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
         ..PermissionOptions::default()
     };
 
+    // The flat names, which a front end maps onto the vendor it was asked for.
     assert_that!(
-        Delegate::from_parts(Vendor::Claude, "opus", None, None, network.clone()),
+        network.clone().for_vendor(Vendor::Claude),
         err(matches_pattern!(DelegateError::NotForVendor {
             option: eq(&"network_access"),
             ..
         }))
     );
     assert_that!(
-        Delegate::from_parts(Vendor::Codex, "sol", None, None, mode.clone()),
+        mode.clone().for_vendor(Vendor::Codex),
         err(matches_pattern!(DelegateError::NotForVendor {
             option: eq(&"permission_mode"),
             ..
         }))
     );
+
+    // Another vendor's permissions, at the start and on a follow-up.
+    let codex_overrides = network.for_vendor(Vendor::Codex).or_fail()?;
+    let claude_overrides = mode.for_vendor(Vendor::Claude).or_fail()?;
     assert_that!(
-        codex(None, None)?.with_options(mode),
+        Delegate::from_parts(Vendor::Claude, "opus", None, None, codex_overrides.clone()),
         err(matches_pattern!(DelegateError::NotForVendor { .. }))
     );
     assert_that!(
-        claude(ClaudePermissions::default())?.with_options(network),
+        Delegate::from_parts(Vendor::Codex, "sol", None, None, claude_overrides.clone()),
+        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+    );
+    assert_that!(
+        codex(None, None)?.with_overrides(claude_overrides),
+        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+    );
+    assert_that!(
+        claude(ClaudePermissions::default())?.with_overrides(codex_overrides),
         err(matches_pattern!(DelegateError::NotForVendor { .. }))
     );
     Ok(())
@@ -1039,8 +1072,8 @@ fn a_consultation_pins_the_defaults_it_started_with() -> Result<()> {
 
     let started = machine.store.start(&machine.request(codex(None, None)?))?;
     assert_that!(
-        started.delegate.codex_permissions().copied(),
-        some(eq(CodexPermissions {
+        started.delegate.permissions,
+        eq(&Permissions::Codex(CodexPermissions {
             sandbox: Some(CodexSandbox::ReadOnly),
             network_access: Some(true),
         }))
@@ -1049,7 +1082,7 @@ fn a_consultation_pins_the_defaults_it_started_with() -> Result<()> {
         started.delegate.summary(),
         contains_substring("sandbox=read-only+network")
     );
-    assert_that!(started.delegate.isolation(), some(eq(Isolation::Inherit)));
+    assert_that!(started.delegate.isolation, some(eq(Isolation::Inherit)));
     assert_that!(
         machine
             .args(0)?
@@ -1083,11 +1116,12 @@ fn a_follow_up_override_becomes_the_recorded_choice() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "write it out",
-        PermissionOptions {
-            sandbox: Some(CodexSandbox::WorkspaceWrite),
-            network_access: Some(false),
+        Overrides {
             isolation: Some(Isolation::Isolated),
-            ..PermissionOptions::default()
+            permissions: Some(Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::WorkspaceWrite),
+                network_access: Some(false),
+            })),
         },
         None,
     )?;
@@ -1156,9 +1190,12 @@ fn a_tightened_limit_refuses_the_next_turn() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, offline",
-        PermissionOptions {
-            network_access: Some(false),
-            ..PermissionOptions::default()
+        Overrides {
+            permissions: Some(Permissions::Codex(CodexPermissions {
+                network_access: Some(false),
+                ..CodexPermissions::default()
+            })),
+            ..Overrides::default()
         },
         None,
     )?;
@@ -1299,9 +1336,12 @@ fn a_permission_change_leaves_the_rendered_transcript_in_place() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, read-only",
-        PermissionOptions {
-            sandbox: Some(CodexSandbox::ReadOnly),
-            ..PermissionOptions::default()
+        Overrides {
+            permissions: Some(Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                ..CodexPermissions::default()
+            })),
+            ..Overrides::default()
         },
         None,
     )?;
@@ -1348,9 +1388,9 @@ fn a_reopened_turn_is_judged_by_its_own_isolation() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, isolated",
-        PermissionOptions {
+        Overrides {
             isolation: Some(Isolation::Isolated),
-            ..PermissionOptions::default()
+            ..Overrides::default()
         },
         None,
     )?;
@@ -1360,7 +1400,7 @@ fn a_reopened_turn_is_judged_by_its_own_isolation() -> Result<()> {
         status.hook_reopening,
         some(eq(agentmux::run::HookReopening::Expected))
     );
-    assert_that!(status.delegate.isolation(), some(eq(Isolation::Isolated)));
+    assert_that!(status.delegate.isolation, some(eq(Isolation::Isolated)));
     assert_that!(
         has_pair(&machine.args(1)?, "--setting-sources", ""),
         eq(true)
@@ -1379,10 +1419,12 @@ fn list_and_status_agree_after_an_override() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, offline and read-only",
-        PermissionOptions {
-            sandbox: Some(CodexSandbox::ReadOnly),
-            network_access: Some(false),
-            ..PermissionOptions::default()
+        Overrides {
+            permissions: Some(Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: Some(false),
+            })),
+            ..Overrides::default()
         },
         None,
     )?;
@@ -1416,9 +1458,9 @@ async fn a_steer_refusal_names_the_running_turns_isolation() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, isolated",
-        PermissionOptions {
+        Overrides {
             isolation: Some(Isolation::Isolated),
-            ..PermissionOptions::default()
+            ..Overrides::default()
         },
         None,
     )?;

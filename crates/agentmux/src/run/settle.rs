@@ -960,7 +960,7 @@ fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &D
     turn.auto_resume = invocation.auto_resume;
     turn.label.clone_from(&invocation.label);
     let ran_as = invocation.delegate.as_ref();
-    turn.isolation = ran_as.and_then(Delegate::isolation);
+    turn.isolation = ran_as.and_then(|delegate| delegate.isolation);
     turn.ran_as = ran_as
         .map(Delegate::summary)
         .filter(|summary| *summary != header.summary());

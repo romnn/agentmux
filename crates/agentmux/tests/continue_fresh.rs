@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use agentmux::delegate::{
     AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+    Permissions,
 };
 use agentmux::run::{Retention, RunError, RunLabel, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
@@ -54,15 +55,15 @@ fn request(delegate: Delegate) -> Result<StartRequest> {
 }
 
 fn codex() -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::WorkspaceWrite),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            network_access: None,
+        }),
     })
 }
 
@@ -167,12 +168,12 @@ fn a_claude_delegate_may_read_the_old_transcript() -> Result<()> {
         Script::completed(fixtures::CLAUDE_HAPPY),
         Script::completed(fixtures::CLAUDE_HAPPY),
     ])?;
-    let claude = Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    let claude = Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     };
     let old = harness.store.start(&request(claude)?)?;
     harness.store.continue_fresh(&old.run_id, Some("go on"))?;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use agentmux::delegate::{
     AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
-    ModelId,
+    ModelId, Permissions,
 };
 use agentmux::run::{AutoResume, Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
@@ -23,15 +23,15 @@ use googletest::prelude::*;
 fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     consult_with(
         events,
-        Delegate::Codex {
+        Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
     )
 }
@@ -43,12 +43,12 @@ fn consult(events: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
 fn consult_claude(events: &str, model: &str) -> Result<(RunStore, RunStatus, tempfile::TempDir)> {
     consult_with(
         events,
-        Delegate::Claude {
-            permissions: ClaudePermissions::default(),
+        Delegate {
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Claude(ClaudePermissions::default()),
         },
     )
 }
@@ -133,15 +133,15 @@ fn a_session_the_filter_keeps_refusing_is_pointed_at_a_fresh_one() -> Result<()>
     let store = RunStore::open(dir.path(), Arc::new(launcher), env).or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "Review the parser.".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -337,13 +337,13 @@ fn the_hook_warning_lands_above_the_transcript() -> Result<()> {
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: AccountChoice::Default,
                 // Isolated, so the hook that reopened the turn is the alarming kind.
                 isolation: Some(Isolation::Isolated),
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "Reply with exactly: THE_REPORT_BODY".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -412,15 +412,15 @@ fn a_running_consultation_hands_back_a_usable_cursor() -> Result<()> {
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "A long review.".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -600,12 +600,12 @@ fn a_model_this_machine_rewrote_is_named_beside_the_one_that_ran() -> Result<()>
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("sonnet").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: home.path().to_path_buf(),
@@ -710,15 +710,15 @@ fn usage_is_broken_down_by_turn() -> Result<()> {
     .or_fail()?;
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -784,12 +784,12 @@ fn an_uncounted_price_qualifies_the_price_alone() -> Result<()> {
     .or_fail()?;
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: PathBuf::from("/work/project"),
@@ -849,12 +849,12 @@ fn a_failure_the_stream_leaves_unexplained_quotes_the_cli_stderr() -> Result<()>
     .or_fail()?;
     let status = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "q".to_owned(),
             cwd: dir.path().to_path_buf(),
@@ -974,15 +974,15 @@ fn earlier_failures_do_not_read_as_the_newest_turns_state() -> Result<()> {
     .or_fail()?;
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "Review the diff for correctness bugs.".to_owned(),
             cwd: PathBuf::from("/work/project"),

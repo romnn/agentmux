@@ -15,7 +15,7 @@ use agentmux::appserver::mailbox::{Mailbox, SteerReply};
 use agentmux::appserver::{DriverPlan, STOP_BUDGET};
 use agentmux::delegate::{
     AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort,
-    Isolation, ModelId,
+    Isolation, ModelId, Permissions,
 };
 use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
@@ -43,25 +43,25 @@ fn env() -> BTreeMap<String, String> {
 }
 
 fn codex(isolation: Isolation) -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::WorkspaceWrite),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: Some(isolation),
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            network_access: None,
+        }),
     })
 }
 
 fn claude() -> Result<Delegate> {
-    Ok(Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     })
 }
 

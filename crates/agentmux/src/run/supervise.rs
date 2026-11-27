@@ -389,7 +389,9 @@ mod tests {
     use googletest::prelude::*;
 
     use super::Admission;
-    use crate::delegate::{AccountChoice, Billing, CodexPermissions, Delegate, Isolation, ModelId};
+    use crate::delegate::{
+        AccountChoice, Billing, CodexPermissions, Delegate, Isolation, ModelId, Permissions,
+    };
     use crate::launch::Launched;
     use crate::run::auto_resume::AutoResumeRecord;
     use crate::run::records::{
@@ -618,12 +620,12 @@ mod tests {
         let started = open()?
             .with_codex_app_server("/opt/agentmux")
             .start(&StartRequest {
-                delegate: Delegate::Codex {
+                delegate: Delegate {
                     model: ModelId::parse("gpt-6-astra").or_fail()?,
                     effort: None,
-                    permissions: CodexPermissions::default(),
                     account: AccountChoice::Default,
                     isolation: Some(Isolation::Inherit),
+                    permissions: Permissions::Codex(CodexPermissions::default()),
                 },
                 question: "review this".to_owned(),
                 cwd: PathBuf::from("/work/project"),

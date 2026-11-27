@@ -16,6 +16,7 @@ use agentmux::quota::{
 #[cfg(unix)]
 use agentmux::quota::Refresh;
 use googletest::prelude::*;
+use strum::VariantArray as _;
 
 /// A probe that answers from a script instead of a machine.
 #[derive(Debug)]
@@ -718,7 +719,7 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
 fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    for vendor in Vendor::ALL {
+    for &vendor in Vendor::VARIANTS {
         let root = tempfile::tempdir().or_fail()?;
         let config_dir = root.path().join("config");
         let bin = root.path().join("bin");

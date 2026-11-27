@@ -348,7 +348,7 @@ pub fn summarise(text: &str, max_chars: usize) -> String {
 pub fn delegate_line(status: &RunStatus) -> String {
     let summary = describe_delegate(&status.delegate, status.rewritten_from.as_ref());
     let line = match &status.resolved_model {
-        Some(resolved) if resolved != status.delegate.model().as_str() => {
+        Some(resolved) if resolved != status.delegate.model.as_str() => {
             format!("{summary} (answered by {resolved})")
         }
         _ => summary,
@@ -684,7 +684,7 @@ fn quota_lead_in(consultation_account: Option<&AccountAlias>, others_exist: bool
 /// exhausted one first and conclude nothing is available.
 #[must_use]
 pub fn quota_block(status: &RunStatus) -> Vec<String> {
-    let consultation_account = status.delegate.account().alias();
+    let consultation_account = status.delegate.account.alias();
     // Only this vendor's accounts: the lead-in offers each as an `account` value, and an alias
     // from the other vendor's table resolves to nothing but a paid round trip.
     let (consultation_accounts, others): (Vec<_>, Vec<_>) = status

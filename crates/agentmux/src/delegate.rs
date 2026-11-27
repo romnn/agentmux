@@ -623,6 +623,17 @@ impl CodexPermissions {
         self.sandbox() == CodexSandbox::ReadOnly && self.network_access == Some(true)
     }
 
+    /// These permissions, with each one `asked` sets in place of the recorded one.
+    ///
+    /// Field by field, so a follow-up that changes only the sandbox keeps a network the
+    /// consultation switched off.
+    fn overridden_by(self, asked: Self) -> Self {
+        Self {
+            sandbox: asked.sandbox.or(self.sandbox),
+            network_access: asked.network_access.or(self.network_access),
+        }
+    }
+
     /// How these permissions read in a one-line summary, as `read-only+network`.
     fn describe(self) -> String {
         let network = match self.network_access {
@@ -783,6 +794,16 @@ impl ClaudePermissions {
         self.permission_mode.unwrap_or_default()
     }
 
+    /// These permissions, with each one `asked` sets in place of the recorded one.
+    fn overridden_by(self, asked: Self) -> Self {
+        Self {
+            permission_mode: asked.permission_mode.or(self.permission_mode),
+            tools: asked.tools.or(self.tools),
+            allowed_tools: asked.allowed_tools.or(self.allowed_tools),
+            disallowed_tools: asked.disallowed_tools.or(self.disallowed_tools),
+        }
+    }
+
     /// How these permissions read in a one-line summary, naming only what departs from plan mode
     /// and the read-only tool list.
     fn describe(&self) -> String {
@@ -816,9 +837,8 @@ fn join_tools(tools: &[ClaudeTool]) -> String {
 
 /// The permission options a front end presents flat, for every vendor.
 ///
-/// What [`Delegate::from_parts`] builds a request from, and what [`Delegate::with_options`]
-/// applies to a recorded consultation as a follow-up's overrides; an absent value takes the
-/// default there, and keeps the recorded choice here.
+/// The one place the flat names are mapped onto a vendor: [`PermissionOptions::for_vendor`]
+/// turns them into the [`Overrides`] the core takes.
 /// Each option belongs to one vendor except the isolation, and one given for another vendor is
 /// refused rather than ignored.
 /// agy has none of its own: its permissions are fixed, as `agy_args` describes.
@@ -883,6 +903,57 @@ impl PermissionOptions {
             None => Ok(()),
         }
     }
+
+    /// The overrides these options name for a `vendor` delegate.
+    ///
+    /// What [`Delegate::from_parts`] builds a request from, and what
+    /// [`Delegate::with_overrides`] applies to a recorded consultation as a follow-up's; an absent
+    /// value takes the default there, and keeps the recorded choice here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::NotForVendor`] when an option belongs to another vendor.
+    pub fn for_vendor(self, vendor: Vendor) -> Result<Overrides, DelegateError> {
+        self.refuse_foreign(vendor)?;
+        let Self {
+            isolation,
+            sandbox,
+            network_access,
+            permission_mode,
+            tools,
+            allowed_tools,
+            disallowed_tools,
+        } = self;
+        let permissions = match vendor {
+            Vendor::Claude => Permissions::Claude(ClaudePermissions {
+                permission_mode,
+                tools,
+                allowed_tools,
+                disallowed_tools,
+            }),
+            Vendor::Codex => Permissions::Codex(CodexPermissions {
+                sandbox,
+                network_access,
+            }),
+            Vendor::Agy => Permissions::Agy,
+        };
+        Ok(Overrides {
+            isolation,
+            permissions: Some(permissions),
+        })
+    }
+}
+
+/// What a caller asks to change of a delegate: its isolation, and its vendor's permissions.
+///
+/// A patch, not a replacement: each value it sets takes the place of the recorded one, field by
+/// field down to each permission, and each it leaves out keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overrides {
+    /// Whether to skip the user's own configuration; see [`Isolation::from_spellings`].
+    pub isolation: Option<Isolation>,
+    /// The permissions to change, which must be the delegate's own vendor's.
+    pub permissions: Option<Permissions>,
 }
 
 /// Whether a delegate's environment may carry billing credentials and endpoint overrides.
@@ -923,33 +994,62 @@ impl std::fmt::Display for Billing {
     }
 }
 
-/// Which CLI a consultation is talking to, without the options.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, VariantArray,
+/// What a delegate may do, which is particular to its CLI: each variant is a vendor, carrying
+/// that vendor's own permissions.
+///
+/// It is also where the roster of vendors is spelled, once: [`Vendor`] is derived from it, and
+/// `Vendor::VARIANTS` is what `quota`, `accounts` and the server's roster fan out over, so a
+/// vendor cannot be added here and left out there.
+/// agy has no permission options: every launch runs under the fixed policy `agy_args` describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[serde(tag = "vendor", rename_all = "snake_case")]
+#[strum_discriminants(
+    name(Vendor),
+    doc = "Which CLI a consultation is talking to, without the options.",
+    derive(Hash, PartialOrd, Ord, Serialize, Deserialize, VariantArray),
+    serde(rename_all = "snake_case"),
+    cfg_attr(feature = "clap", derive(clap::ValueEnum))
 )]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-#[serde(rename_all = "snake_case")]
-pub enum Vendor {
+pub enum Permissions {
     /// Anthropic's `claude` CLI.
     ///
     /// Also spelled `claude-code` on the command line, because the CLI and the harness that runs
     /// it are named differently, and `--deny` is written while thinking of the harness.
-    #[cfg_attr(feature = "clap", value(alias = "claude-code"))]
-    Claude,
+    #[strum_discriminants(cfg_attr(feature = "clap", value(alias = "claude-code")))]
+    Claude(ClaudePermissions),
     /// The `codex` CLI from `OpenAI`.
-    Codex,
+    Codex(CodexPermissions),
     /// Google's Antigravity CLI, `agy`.
     Agy,
 }
 
-impl Vendor {
-    /// Every vendor, for the places that fan out over all of them.
+impl Permissions {
+    /// These permissions, with every one `asked` sets in place of the recorded one.
     ///
-    /// The one list, so that a third vendor cannot be added to the enum and left out of `quota`,
-    /// `accounts` or the server's roster: those iterate this rather than spelling the set again,
-    /// and its length is checked against the enum's own.
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::NotForVendor`] when `asked` belongs to another vendor.
+    fn overridden_by(self, asked: Self) -> Result<Self, DelegateError> {
+        Ok(match (self, asked) {
+            (Self::Claude(recorded), Self::Claude(asked)) => {
+                Self::Claude(recorded.overridden_by(asked))
+            }
+            (Self::Codex(recorded), Self::Codex(asked)) => {
+                Self::Codex(recorded.overridden_by(asked))
+            }
+            (Self::Agy, Self::Agy) => Self::Agy,
+            (recorded @ (Self::Claude(_) | Self::Codex(_) | Self::Agy), asked) => {
+                return Err(DelegateError::NotForVendor {
+                    option: "permissions",
+                    owner: Vendor::from(&asked),
+                    vendor: Vendor::from(&recorded),
+                });
+            }
+        })
+    }
+}
 
+impl Vendor {
     /// The executable name, as found on `PATH`.
     #[must_use]
     pub fn program(self) -> &'static str {
@@ -1000,9 +1100,6 @@ impl Vendor {
         Some(self.config_dir(env)?.join(store))
     }
 }
-
-// `Vendor::ALL` names every variant once; a vendor added to the enum and not to it fails here.
-const _: () = assert!(Vendor::ALL.len() == <Vendor as VariantArray>::VARIANTS.len());
 
 impl std::fmt::Display for Vendor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1102,180 +1199,101 @@ mod stored_account {
 
 /// Who is being consulted, and on what terms.
 ///
-/// Each variant carries only what that vendor accepts: a Claude consultation with a sandbox mode
-/// does not compile.
+/// What every vendor shares is a field here, and what only one vendor accepts is in its
+/// [`Permissions`]: a Claude consultation with a sandbox mode does not compile.
 /// The flat shapes a tool schema or a command line present are turned into this by
-/// [`Delegate::from_parts`], which is where a vendor-specific option given for another vendor
-/// is refused.
+/// [`PermissionOptions::for_vendor`] and [`Delegate::from_parts`], which is where a
+/// vendor-specific option given for another vendor is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "vendor", rename_all = "snake_case")]
-pub enum Delegate {
-    /// Anthropic's CLI.
-    Claude {
-        /// Model identifier, forwarded verbatim.
-        model: ModelId,
-        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        effort: Option<Effort>,
-        /// Which account to authenticate as.
-        #[serde(
-            default,
-            skip_serializing_if = "AccountChoice::is_default",
-            with = "stored_account"
-        )]
-        account: AccountChoice,
-        /// Whether to load the account's own settings, or the configured default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        isolation: Option<Isolation>,
-        /// The permission mode and the tools offered.
-        #[serde(flatten)]
-        permissions: ClaudePermissions,
-    },
-    /// The `OpenAI` CLI.
-    Codex {
-        /// Model identifier, forwarded verbatim.
-        model: ModelId,
-        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        effort: Option<Effort>,
-        /// How much the delegate's commands may write, and whether they reach the network.
-        #[serde(flatten)]
-        permissions: CodexPermissions,
-        /// Which account to authenticate as.
-        #[serde(
-            default,
-            skip_serializing_if = "AccountChoice::is_default",
-            with = "stored_account"
-        )]
-        account: AccountChoice,
-        /// Whether to load the account's own settings, or the configured default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        isolation: Option<Isolation>,
-    },
-    /// Google's Antigravity CLI.
+pub struct Delegate {
+    /// Model identifier, forwarded verbatim.
     ///
-    /// It has no permission options: every launch runs under the fixed policy `agy_args`
-    /// describes.
-    Agy {
-        /// Model identifier, forwarded verbatim.
-        model: ModelId,
-        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        effort: Option<Effort>,
-        /// Which account to authenticate as.
-        #[serde(
-            default,
-            skip_serializing_if = "AccountChoice::is_default",
-            with = "stored_account"
-        )]
-        account: AccountChoice,
-        /// Whether to load the user's own settings, or the configured default when absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        isolation: Option<Isolation>,
-    },
+    /// Where the machine's configuration rewrites the identifier a caller asked for, the record
+    /// names the one that ran, so every later reader of it — the launch, the transcript, the
+    /// status — names the model that actually ran.
+    pub model: ModelId,
+    /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
+    ///
+    /// Filled in when the caller named none and the machine's configuration names one for the
+    /// model that runs, so the record says what the CLI was actually given; `None` once the
+    /// record is pinned means neither named one, and the CLI's own default runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// Which account to authenticate as.
+    ///
+    /// Pinned to the account a consultation actually ran as once a configured default has chosen
+    /// one.
+    /// Without that the record would say the caller named nothing, which is true but does not
+    /// answer the question a reader of a surprising result asks: which identity paid for this.
+    #[serde(
+        default,
+        skip_serializing_if = "AccountChoice::is_default",
+        with = "stored_account"
+    )]
+    pub account: AccountChoice,
+    /// Whether to load the account's own settings, or the configured default when absent.
+    ///
+    /// Pinned for the same reason the account is: whether a run loads the user's configuration
+    /// decides whether it is reproducible, and a run whose provenance stops being reproducible is
+    /// the one run whose provenance most needs writing down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
+    /// Which CLI runs, and what it may do.
+    #[serde(flatten)]
+    pub permissions: Permissions,
 }
 
 impl Delegate {
-    /// Build a delegate from the flat shape a tool schema or a command line presents.
+    /// Build a delegate from the parts a tool schema or a command line presents.
     ///
     /// This is the one parse step both front ends share, so they cannot come to accept
     /// different things.
-    /// What `options` leaves out stays unset, for [`crate::run::RunStore::start`] to fill from the
-    /// machine file's defaults once it knows which configuration applies.
+    /// What `overrides` leaves out stays unset, for [`crate::run::RunStore::start`] to fill from
+    /// the machine file's defaults once it knows which configuration applies.
     ///
     /// # Errors
     ///
     /// Returns [`DelegateError::Argument`] when the model, effort or alias is not argv-safe, and
-    /// [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
+    /// [`DelegateError::NotForVendor`] when `overrides` names another vendor's permissions.
     pub fn from_parts(
         vendor: Vendor,
         model: &str,
         effort: Option<&str>,
         account: Option<&str>,
-        options: PermissionOptions,
+        overrides: Overrides,
     ) -> Result<Self, DelegateError> {
-        let model = ModelId::parse(model)?;
-        let effort = effort.map(Effort::parse).transpose()?;
-        let account = AccountChoice::from(account.map(AccountAlias::parse).transpose()?);
-        let unset = match vendor {
-            Vendor::Claude => Self::Claude {
-                model,
-                effort,
-                account,
-                isolation: None,
-                permissions: ClaudePermissions::default(),
-            },
-            Vendor::Codex => Self::Codex {
-                model,
-                effort,
-                permissions: CodexPermissions::default(),
-                account,
-                isolation: None,
-            },
-            Vendor::Agy => Self::Agy {
-                model,
-                effort,
-                account,
-                isolation: None,
+        let unset = Self {
+            model: ModelId::parse(model)?,
+            effort: effort.map(Effort::parse).transpose()?,
+            account: AccountChoice::from(account.map(AccountAlias::parse).transpose()?),
+            isolation: None,
+            permissions: match vendor {
+                Vendor::Claude => Permissions::Claude(ClaudePermissions::default()),
+                Vendor::Codex => Permissions::Codex(CodexPermissions::default()),
+                Vendor::Agy => Permissions::Agy,
             },
         };
-        unset.with_options(options)
+        unset.with_overrides(overrides)
     }
 
-    /// The same delegate, with every option `options` sets in place of the recorded one.
+    /// The same delegate, with every value `overrides` sets in place of the recorded one.
     ///
-    /// What a follow-up's explicit overrides do: an option left out keeps the consultation's
+    /// What a follow-up's explicit overrides do: a value left out keeps the consultation's
     /// recorded choice, and the machine file's defaults are not consulted again.
     ///
     /// # Errors
     ///
-    /// Returns [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
-    pub fn with_options(mut self, options: PermissionOptions) -> Result<Self, DelegateError> {
-        options.refuse_foreign(self.vendor())?;
-        let PermissionOptions {
-            isolation: requested_isolation,
-            sandbox,
-            network_access,
-            permission_mode,
-            tools,
-            allowed_tools,
-            disallowed_tools,
-        } = options;
-        match &mut self {
-            Self::Claude {
-                isolation,
-                permissions,
-                ..
-            } => {
-                *isolation = requested_isolation.or(*isolation);
-                let ClaudePermissions {
-                    permission_mode: recorded_mode,
-                    tools: recorded_tools,
-                    allowed_tools: recorded_allowed,
-                    disallowed_tools: recorded_disallowed,
-                } = permissions;
-                *recorded_mode = permission_mode.or(*recorded_mode);
-                if tools.is_some() {
-                    *recorded_tools = tools;
-                }
-                if allowed_tools.is_some() {
-                    *recorded_allowed = allowed_tools;
-                }
-                if disallowed_tools.is_some() {
-                    *recorded_disallowed = disallowed_tools;
-                }
-            }
-            Self::Codex {
-                isolation,
-                permissions,
-                ..
-            } => {
-                *isolation = requested_isolation.or(*isolation);
-                permissions.sandbox = sandbox.or(permissions.sandbox);
-                permissions.network_access = network_access.or(permissions.network_access);
-            }
-            Self::Agy { isolation, .. } => *isolation = requested_isolation.or(*isolation),
+    /// Returns [`DelegateError::NotForVendor`] when `overrides` names another vendor's
+    /// permissions.
+    pub fn with_overrides(mut self, overrides: Overrides) -> Result<Self, DelegateError> {
+        let Overrides {
+            isolation,
+            permissions,
+        } = overrides;
+        if let Some(asked) = permissions {
+            self.permissions = self.permissions.overridden_by(asked)?;
         }
+        self.isolation = isolation.or(self.isolation);
         Ok(self)
     }
 
@@ -1288,45 +1306,9 @@ impl Delegate {
     /// nothing.
     #[must_use]
     pub fn with_settings_of(mut self, turn: &Self) -> Self {
-        match (&mut self, turn) {
-            (
-                Self::Claude {
-                    isolation,
-                    permissions,
-                    ..
-                },
-                Self::Claude {
-                    isolation: ran_isolation,
-                    permissions: ran_permissions,
-                    ..
-                },
-            ) => {
-                *isolation = *ran_isolation;
-                permissions.clone_from(ran_permissions);
-            }
-            (
-                Self::Codex {
-                    isolation,
-                    permissions,
-                    ..
-                },
-                Self::Codex {
-                    isolation: ran_isolation,
-                    permissions: ran_permissions,
-                    ..
-                },
-            ) => {
-                *isolation = *ran_isolation;
-                *permissions = *ran_permissions;
-            }
-            (
-                Self::Agy { isolation, .. },
-                Self::Agy {
-                    isolation: ran_isolation,
-                    ..
-                },
-            ) => *isolation = *ran_isolation,
-            (Self::Claude { .. } | Self::Codex { .. } | Self::Agy { .. }, _) => {}
+        if turn.vendor() == self.vendor() {
+            self.isolation = turn.isolation;
+            self.permissions.clone_from(&turn.permissions);
         }
         self
     }
@@ -1334,72 +1316,13 @@ impl Delegate {
     /// Which CLI this delegate runs.
     #[must_use]
     pub fn vendor(&self) -> Vendor {
-        match self {
-            Self::Claude { .. } => Vendor::Claude,
-            Self::Codex { .. } => Vendor::Codex,
-            Self::Agy { .. } => Vendor::Agy,
-        }
-    }
-
-    /// The isolation recorded on this delegate, once it has been pinned.
-    #[must_use]
-    pub fn isolation(&self) -> Option<Isolation> {
-        match self {
-            Self::Claude { isolation, .. }
-            | Self::Codex { isolation, .. }
-            | Self::Agy { isolation, .. } => *isolation,
-        }
-    }
-
-    /// The same delegate, with its isolation pinned.
-    ///
-    /// Recorded for the same reason the account is: whether a run loads the user's configuration
-    /// decides whether it is reproducible, and a run whose provenance stops being reproducible is
-    /// the one run whose provenance most needs writing down.
-    #[must_use]
-    pub fn with_isolation(mut self, resolved: Isolation) -> Self {
-        match &mut self {
-            Self::Claude { isolation, .. }
-            | Self::Codex { isolation, .. }
-            | Self::Agy { isolation, .. } => {
-                *isolation = Some(resolved);
-            }
-        }
-        self
+        Vendor::from(&self.permissions)
     }
 
     /// The isolation this delegate would run under, given the machine's configuration.
     #[must_use]
     pub fn resolved_isolation(&self, config: &Config) -> Isolation {
-        match self {
-            Self::Claude {
-                account, isolation, ..
-            } => resolve_isolation(*isolation, Vendor::Claude, account, config),
-            Self::Codex {
-                account, isolation, ..
-            } => resolve_isolation(*isolation, Vendor::Codex, account, config),
-            Self::Agy {
-                account, isolation, ..
-            } => resolve_isolation(*isolation, Vendor::Agy, account, config),
-        }
-    }
-
-    /// The Codex permissions, for a Codex delegate.
-    #[must_use]
-    pub fn codex_permissions(&self) -> Option<&CodexPermissions> {
-        match self {
-            Self::Codex { permissions, .. } => Some(permissions),
-            Self::Claude { .. } | Self::Agy { .. } => None,
-        }
-    }
-
-    /// The Claude permissions, for a Claude delegate.
-    #[must_use]
-    pub fn claude_permissions(&self) -> Option<&ClaudePermissions> {
-        match self {
-            Self::Claude { permissions, .. } => Some(permissions),
-            Self::Codex { .. } | Self::Agy { .. } => None,
-        }
+        resolve_isolation(self.isolation, self.vendor(), &self.account, config)
     }
 
     /// The same delegate, with every permission the request left unset filled from the machine
@@ -1409,15 +1332,13 @@ impl Delegate {
     /// filled in here, so a default edited later never changes a consultation already running.
     #[must_use]
     pub fn with_default_permissions(mut self, config: &Config) -> Self {
-        match &mut self {
-            Self::Claude { permissions, .. } => {
-                *permissions = config.claude.fill(permissions);
+        self.permissions = match self.permissions {
+            Permissions::Claude(permissions) => {
+                Permissions::Claude(config.claude.fill(&permissions))
             }
-            Self::Codex { permissions, .. } => {
-                *permissions = config.codex.fill(*permissions);
-            }
-            Self::Agy { .. } => {}
-        }
+            Permissions::Codex(permissions) => Permissions::Codex(config.codex.fill(permissions)),
+            Permissions::Agy => Permissions::Agy,
+        };
         self
     }
 
@@ -1436,149 +1357,44 @@ impl Delegate {
     /// Returns [`DelegateError::Permission`] when the isolation or a permission exceeds the
     /// limits.
     pub fn held_to_limits(&self, config: &Config) -> Result<Self, DelegateError> {
-        let vendor = self.vendor();
         config
-            .permissions(vendor)
+            .permissions(self.vendor())
             .hold_isolation(self.resolved_isolation(config))?;
         let mut held = self.clone();
-        match &mut held {
-            Self::Claude { permissions, .. } => {
+        match &mut held.permissions {
+            Permissions::Claude(permissions) => {
                 config.claude.hold(permissions, config.source.as_deref())?;
             }
-            Self::Codex { permissions, .. } => {
+            Permissions::Codex(permissions) => {
                 *permissions = config.codex.hold(*permissions, config.source.as_deref())?;
             }
-            Self::Agy { .. } => {}
+            Permissions::Agy => {}
         }
         Ok(held)
-    }
-
-    /// The same delegate, with its account pinned to `alias`.
-    ///
-    /// Used to record the account a consultation actually ran as, once a configured default has
-    /// chosen one.
-    /// Without it the record would say the caller named nothing, which is true but does not answer
-    /// the question a reader of a surprising result asks: which identity paid for this.
-    #[must_use]
-    pub fn with_account(mut self, choice: AccountChoice) -> Self {
-        match &mut self {
-            Self::Claude { account, .. }
-            | Self::Codex { account, .. }
-            | Self::Agy { account, .. } => *account = choice,
-        }
-        self
-    }
-
-    /// The same delegate, with its model identifier replaced.
-    ///
-    /// Used where the machine's configuration rewrites the identifier a caller asked for, so that
-    /// every later reader of the record — the launch, the transcript, the status — names the model
-    /// that actually ran.
-    #[must_use]
-    pub fn with_model(mut self, replacement: ModelId) -> Self {
-        match &mut self {
-            Self::Claude { model, .. } | Self::Codex { model, .. } | Self::Agy { model, .. } => {
-                *model = replacement;
-            }
-        }
-        self
-    }
-
-    /// The same delegate, with a reasoning effort filled in.
-    ///
-    /// Used where the caller named none and the machine's configuration names one for the model
-    /// that runs, so the record says what the CLI was actually given.
-    #[must_use]
-    pub fn with_effort(mut self, chosen: Effort) -> Self {
-        match &mut self {
-            Self::Claude { effort, .. } | Self::Codex { effort, .. } | Self::Agy { effort, .. } => {
-                *effort = Some(chosen);
-            }
-        }
-        self
-    }
-
-    /// Which account this delegate authenticates as.
-    #[must_use]
-    pub fn account(&self) -> &AccountChoice {
-        match self {
-            Self::Claude { account, .. }
-            | Self::Codex { account, .. }
-            | Self::Agy { account, .. } => account,
-        }
-    }
-
-    /// The model identifier being consulted.
-    #[must_use]
-    pub fn model(&self) -> &ModelId {
-        match self {
-            Self::Claude { model, .. } | Self::Codex { model, .. } | Self::Agy { model, .. } => {
-                model
-            }
-        }
-    }
-
-    /// The reasoning effort being requested, when one is.
-    ///
-    /// `None` once the record is pinned means neither the caller nor the machine's configuration
-    /// named one, and the CLI's own default runs.
-    #[must_use]
-    pub fn effort(&self) -> Option<&Effort> {
-        match self {
-            Self::Claude { effort, .. } | Self::Codex { effort, .. } | Self::Agy { effort, .. } => {
-                effort.as_ref()
-            }
-        }
     }
 
     /// A one-line description, for `list` output and log lines.
     #[must_use]
     pub fn summary(&self) -> String {
-        match self {
-            Self::Claude {
-                model,
-                effort,
-                account,
-                isolation,
-                permissions,
-            } => {
-                format!(
-                    "claude {model} effort={}{} account={}{}",
-                    describe_effort(effort.as_ref()),
-                    permissions.describe(),
-                    describe_account(account),
-                    describe_isolation(*isolation)
-                )
-            }
-            Self::Codex {
-                model,
-                effort,
-                permissions,
-                account,
-                isolation,
-            } => {
-                format!(
-                    "codex {model} effort={} sandbox={} account={}{}",
-                    describe_effort(effort.as_ref()),
-                    permissions.describe(),
-                    describe_account(account),
-                    describe_isolation(*isolation)
-                )
-            }
-            Self::Agy {
-                model,
-                effort,
-                account,
-                isolation,
-            } => {
-                format!(
-                    "agy {model} effort={} account={}{}",
-                    describe_effort(effort.as_ref()),
-                    describe_account(account),
-                    describe_isolation(*isolation)
-                )
-            }
-        }
+        let Self {
+            model,
+            effort,
+            account,
+            isolation,
+            permissions,
+        } = self;
+        let permissions = match permissions {
+            Permissions::Claude(permissions) => permissions.describe(),
+            Permissions::Codex(permissions) => format!(" sandbox={}", permissions.describe()),
+            Permissions::Agy => String::new(),
+        };
+        format!(
+            "{} {model} effort={}{permissions} account={}{}",
+            self.vendor(),
+            describe_effort(effort.as_ref()),
+            describe_account(account),
+            describe_isolation(*isolation)
+        )
     }
 }
 
@@ -1970,13 +1786,7 @@ impl Delegate {
             mut env,
             policy,
             billing,
-        } = resolve_identity(
-            self.vendor(),
-            self.account(),
-            config,
-            host_env,
-            plan.billing,
-        )?;
+        } = resolve_identity(self.vendor(), &self.account, config, host_env, plan.billing)?;
         // Held here, the one step every launch a caller asks for goes through, so no turn runs
         // past a limit the owner set, however it was reached; an automatic resume continues a
         // turn that was held here, in the environment built here.
@@ -1997,7 +1807,7 @@ impl Delegate {
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
 
         // Set over every other layer, so no account or request can move it; see ADR 0035.
-        if let Self::Agy { .. } = held
+        if let Permissions::Agy = held.permissions
             && !isolation.inherits()
         {
             use_agy_home(&mut env, agy_home.ok_or(DelegateError::AgyHomeUnknown)?)?;
@@ -2048,7 +1858,7 @@ impl Delegate {
         env: BTreeMap<String, String>,
         billing: Billing,
     ) -> Result<Invocation, DelegateError> {
-        let isolation = self.isolation().unwrap_or(Isolation::Isolated);
+        let isolation = self.isolation.unwrap_or(Isolation::Isolated);
         Ok(Invocation {
             program: self.vendor().program().to_owned(),
             args: self.args(plan, isolation, &env)?,
@@ -2064,22 +1874,15 @@ impl Delegate {
         isolation: Isolation,
         env: &BTreeMap<String, String>,
     ) -> Result<Vec<String>, DelegateError> {
-        Ok(match self {
-            Self::Claude {
-                model,
-                effort,
-                permissions,
-                ..
-            } => claude_args(model, effort.as_ref(), permissions, plan, isolation),
-            Self::Codex {
-                model,
-                effort,
-                permissions,
-                ..
-            } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
-            Self::Agy { model, effort, .. } => {
-                agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?)
+        let Self { model, effort, .. } = self;
+        Ok(match &self.permissions {
+            Permissions::Claude(permissions) => {
+                claude_args(model, effort.as_ref(), permissions, plan, isolation)
             }
+            Permissions::Codex(permissions) => {
+                codex_args(model, effort.as_ref(), *permissions, plan, isolation)
+            }
+            Permissions::Agy => agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?),
         })
     }
 
@@ -2112,13 +1915,7 @@ impl Delegate {
         &self,
         isolation: Isolation,
     ) -> Option<AppServerSettings> {
-        let Self::Codex {
-            model,
-            effort,
-            permissions,
-            ..
-        } = self
-        else {
+        let Permissions::Codex(permissions) = &self.permissions else {
             return None;
         };
         if !isolation.inherits() {
@@ -2126,8 +1923,8 @@ impl Delegate {
         }
         Some(AppServerSettings {
             program: Vendor::Codex.program().to_owned(),
-            args: codex_app_server_args(effort.as_ref(), *permissions),
-            model: model.clone(),
+            args: codex_app_server_args(self.effort.as_ref(), *permissions),
+            model: self.model.clone(),
             sandbox: permissions.sandbox(),
             network_access: permissions.network_access,
         })
@@ -2174,7 +1971,7 @@ impl Delegate {
         host_env: &BTreeMap<String, String>,
         config: &Config,
     ) -> Result<BTreeMap<String, String>, DelegateError> {
-        Ok(resolve_identity(self.vendor(), self.account(), config, host_env, None)?.env)
+        Ok(resolve_identity(self.vendor(), &self.account, config, host_env, None)?.env)
     }
 
     /// The pricing this delegate runs on when a consultation asks for `requested`.
@@ -2193,7 +1990,7 @@ impl Delegate {
         host_env: &BTreeMap<String, String>,
         config: &Config,
     ) -> Result<Billing, DelegateError> {
-        Ok(resolve_identity(self.vendor(), self.account(), config, host_env, requested)?.billing)
+        Ok(resolve_identity(self.vendor(), &self.account, config, host_env, requested)?.billing)
     }
 }
 
@@ -2292,7 +2089,7 @@ pub(crate) fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
 /// Whether a name is one any CLI reads a credential from, which a named account withholds.
 #[must_use]
 pub fn is_credential_name(name: &str) -> bool {
-    Vendor::ALL
+    Vendor::VARIANTS
         .iter()
         .any(|vendor| credential_keys(*vendor).contains(&name))
 }
@@ -3100,4 +2897,88 @@ pub(crate) fn release_of(version: &str) -> Option<(u64, u64, u64)> {
         digits.parse::<u64>().ok()
     });
     Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+    use serde_json::json;
+    use strum::VariantArray as _;
+
+    use super::{
+        AccountAlias, AccountChoice, CodexPermissions, CodexSandbox, Delegate, Isolation, ModelId,
+        Permissions, Vendor,
+    };
+
+    /// The roster derived from the permissions keeps every vendor's name, in its order, as records
+    /// and requests spell it.
+    #[gtest]
+    fn every_vendor_keeps_its_name() -> Result<()> {
+        let names: Vec<serde_json::Value> = Vendor::VARIANTS
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>()
+            .or_fail()?;
+        assert_that!(
+            names,
+            elements_are![eq(&json!("claude")), eq(&json!("codex")), eq(&json!("agy"))]
+        );
+        assert_that!(
+            serde_json::from_value::<Vendor>(json!("agy")).or_fail()?,
+            eq(Vendor::Agy)
+        );
+        // `--delegate` and `--deny` take Claude by its harness's name too.
+        #[cfg(feature = "clap")]
+        {
+            use clap::ValueEnum as _;
+            assert_that!(
+                Vendor::from_str("claude-code", false),
+                ok(eq(&Vendor::Claude))
+            );
+        }
+        Ok(())
+    }
+
+    /// A delegate is written with its vendor and its permissions beside the fields every vendor
+    /// shares, under the keys a record has always had.
+    #[gtest]
+    fn a_delegate_is_written_flat() -> Result<()> {
+        let codex = Delegate {
+            model: ModelId::parse("sol").or_fail()?,
+            effort: None,
+            account: AccountChoice::CliLogin,
+            isolation: Some(Isolation::Isolated),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: Some(false),
+            }),
+        };
+        assert_that!(
+            serde_json::to_value(&codex).or_fail()?,
+            eq(&json!({
+                "vendor": "codex",
+                "model": "sol",
+                "sandbox": "read_only",
+                "network_access": false,
+                "account": {"kind": "cli_login"},
+                "isolation": "isolated",
+            }))
+        );
+        let agy = Delegate {
+            model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+            effort: None,
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
+            isolation: None,
+            permissions: Permissions::Agy,
+        };
+        assert_that!(
+            serde_json::to_value(&agy).or_fail()?,
+            eq(&json!({
+                "vendor": "agy",
+                "model": "gemini-3.8-flash-low",
+                "account": "personal",
+            }))
+        );
+        Ok(())
+    }
 }

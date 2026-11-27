@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use agentmux::delegate::{
     AccountAlias, AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate,
-    Effort, Isolation, ModelId, PermissionOptions,
+    Effort, Isolation, ModelId, Overrides, Permissions,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
@@ -26,25 +26,25 @@ fn env() -> BTreeMap<String, String> {
 }
 
 fn claude() -> Result<Delegate> {
-    Ok(Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     })
 }
 
 fn codex() -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::ReadOnly),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        }),
     })
 }
 
@@ -571,11 +571,12 @@ fn an_agy_turn_reads_its_question_as_a_record_and_its_follow_up_resumes() -> Res
         Script::completed(fixtures::AGY_TOOL_USE),
         Script::completed(fixtures::AGY_RESUME),
     ])?;
-    let agy = Delegate::Agy {
+    let agy = Delegate {
         model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Agy,
     };
     let started = harness
         .store
@@ -638,11 +639,12 @@ fn an_agy_failure_told_only_on_stderr_is_classified_as_agy_classifies_it() -> Re
         ),
     ] {
         let harness = harness([Script::exited("", stderr, 1)])?;
-        let agy = Delegate::Agy {
+        let agy = Delegate {
             model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
             effort: None,
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Agy,
         };
         let started = harness.store.start(&request(agy, "review this"))?;
         assert_that!(
@@ -666,11 +668,12 @@ fn an_agy_turn_that_died_mid_reply_keeps_what_it_said() -> Result<()> {
         {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Half a reply"}}
     "#};
     let harness = harness([Script::exited(stream, "agy: killed\n", 137)])?;
-    let agy = Delegate::Agy {
+    let agy = Delegate {
         model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Agy,
     };
     let started = harness.store.start(&request(agy, "review this"))?;
 
@@ -689,19 +692,20 @@ fn an_agy_follow_up_cannot_change_its_isolation() -> Result<()> {
         (Isolation::Isolated, Isolation::Inherit),
     ] {
         let harness = harness([Script::completed(fixtures::AGY_TOOL_USE)])?;
-        let agy = Delegate::Agy {
+        let agy = Delegate {
             model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
             effort: None,
             account: AccountChoice::Default,
             isolation: Some(started),
+            permissions: Permissions::Agy,
         };
         let run = harness.store.start(&request(agy, "review this"))?;
         let refused = harness.store.follow_up_with(
             &run.run_id,
             "Again?",
-            PermissionOptions {
+            Overrides {
                 isolation: Some(asked),
-                ..PermissionOptions::default()
+                ..Overrides::default()
             },
             None,
         );
@@ -731,11 +735,12 @@ fn an_isolated_agy_consultation_runs_every_turn_in_the_stores_agy_home() -> Resu
         Script::completed(fixtures::AGY_TOOL_USE),
         Script::completed(fixtures::AGY_RESUME),
     ])?;
-    let agy = Delegate::Agy {
+    let agy = Delegate {
         model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: Some(Isolation::Isolated),
+        permissions: Permissions::Agy,
     };
     let started = harness.store.start(&request(agy, "review this"))?;
     harness.store.follow_up(&started.run_id, "Again?")?;
@@ -779,7 +784,7 @@ async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Resu
     let renamed = harness.store.follow_up_with(
         &started.run_id,
         "review the rework",
-        PermissionOptions::default(),
+        Overrides::default(),
         Some(&label("RE-REVIEW after rework")?),
     )?;
     assert_that!(renamed.label, some(eq(&label("RE-REVIEW after rework")?)));
@@ -878,7 +883,10 @@ fn status_surfaces_drift_and_hook_interference() -> Result<()> {
         Script::completed(fixtures::CLAUDE_STOP_HOOK),
     ])?;
     // An isolated run loads no hook, so one that reopened it is a surprise.
-    let isolated = claude()?.with_isolation(Isolation::Isolated);
+    let isolated = Delegate {
+        isolation: Some(Isolation::Isolated),
+        ..claude()?
+    };
     let started = harness.store.start(&request(isolated, "q"))?;
     let status = harness.store.status(&started.run_id)?;
     // A run that took the default loads the user's settings, and their hook is expected.
@@ -1499,12 +1507,12 @@ async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
 fn a_refused_start_leaves_no_phantom_consultation() -> Result<()> {
     let harness = harness([Script::completed(fixtures::CLAUDE_HAPPY)])?;
     let refused = harness.store.start(&request(
-        Delegate::Claude {
-            permissions: ClaudePermissions::default(),
+        Delegate {
             model: ModelId::parse("claude-opus-5").or_fail()?,
             effort: Some(Effort::parse("xhigh").or_fail()?),
             account: AccountChoice::Named(AccountAlias::parse("nobody").or_fail()?),
             isolation: None,
+            permissions: Permissions::Claude(ClaudePermissions::default()),
         },
         "q",
     ));
@@ -1829,13 +1837,13 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
 
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 // The caller names neither the account nor the isolation.
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "q".to_owned(),
             cwd: home.path().to_path_buf(),
@@ -1849,7 +1857,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
 
     // The account's preference was resolved and written down, not left for each launch to redo.
     assert_that!(
-        started.delegate.isolation(),
+        started.delegate.isolation,
         some(eq(Isolation::Inherit)),
         "an account-driven inherit was not recorded"
     );
@@ -1863,7 +1871,7 @@ fn an_inheriting_account_is_recorded_and_stays_recorded() -> Result<()> {
     let resumed = store.follow_up(&started.run_id, "again").or_fail()?;
 
     assert_that!(
-        resumed.delegate.isolation(),
+        resumed.delegate.isolation,
         some(eq(Isolation::Inherit)),
         "a follow-up re-resolved isolation against an edited configuration"
     );
@@ -1905,12 +1913,12 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
 
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "q".to_owned(),
             cwd: home.path().to_path_buf(),
@@ -1922,7 +1930,7 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
         })
         .or_fail()?;
     // With no default configured, the record says the CLI's own login ran.
-    assert_that!(started.delegate.account(), eq(&AccountChoice::CliLogin));
+    assert_that!(started.delegate.account, eq(&AccountChoice::CliLogin));
 
     // A record written before the CLI login was pinned holds no account at all, and reads the
     // same.
@@ -1953,7 +1961,7 @@ fn a_consultation_on_the_cli_login_stays_there_when_a_default_appears() -> Resul
     let resumed = store.follow_up(&started.run_id, "again").or_fail()?;
 
     // The follow-up kept the CLI login: neither the record nor the launch moved to the default.
-    assert_that!(resumed.delegate.account(), eq(&AccountChoice::CliLogin));
+    assert_that!(resumed.delegate.account, eq(&AccountChoice::CliLogin));
     let launches = launcher.launches();
     assert_that!(launches.len(), eq(2));
     assert_that!(
@@ -2230,8 +2238,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
     let store = RunStore::open(dir.path(), launcher, host).or_fail()?;
     let with_env = |account: Option<&str>| -> Result<StartRequest> {
         Ok(StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("claude-opus-5").or_fail()?,
                 effort: Some(Effort::parse("xhigh").or_fail()?),
                 account: account
@@ -2240,6 +2247,7 @@ fn a_checkout_selected_account_does_not_widen_request_env_through_the_store() ->
                     .or_fail()?
                     .into(),
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: "q".to_owned(),
             cwd: repo.clone(),
@@ -2400,15 +2408,15 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
         Script::completed(fixtures::CODEX_HAPPY),
     ]));
     let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
-    let asked = Delegate::Codex {
+    let asked = Delegate {
         model: ModelId::parse("gpt-6").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::ReadOnly),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        }),
     };
 
     let started = store.start(&StartRequest {
@@ -2424,7 +2432,7 @@ fn a_configured_rewrite_decides_which_model_runs_and_is_recorded() -> Result<()>
 
     let launch = launcher.launches().into_iter().next().or_fail()?;
     assert_that!(launch.has_flag_with("--model", "gpt-6-astra"), eq(true));
-    assert_that!(started.delegate.model().as_str(), eq("gpt-6-astra"));
+    assert_that!(started.delegate.model.as_str(), eq("gpt-6-astra"));
     assert_that!(
         started.rewritten_from.as_ref().map(ModelId::as_str),
         some(eq("gpt-6"))
@@ -2483,15 +2491,15 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
     ]));
     let store = RunStore::open(dir.path(), launcher.clone(), host).or_fail()?;
     let codex = |model: &str, effort: Option<&str>| -> Result<Delegate> {
-        Ok(Delegate::Codex {
+        Ok(Delegate {
             model: ModelId::parse(model).or_fail()?,
             effort: effort.map(Effort::parse).transpose().or_fail()?,
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         })
     };
     let start = |delegate: Delegate| {
@@ -2524,7 +2532,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
         eq(true)
     );
     assert_that!(
-        defaulted.delegate.effort().map(Effort::as_str),
+        defaulted.delegate.effort.as_ref().map(Effort::as_str),
         some(eq("medium"))
     );
     assert_that!(
@@ -2532,7 +2540,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
         eq(true)
     );
     assert_that!(
-        pinned.delegate.effort().map(Effort::as_str),
+        pinned.delegate.effort.as_ref().map(Effort::as_str),
         some(eq("high"))
     );
     assert_that!(
@@ -2544,7 +2552,7 @@ fn a_default_effort_fills_in_only_what_the_caller_left_out() -> Result<()> {
         "an effort nobody named reached the argv: {:?}",
         third.args
     );
-    assert_that!(unnamed.delegate.effort(), none());
+    assert_that!(unnamed.delegate.effort, none());
     assert_that!(
         unnamed.delegate.summary(),
         contains_substring("effort=cli-default")
@@ -2834,15 +2842,15 @@ fn configured_store(
 /// A Codex consultation of `model`, reading the configured home.
 fn codex_request(model: &str, cwd: &Path) -> Result<StartRequest> {
     Ok(StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse(model).or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "q".to_owned(),
         cwd: cwd.to_path_buf(),
@@ -2922,7 +2930,7 @@ fn an_old_spelling_rewritten_to_an_allowed_model_is_not_blocked() -> Result<()> 
         .store
         .start(&codex_request("gpt-5.6", configured.home.path())?)?;
 
-    assert_that!(started.delegate.model().as_str(), eq("gpt-6.1-sol"));
+    assert_that!(started.delegate.model.as_str(), eq("gpt-6.1-sol"));
     let launch = configured
         .launcher
         .launches()

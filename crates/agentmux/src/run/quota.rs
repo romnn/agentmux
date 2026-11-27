@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use strum::VariantArray as _;
+
 use crate::config::{Config, ConfigError, ModelRules};
 use crate::delegate::Vendor;
 use crate::transcript::{FailureKind, Outcome};
@@ -74,7 +76,9 @@ impl RunStore {
             Ok(config) => (config, None),
             Err(error) => (machine.clone(), Some(error)),
         };
-        let vendors: &[Vendor] = vendor.as_ref().map_or(&Vendor::ALL, std::slice::from_ref);
+        let vendors: &[Vendor] = vendor
+            .as_ref()
+            .map_or(Vendor::VARIANTS, std::slice::from_ref);
         let accounts = vendors
             .iter()
             .flat_map(|vendor| {
@@ -111,7 +115,7 @@ impl QuotaReport {
     pub fn vendors(&self) -> &[Vendor] {
         self.asked
             .as_ref()
-            .map_or(&Vendor::ALL, std::slice::from_ref)
+            .map_or(Vendor::VARIANTS, std::slice::from_ref)
     }
 
     /// What the machine file lets a delegate of one vendor do, as read for this report; see

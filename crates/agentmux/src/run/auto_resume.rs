@@ -327,8 +327,8 @@ impl RunStore {
         }
         let session = Self::resumable_session(&plan.run_id, &state)?;
         let mut delegate = self.current_delegate(&meta, Some(plan.turn_index))?;
-        if delegate.isolation().is_none() {
-            delegate = delegate.with_isolation(Isolation::Isolated);
+        if delegate.isolation.is_none() {
+            delegate.isolation = Some(Isolation::Isolated);
         }
         let next = NextTurn {
             delegate: &delegate,

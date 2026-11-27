@@ -20,6 +20,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use strum::VariantArray as _;
 
 use crate::params::{
     DelegateParams, ListParams, PermissionParams, QuestionParams, QuotaParams, label, run_id,
@@ -580,16 +581,17 @@ impl AgentMux {
                 None,
             ));
         }
-        let overrides = params.permissions.options()?;
+        let options = params.permissions.options()?;
         let label = label(params.label.as_deref())?;
         // Read before the turn is claimed, so it is the length through the previous turn exactly.
         // The rendered transcript is append-only, which is what makes that a turn boundary and
         // not a cut through the middle of one.
-        let before = self
-            .store
-            .status(&id)
-            .map_err(|error| run_error(&error))?
-            .transcript_bytes;
+        let before = self.store.status(&id).map_err(|error| run_error(&error))?;
+        // The fields are the consultation's vendor's, which its status names.
+        let overrides = options
+            .for_vendor(before.delegate.vendor())
+            .map_err(|error| run_error(&error.into()))?;
+        let before = before.transcript_bytes;
         let status = self
             .store
             .follow_up_with(&id, &params.question, overrides, label.as_ref())
@@ -892,8 +894,9 @@ fn denial(denied: &BTreeSet<Vendor>) -> String {
         return String::new();
     }
     let allowed = named(
-        Vendor::ALL
-            .into_iter()
+        Vendor::VARIANTS
+            .iter()
+            .copied()
             .filter(|vendor| !denied.contains(vendor)),
     );
     // The binary refuses a server that denies every vendor, but this library is not the only
@@ -946,8 +949,9 @@ fn instructions(
     // Read from the machine file alone, the only file that may set a rule, so a checkout's
     // broken file does not hide them; and only for the vendors this server launches, while
     // `quota` reports the machine as a whole.
-    let rules: Vec<_> = Vendor::ALL
-        .into_iter()
+    let rules: Vec<_> = Vendor::VARIANTS
+        .iter()
+        .copied()
         .filter(|vendor| !denied.contains(vendor))
         .map(|vendor| machine.model_rules(vendor))
         .collect();
@@ -1001,8 +1005,9 @@ fn instructions(
 /// The paragraph saying what a delegate loads and may do: each launched vendor's defaults and
 /// limits, read from the machine file alone, which is the only file that may set them.
 fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) -> String {
-    let rules: String = Vendor::ALL
-        .into_iter()
+    let rules: String = Vendor::VARIANTS
+        .iter()
+        .copied()
         .filter(|vendor| !denied.contains(vendor))
         .map(|vendor| {
             indoc::formatdoc! {"
@@ -1033,7 +1038,7 @@ fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) ->
 /// The paragraph naming this machine's accounts, and which one an omitted `account` uses.
 fn roster(config: &agentmux::config::Config) -> String {
     let mut described = Vec::new();
-    for vendor in Vendor::ALL {
+    for &vendor in Vendor::VARIANTS {
         let accounts = config.accounts(vendor);
         if accounts.is_empty() {
             continue;
@@ -1198,6 +1203,7 @@ mod tests {
     use agentmux::appserver::mailbox::{Mailbox, SteerReply};
     use agentmux::delegate::{
         AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+        Permissions,
     };
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
@@ -1595,15 +1601,15 @@ mod tests {
             .or_fail()?
             .with_codex_app_server("/opt/agentmux");
         let run_status = store.start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: Some(Isolation::Inherit),
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "q".to_owned(),
             cwd: state_directory.path().to_path_buf(),
