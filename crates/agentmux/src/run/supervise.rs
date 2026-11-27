@@ -308,7 +308,8 @@ impl RunStore {
             self.host_env.clone(),
             plan.producer.billing,
         );
-        let stdin = turn.stdin();
+        // Which file the delegate reads follows from who it is, which the consultation fixed.
+        let stdin = turn.stdin(self.meta(&plan.run_id)?.delegate.vendor());
         let launched = match self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &plan.producer.cwd,

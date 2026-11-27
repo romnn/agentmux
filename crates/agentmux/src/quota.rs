@@ -753,48 +753,69 @@ fn probe_agy(request: &ProbeRequest<'_>) -> Observation {
 }
 
 /// Run `agy --print /usage --output-format json` and read the usage it reports.
+///
+/// It runs in a fresh home of its own, because agy starts the MCP servers its home configures even
+/// to answer `/usage`, and its login is in the operating system's keyring rather than in the home.
+/// Its output goes to a file rather than a pipe, as the version probe's does: a descendant that
+/// inherited a pipe could hold it open past the deadline, where a file is read for what it holds.
 fn agy_usage(request: &ProbeRequest<'_>) -> Result<serde_json::Value, String> {
-    use std::io::Read as _;
+    use std::io::{Read as _, Seek as _};
     use std::process::Stdio;
 
+    let unavailable = |what: &str, error: std::io::Error| format!("{what}: {error}");
+    let home = tempfile::tempdir()
+        .map_err(|error| unavailable("cannot make a home for `agy --print /usage`", error))?;
+    let mut output = tempfile::tempfile()
+        .map_err(|error| unavailable("cannot make a file for `agy --print /usage`", error))?;
+    let stdout = output
+        .try_clone()
+        .map_err(|error| unavailable("cannot hand `agy --print /usage` its output", error))?;
     let mut command = probe_command(request, Vendor::Agy.program());
-    command.args(["--print", "/usage", "--output-format", "json"]);
-    let mut child = command
+    command
+        .args(["--print", "/usage", "--output-format", "json"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::null());
+    let mut child = command
         .spawn()
-        .map_err(|error| format!("cannot run `agy --print /usage`: {error}"))?;
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        return Err("`agy --print /usage` did not offer its output".to_owned());
-    };
+        .map_err(|error| unavailable("cannot run `agy --print /usage`", error))?;
 
-    // Read on its own thread so a CLI that never finishes cannot hang the caller.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut output = String::new();
-        // A caller that stopped waiting has already reported the timeout.
-        let _ = sender.send(stdout.read_to_string(&mut output).map(|_| output));
-    });
-    let output = receiver.recv_timeout(PROBE_TIMEOUT);
-    // The child is finished with either way; leaving it running would leak a process per probe.
-    let _ = child.kill();
-    let status = child.wait();
-    match output {
-        Ok(Ok(output)) => match status {
-            Ok(status) if status.success() => agy_usage_payload(&output),
-            Ok(status) => Err(format!("`agy --print /usage` exited with {status}")),
-            Err(error) => Err(format!(
-                "`agy --print /usage` could not be waited on: {error}"
-            )),
-        },
-        Ok(Err(error)) => Err(format!("reading `agy --print /usage`: {error}")),
-        Err(_) => Err(format!(
-            "`agy --print /usage` did not answer within {}s",
-            PROBE_TIMEOUT.as_secs()
-        )),
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`agy --print /usage` did not answer within {}s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(unavailable(
+                    "`agy --print /usage` could not be waited on",
+                    error,
+                ));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!("`agy --print /usage` exited with {status}"));
     }
+    let mut printed = String::new();
+    output
+        .rewind()
+        .and_then(|()| output.read_to_string(&mut printed))
+        .map_err(|error| unavailable("reading `agy --print /usage`", error))?;
+    agy_usage_payload(&printed)
 }
 
 /// The usage figures in what `agy --print /usage --output-format json` printed.

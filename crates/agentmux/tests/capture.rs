@@ -599,6 +599,19 @@ fn no_committed_fixture_carries_a_recording_machine_path() {
                  replace it with a mocked value before committing"
             );
         }
+        // A home directory is the mocked user's, `/home/dev`, or the recording user's.
+        let foreign_homes: Vec<&str> = stream
+            .match_indices("/home/")
+            .map(|(at, _)| stream.get(at..).unwrap_or_default())
+            .map(|home| home.split(['/', '"', '\\']).nth(2).unwrap_or_default())
+            .filter(|user| *user != "dev")
+            .collect();
+        assert_that!(
+            foreign_homes,
+            is_empty(),
+            "fixture {name} carries a home directory from the machine that recorded it; \
+             replace it with /home/dev before committing"
+        );
     }
 }
 
@@ -1278,6 +1291,37 @@ fn an_agy_answer_is_its_steps_text_once() {
             cost_usd: None,
         })
     );
+}
+
+/// An agy answer that only the `result` carries, because no step said anything, is the answer.
+#[gtest]
+fn an_agy_answer_only_its_result_carries_is_the_answer() {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","init":{"model":"gemini-3.8-flash-low"},"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba"}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"DONE","step_type":"agent_response"}}
+        {"event":"result","result":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","status":"SUCCESS","response":"PELICAN\n"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(report(&turn), elements_are![eq("PELICAN\n")]);
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+}
+
+/// The reply an agy stream ended in the middle of is not in the turn, whose render must only
+/// grow while more of it may arrive, but is handed on for the turn to keep once it has ended.
+#[gtest]
+fn an_agy_reply_the_stream_ended_in_the_middle_of_is_handed_on() {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","init":{"model":"gemini-3.8-flash-low"},"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba"}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Half a "}}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"reply"}}
+    "#};
+    let Fold {
+        turn, unfinished, ..
+    } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(report(&turn), is_empty());
+    assert_that!(unfinished.as_deref(), some(eq("Half a reply")));
 }
 
 /// An agy follow-up continues the conversation it resumed.

@@ -1697,6 +1697,7 @@ fn an_agy_account_only_labels_its_one_login() -> Result<()> {
         indoc::indoc! {r#"
             [accounts.agy.personal]
             description = "Google AI Pro"
+            inherit_settings = false
             [defaults.agy]
             account = "personal"
         "#},

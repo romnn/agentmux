@@ -51,7 +51,7 @@ fn codex() -> Result<Delegate> {
 struct Harness {
     store: RunStore,
     launcher: Arc<ScriptedLauncher>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
@@ -61,7 +61,7 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
     Ok(Harness {
         store,
         launcher,
-        _dir: dir,
+        dir,
     })
 }
 
@@ -622,26 +622,91 @@ fn an_agy_turn_reads_its_question_as_a_record_and_its_follow_up_resumes() -> Res
     Ok(())
 }
 
-/// An agy consultation asked to run isolated is refused before anything is launched or kept.
+/// An agy CLI that failed with only its stderr to say why is classified by agy's own reading of
+/// its errors: an unknown model is named as such, and an overload is not guessed at from another
+/// vendor's wording, which would have agentmux resume the consultation at a cost.
 #[gtest]
-fn an_isolated_agy_consultation_is_refused_at_start() -> Result<()> {
-    let harness = harness([Script::completed(fixtures::AGY_TOOL_USE)])?;
+fn an_agy_failure_told_only_on_stderr_is_classified_as_agy_classifies_it() -> Result<()> {
+    for (stderr, expected) in [
+        (
+            "error: invalid model selection (--model \"gemini-nonexistent-xyz\" --effort \"\")\n",
+            FailureKind::ModelUnavailable,
+        ),
+        (
+            "upstream: the model is overloaded\n",
+            FailureKind::LaunchFailed,
+        ),
+    ] {
+        let harness = harness([Script::exited("", stderr, 1)])?;
+        let agy = Delegate::Agy {
+            model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+            effort: None,
+            account: AccountChoice::Default,
+            isolation: None,
+        };
+        let started = harness.store.start(&request(agy, "review this"))?;
+        assert_that!(
+            started.outcome,
+            matches_pattern!(Outcome::Failed {
+                kind: eq(&expected),
+                detail: anything()
+            }),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// An agy turn whose CLI exited in the middle of a reply keeps what it said, after agentmux's note
+/// of how it ended.
+#[gtest]
+fn an_agy_turn_that_died_mid_reply_keeps_what_it_said() -> Result<()> {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","init":{"model":"gemini-3.8-flash-low"},"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba"}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Half a reply"}}
+    "#};
+    let harness = harness([Script::exited(stream, "agy: killed\n", 137)])?;
+    let agy = Delegate::Agy {
+        model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: None,
+    };
+    let started = harness.store.start(&request(agy, "review this"))?;
+
+    assert_that!(started.outcome, matches_pattern!(Outcome::Failed { .. }));
+    let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
+    assert_that!(transcript, contains_substring("Half a reply"));
+    Ok(())
+}
+
+/// An isolated agy consultation runs every turn in the one home the store keeps for agy, so a
+/// follow-up finds the conversation the first turn saved there.
+#[gtest]
+fn an_isolated_agy_consultation_runs_every_turn_in_the_stores_agy_home() -> Result<()> {
+    let harness = harness([
+        Script::completed(fixtures::AGY_TOOL_USE),
+        Script::completed(fixtures::AGY_RESUME),
+    ])?;
     let agy = Delegate::Agy {
         model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: Some(Isolation::Isolated),
     };
-    let refused = harness.store.start(&request(agy, "review this"));
+    let started = harness.store.start(&request(agy, "review this"))?;
+    harness.store.follow_up(&started.run_id, "Again?")?;
 
+    let home = harness.dir.path().join("agy-home");
+    let launches = harness.launcher.launches();
     assert_that!(
-        refused.map(|_| ()),
-        err(displays_as(contains_substring(
-            "ignore_user_config=true cannot be honoured"
-        )))
+        launches
+            .iter()
+            .map(|launch| launch.env.get("HOME").map(PathBuf::from))
+            .collect::<Vec<_>>(),
+        elements_are![some(eq(&home)), some(eq(&home))]
     );
-    assert_that!(harness.launcher.launches(), is_empty());
-    assert_that!(harness.store.list(10, &ListFilter::default())?, is_empty());
+    assert_that!(home.is_dir(), eq(true));
     Ok(())
 }
 
@@ -2518,7 +2583,7 @@ fn store_with_home(home: &Path) -> Result<Harness> {
     Ok(Harness {
         store,
         launcher,
-        _dir: dir,
+        dir,
     })
 }
 

@@ -63,7 +63,7 @@ use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::left_running::LeftRunning;
 use crate::stream::{self, Fold, StreamInput, TurnInput};
-use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
+use crate::transcript::{FailureKind, Message, Outcome, Role, Transcript, Turn, UsageWindow};
 
 /// How many bytes of a departed child's stderr are kept with its exit record.
 const STDERR_TAIL: usize = 2000;
@@ -584,9 +584,11 @@ impl LockedRun<'_> {
             input,
             last_result,
             steers_taken,
+            unfinished,
         } = fold;
         let settled_by =
             RunStore::settle_outcome(&mut turn, dir, record.as_ref(), last_result, vendor);
+        keep_unfinished(&mut turn, unfinished);
 
         note_launch_record(&mut turn, &invocation, &meta.delegate);
         note_continuity(
@@ -1066,11 +1068,10 @@ impl RunStore {
             ExitRecord::Cancelled { .. } => Outcome::Cancelled,
             ExitRecord::NotStarted { reason } => {
                 let detail = format!("the {vendor} CLI was never started: {reason}");
-                let kind = match stream::classify(&detail) {
-                    FailureKind::Unclassified => FailureKind::LaunchFailed,
-                    classified => classified,
-                };
-                Outcome::Failed { kind, detail }
+                Outcome::Failed {
+                    kind: classify_exit(vendor, &detail),
+                    detail,
+                }
             }
             ExitRecord::Exited {
                 status,
@@ -1116,11 +1117,35 @@ impl RunStore {
         } else {
             format!("the {vendor} CLI {how}: {stderr}")
         };
-        let kind = match stream::classify(&detail) {
-            FailureKind::Unclassified => FailureKind::LaunchFailed,
-            classified => classified,
-        };
-        Outcome::Failed { kind, detail }
+        Outcome::Failed {
+            kind: classify_exit(vendor, &detail),
+            detail,
+        }
+    }
+}
+
+/// Keep the reply a stream ended in the middle of, once the turn has ended.
+///
+/// Kept only then, after everything else the turn said, so no earlier render showed less of it.
+fn keep_unfinished(turn: &mut Turn, unfinished: Option<String>) {
+    if turn.outcome.is_terminal()
+        && let Some(text) = unfinished
+    {
+        turn.messages.push(Message::delegate(Role::Assistant, text));
+    }
+}
+
+/// Classify a failure a `vendor` CLI described only outside its event stream: agy's as its own
+/// reports are, the others' by the phrases they share, and anything unfamiliar as a launch that
+/// failed.
+fn classify_exit(vendor: Vendor, detail: &str) -> FailureKind {
+    let kind = match vendor {
+        Vendor::Agy => stream::agy::classify(detail),
+        Vendor::Claude | Vendor::Codex => stream::classify(detail),
+    };
+    match kind {
+        FailureKind::Unclassified => FailureKind::LaunchFailed,
+        classified => classified,
     }
 }
 

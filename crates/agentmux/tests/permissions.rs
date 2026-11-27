@@ -97,6 +97,8 @@ fn build(
         extra_env: &extra_env,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_env(), config)
 }
@@ -419,6 +421,59 @@ fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Re
     assert_that!(
         codex(None, None)?.resolved_isolation(&Config::default()),
         eq(Isolation::Inherit)
+    );
+    Ok(())
+}
+
+/// An agy delegate's isolation is decided as the others' are: `[agy.defaults]` names the default,
+/// its one account may prefer otherwise, and `[agy.limits]` refuses loading the user's
+/// configuration.
+#[gtest]
+fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
+    let agy = || -> Result<Delegate> {
+        Ok(Delegate::Agy {
+            model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+            effort: None,
+            account: AccountChoice::Default,
+            isolation: None,
+        })
+    };
+    let config = machine(indoc::indoc! {r#"
+        [accounts.agy.personal]
+        description = "Google AI Pro"
+        inherit_settings = true
+        [defaults.agy]
+        account = "personal"
+
+        [agy.defaults]
+        ignore_user_config = true
+    "#})?;
+    assert_that!(
+        agy()?
+            .with_account(AccountChoice::CliLogin)
+            .resolved_isolation(&config),
+        eq(Isolation::Isolated)
+    );
+    assert_that!(
+        agy()?
+            .with_account(AccountChoice::Named(
+                AccountAlias::parse("personal").or_fail()?
+            ))
+            .resolved_isolation(&config),
+        eq(Isolation::Inherit)
+    );
+
+    let config = machine(indoc::indoc! {"
+        [agy.limits]
+        allow_user_config = false
+    "})?;
+    assert_that!(agy()?.resolved_isolation(&config), eq(Isolation::Isolated));
+    assert_that!(
+        agy()?
+            .with_isolation(Isolation::Inherit)
+            .held_to_limits(&config)
+            .map(|_| ()),
+        err(displays_as(contains_substring("allow_user_config")))
     );
     Ok(())
 }

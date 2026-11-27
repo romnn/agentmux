@@ -3,7 +3,8 @@
 ## Unreleased
 
 - **agy, Google's Antigravity CLI, is a third delegate.** `--delegate agy` (`delegate: "agy"`)
-  reaches Gemini models on a Google AI subscription, read-only, always with the user's own settings.
+  reaches Gemini models on a Google AI subscription, read-only; with `ignore_user_config` it runs
+  in a home of agentmux's own.
 - **A running Claude turn can be steered.** Its supervisor holds Claude's input, so `steer` reaches
   it until Claude reports its result.
 - **A Claude turn ends when Claude exits, and keeps what Claude answers after its first result,**

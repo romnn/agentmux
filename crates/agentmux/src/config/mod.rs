@@ -48,8 +48,9 @@ mod trust;
 
 pub use model_rules::{BlockedModel, ModelRules, RefusedModel, ResolvedModel};
 pub use permissions::{
-    BUILT_IN_MAX_SANDBOX, ClaudeDefaults, ClaudeLimits, ClaudePolicy, CodexDefaults, CodexLimits,
-    CodexPolicy, LimitSource, PERMISSION_PROFILE_MIN_CODEX, PermissionPolicy, PermissionRefusal,
+    AgyDefaults, AgyLimits, AgyPolicy, BUILT_IN_MAX_SANDBOX, ClaudeDefaults, ClaudeLimits,
+    ClaudePolicy, CodexDefaults, CodexLimits, CodexPolicy, LimitSource,
+    PERMISSION_PROFILE_MIN_CODEX, PermissionPolicy, PermissionRefusal,
 };
 
 /// Environment variable holding an explicit path to the configuration file.
@@ -108,7 +109,7 @@ pub enum ConfigError {
     /// or limits, rather than select an account.
     #[error(
         "{path} defines accounts, model rewrites, default efforts, blocked models, a retention, \
-         [codex] or [claude] permission defaults or limits, or a [launch] environment, and a \
+         [codex], [claude] or [agy] permission defaults or limits, or a [launch] environment, and a \
          project agentmux.toml may only select an account with [defaults.<vendor>]. Move the \
          definitions to your machine configuration: a file that travels with a repository must \
          not be able to name a credential, an endpoint, an environment variable, which model \
@@ -719,6 +720,10 @@ pub struct Config {
     /// `[claude.limits]`.
     #[serde(default)]
     pub claude: ClaudePolicy,
+    /// Whether an agy delegate loads the user's configuration by default, and may:
+    /// `[agy.defaults]` and `[agy.limits]`.
+    #[serde(default)]
+    pub agy: AgyPolicy,
     /// How long a consultation without `keep` survives after its delegate last wrote anything,
     /// written as a duration such as `"7d"`, `"1w"`, `"36h"` or `"2w 3d"`.
     ///
@@ -987,6 +992,7 @@ impl Config {
                 || project.retention.is_some()
                 || !project.codex.is_empty()
                 || !project.claude.is_empty()
+                || !project.agy.is_empty()
             {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
@@ -1171,8 +1177,9 @@ impl Config {
     /// agy keeps its one login in the operating system's keyring and reads no credential,
     /// directory or environment an account could name, so an agy account can only label that
     /// login.
-    /// There is at most one, it holds only a `description`, and it is the file's own default, so
-    /// a consultation naming no account runs as it and `quota` reports the login once.
+    /// There is at most one, it holds only a `description` and `inherit_settings`, and it is the
+    /// file's own default, so a consultation naming no account runs as it and `quota` reports the
+    /// login once.
     fn validate_agy_accounts(&self, path: &Path) -> Result<(), ConfigError> {
         let accounts = self.accounts(Vendor::Agy);
         let default = self
@@ -1182,15 +1189,16 @@ impl Config {
         for (index, (alias, account)) in accounts.iter().enumerate() {
             let label_only = Account {
                 description: account.description.clone(),
+                inherit_settings: account.inherit_settings,
                 ..Account::default()
             };
             let reason = if index > 0 {
                 "is a second agy account, but agy has one login per machine, which only one \
                  account may label"
             } else if *account != label_only {
-                "sets more than a `description`, but agy keeps its one login in the operating \
-                 system's keyring and reads no credential, directory or environment an account \
-                 could name"
+                "sets more than a `description` and `inherit_settings`, but agy keeps its one \
+                 login in the operating system's keyring and reads no credential, directory or \
+                 environment an account could name"
             } else if default != Some(alias) {
                 "is not the `[defaults.agy]` account, but agy has one login, which a \
                  consultation naming no account runs as too, so the account labelling it must be \
@@ -1255,8 +1263,10 @@ impl Config {
                 self.codex.defaults.ignore_user_config,
                 self.codex.limits.allow_user_config,
             ),
-            // agy always loads the user's settings, and the file has no table to say otherwise.
-            Vendor::Agy => (None, None),
+            Vendor::Agy => (
+                self.agy.defaults.ignore_user_config,
+                self.agy.limits.allow_user_config,
+            ),
         };
         PermissionPolicy::new(
             vendor,

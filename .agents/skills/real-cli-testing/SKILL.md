@@ -34,7 +34,8 @@ chosen accounts: the library suite uses the configured default accounts, and
 `AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` select an account only for the CLI
 steering tests.
 
-`crates/agentmux/tests/live.rs` drives real `claude`, `codex` and `agy` processes. Run it after
+`crates/agentmux/tests/live.rs` drives real `claude`, `codex` and `agy` processes; the agy test
+runs a consultation in the user's own home and one in the home agentmux keeps. Run it after
 upgrading a CLI:
 
 ```bash
@@ -126,5 +127,9 @@ before committing, following the committed fixtures: `/work/project` for the che
 for the home directory, `-work-project` for the memory slug, `/tmp/socket` for a socket path, and an
 empty or stock list of skills and slash commands.
 
-`no_committed_fixture_carries_a_recording_machine_path` rejects several known path markers when the
-capture tests run. It does not replace manual scrubbing.
+`no_committed_fixture_carries_a_recording_machine_path` rejects several known path markers, and
+every home directory other than `/home/dev`, when the capture tests run. It does not replace manual
+scrubbing.
+A chunk that splits a word can trip `task spellcheck`; add a pattern for that one chunk to
+`.typos.toml`'s `extend-ignore-re`, as the one there for `resume.jsonl` does, rather than excluding
+the fixture.

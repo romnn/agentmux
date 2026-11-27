@@ -52,6 +52,11 @@ pub struct Fold {
     /// The ids of the steers the fold placed in the turn, where Claude's replay of each said it
     /// took it.
     pub steers_taken: Vec<Uuid>,
+    /// The text of an agy reply the stream ended in the middle of.
+    ///
+    /// Not in [`Self::turn`], whose render must only grow at its end while more of the same reply
+    /// may still arrive; the turn keeps it once it has ended without finishing it.
+    pub unfinished: Option<String>,
 }
 
 /// Whether a turn takes an instruction now, as its stream says.

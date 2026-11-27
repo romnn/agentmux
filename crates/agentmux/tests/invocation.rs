@@ -120,6 +120,8 @@ fn build_with(
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     delegate
         .invocation(&plan, &host_session_env(), config)
@@ -406,6 +408,8 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -450,6 +454,8 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -485,6 +491,8 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -531,6 +539,8 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     let mut host = host_session_env();
     host.insert("LOCAL_TOKEN".to_owned(), "not-a-real-key".to_owned());
@@ -719,6 +729,8 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             extra_env: &requested,
             billing: None,
             read_dirs: &[],
+            cwd: Path::new("/work/project"),
+            agy_home: Path::new("/state/agy-home"),
         };
         let result = Delegate::Claude {
             permissions: ClaudePermissions::default(),
@@ -756,6 +768,8 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let invocation = Delegate::Claude {
@@ -793,6 +807,8 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -890,6 +906,8 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let invocation = Delegate::Claude {
@@ -983,6 +1001,8 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -1227,6 +1247,8 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     let delegate = Delegate::Claude {
         permissions: ClaudePermissions::default(),
@@ -1268,6 +1290,8 @@ fn build_invocation_with_request_env(
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
@@ -1358,6 +1382,46 @@ fn a_subscription_delegate_carries_no_billing_variable_from_any_layer() -> Resul
     Ok(())
 }
 
+/// An agy delegate on its subscription login is not switched onto Google Cloud's credentials,
+/// even when the machine layer forwards them.
+///
+/// `AGY_ADC_AUTH` turns agy onto application default credentials, which bill a Cloud project, and
+/// `GOOGLE_APPLICATION_CREDENTIALS` names the file they are read from.
+#[gtest]
+fn an_agy_delegate_withholds_cloud_credentials_the_machine_layer_forwarded() -> Result<()> {
+    let names = ["AGY_ADC_AUTH", "GOOGLE_APPLICATION_CREDENTIALS"];
+    let mut config = Config::default();
+    config.launch.env_passthrough = names.map(str::to_owned).to_vec();
+    let mut host = host_session_env();
+    host.insert("AGY_ADC_AUTH".to_owned(), "1".to_owned());
+    host.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+        "/home/dev/adc.json".to_owned(),
+    );
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
+        resume: None,
+        extra_env: &BTreeMap::new(),
+        billing: None,
+        read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
+    };
+    let delegate = Delegate::Agy {
+        model: model("gemini-3.8-flash-low")?,
+        effort: None,
+        account: AccountChoice::CliLogin,
+        isolation: Some(Isolation::Inherit),
+    };
+    let invocation = delegate.invocation(&plan, &host, &config).or_fail()?;
+    for name in names {
+        assert_that!(invocation.env().get(name), none(), "{name}");
+    }
+    assert_that!(invocation.billing(), eq(Billing::Subscription));
+    Ok(())
+}
+
 /// The billing rule covers every way a vendor namespace names an endpoint or a token, and spares
 /// the names a subscription login itself needs.
 #[gtest]
@@ -1378,6 +1442,8 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "AGY_LLM_GATEWAY_MODELS",
         "AGY_LLM_GATEWAY_API_KEY",
         "AGY_LLM_GATEWAY_HEADERS",
+        "AGY_ADC_AUTH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     ] {
         expect_that!(
             agentmux::delegate::is_billing_env_name(name),
@@ -1460,6 +1526,8 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     let api_invocation = delegate_on_account(Vendor::Codex, "metered")?
         .invocation(&plan, &host, &config)
@@ -1595,6 +1663,8 @@ fn build_invocation_with_billing(
         extra_env: &requested,
         billing,
         read_dirs: &[],
+        cwd: Path::new("/work/project"),
+        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
@@ -1685,88 +1755,210 @@ fn agy_settings(args: &[String]) -> Result<serde_json::Value> {
     serde_json::from_str(settings).or_fail()
 }
 
-/// An agy turn's arguments, with `settings_json` as the user's own agy settings file when given.
-fn agy_args(
-    settings_json: Option<&str>,
-    resume: Option<&SessionRef>,
-    read_dirs: &[std::path::PathBuf],
-) -> Result<Vec<String>> {
-    Ok(agy_invocation(settings_json, resume, read_dirs)?
-        .or_fail()?
-        .args()
-        .to_vec())
+/// Where an agy invocation is built: a user's home, a project to run in, and the home the run
+/// store keeps for an isolated agy delegate.
+struct AgyMachine {
+    root: tempfile::TempDir,
 }
 
-/// An agy turn's launch, or why it was refused, with `settings_json` as the user's own agy
-/// settings file when given.
-fn agy_invocation(
-    settings_json: Option<&str>,
-    resume: Option<&SessionRef>,
-    read_dirs: &[std::path::PathBuf],
-) -> Result<std::result::Result<Invocation, DelegateError>> {
-    let home = tempfile::tempdir().or_fail()?;
-    if let Some(settings_json) = settings_json {
-        let dir = home.path().join(".gemini").join("antigravity-cli");
-        std::fs::create_dir_all(&dir).or_fail()?;
-        std::fs::write(dir.join("settings.json"), settings_json).or_fail()?;
+impl AgyMachine {
+    fn new() -> Result<Self> {
+        let root = tempfile::tempdir().or_fail()?;
+        for dir in ["home", "project"] {
+            std::fs::create_dir_all(root.path().join(dir)).or_fail()?;
+        }
+        Ok(Self { root })
     }
-    let mut env = host_session_env();
-    env.insert("HOME".to_owned(), home.path().display().to_string());
-    let plan = TurnPlan {
-        question_path: Path::new("/runs/r/turns/0001/question.md"),
-        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
-        resume,
-        extra_env: &BTreeMap::new(),
-        billing: None,
-        read_dirs,
-    };
-    let delegate =
-        delegate_on_account(Vendor::Agy, "unused")?.with_account(AccountChoice::CliLogin);
-    Ok(delegate.invocation(&plan, &env, &Config::default()))
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.root.path().join(name)
+    }
+
+    /// Write the user's own agy settings file.
+    fn user_settings(&self, text: &str) -> Result<()> {
+        let dir = self.path("home").join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&dir).or_fail()?;
+        std::fs::write(dir.join("settings.json"), text).or_fail()
+    }
+
+    /// Create `relative` in the project, as a directory when it ends in `/`.
+    fn project_file(&self, relative: &str) -> Result<()> {
+        let path = self.path("project").join(relative);
+        if relative.ends_with('/') {
+            return std::fs::create_dir_all(path).or_fail();
+        }
+        std::fs::create_dir_all(path.parent().or_fail()?).or_fail()?;
+        std::fs::write(path, "{}").or_fail()
+    }
+
+    /// The launch of an agy turn on the CLI's login, run under `isolation` in `cwd`.
+    fn launch_in(
+        &self,
+        cwd: &Path,
+        isolation: Isolation,
+        resume: Option<&SessionRef>,
+        read_dirs: &[std::path::PathBuf],
+    ) -> Result<std::result::Result<Invocation, DelegateError>> {
+        let mut env = host_session_env();
+        env.insert("HOME".to_owned(), self.path("home").display().to_string());
+        let agy_home = self.path("agy-home");
+        let plan = TurnPlan {
+            question_path: Path::new("/runs/r/turns/0001/question.md"),
+            last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
+            resume,
+            extra_env: &BTreeMap::new(),
+            billing: None,
+            read_dirs,
+            cwd,
+            agy_home: &agy_home,
+        };
+        let delegate = Delegate::Agy {
+            model: model("gemini-3.8-flash-low")?,
+            effort: None,
+            account: AccountChoice::CliLogin,
+            isolation: Some(isolation),
+        };
+        Ok(delegate.invocation(&plan, &env, &Config::default()))
+    }
+
+    /// The same, in the project.
+    fn launch(
+        &self,
+        isolation: Isolation,
+    ) -> Result<std::result::Result<Invocation, DelegateError>> {
+        self.launch_in(&self.path("project"), isolation, None, &[])
+    }
 }
 
-/// The user's own agy deny and ask rules stay in force beside agentmux's, and their allow rules
-/// and their permissive mode do not.
+/// The settings every agy launch pins, whatever the user's own say, followed by the user's own
+/// deny rules and ask rules when the launch carries them over.
+fn pinned_agy_settings(user_deny: &[&str], user_ask: &[&str]) -> serde_json::Value {
+    let mut deny = vec![
+        "command(*)",
+        "write_file(*)",
+        "mcp(*)",
+        "execute_url(*)",
+        "download_url(*)",
+    ];
+    deny.extend_from_slice(user_deny);
+    serde_json::json!({
+        "agentMode": "",
+        "toolPermission": "request-review",
+        "permissions": {"deny": deny, "ask": user_ask},
+        "useG1Credits": false,
+    })
+}
+
+/// A user's agy settings that would let a delegate do much more than read.
+const PERMISSIVE_AGY_SETTINGS: &str = r#"{
+    "agentMode": "accept-edits",
+    "toolPermission": "always-proceed",
+    "useG1Credits": true,
+    "permissions": {
+        "allow": ["command(echo)", "write_file(*)"],
+        "deny": ["read_file(/work/project/barred.txt)"],
+        "ask": ["read_url(*)"]
+    }
+}"#;
+
+/// An agy delegate that loads the user's configuration keeps their deny and ask rules beside
+/// agentmux's, and not their allow rules, their permissive mode or their AI credits.
 ///
 /// `--settings` replaces agy's whole `permissions` object, so a rule the launch did not carry
 /// over would be lost: measured, a user's deny rule on a file stopped holding under an overlay
 /// that named only agentmux's own.
 #[gtest]
-fn an_agy_launch_keeps_the_users_deny_and_ask_rules_and_drops_their_allow_rules() -> Result<()> {
-    let user = r#"{
-        "agentMode": "accept-edits",
-        "toolPermission": "always-proceed",
-        "permissions": {
-            "allow": ["command(echo)", "write_file(*)"],
-            "deny": ["read_file(/work/project/barred.txt)"],
-            "ask": ["read_url(*)"]
-        },
-        "model": "Gemini 4 Hydrogen (High)"
-    }"#;
-    let args = agy_args(Some(user), None, &[])?;
-    let settings = agy_settings(&args)?;
+fn an_inheriting_agy_launch_keeps_the_users_deny_and_ask_rules_and_nothing_wider() -> Result<()> {
+    let machine = AgyMachine::new()?;
+    machine.user_settings(PERMISSIVE_AGY_SETTINGS)?;
+    let invocation = machine.launch(Isolation::Inherit)?.or_fail()?;
 
-    // The mode and the tool preset are agentmux's, whatever the user chose.
-    assert_that!(settings["agentMode"], eq(&serde_json::json!("")));
     assert_that!(
-        settings["toolPermission"],
-        eq(&serde_json::json!("request-review"))
+        agy_settings(invocation.args())?,
+        eq(&pinned_agy_settings(
+            &["read_file(/work/project/barred.txt)"],
+            &["read_url(*)"]
+        ))
     );
-    // agentmux's deny rules come first, then the user's, and the user's ask rules are kept.
+    // It runs in the user's own home.
     assert_that!(
-        settings["permissions"],
-        eq(&serde_json::json!({
-            "deny": [
-                "command(*)",
-                "write_file(*)",
-                "mcp(*)",
-                "execute_url(*)",
-                "download_url(*)",
-                "read_file(/work/project/barred.txt)"
-            ],
-            "ask": ["read_url(*)"]
-        }))
+        invocation.env().get("HOME"),
+        some(eq(&machine.path("home").display().to_string()))
     );
+    Ok(())
+}
+
+/// An isolated agy delegate runs in the home the store keeps for it, which the launch creates, and
+/// carries none of the user's rules, which live in a home it does not load.
+#[gtest]
+fn an_isolated_agy_launch_runs_in_its_own_home() -> Result<()> {
+    let machine = AgyMachine::new()?;
+    machine.user_settings(PERMISSIVE_AGY_SETTINGS)?;
+    let invocation = machine.launch(Isolation::Isolated)?.or_fail()?;
+
+    let agy_home = machine.path("agy-home");
+    assert_that!(agy_home.is_dir(), eq(true));
+    for name in ["HOME", "USERPROFILE"] {
+        assert_that!(
+            invocation.env().get(name),
+            some(eq(&agy_home.display().to_string())),
+            "{name}"
+        );
+    }
+    assert_that!(
+        agy_settings(invocation.args())?,
+        eq(&pinned_agy_settings(&[], &[]))
+    );
+    Ok(())
+}
+
+/// An isolated agy launch is refused when its workspace holds a hook, an MCP server or a plugin,
+/// which agy loads whatever its home and nothing turns off; the refusal names the file.
+#[gtest]
+fn an_isolated_agy_launch_refuses_a_workspace_that_would_still_load_its_tooling() -> Result<()> {
+    for source in [
+        ".agents/hooks.json",
+        ".agents/mcp_config.json",
+        ".agents/plugins/",
+    ] {
+        let machine = AgyMachine::new()?;
+        machine.project_file(source)?;
+        let refused = machine.launch(Isolation::Isolated)?;
+        assert_that!(
+            refused.map(|_| ()),
+            err(displays_as(contains_substring(
+                source.trim_end_matches('/')
+            ))),
+            "{source}"
+        );
+        // Loading the user's configuration was asked for, so the workspace's comes with it.
+        assert_that!(
+            machine.launch(Isolation::Inherit)?,
+            ok(anything()),
+            "{source}"
+        );
+    }
+
+    // In a repository agy's workspace is its root, which a subdirectory's launch still loads.
+    let machine = AgyMachine::new()?;
+    machine.project_file(".git/")?;
+    machine.project_file(".agents/mcp_config.json")?;
+    machine.project_file("sub/")?;
+    let refused = machine.launch_in(
+        &machine.path("project").join("sub"),
+        Isolation::Isolated,
+        None,
+        &[],
+    )?;
+    assert_that!(
+        refused.map(|_| ()),
+        err(displays_as(contains_substring(".agents/mcp_config.json")))
+    );
+
+    // Skills alone run nothing by themselves, and do not stand in the way.
+    let machine = AgyMachine::new()?;
+    machine.project_file(".agents/skills/")?;
+    assert_that!(machine.launch(Isolation::Isolated)?, ok(anything()));
     Ok(())
 }
 
@@ -1774,66 +1966,40 @@ fn an_agy_launch_keeps_the_users_deny_and_ask_rules_and_drops_their_allow_rules(
 /// working directory is granted each directory.
 #[gtest]
 fn an_agy_follow_up_names_its_conversation_and_its_read_dirs() -> Result<()> {
+    let machine = AgyMachine::new()?;
     let session = SessionRef::parse("e4c7ded7-2bf0-480b-9326-24191d51e4ba").or_fail()?;
     let read_dir = std::path::PathBuf::from("/state/runs/r0");
-    let args = agy_args(None, Some(&session), std::slice::from_ref(&read_dir))?;
+    let invocation = machine
+        .launch_in(
+            &machine.path("project"),
+            Isolation::Inherit,
+            Some(&session),
+            std::slice::from_ref(&read_dir),
+        )?
+        .or_fail()?;
 
-    assert_that!(
-        has_pair(&args, "--conversation", session.as_str()),
-        eq(true)
-    );
-    assert_that!(has_pair(&args, "--add-dir", "/state/runs/r0"), eq(true));
-    // No user file holds no rules of the user's to carry over.
-    assert_that!(
-        agy_settings(&args)?["permissions"]["ask"],
-        eq(&serde_json::json!([]))
-    );
+    let args = invocation.args();
+    assert_that!(has_pair(args, "--conversation", session.as_str()), eq(true));
+    assert_that!(has_pair(args, "--add-dir", "/state/runs/r0"), eq(true));
     Ok(())
 }
 
-/// A user agy settings file that cannot be parsed refuses the launch, rather than launching
-/// without the rules it may hold.
+/// A user agy settings file saved with a byte-order mark, which agy reads, is read; one that
+/// cannot be parsed refuses the launch, rather than launching without the rules it may hold.
 #[gtest]
-fn an_unparsable_agy_settings_file_refuses_the_launch() -> Result<()> {
-    let refused = agy_invocation(
-        Some(r#"{"permissions": {"deny": "command(*)"}}"#),
-        None,
-        &[],
-    )?;
+fn an_agy_settings_file_is_read_as_agy_reads_it() -> Result<()> {
+    let machine = AgyMachine::new()?;
+    machine.user_settings("\u{feff}{\"permissions\": {\"deny\": [\"command(git push)\"]}}")?;
+    let invocation = machine.launch(Isolation::Inherit)?.or_fail()?;
     assert_that!(
-        refused.map(|_| ()),
+        agy_settings(invocation.args())?,
+        eq(&pinned_agy_settings(&["command(git push)"], &[]))
+    );
+
+    machine.user_settings(r#"{"permissions": {"deny": "command(*)"}}"#)?;
+    assert_that!(
+        machine.launch(Isolation::Inherit)?.map(|_| ()),
         err(displays_as(contains_substring("cannot be read")))
-    );
-    Ok(())
-}
-
-/// An agy delegate asked to run isolated is refused, because agy has no argument that skips the
-/// user's settings, and naming the setting tells the caller what to ask for instead.
-#[gtest]
-fn an_isolated_agy_delegate_is_refused() -> Result<()> {
-    let delegate = Delegate::Agy {
-        model: model("gemini-3.8-flash-low")?,
-        effort: None,
-        account: AccountChoice::CliLogin,
-        isolation: Some(Isolation::Isolated),
-    };
-    let refused = delegate.invocation(
-        &TurnPlan {
-            question_path: Path::new("/runs/r/turns/0001/question.md"),
-            last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
-            resume: None,
-            extra_env: &BTreeMap::new(),
-            billing: None,
-            read_dirs: &[],
-        },
-        &host_session_env(),
-        &Config::default(),
-    );
-    assert_that!(
-        refused,
-        err(displays_as(contains_substring(
-            "Cannot launch agy: ignore_user_config=true cannot be honoured"
-        )))
     );
     Ok(())
 }

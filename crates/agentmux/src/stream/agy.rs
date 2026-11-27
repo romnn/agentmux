@@ -8,8 +8,10 @@
 //!   An `agent_response` step streams `text_delta` chunks while it is `ACTIVE`, and the `DONE`
 //!   update carries the last one, so a step's text is the chunks joined, kept once the step is
 //!   done.
-//!   `result.response` repeats the same text and is never read as the answer, so nothing appears
-//!   twice.
+//!   `result.response` repeats the same text, so it is read as the answer only when no step said
+//!   anything, and nothing appears twice.
+//!   A step the stream ended in the middle of is reported as [`Fold::unfinished`], which the turn
+//!   keeps once it has ended.
 //! - **A denial does not fail the run.**
 //!   A call that needed approval nobody could give is listed in `result.denied_actions` of a
 //!   `SUCCESS` result, and a call a deny rule refused is a `tool` step ending `ERROR`.
@@ -158,36 +160,25 @@ impl From<&AgyUsage> for Usage {
     }
 }
 
-/// Enough of a line to name it in the drift count.
-#[derive(Debug, Deserialize)]
-struct EventProbe {
-    event: String,
-    #[serde(default)]
-    step_update: Option<StepTypeProbe>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StepTypeProbe {
-    step_type: String,
-}
-
 /// What the drift count calls a line: its `event`, and a step's `step_type`.
 fn drift_label(value: &Value) -> String {
-    match EventProbe::deserialize(value) {
-        Ok(EventProbe {
-            event,
-            step_update: Some(StepTypeProbe { step_type }),
-        }) => format!("{event}.{step_type}"),
-        Ok(EventProbe { event, .. }) => event,
-        Err(_) => MALFORMED_LINE.to_owned(),
+    let Some(event) = value.get("event").and_then(Value::as_str) else {
+        return MALFORMED_LINE.to_owned();
+    };
+    match value
+        .pointer("/step_update/step_type")
+        .and_then(Value::as_str)
+    {
+        Some(step_type) => format!("{event}.{step_type}"),
+        None => event.to_owned(),
     }
 }
 
 /// What the drift count calls a line it cannot read: its `event`.
 fn unparsable_drift_label(value: &Value) -> String {
-    match EventProbe::deserialize(value) {
-        Ok(EventProbe { event, .. }) => format!("{event}.<unparsable>"),
-        Err(_) => MALFORMED_LINE.to_owned(),
+    match value.get("event").and_then(Value::as_str) {
+        Some(event) => format!("{event}.<unparsable>"),
+        None => MALFORMED_LINE.to_owned(),
     }
 }
 
@@ -260,6 +251,16 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
             },
             Event::Result { result } => {
                 flush(&mut pending, &mut turn);
+                // A stream whose steps said nothing still has the answer here.
+                if !turn.messages.iter().any(Message::is_report_content)
+                    && let Some(response) = result
+                        .response
+                        .as_deref()
+                        .filter(|response| !response.trim().is_empty())
+                {
+                    turn.messages
+                        .push(Message::delegate(Role::Assistant, response));
+                }
                 if session.is_none()
                     && let Some(parsed) = result
                         .conversation_id
@@ -283,6 +284,9 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         input: TurnInput::Pending,
         last_result: None,
         steers_taken: Vec::new(),
+        unfinished: pending
+            .map(|under_way| under_way.text)
+            .filter(|text| !text.trim().is_empty()),
     }
 }
 

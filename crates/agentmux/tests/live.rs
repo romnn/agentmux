@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
+    ModelId,
 };
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStore, StartRequest};
@@ -208,18 +209,26 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
     Ok(())
 }
 
-/// The flags agentmux builds still work against today's agy: the question read as a stream-json
-/// record, a follow-up resuming its conversation, and the pinned permissions refusing a write.
+/// The flags agentmux builds still work against today's agy, in the user's own home and in the
+/// one agentmux keeps: the question read as a stream-json record, the pinned permissions refusing
+/// a write in a way the stream reports, and a follow-up resuming the conversation.
 #[gtest]
 #[tokio::test]
 #[ignore = "spends quota and needs a signed-in agy CLI"]
 async fn a_live_agy_consultation_can_be_followed_up_and_writes_nothing() -> Result<()> {
+    for isolation in [Isolation::Inherit, Isolation::Isolated] {
+        live_agy_consultation(isolation).await?;
+    }
+    Ok(())
+}
+
+async fn live_agy_consultation(isolation: Isolation) -> Result<()> {
     let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-agy-probe");
     let agy = Delegate::Agy {
         model: ModelId::parse(AGY_MODEL).or_fail()?,
         effort: None,
         account: AccountChoice::Default,
-        isolation: None,
+        isolation: Some(isolation),
     };
     let (store, status) = consult(
         agy,
@@ -229,35 +238,66 @@ async fn a_live_agy_consultation_can_be_followed_up_and_writes_nothing() -> Resu
     )
     .await?;
 
-    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
-    assert_that!(status.resumable, eq(true));
+    assert_that!(
+        status.outcome,
+        matches_pattern!(Outcome::Completed { .. }),
+        "{isolation:?}"
+    );
+    assert_that!(status.resumable, eq(true), "{isolation:?}");
     assert_that!(
         status.unrecognised.summary(),
         none(),
-        "the agy event stream has drifted"
+        "the agy event stream has drifted ({isolation:?})"
     );
-    assert_that!(probe.exists(), eq(false), "an agy delegate wrote a file");
+    assert_that!(
+        probe.exists(),
+        eq(false),
+        "an agy delegate wrote a file ({isolation:?})"
+    );
+    // The refusal is one agy reported, as a denied call or a failed tool step, not one inferred
+    // from the delegate's prose.
+    let first = store
+        .wait_for_settlement(&store.pin_turn(&status.run_id, Some(1)).or_fail()?)
+        .await
+        .or_fail()?;
+    let first_text = store
+        .page(
+            &status.run_id,
+            0,
+            usize::try_from(first.transcript_end()).or_fail()?,
+        )
+        .or_fail()?
+        .text;
+    assert_that!(
+        first_text,
+        any![
+            contains_substring("agy denied calls"),
+            contains_substring("call failed:")
+        ],
+        "{isolation:?}"
+    );
 
-    let followed = store
+    store
         .follow_up(
             &status.run_id,
             "What was the secret word? Reply with only the word.",
         )
         .or_fail()?;
-    store
-        .wait_until_terminal(&followed.run_id, Duration::from_secs(300))
+    let second = store
+        .wait_for_settlement(&store.pin_turn(&status.run_id, Some(2)).or_fail()?)
         .await
         .or_fail()?;
-    let followed = store.status(&followed.run_id).or_fail()?;
-    assert_that!(followed.turns, eq(2));
     assert_that!(
-        followed.outcome,
-        matches_pattern!(Outcome::Completed { .. })
+        second.outcome(),
+        matches_pattern!(Outcome::Completed { .. }),
+        "{isolation:?}"
     );
-
-    // The first question names the word once; the follow-up's answer names it again.
-    let page = store.page(&status.run_id, 0, usize::MAX).or_fail()?;
-    assert_that!(page.text, contains_substring("LIVE_AGY_OK"));
-    assert_that!(page.text.matches("ZEPPELIN").count(), ge(2));
+    // The follow-up's question does not name the word, so its section names it only if the
+    // delegate recalled it.
+    let second_text = store
+        .page(&status.run_id, second.transcript_start(), usize::MAX)
+        .or_fail()?
+        .text;
+    assert_that!(second_text, contains_substring("ZEPPELIN"), "{isolation:?}");
     Ok(())
 }

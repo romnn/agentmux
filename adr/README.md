@@ -75,8 +75,8 @@ A new decision gets a record with the next number.
   turn.
 - [0026](0026-delegate-permissions.md): A delegate's permissions are the CLI's own controls,
   bounded by machine-file limits.
-- [0035](0035-agy-always-loads-the-users-settings.md): An agy delegate always loads the user's
-  settings, and an isolated one is refused.
+- [0035](0035-agy-isolation-through-a-home-of-its-own.md): An isolated agy delegate runs in a home
+  of its own.
 
 ## Run lifecycle and transcripts
 

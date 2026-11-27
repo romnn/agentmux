@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::appserver::mailbox::Mailbox;
+use crate::delegate::Vendor;
 use crate::launch::Launched;
 
 use super::RunStore;
@@ -28,14 +29,12 @@ impl TurnDir {
     pub(super) fn encoded_question(&self) -> PathBuf {
         self.root.join("question.jsonl")
     }
-    /// What the delegate reads as its stdin: the encoded question when its launch wrote one, and
-    /// the question itself otherwise.
-    pub(super) fn stdin(&self) -> PathBuf {
-        let encoded = self.encoded_question();
-        if encoded.is_file() {
-            encoded
-        } else {
-            self.question()
+    /// What a `vendor` delegate reads as its stdin: the encoded question for agy, and the question
+    /// itself for the others.
+    pub(super) fn stdin(&self, vendor: Vendor) -> PathBuf {
+        match vendor {
+            Vendor::Agy => self.encoded_question(),
+            Vendor::Claude | Vendor::Codex => self.question(),
         }
     }
     pub(super) fn events(&self) -> PathBuf {
@@ -142,6 +141,14 @@ impl RunStore {
 
     pub(super) fn run_dir(&self, run_id: &RunId) -> PathBuf {
         self.runs_dir().join(run_id.as_str())
+    }
+
+    /// The home every isolated agy delegate of this store runs in, which keeps their
+    /// conversations for as long as the store is kept.
+    ///
+    /// One for the store, because agy has one login, which its keyring holds.
+    pub(super) fn agy_home(&self) -> PathBuf {
+        self.root.join("agy-home")
     }
 
     /// The directory of the turn with zero-based `index`, named by its one-based number, as the

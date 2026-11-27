@@ -10,7 +10,9 @@
 //! Asked for `--version` it says so and exits.
 //! Otherwise it reads its question from stdin: to its end, or as its first line when its
 //! arguments say `--input-format stream-json`, as a Claude turn's do once its supervisor holds its
-//! input open and an agy turn's always do.
+//! input open.
+//! Started as agy is, with `--print=`, it reads to the end of its input and refuses anything but
+//! the one stream-json record agy takes, as agy itself would.
 //! It then writes the configured stream and stderr, waits until the configured release file
 //! exists, its directory has gone or [`LONGEST_WAIT`] has passed, writes what it was told to write
 //! last, and exits with the configured status.
@@ -30,10 +32,6 @@ const FAKE_DELEGATE_CONFIG: &str = "fake-delegate.json";
 /// Where each run appends the arguments it was started with, as one JSON array per line, beside
 /// the executable, so a test can check what the delegate actually received.
 const FAKE_DELEGATE_ARGV: &str = "fake-delegate-argv.jsonl";
-
-/// Where each run appends the question it read, as one JSON string per line, beside the
-/// executable, so a test can check what the delegate was given on its stdin.
-const FAKE_DELEGATE_STDIN: &str = "fake-delegate-stdin.jsonl";
 
 /// How long the fake waits for its release before it goes on regardless.
 ///
@@ -116,16 +114,25 @@ fn record_argv(path: &std::path::Path) -> Result<usize, String> {
     Ok(recorded.lines().count())
 }
 
-/// Append the question this run read to `path`.
-fn record_question(path: &std::path::Path, question: &str) -> Result<(), String> {
-    let line =
-        serde_json::to_string(question).map_err(|err| format!("cannot encode question: {err}"))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
-    writeln!(file, "{line}").map_err(|err| format!("cannot write {}: {err}", path.display()))
+/// Refuse an agy question that is not exactly one `{"event":"user","message":{"content":…}}`
+/// record.
+fn check_agy_record(question: &str) -> Result<(), String> {
+    let mut lines = question.lines();
+    let record = lines
+        .next()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| {
+            record.get("event").and_then(serde_json::Value::as_str) == Some("user")
+                && record
+                    .pointer("/message/content")
+                    .is_some_and(serde_json::Value::is_string)
+        });
+    match (record, lines.next()) {
+        (Some(_), None) => Ok(()),
+        _ => Err(format!(
+            "agy takes one stream-json user record, not {question:?}"
+        )),
+    }
 }
 
 fn run() -> Result<u8, String> {
@@ -150,7 +157,9 @@ fn run() -> Result<u8, String> {
         std::io::stdin().read_to_string(&mut question)
     };
     read.map_err(|err| format!("cannot read the question: {err}"))?;
-    record_question(&config_path.with_file_name(FAKE_DELEGATE_STDIN), &question)?;
+    if std::env::args().any(|arg| arg == "--print=") {
+        check_agy_record(&question)?;
+    }
     let mut stdout = std::io::stdout();
     write!(stdout, "{}", config.stdout).map_err(|err| format!("cannot write stdout: {err}"))?;
     stdout

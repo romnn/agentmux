@@ -631,9 +631,10 @@ agentmux ask --delegate claude --model opus --effort xhigh \
 agentmux ask ... --ignore-user-config=false   # load it, even where the machine's default skips it
 ```
 
-Isolation is imposed by *argument*, not by environment — no variable switches it on or off. An
-account a checkout's own `agentmux.toml` selects runs isolated unless the call explicitly asks to
-load the configuration.
+Isolation is imposed by *argument*, not by environment — no variable switches it on or off — except
+for agy, which has no such argument and is isolated by a home of its own (below). An account a
+checkout's own `agentmux.toml` selects runs isolated unless the call explicitly asks to load the
+configuration.
 
 Every delegate is launched with `AGENTMUX_DELEGATE=1`, and `agentmux` refuses to launch a
 delegate — or to serve as an MCP server at all — when it finds itself inside one. An isolated
@@ -652,24 +653,31 @@ guarded by the variable alone.
 
 `--delegate agy` reaches Gemini models, and the others Google's subscription offers, through the
 Antigravity CLI, which is what a Google AI Pro or Ultra subscription runs on; `agy models` lists
-them. It differs from the other two in four ways; why it loads your settings and how its
-permissions are pinned is in [ADR 0035](adr/0035-agy-always-loads-the-users-settings.md):
+them. It differs from the other two in four ways; how it is isolated and how its permissions are
+pinned is in [ADR 0035](adr/0035-agy-isolation-through-a-home-of-its-own.md):
 
-- **It always loads your settings.** agy has no argument that skips its user settings, hooks or
-  MCP servers, so `ignore_user_config: true` is refused for it rather than quietly not honoured, and
-  `settings=inherited` is on every agy delegate line.
+- **It is isolated by a home of its own.** agy has no argument that skips its user settings, hooks
+  or MCP servers, so an agy delegate with `ignore_user_config: true` runs with `HOME` set to
+  `agy-home` in agentmux's state directory, where its conversations stay too; its login, in the
+  operating system's keyring, still reaches it. agy also runs the hooks, MCP servers and plugins of
+  the workspace, in `.agents/hooks.json`, `.agents/mcp_config.json` and `.agents/plugins` at the
+  repository root, and nothing turns them off, so an isolated launch where one of them exists is
+  refused, naming it. With `ignore_user_config: false` agy runs in your own home and loads all of
+  it, as the other vendors do. `[agy.defaults] ignore_user_config` and
+  `[agy.limits] allow_user_config` work as they do for them.
 - **Its permissions are fixed.** Every launch passes `--settings` with agy's default execution mode,
-  the `request-review` tool preset, which headless agy turns into a denial, and deny rules for
+  the `request-review` tool preset, which headless agy turns into a denial, deny rules for
   commands, file writes, MCP calls, browser actions and downloads, which win over any rule allowing
-  them. Reading files is allowed, and fetching a URL asks, which headless agy denies. `--settings`
-  replaces your whole `permissions` table, so agentmux carries over the `deny` and `ask` rules of
-  your `~/.gemini/antigravity-cli/settings.json`, and not its `allow` rules; a file there that cannot
-  be parsed refuses the launch. agy takes none of the `sandbox`, `network_access`,
-  `permission_mode` or tool-list options.
+  them, and `useG1Credits: false`, so a model whose quota is used up stops rather than spending AI
+  credits. Reading files is allowed, and fetching a URL asks, which headless agy denies.
+  `--settings` replaces your whole `permissions` table, so a delegate in your own home carries over
+  the `deny` and `ask` rules of your `~/.gemini/antigravity-cli/settings.json`, and not its `allow`
+  rules; a file there that cannot be parsed refuses the launch. agy takes none of the `sandbox`,
+  `network_access`, `permission_mode` or tool-list options.
 - **One login, so at most one account.** agy keeps its login in the operating system's keyring,
   and reads no directory or credential an account could name. An `[accounts.agy.<alias>]` table
-  may only label that login with a `description`, there may be one, and it must be the
-  `[defaults.agy]` account.
+  may only label that login with a `description` and choose `inherit_settings`, there may be one,
+  and it must be the `[defaults.agy]` account.
 - **A turn cannot be steered**, because `agy --print` reads its question once: a stream-json record
   on stdin, so the question never appears in the argument vector.
 
@@ -696,7 +704,9 @@ actually detaches the machine's configured MCP servers — `-c mcp_servers={}` l
 and does not. Measured against codex-cli 0.153.4, a delegate launched with that override still
 called a configured server's tool, so a machine with `agentmux` in its own Codex config could have
 had a delegate call `agentmux` and recurse. It also runs with `features.hooks=false`. It still
-loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions.
+loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions. An isolated
+agy delegate runs in a home of its own, as described under
+[agy, Google's Antigravity CLI](#agy-googles-antigravity-cli).
 
 Either way, a Claude delegate runs in plan mode and is offered no editing tools, and a Codex
 delegate runs read-only, unless the consultation's permissions say otherwise.

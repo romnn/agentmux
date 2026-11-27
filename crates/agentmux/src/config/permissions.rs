@@ -103,17 +103,6 @@ pub enum PermissionRefusal {
         /// Where the limit was set.
         set_by: LimitSource,
     },
-    /// Isolation was asked of a vendor whose CLI has no argument that skips the user's own
-    /// settings.
-    #[error(
-        "Cannot launch {vendor}: ignore_user_config=true cannot be honoured, because {vendor} has \
-         no argument that skips the user's own settings. Request ignore_user_config=false, or \
-         leave it unset."
-    )]
-    IsolationUnavailable {
-        /// The vendor asked for.
-        vendor: Vendor,
-    },
     /// The Claude permission mode is not among `claude.limits.allowed_permission_modes`.
     #[error(
         "Cannot launch claude: permission_mode=\"{mode}\" is not in \
@@ -260,6 +249,36 @@ pub struct CodexLimits {
     pub allow_network: Option<bool>,
 }
 
+/// `[agy]` in a machine file: whether an agy consultation loads the user's configuration by
+/// default, and whether it may.
+///
+/// agy's permissions are fixed, so isolation is all its tables hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyPolicy {
+    /// What a consultation gets when its caller names nothing.
+    #[serde(default)]
+    pub defaults: AgyDefaults,
+    /// What a caller may ask for.
+    #[serde(default)]
+    pub limits: AgyLimits,
+}
+
+/// `[agy.defaults]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyDefaults {
+    /// Whether to run agy in a home of its own rather than the user's; `false` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_user_config: Option<bool>,
+}
+
+/// `[agy.limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyLimits {
+    /// Whether a delegate may run in the user's own home; `true` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_user_config: Option<bool>,
+}
+
 /// `[claude]` in a machine file: what a Claude consultation gets by default, and may ask for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudePolicy {
@@ -320,7 +339,10 @@ empty_when_default!(
     CodexLimits,
     ClaudePolicy,
     ClaudeDefaults,
-    ClaudeLimits
+    ClaudeLimits,
+    AgyPolicy,
+    AgyDefaults,
+    AgyLimits
 );
 
 impl CodexLimits {

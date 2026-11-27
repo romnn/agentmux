@@ -159,7 +159,8 @@ pub struct PermissionParams {
     /// not the answer; the delegate gains the MCP servers the configuration names; and the same
     /// question asked elsewhere may answer differently.
     /// A `codex` consultation with `true` runs over `codex exec` and cannot be steered.
-    /// An `agy` consultation always loads it, so `true` is refused for one.
+    /// An `agy` consultation with `true` runs in a home agentmux keeps for it, and is refused in a
+    /// workspace whose own hooks, MCP servers or plugins agy would still load.
     #[serde(default)]
     #[schemars(with = "bool")]
     pub ignore_user_config: Option<bool>,

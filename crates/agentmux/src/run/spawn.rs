@@ -830,6 +830,8 @@ impl RunStore {
             extra_env: &meta.env,
             billing: meta.billing,
             read_dirs: &read_dirs,
+            cwd: &meta.cwd,
+            agy_home: &self.agy_home(),
         };
         let Resolved {
             mut invocation,
@@ -847,19 +849,13 @@ impl RunStore {
             self.prepare_launch_mode(turn, meta, app_server_settings, resume, &mut invocation)?;
         refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
 
-        // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
-        // confines this process, so a session store this process cannot write to is one the
-        // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
         let vendor = delegate.vendor();
         let config_dir = vendor
             .config_dir(invocation.env())
             .map(|dir| meta.cwd.join(dir));
-        let unsaved_session_store = vendor
-            .session_store(invocation.env())
-            .map(|store| meta.cwd.join(store))
-            .filter(|store| !can_create_files_in(store));
+        let unsaved_session_store = unsaved_session_store(vendor, invocation.env(), &meta.cwd);
         if let Some(store) = &unsaved_session_store {
             tracing::warn!(
                 run_id = %meta.run_id,
@@ -914,7 +910,7 @@ impl RunStore {
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
-            input: LaunchInput::Question(&turn.stdin()),
+            input: LaunchInput::Question(&turn.stdin(delegate.vendor())),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -1010,6 +1006,23 @@ impl RunStore {
         );
         Ok(())
     }
+}
+
+/// The session store a `vendor` delegate with environment `env` in `cwd` cannot save into, if it
+/// cannot.
+///
+/// Asked of the environment the child gets, before the spawn: a delegate inherits whatever
+/// confines this process, so a session store this process cannot write to is one the delegate
+/// cannot save into, and a follow-up would resume a session that was never kept.
+fn unsaved_session_store(
+    vendor: Vendor,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    vendor
+        .session_store(env)
+        .map(|store| cwd.join(store))
+        .filter(|store| !can_create_files_in(store))
 }
 
 /// Write turn `index`'s question, and for a CLI that reads it as a record, the record it reads,

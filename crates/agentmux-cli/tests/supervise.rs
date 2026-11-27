@@ -815,15 +815,7 @@ fn the_supervisor_hands_agy_its_question_as_a_record() -> Result<()> {
         eq(true)
     );
 
-    // What the fake read on its stdin: one line, a record whose content is the question.
-    let read = std::fs::read_to_string(machine.bin.join("fake-delegate-stdin.jsonl")).or_fail()?;
-    let question: String = serde_json::from_str(read.lines().next().or_fail()?).or_fail()?;
-    let record: serde_json::Value = serde_json::from_str(&question).or_fail()?;
-    assert_that!(record["event"], eq(&serde_json::json!("user")));
-    assert_that!(
-        record["message"]["content"].as_str(),
-        some(starts_with("Review it."))
-    );
+    // The fake answers only when its stdin was the one record agy takes, and fails otherwise.
     let transcript =
         std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
     assert_that!(transcript, contains_substring("PROBE_B"));

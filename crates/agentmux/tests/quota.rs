@@ -782,7 +782,7 @@ fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
 
 /// What the real agy probe reports when `agy` on `PATH` prints `output` and exits with `status`.
 #[cfg(unix)]
-fn probe_agy_with_fake_cli(output: &str, status: u8) -> Result<Observation> {
+fn probe_agy_with_fake_cli(output: &str, status: u8) -> Result<(Observation, String)> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().or_fail()?;
@@ -790,15 +790,18 @@ fn probe_agy_with_fake_cli(output: &str, status: u8) -> Result<Observation> {
     std::fs::create_dir_all(&bin).or_fail()?;
     let printed = root.path().join("printed.json");
     std::fs::write(&printed, output).or_fail()?;
+    let home = root.path().join("home");
     let program = bin.join("agy");
     std::fs::write(
         &program,
         indoc::formatdoc!(
             "
                 #!/bin/sh
+                printf '%s' \"$HOME\" > '{}'
                 cat '{}'
                 exit {status}
             ",
+            home.display(),
             printed.display()
         ),
     )
@@ -810,18 +813,21 @@ fn probe_agy_with_fake_cli(output: &str, status: u8) -> Result<Observation> {
         "PATH".to_owned(),
         format!("{}:/usr/bin:/bin", bin.display()),
     );
-    Ok(SystemProbe.probe(&ProbeRequest {
+    let observation = SystemProbe.probe(&ProbeRequest {
         vendor: Vendor::Agy,
         target: ProbeTarget::Window { config_dir: None },
         host_env: &env,
-    }))
+    });
+    Ok((observation, std::fs::read_to_string(home).or_fail()?))
 }
 
 /// agy's usage is the `command.data` of its `/usage` reply, passed on as it arrived, fetched live.
 #[cfg(unix)]
 #[gtest]
 fn agy_usage_is_the_data_of_its_usage_command() -> Result<()> {
-    let observation = probe_agy_with_fake_cli(agentmux::testing::fixtures::AGY_USAGE, 0)?;
+    let (observation, home) = probe_agy_with_fake_cli(agentmux::testing::fixtures::AGY_USAGE, 0)?;
+    // In a home of its own, so it starts none of the MCP servers the user's home configures.
+    assert_that!(home.as_str(), not(eq("/home/dev")));
 
     let reply: serde_json::Value =
         serde_json::from_str(agentmux::testing::fixtures::AGY_USAGE).or_fail()?;
@@ -855,7 +861,7 @@ fn an_agy_reply_without_usage_is_unavailable() -> Result<()> {
         (agentmux::testing::fixtures::AGY_USAGE, 1, "exited with"),
     ];
     for (printed, status, reason) in cases {
-        let observation = probe_agy_with_fake_cli(printed, status)?;
+        let (observation, _) = probe_agy_with_fake_cli(printed, status)?;
         let Observation::Unavailable { reason: reported } = observation else {
             return fail!("a reply without usage must be unavailable: {printed}");
         };

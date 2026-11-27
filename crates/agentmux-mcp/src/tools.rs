@@ -1016,8 +1016,9 @@ fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) ->
         configuration: its settings, hooks and MCP servers, so a hook can reopen its finished turn
         and its answer can depend on this machine. Pass `ignore_user_config: true` to skip that
         configuration (a `codex` delegate still applies this machine's exec-policy rules, and an
-        `agy` delegate cannot skip it, so `true` is refused for one), `false` when the point is to exercise that tooling, and `env`
-        to set variables that tooling reads. Within the limits, `sandbox` and `network_access`
+        `agy` delegate is refused in a workspace with hooks, MCP servers or plugins of its own),
+        `false` when the point is to exercise that tooling, and `env` to set variables that
+        tooling reads. Within the limits, `sandbox` and `network_access`
         choose what a `codex` delegate's commands may do, and `permission_mode`, `tools`,
         `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted, the
         default above applies. An `agy` delegate takes none of them: it may read, and its `deny`
