@@ -25,8 +25,8 @@ frozen once something settles it:
   the recorded settlement evidence.
 - Cancellation marks intent under the lock, attempts to stop the child with bounded waits, then
   records the capture boundary under the lock (`ExitRecord::Cancelled`). A cancellation record
-  freezes the capture; it does not prove the child has departed. A child already gone when the
-  cancellation comes is not marked, and its exit settles the turn.
+  freezes the capture; it does not prove the child has departed. A child that has already exited
+  keeps its exit's outcome; the cancellation still stops a pending automatic resume.
 - A Codex reply recovered from `last-message.md` is only ever added to the newest turn and is
   persisted in `recovered.md` before it is published, so it can neither land above a later turn nor
   go missing once rendered. Text that cannot be kept is not rendered.

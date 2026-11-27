@@ -803,11 +803,11 @@ close and clear up after itself. The record freezes the transcript at what the c
 then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
 that had already finished its turn when the signal landed is reported as having finished, but for a
 Claude turn, which ends when Claude exits and may still be answering a steer after its result. A
-`cancel` that comes once the child has exited records nothing, and the exit settles the turn. A
-`status` or `tail` that happens to see the child go first records the same cancellation. The record
-does not prove the child left: one that somehow survives both signals is stopped again by the next
-`cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose process
-is still there — because deleting its record would leave the child running, billing, and
+delegate that has already exited keeps its exit's outcome; `cancel` still stops a pending automatic
+resume. A `status` or `tail` that happens to see the child go first records the same cancellation.
+The record does not prove the child left: one that somehow survives both signals is stopped again by
+the next `cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose
+process is still there — because deleting its record would leave the child running, billing, and
 unreachable. On a consultation whose last turn failed because the model was overloaded, `cancel`
 stops the automatic resume agentmux scheduled, before it starts.
 

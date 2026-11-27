@@ -32,13 +32,14 @@ const ECHO: &str = r#"echo_input() {
   printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"%s"}]},"parent_tool_use_id":null,"uuid":"%s","isReplay":true}\n' "$text" "$id"
 }"#;
 
-/// A function of the shell script that keeps it running, for a minute at most, so a fake whose
-/// test failed before stopping it leaves on its own.
-/// It sleeps in the background and waits, so a trapped signal is handled at once.
-const LINGER: &str = r#"linger() {
+/// A watchdog the shell script starts first, which kills it after a minute, so a fake whose test
+/// failed before ending it, or whose input is never closed, leaves on its own.
+/// It looks each second whether the script is still there, and leaves with it.
+const WATCHDOG: &str = r#"(
   i=0
-  while [ "$i" -lt 60 ]; do sleep 1 & wait $!; i=$((i + 1)); done
-}"#;
+  while [ "$i" -lt 60 ] && kill -0 $$ 2>/dev/null; do sleep 1; i=$((i + 1)); done
+  [ "$i" -lt 60 ] || kill -KILL $$
+) &"#;
 
 /// A machine of its own: a `bin` for the fake `claude`, a home, a project and a store.
 struct Machine {
@@ -64,8 +65,8 @@ impl Machine {
         let script = indoc::formatdoc! {r#"
             #!/bin/sh
             case "$1" in --version) echo "2.1.332 (Claude Code)"; exit 0;; esac
+            {WATCHDOG}
             {ECHO}
-            {LINGER}
             {body}
             "#,
         };
@@ -223,7 +224,7 @@ async fn a_supervisor_writing_to_a_claude_that_does_not_read_still_cancels_it() 
     let machine = Machine::new(
         &indoc::formatdoc! {r#"
             echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'
-            linger
+            while :; do sleep 1; done
             "#,
         },
         None,
@@ -259,7 +260,7 @@ async fn a_cancelled_claude_turn_is_gone_with_its_helpers() -> Result<()> {
             trap 'sleep 2; exit 143' TERM
             read -r question
             echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'
-            linger
+            while :; do sleep 1 & wait $!; done
             "#,
             claude_pid = claude_pid_file.display(),
             tool_pid = tool_pid_file.display(),

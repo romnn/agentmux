@@ -49,7 +49,8 @@ impl RunStore {
     /// that sees the child go first records the same cancellation rather than a death.
     /// A child that survives both signals is still stopped by the next `cancel`, which stops
     /// whatever is still running whether or not the turn is already recorded.
-    /// A turn whose child had already gone is not marked, and its exit settles it.
+    /// A delegate that has already exited keeps its exit's outcome; `cancel` still stops an
+    /// automatic resume that outcome may call for.
     ///
     /// A consultation whose newest turn failed because the model was overloaded is not running,
     /// but agentmux may be about to resume it; cancelling it stops that resume, which then never
@@ -81,10 +82,10 @@ impl RunStore {
                 }
                 Some(newest) => {
                     let outcome = run.fold_turn(&meta, &newest)?.turn.outcome;
-                    // A delegate that has already gone ended the turn itself, and its exit
-                    // settles it: marked now, its departure would be recorded as this
-                    // cancellation, over a turn it may have finished, as a Claude turn whose
-                    // `result` ends nothing does until its exit is recorded.
+                    // A delegate that has already exited keeps its exit's outcome, and `cancel`
+                    // still stops an automatic resume it may call for: marked as cancelling, its
+                    // exit would be recorded as this cancellation, over a Claude turn that may
+                    // have finished, since its `result` ends nothing until the exit is recorded.
                     let cancelling = !outcome.is_terminal() && !self.delegate_has_exited(&newest);
                     if cancelling {
                         File::create(newest.dir.cancelling()).map_err(|source| RunError::Io {

@@ -102,9 +102,9 @@ past stays in the transcript as a note. Tokens are summed across the `result`s a
 is kept, whose scope is its release's ([0031](0031-spend-derived-from-vendor-reports.md)). Once the
 exit record is there (`RunStore::settle_outcome`):
 
-- a cancellation of the running turn is the outcome, as is a launch that never happened; a
-  `cancel` that comes once Claude has exited, before the exit is recorded, marks nothing, so the
-  exit settles the turn, as for any delegate already gone;
+- a cancellation of the running turn is the outcome, as is a launch that never happened; a Claude
+  that has already exited when `cancel` comes keeps its exit's outcome, as any delegate does, and
+  the `cancel` still stops a pending automatic resume;
 - an exit known to be abnormal decides over a success, which Claude did not finish, but not over a
   failure Claude reported itself;
 - after a clean exit, or one whose status nobody saw, the candidate stands;
@@ -130,6 +130,8 @@ A turn recorded without a mode or as `exec`, and a Codex turn over the app-serve
   next observer settles the turn.
 - Cancellation, and what a cancellation reaches on Windows or outside Claude's process group, are as
   for any direct launch.
+- On Windows, a `claude.exe` found only through the application directory, which Windows searches
+  before `PATH`, and not on `PATH`, launches in the unsteerable mode.
 - agentmux v0.0.13 and older reject the `claude_stream_input` launch mode as a corrupt record, so
   they cannot read a consultation with such a turn, which narrows what
   [0030](0030-refuse-to-launch-from-a-replaced-executable.md) promises across an upgrade: restart
