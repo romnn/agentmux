@@ -97,8 +97,6 @@ fn build(
         extra_env: &extra_env,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_env(), config)
 }

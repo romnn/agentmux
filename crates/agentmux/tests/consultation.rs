@@ -680,6 +680,49 @@ fn an_agy_turn_that_died_mid_reply_keeps_what_it_said() -> Result<()> {
     Ok(())
 }
 
+/// A follow-up cannot move an agy consultation between the user's home and agentmux's own, where
+/// it could not resume the conversation the other keeps, and is refused before a turn is claimed.
+#[gtest]
+fn an_agy_follow_up_cannot_change_its_isolation() -> Result<()> {
+    for (started, asked) in [
+        (Isolation::Inherit, Isolation::Isolated),
+        (Isolation::Isolated, Isolation::Inherit),
+    ] {
+        let harness = harness([Script::completed(fixtures::AGY_TOOL_USE)])?;
+        let agy = Delegate::Agy {
+            model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+            effort: None,
+            account: AccountChoice::Default,
+            isolation: Some(started),
+        };
+        let run = harness.store.start(&request(agy, "review this"))?;
+        let refused = harness.store.follow_up_with(
+            &run.run_id,
+            "Again?",
+            PermissionOptions {
+                isolation: Some(asked),
+                ..PermissionOptions::default()
+            },
+            None,
+        );
+
+        assert_that!(
+            refused.map(|_| ()),
+            err(displays_as(contains_substring(
+                "cannot change ignore_user_config"
+            ))),
+            "{started:?}"
+        );
+        assert_that!(harness.launcher.launches().len(), eq(1), "{started:?}");
+        assert_that!(
+            harness.store.status(&run.run_id)?.turns,
+            eq(1),
+            "{started:?}"
+        );
+    }
+    Ok(())
+}
+
 /// An isolated agy consultation runs every turn in the one home the store keeps for agy, so a
 /// follow-up finds the conversation the first turn saved there.
 #[gtest]

@@ -222,6 +222,34 @@ async fn a_live_agy_consultation_can_be_followed_up_and_writes_nothing() -> Resu
     Ok(())
 }
 
+/// Whether an agy capture shows agy refusing a write to `target`: a tool step it failed with a
+/// permission denial naming the file, or a call its result lists as denied.
+fn agy_refused_write(events: &str, target: &str) -> bool {
+    use serde_json::Value;
+
+    events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            let text = |pointer: &str| event.pointer(pointer).and_then(Value::as_str);
+            let failed_write = text("/step_update/state") == Some("ERROR")
+                && text("/step_update/tool_info/name")
+                    .is_some_and(|name| name.starts_with("write"))
+                && text("/step_update/tool_info/error/message").is_some_and(|message| {
+                    message.contains("Permission denied") && message.contains(target)
+                });
+            let denied = event
+                .pointer("/result/denied_actions")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action.to_string().contains(target))
+                });
+            failed_write || denied
+        })
+}
+
 async fn live_agy_consultation(isolation: Isolation) -> Result<()> {
     let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-agy-probe");
     let agy = Delegate::Agy {
@@ -254,26 +282,17 @@ async fn live_agy_consultation(isolation: Isolation) -> Result<()> {
         eq(false),
         "an agy delegate wrote a file ({isolation:?})"
     );
-    // The refusal is one agy reported, as a denied call or a failed tool step, not one inferred
-    // from the delegate's prose.
+    // The refusal is one agy reported for the write to the probe, not one read into the
+    // delegate's prose.
     let first = store
         .wait_for_settlement(&store.pin_turn(&status.run_id, Some(1)).or_fail()?)
         .await
         .or_fail()?;
-    let first_text = store
-        .page(
-            &status.run_id,
-            0,
-            usize::try_from(first.transcript_end()).or_fail()?,
-        )
-        .or_fail()?
-        .text;
+    let events =
+        std::fs::read_to_string(first.marker_path().with_file_name("events.jsonl")).or_fail()?;
     assert_that!(
-        first_text,
-        any![
-            contains_substring("agy denied calls"),
-            contains_substring("call failed:")
-        ],
+        agy_refused_write(&events, &probe.display().to_string()),
+        eq(true),
         "{isolation:?}"
     );
 

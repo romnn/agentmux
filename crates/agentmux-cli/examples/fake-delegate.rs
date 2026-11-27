@@ -146,18 +146,21 @@ fn run() -> Result<u8, String> {
     let number = record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
     let config = config.run(number);
 
+    // agy also takes `--input-format stream-json`, but reads its input to the end, where Claude
+    // reads one line and keeps its input open.
+    let agy = std::env::args().any(|arg| arg == "--print=");
     let streamed = std::env::args()
         .collect::<Vec<_>>()
         .windows(2)
         .any(|pair| pair == ["--input-format", "stream-json"]);
     let mut question = String::new();
-    let read = if streamed {
+    let read = if streamed && !agy {
         std::io::stdin().lock().read_line(&mut question)
     } else {
         std::io::stdin().read_to_string(&mut question)
     };
     read.map_err(|err| format!("cannot read the question: {err}"))?;
-    if std::env::args().any(|arg| arg == "--print=") {
+    if agy {
         check_agy_record(&question)?;
     }
     let mut stdout = std::io::stdout();

@@ -473,8 +473,9 @@ impl RunStore {
     ///
     /// Returns the errors of [`RunStore::follow_up`], [`RunError::Delegate`] with
     /// [`DelegateError::NotForVendor`] for an override of another vendor, and with
-    /// [`DelegateError::Permission`] when the turn would exceed the current limits, before the
-    /// turn is claimed.
+    /// [`DelegateError::Permission`] when the turn would exceed the current limits, and
+    /// [`NotResumable::AgyIsolationChange`] for an agy consultation asked to change its
+    /// isolation, before the turn is claimed.
     pub fn follow_up_with(
         &self,
         run_id: &RunId,
@@ -506,7 +507,15 @@ impl RunStore {
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
+            let ran_with = delegate.isolation();
             let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
+            // Isolation decides which home agy runs in, and so where its conversation is kept.
+            if delegate.vendor() == Vendor::Agy && delegate.isolation() != ran_with {
+                return Err(NotResumable::AgyIsolationChange {
+                    run_id: run_id.clone(),
+                }
+                .into());
+            }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
                 delegate: &delegate,
@@ -798,6 +807,22 @@ impl RunStore {
         Ok(LaunchMode::AppServer)
     }
 
+    /// Run an isolated agy delegate in the home this store keeps for it, set over every other layer
+    /// of its environment; see ADR 0035.
+    fn place_in_agy_home(
+        &self,
+        delegate: &Delegate,
+        invocation: &mut crate::delegate::Invocation,
+    ) -> Result<(), RunError> {
+        if delegate.vendor() == Vendor::Agy
+            && !delegate.isolation().is_some_and(Isolation::inherits)
+        {
+            create_private_dir(&self.agy_home())?;
+            invocation.set_home(&self.agy_home());
+        }
+        Ok(())
+    }
+
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
@@ -830,8 +855,6 @@ impl RunStore {
             extra_env: &meta.env,
             billing: meta.billing,
             read_dirs: &read_dirs,
-            cwd: &meta.cwd,
-            agy_home: &self.agy_home(),
         };
         let Resolved {
             mut invocation,
@@ -842,6 +865,7 @@ impl RunStore {
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
         invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
+        self.place_in_agy_home(delegate, &mut invocation)?;
 
         // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
@@ -849,13 +873,19 @@ impl RunStore {
             self.prepare_launch_mode(turn, meta, app_server_settings, resume, &mut invocation)?;
         refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
 
+        // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
+        // confines this process, so a session store this process cannot write to is one the
+        // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
         let vendor = delegate.vendor();
         let config_dir = vendor
             .config_dir(invocation.env())
             .map(|dir| meta.cwd.join(dir));
-        let unsaved_session_store = unsaved_session_store(vendor, invocation.env(), &meta.cwd);
+        let unsaved_session_store = vendor
+            .session_store(invocation.env())
+            .map(|store| meta.cwd.join(store))
+            .filter(|store| !can_create_files_in(store));
         if let Some(store) = &unsaved_session_store {
             tracing::warn!(
                 run_id = %meta.run_id,
@@ -1006,23 +1036,6 @@ impl RunStore {
         );
         Ok(())
     }
-}
-
-/// The session store a `vendor` delegate with environment `env` in `cwd` cannot save into, if it
-/// cannot.
-///
-/// Asked of the environment the child gets, before the spawn: a delegate inherits whatever
-/// confines this process, so a session store this process cannot write to is one the delegate
-/// cannot save into, and a follow-up would resume a session that was never kept.
-fn unsaved_session_store(
-    vendor: Vendor,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Option<PathBuf> {
-    vendor
-        .session_store(env)
-        .map(|store| cwd.join(store))
-        .filter(|store| !can_create_files_in(store))
 }
 
 /// Write turn `index`'s question, and for a CLI that reads it as a record, the record it reads,

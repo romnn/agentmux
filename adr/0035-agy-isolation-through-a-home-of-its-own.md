@@ -14,12 +14,12 @@ Probes of agy 1.5.18 established what it has instead:
   does not know before any model call.
 - `--settings` replaces a whole top-level key rather than merging into it: an overlay naming only
   `permissions.deny` dropped the deny rules of the user's own file.
-- It loads hooks and MCP servers from two places, and runs them headless: the user's
-  `$HOME/.gemini/config/{hooks,mcp_config}.json` and the workspace's `.agents/hooks.json` and
-  `.agents/mcp_config.json`, where the workspace is the repository the working directory is in, or
-  that directory outside one.
-  Its documentation adds plugins, under `$HOME/.gemini/config/plugins/` and `.agents/plugins/`,
-  which can bundle both.
+- It loads hooks, MCP servers and plugins from two places, and runs them headless: the user's
+  `$HOME/.gemini/config/`, and the project's `.agents/` — its `hooks.json`, `mcp_config.json`,
+  `plugins/` and the plugins `plugins.json` registers.
+  It finds the project's in every directory it can read: the working directory's repository, and
+  equally a directory granted with `--add-dir`, with or without a repository, while running in an
+  empty directory of its own.
   No setting turns hooks or MCP servers off: `--settings` refused every candidate key as unknown,
   and the documentation disables them only one by one.
 - It honours `HOME`, and has no other variable for its configuration: `GEMINI_HOME` and
@@ -37,23 +37,27 @@ Probes of agy 1.5.18 established what it has instead:
 **An isolated agy delegate runs with `HOME` set to a home agentmux keeps for it.**
 The run store keeps one, `agy-home` beside `runs`, for every isolated agy delegate: agy has one
 login, so one home serves it.
-`Delegate::invocation` sets `HOME`, and `USERPROFILE` where agy looks on Windows, after every other
-environment layer, so no account or request can move it, and creates the home on first use.
+agentmux owns that directory: it creates it, and nothing but agy is meant to write there, so a home
+restored over it or linked to another profile is the user's own doing.
+The store sets `HOME`, and `USERPROFILE` where agy looks on Windows, over every other environment
+layer once the launch is built, so no account or request can move it.
 agentmux writes nothing into it: the pinned settings travel in `--settings` on every launch, as for
 an inheriting delegate.
 Its conversations live there, so a follow-up resumes them and the session-store check
 ([0016](0016-unsaved-session-store.md)) reads them through the same environment.
+A follow-up that would change an agy consultation's isolation, and so its home, is refused before
+its turn is claimed, because the conversation it resumes is kept in the other one.
 Isolation resolves for agy as for the other vendors: an explicit request, then an account's
 `inherit_settings`, then a project-selected account, which runs isolated, then the machine file's
 `[agy.defaults]` and `[agy.limits]`, and otherwise loading the user's configuration.
 
-**A workspace that would still be loaded refuses an isolated launch.**
-A private home cannot drop what agy reads from the workspace, and nothing turns it off, so an
-isolated launch whose working directory, or any directory above it up to the repository root,
-holds `.agents/hooks.json`, `.agents/mcp_config.json` or `.agents/plugins` is refused with
-`DelegateError::AgyWorkspaceConfig`, which names the file.
-An inheriting delegate runs with them: loading the user's configuration is what it asked for, as
-for Claude's and Codex's.
+**The project's own tooling runs in both modes.**
+agy runs the project's `.agents` hooks, MCP servers and plugins whether it is isolated or not: it
+finds them in any directory it can read, and nothing turns them off.
+Running it elsewhere does not help, since the project it must read is then such a directory, and
+predicting which files it will load proved a moving target, so agentmux does neither.
+Isolation therefore keeps out the user's own configuration only, which is narrower than Claude's:
+an agy delegate is not to be pointed at a checkout the user does not trust.
 
 **What it may do is pinned by argument in both modes.**
 `agy_args` passes `--settings` on every launch, with `agentMode: ""`, `toolPermission:
@@ -76,11 +80,14 @@ only a `description` and `inherit_settings`, and it must be the `[defaults.agy]`
 
 ## Consequences
 
-- An isolated agy delegate has isolation's three guarantees as far as agy's own configuration
-  goes: no hook of the user's runs, no MCP server of the user's loads, and its answer does not
-  depend on the user's settings.
-  The `mcp(*)` deny rule refuses every MCP call besides, and the delegate marker
-  ([0007](0007-recursion-guard.md)) still stops an agentmux it reaches from consulting again.
+- An isolated agy delegate runs none of the user's hooks or MCP servers and none of their
+  settings, and spends no AI credits, but it runs the project's own tooling, which an isolated
+  Claude delegate does not.
+  The `mcp(*)` deny rule refuses every MCP call the model makes, though not an MCP server starting,
+  and the delegate marker ([0007](0007-recursion-guard.md)) still stops an agentmux it reaches from
+  consulting again.
+- Under inherit, agy's own sign-in decides what is billed: agentmux cannot see what the login agy
+  saved is priced at, and records the turn as a subscription's.
 - Conversations of isolated consultations stay in the store's `agy-home` for as long as the store
   does; pruning a run does not delete them, as it does not delete a Claude or Codex session.
 - The quota probe runs `agy --print /usage` in a fresh temporary home, because agy starts the MCP

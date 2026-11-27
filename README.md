@@ -653,18 +653,21 @@ guarded by the variable alone.
 
 `--delegate agy` reaches Gemini models, and the others Google's subscription offers, through the
 Antigravity CLI, which is what a Google AI Pro or Ultra subscription runs on; `agy models` lists
-them. It differs from the other two in four ways; how it is isolated and how its permissions are
+them. It differs from the other two in five ways; how it is isolated and how its permissions are
 pinned is in [ADR 0035](adr/0035-agy-isolation-through-a-home-of-its-own.md):
 
+- **It always runs the project's own tooling.** agy runs the hooks, MCP servers and plugins of the
+  project's `.agents` directory in both modes: agy 1.5.18 loads them from any directory it can
+  read, and no setting turns them off. Do not point agy at a checkout you do not trust.
 - **It is isolated by a home of its own.** agy has no argument that skips its user settings, hooks
   or MCP servers, so an agy delegate with `ignore_user_config: true` runs with `HOME` set to
-  `agy-home` in agentmux's state directory, where its conversations stay too; its login, in the
-  operating system's keyring, still reaches it. agy also runs the hooks, MCP servers and plugins of
-  the workspace, in `.agents/hooks.json`, `.agents/mcp_config.json` and `.agents/plugins` at the
-  repository root, and nothing turns them off, so an isolated launch where one of them exists is
-  refused, naming it. With `ignore_user_config: false` agy runs in your own home and loads all of
-  it, as the other vendors do. `[agy.defaults] ignore_user_config` and
-  `[agy.limits] allow_user_config` work as they do for them.
+  `agy-home` in agentmux's state directory, which agentmux owns and where its conversations stay
+  too; its login, in the operating system's keyring, still reaches it. That keeps out your own
+  configuration only, which is narrower than Claude's isolation. With `ignore_user_config: false`
+  agy runs in your own home and loads all of it, as the other vendors do, and its own sign-in
+  decides what is billed. A follow-up cannot change which of the two a consultation runs in,
+  because its conversation is kept in that home. `[agy.defaults] ignore_user_config` and
+  `[agy.limits] allow_user_config` work as they do for the other vendors.
 - **Its permissions are fixed.** Every launch passes `--settings` with agy's default execution mode,
   the `request-review` tool preset, which headless agy turns into a denial, deny rules for
   commands, file writes, MCP calls, browser actions and downloads, which win over any rule allowing
@@ -705,8 +708,8 @@ and does not. Measured against codex-cli 0.153.4, a delegate launched with that 
 called a configured server's tool, so a machine with `agentmux` in its own Codex config could have
 had a delegate call `agentmux` and recurse. It also runs with `features.hooks=false`. It still
 loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions. An isolated
-agy delegate runs in a home of its own, as described under
-[agy, Google's Antigravity CLI](#agy-googles-antigravity-cli).
+agy delegate runs in a home of its own, but still runs the project's own hooks, MCP servers and
+plugins, as described under [agy, Google's Antigravity CLI](#agy-googles-antigravity-cli).
 
 Either way, a Claude delegate runs in plan mode and is offered no editing tools, and a Codex
 delegate runs read-only, unless the consultation's permissions say otherwise.

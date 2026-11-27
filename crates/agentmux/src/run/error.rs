@@ -248,6 +248,19 @@ pub enum NotResumable {
         run_id: RunId,
     },
 
+    /// A follow-up asked an agy consultation to change whether it loads the user's configuration,
+    /// which would run it in another home than the one its conversation is kept in.
+    #[error(
+        "consultation {run_id} cannot change ignore_user_config: agy keeps its conversation in the \
+         home it ran in, agentmux's own for ignore_user_config=true and yours for false, so a \
+         follow-up in the other one could not resume it. Ask the follow-up without \
+         ignore_user_config, or start a new consultation."
+    )]
+    AgyIsolationChange {
+        /// Which consultation.
+        run_id: RunId,
+    },
+
     /// The consultation was cancelled, so the delegate was stopped part-way through a turn.
     #[error(
         "consultation {run_id} was cancelled, so its delegate was stopped part-way through a \

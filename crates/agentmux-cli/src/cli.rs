@@ -258,8 +258,10 @@ pub struct PermissionArgs {
     /// `--ignore-user-config` alone means `true`; `--ignore-user-config=false` loads them.
     /// Omitted, the machine's default for the vendor decides, which `agentmux accounts` shows.
     /// With `false`, a hook can reopen the delegate's finished turn.
-    /// `--delegate agy` with `true` runs in a home agentmux keeps for it, and is refused in a
-    /// workspace whose own hooks, MCP servers or plugins agy would still load.
+    /// `--delegate agy` with `true` runs in a home agentmux keeps for it, which keeps out the
+    /// user's configuration only: agy runs the project's own hooks, MCP servers and plugins in
+    /// both modes, so do not point it at a checkout you do not trust.
+    /// A follow-up cannot change it for an agy consultation.
     #[arg(
         long,
         num_args = 0..=1,

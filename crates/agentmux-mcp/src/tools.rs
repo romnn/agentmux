@@ -1016,12 +1016,12 @@ fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) ->
         configuration: its settings, hooks and MCP servers, so a hook can reopen its finished turn
         and its answer can depend on this machine. Pass `ignore_user_config: true` to skip that
         configuration (a `codex` delegate still applies this machine's exec-policy rules, and an
-        `agy` delegate is refused in a workspace with hooks, MCP servers or plugins of its own),
-        `false` when the point is to exercise that tooling, and `env` to set variables that
-        tooling reads. Within the limits, `sandbox` and `network_access`
-        choose what a `codex` delegate's commands may do, and `permission_mode`, `tools`,
-        `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted, the
-        default above applies. An `agy` delegate takes none of them: it may read, and its `deny`
+        `agy` delegate still runs the project's own hooks, MCP servers and plugins, so do not
+        point it at a checkout you do not trust), `false` when the point is to exercise that
+        tooling, and `env` to set variables that tooling reads. Within the limits, `sandbox` and
+        `network_access` choose what a `codex` delegate's commands may do, and `permission_mode`,
+        `tools`, `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted,
+        the default above applies. An `agy` delegate takes none of them: it may read, and its `deny`
         rules above refuse the rest. A value beyond a limit is refused, naming the limit, and never
         lowered to fit. A limit is a ceiling on what agentmux requests, not on what this machine's
         own Codex `.rules` allow, which can run a matching command outside the sandbox. `follow_up` takes the same fields to change them for the next turn, and

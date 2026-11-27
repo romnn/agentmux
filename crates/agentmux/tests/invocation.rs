@@ -120,8 +120,6 @@ fn build_with(
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     delegate
         .invocation(&plan, &host_session_env(), config)
@@ -408,8 +406,6 @@ fn an_unknown_alias_lists_the_configured_ones() -> Result<()> {
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -454,8 +450,6 @@ fn a_recorded_default_that_is_not_defined_names_the_file_that_chose_it() -> Resu
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -491,8 +485,6 @@ fn an_account_directory_that_is_missing_is_refused_before_launch() -> Result<()>
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -539,8 +531,6 @@ fn an_account_can_supply_credentials_instead_of_a_directory() -> Result<()> {
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     let mut host = host_session_env();
     host.insert("LOCAL_TOKEN".to_owned(), "not-a-real-key".to_owned());
@@ -729,8 +719,6 @@ fn a_request_may_not_set_anything_that_redirects_the_consultation() -> Result<()
             extra_env: &requested,
             billing: None,
             read_dirs: &[],
-            cwd: Path::new("/work/project"),
-            agy_home: Path::new("/state/agy-home"),
         };
         let result = Delegate::Claude {
             permissions: ClaudePermissions::default(),
@@ -768,8 +756,6 @@ fn a_request_environment_reaches_the_delegate_when_listed() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let invocation = Delegate::Claude {
@@ -807,8 +793,6 @@ fn a_request_value_with_a_nul_byte_is_refused_as_an_argument() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -906,8 +890,6 @@ fn the_machine_account_and_request_layers_apply_in_that_order() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let invocation = Delegate::Claude {
@@ -1001,8 +983,6 @@ fn a_default_that_cannot_be_resolved_names_the_file_that_selected_it() -> Result
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
 
     let error = Delegate::Claude {
@@ -1247,8 +1227,6 @@ fn a_project_selected_account_does_not_widen_request_env() -> Result<()> {
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     let delegate = Delegate::Claude {
         permissions: ClaudePermissions::default(),
@@ -1290,8 +1268,6 @@ fn build_invocation_with_request_env(
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
@@ -1405,8 +1381,6 @@ fn an_agy_delegate_withholds_cloud_credentials_the_machine_layer_forwarded() -> 
         extra_env: &BTreeMap::new(),
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     let delegate = Delegate::Agy {
         model: model("gemini-3.8-flash-low")?,
@@ -1526,8 +1500,6 @@ fn request_env_cannot_smuggle_a_key_into_a_subscription_delegate() -> Result<()>
         extra_env: &requested,
         billing: None,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     let api_invocation = delegate_on_account(Vendor::Codex, "metered")?
         .invocation(&plan, &host, &config)
@@ -1663,8 +1635,6 @@ fn build_invocation_with_billing(
         extra_env: &requested,
         billing,
         read_dirs: &[],
-        cwd: Path::new("/work/project"),
-        agy_home: Path::new("/state/agy-home"),
     };
     delegate.invocation(&plan, &host_session_env(), config)
 }
@@ -1755,53 +1725,34 @@ fn agy_settings(args: &[String]) -> Result<serde_json::Value> {
     serde_json::from_str(settings).or_fail()
 }
 
-/// Where an agy invocation is built: a user's home, a project to run in, and the home the run
-/// store keeps for an isolated agy delegate.
+/// Where an agy invocation is built: the user's own home.
 struct AgyMachine {
-    root: tempfile::TempDir,
+    home: tempfile::TempDir,
 }
 
 impl AgyMachine {
     fn new() -> Result<Self> {
-        let root = tempfile::tempdir().or_fail()?;
-        for dir in ["home", "project"] {
-            std::fs::create_dir_all(root.path().join(dir)).or_fail()?;
-        }
-        Ok(Self { root })
-    }
-
-    fn path(&self, name: &str) -> std::path::PathBuf {
-        self.root.path().join(name)
+        Ok(Self {
+            home: tempfile::tempdir().or_fail()?,
+        })
     }
 
     /// Write the user's own agy settings file.
     fn user_settings(&self, text: &str) -> Result<()> {
-        let dir = self.path("home").join(".gemini").join("antigravity-cli");
+        let dir = self.home.path().join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&dir).or_fail()?;
         std::fs::write(dir.join("settings.json"), text).or_fail()
     }
 
-    /// Create `relative` in the project, as a directory when it ends in `/`.
-    fn project_file(&self, relative: &str) -> Result<()> {
-        let path = self.path("project").join(relative);
-        if relative.ends_with('/') {
-            return std::fs::create_dir_all(path).or_fail();
-        }
-        std::fs::create_dir_all(path.parent().or_fail()?).or_fail()?;
-        std::fs::write(path, "{}").or_fail()
-    }
-
-    /// The launch of an agy turn on the CLI's login, run under `isolation` in `cwd`.
-    fn launch_in(
+    /// The launch of an agy turn on the CLI's login, run under `isolation`.
+    fn launch_with(
         &self,
-        cwd: &Path,
         isolation: Isolation,
         resume: Option<&SessionRef>,
         read_dirs: &[std::path::PathBuf],
     ) -> Result<std::result::Result<Invocation, DelegateError>> {
         let mut env = host_session_env();
-        env.insert("HOME".to_owned(), self.path("home").display().to_string());
-        let agy_home = self.path("agy-home");
+        env.insert("HOME".to_owned(), self.home.path().display().to_string());
         let plan = TurnPlan {
             question_path: Path::new("/runs/r/turns/0001/question.md"),
             last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
@@ -1809,8 +1760,6 @@ impl AgyMachine {
             extra_env: &BTreeMap::new(),
             billing: None,
             read_dirs,
-            cwd,
-            agy_home: &agy_home,
         };
         let delegate = Delegate::Agy {
             model: model("gemini-3.8-flash-low")?,
@@ -1821,12 +1770,12 @@ impl AgyMachine {
         Ok(delegate.invocation(&plan, &env, &Config::default()))
     }
 
-    /// The same, in the project.
+    /// The same, for a first turn.
     fn launch(
         &self,
         isolation: Isolation,
     ) -> Result<std::result::Result<Invocation, DelegateError>> {
-        self.launch_in(&self.path("project"), isolation, None, &[])
+        self.launch_with(isolation, None, &[])
     }
 }
 
@@ -1883,82 +1832,23 @@ fn an_inheriting_agy_launch_keeps_the_users_deny_and_ask_rules_and_nothing_wider
     // It runs in the user's own home.
     assert_that!(
         invocation.env().get("HOME"),
-        some(eq(&machine.path("home").display().to_string()))
+        some(eq(&machine.home.path().display().to_string()))
     );
     Ok(())
 }
 
-/// An isolated agy delegate runs in the home the store keeps for it, which the launch creates, and
-/// carries none of the user's rules, which live in a home it does not load.
+/// An isolated agy delegate carries none of the user's rules, which live in a home it does not
+/// run in; the run store moves it to its own.
 #[gtest]
-fn an_isolated_agy_launch_runs_in_its_own_home() -> Result<()> {
+fn an_isolated_agy_launch_carries_none_of_the_users_rules() -> Result<()> {
     let machine = AgyMachine::new()?;
     machine.user_settings(PERMISSIVE_AGY_SETTINGS)?;
     let invocation = machine.launch(Isolation::Isolated)?.or_fail()?;
 
-    let agy_home = machine.path("agy-home");
-    assert_that!(agy_home.is_dir(), eq(true));
-    for name in ["HOME", "USERPROFILE"] {
-        assert_that!(
-            invocation.env().get(name),
-            some(eq(&agy_home.display().to_string())),
-            "{name}"
-        );
-    }
     assert_that!(
         agy_settings(invocation.args())?,
         eq(&pinned_agy_settings(&[], &[]))
     );
-    Ok(())
-}
-
-/// An isolated agy launch is refused when its workspace holds a hook, an MCP server or a plugin,
-/// which agy loads whatever its home and nothing turns off; the refusal names the file.
-#[gtest]
-fn an_isolated_agy_launch_refuses_a_workspace_that_would_still_load_its_tooling() -> Result<()> {
-    for source in [
-        ".agents/hooks.json",
-        ".agents/mcp_config.json",
-        ".agents/plugins/",
-    ] {
-        let machine = AgyMachine::new()?;
-        machine.project_file(source)?;
-        let refused = machine.launch(Isolation::Isolated)?;
-        assert_that!(
-            refused.map(|_| ()),
-            err(displays_as(contains_substring(
-                source.trim_end_matches('/')
-            ))),
-            "{source}"
-        );
-        // Loading the user's configuration was asked for, so the workspace's comes with it.
-        assert_that!(
-            machine.launch(Isolation::Inherit)?,
-            ok(anything()),
-            "{source}"
-        );
-    }
-
-    // In a repository agy's workspace is its root, which a subdirectory's launch still loads.
-    let machine = AgyMachine::new()?;
-    machine.project_file(".git/")?;
-    machine.project_file(".agents/mcp_config.json")?;
-    machine.project_file("sub/")?;
-    let refused = machine.launch_in(
-        &machine.path("project").join("sub"),
-        Isolation::Isolated,
-        None,
-        &[],
-    )?;
-    assert_that!(
-        refused.map(|_| ()),
-        err(displays_as(contains_substring(".agents/mcp_config.json")))
-    );
-
-    // Skills alone run nothing by themselves, and do not stand in the way.
-    let machine = AgyMachine::new()?;
-    machine.project_file(".agents/skills/")?;
-    assert_that!(machine.launch(Isolation::Isolated)?, ok(anything()));
     Ok(())
 }
 
@@ -1970,8 +1860,7 @@ fn an_agy_follow_up_names_its_conversation_and_its_read_dirs() -> Result<()> {
     let session = SessionRef::parse("e4c7ded7-2bf0-480b-9326-24191d51e4ba").or_fail()?;
     let read_dir = std::path::PathBuf::from("/state/runs/r0");
     let invocation = machine
-        .launch_in(
-            &machine.path("project"),
+        .launch_with(
             Isolation::Inherit,
             Some(&session),
             std::slice::from_ref(&read_dir),

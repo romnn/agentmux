@@ -147,6 +147,7 @@ impl RunStore {
     /// conversations for as long as the store is kept.
     ///
     /// One for the store, because agy has one login, which its keyring holds.
+    /// The store owns it: nothing but agy writes there, and nothing else should.
     pub(super) fn agy_home(&self) -> PathBuf {
         self.root.join("agy-home")
     }

@@ -146,18 +146,6 @@ pub enum DelegateError {
         why: &'static str,
     },
 
-    /// An isolated agy delegate would still load a hook, an MCP server or a plugin of the
-    /// workspace, which nothing switches off.
-    #[error(
-        "cannot launch agy with ignore_user_config=true: agy loads {path} from the workspace whatever \
-         home it runs in, and nothing turns it off, so the delegate would not be isolated. Request \
-         ignore_user_config=false to run with it, or run the consultation where it is absent."
-    )]
-    AgyWorkspaceConfig {
-        /// The workspace's hook, MCP or plugin source.
-        path: PathBuf,
-    },
-
     /// agy's own settings file exists but cannot be read, and its permission rules have to be
     /// carried into the launch.
     #[error(
@@ -454,9 +442,9 @@ string_newtype_conversions!(AccountAlias);
 ///
 /// Isolation is what makes a consultation a second opinion rather than a second copy of the
 /// caller's own setup: no settings, no hooks, no MCP servers.
-/// It is imposed by argument, not by environment — no variable can switch it on or off — but for
-/// agy, which has no such argument, it is a home of agentmux's own, set after every other layer;
-/// see `agy_args`.
+/// It is imposed by argument, not by environment — no variable can switch it on or off — except
+/// for agy, which has no such argument and runs in a home the run store keeps for it instead; see
+/// `agy_args`.
 /// The public spelling is `ignore_user_config`: `true` is [`Self::Isolated`], `false` is
 /// [`Self::Inherit`].
 ///
@@ -1616,12 +1604,6 @@ pub struct TurnPlan<'a> {
     /// Claude and agy read only their working directory unless granted more, so each is passed
     /// as `--add-dir`; Codex's sandboxes read everywhere and need nothing.
     pub read_dirs: &'a [PathBuf],
-    /// The directory the delegate runs in, whose workspace configuration an isolated agy
-    /// delegate would still load.
-    pub cwd: &'a Path,
-    /// The home an isolated agy delegate runs in, which the run store keeps for it.
-    /// Ignored by every other delegate.
-    pub agy_home: &'a Path,
 }
 
 /// The delegate CLI's own handle on a conversation, so a later turn can continue it.
@@ -1707,6 +1689,16 @@ impl Invocation {
     pub(crate) fn set_state_dir_env(&mut self, name: &str, dir: &Path) {
         self.env
             .insert(name.to_owned(), dir.to_string_lossy().into_owned());
+    }
+
+    /// Run the child with `home` as its home directory, in both the spelling Unix reads and the
+    /// one Windows does.
+    pub(crate) fn set_home(&mut self, home: &Path) {
+        let home = home.to_string_lossy().into_owned();
+        for name in ["HOME", "USERPROFILE"] {
+            self.env
+                .insert(crate::config::canonical_env_name(name), home.clone());
+        }
     }
 
     /// Add `args` to the end of the argument vector.
@@ -1957,10 +1949,8 @@ impl Delegate {
     /// endpoint without opting into API pricing, [`DelegateError::Environment`] for an account that
     /// is empty, reads a secret from a host variable that is not set, or is otherwise unusable, and
     /// [`DelegateError::Argument`] or [`DelegateError::Environment`] for a request environment
-    /// entry the configuration does not allow, [`DelegateError::AgySettingsUnreadable`] for an
-    /// agy delegate whose own settings file cannot be read, and
-    /// [`DelegateError::AgyWorkspaceConfig`] for an isolated agy delegate whose workspace it
-    /// cannot isolate it from.
+    /// entry the configuration does not allow, and [`DelegateError::AgySettingsUnreadable`] for an
+    /// agy delegate whose own settings file cannot be read.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
@@ -1996,14 +1986,6 @@ impl Delegate {
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
-
-        // Set after every other layer, so no request or account can move it.
-        if let Self::Agy { .. } = held
-            && !isolation.inherits()
-        {
-            refuse_agy_workspace_config(plan.cwd)?;
-            use_agy_home(&mut env, plan.agy_home)?;
-        }
 
         // Built from the complete environment, whose home is where agy reads its own settings.
         let args = held.args(plan, isolation, &env)?;
@@ -2080,7 +2062,14 @@ impl Delegate {
                 ..
             } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
             Self::Agy { model, effort, .. } => {
-                agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?)
+                // An isolated delegate runs in a home of its own, which holds no rules of the
+                // user's; the run store moves it there once this is built.
+                let user_rules = if isolation.inherits() {
+                    agy_user_rules(env)?
+                } else {
+                    AgyPermissionRules::default()
+                };
+                agy_args(model, effort.as_ref(), plan, &user_rules)
             }
         })
     }
@@ -2927,11 +2916,11 @@ fn codex_app_server_args(effort: Option<&Effort>, permissions: CodexPermissions)
 /// - `--settings`, always: the permission policy [`agy_settings`] builds.
 /// - `--add-dir`, once for each directory the turn must read outside its working directory.
 ///
-/// agy has no argument that skips the user's settings, hooks or MCP servers, so an isolated
-/// delegate runs with `HOME` set to a home of its own instead (see `use_agy_home`), which holds
-/// none of them and no rules of the user's to carry over; one whose workspace holds a hook, an MCP
-/// server or a plugin, which agy loads whatever its home, is refused (see
-/// `refuse_agy_workspace_config`).
+/// agy has no argument that skips the user's settings, hooks or MCP servers, so the run store
+/// runs an isolated delegate with `HOME` set to a home it keeps for agy instead, which holds none
+/// of them and no rules of the user's to carry over.
+/// The project's own hooks, MCP servers and plugins load in either mode: agy finds them in any
+/// directory it can read, and nothing turns them off.
 /// ADR 0035 records why.
 fn agy_args(
     model: &ModelId,
@@ -3048,54 +3037,6 @@ fn agy_user_rules(env: &BTreeMap<String, String>) -> Result<AgyPermissionRules, 
     serde_json::from_str::<AgySettingsFile>(text)
         .map(|settings| settings.permissions)
         .map_err(|err| unreadable(err.to_string()))
-}
-
-/// Point `env` at `home` as the home an isolated agy delegate runs in, creating it on first use.
-///
-/// agy reads its settings, hooks, MCP servers, plugins and conversations from its home, and its
-/// login from the operating system's keyring, so a home of its own isolates it without signing it
-/// out.
-/// Both spellings are set: `HOME`, and `USERPROFILE`, which is where agy looks on Windows.
-fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), DelegateError> {
-    std::fs::create_dir_all(home).map_err(|err| {
-        DelegateError::Environment(format!(
-            "cannot create the home an isolated agy delegate runs in, {}: {err}",
-            home.display()
-        ))
-    })?;
-    let home = home.to_string_lossy().into_owned();
-    for name in ["HOME", "USERPROFILE"] {
-        env.insert(crate::config::canonical_env_name(name), home.clone());
-    }
-    Ok(())
-}
-
-/// Where in a workspace agy finds hooks, MCP servers and plugins, which no setting turns off.
-const AGY_WORKSPACE_SOURCES: [&str; 3] = [
-    ".agents/hooks.json",
-    ".agents/mcp_config.json",
-    ".agents/plugins",
-];
-
-/// Refuse an isolated agy launch in `cwd` when its workspace holds a hook, an MCP server or a
-/// plugin.
-///
-/// agy's workspace is the repository `cwd` is in, or `cwd` itself outside one; every directory
-/// from `cwd` up to that root is checked, which errs towards refusing.
-fn refuse_agy_workspace_config(cwd: &Path) -> Result<(), DelegateError> {
-    let repository = cwd.ancestors().position(|dir| dir.join(".git").exists());
-    let workspace = cwd
-        .ancestors()
-        .take(repository.map_or(1, |depth| depth.saturating_add(1)));
-    for dir in workspace {
-        for source in AGY_WORKSPACE_SOURCES {
-            let path = dir.join(source);
-            if path.exists() {
-                return Err(DelegateError::AgyWorkspaceConfig { path });
-            }
-        }
-    }
-    Ok(())
 }
 
 /// What an agy turn reads on stdin: its question as the one stream-json record agy takes.
