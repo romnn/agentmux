@@ -107,27 +107,12 @@ pub async fn supervise(
             return 2;
         }
     };
-    let mut store =
-        match RunStore::open(&plan.store_root, Arc::new(ProcessLauncher::new()), host_env) {
-            Ok(store) => store,
-            Err(err) => {
-                eprintln!("agentmux: {err}");
-                return 2;
-            }
-        };
-    // An automatic resume runs as the store that launched this turn would have run it:
-    // supervised, by the same executables, under the same policy.
-    store = match &plan.auto_resume {
-        Some(resume) => {
-            let configured = store
-                .with_supervisor(&resume.supervisor)
-                .with_auto_resume(Some(resume.policy));
-            match &resume.codex_driver {
-                Some(driver) => configured.with_codex_app_server(driver),
-                None => configured,
-            }
+    let store = match RunStore::open(&plan.store_root, Arc::new(ProcessLauncher::new()), host_env) {
+        Ok(store) => store.launching_as(&plan),
+        Err(err) => {
+            eprintln!("agentmux: {err}");
+            return 2;
         }
-        None => store.with_auto_resume(None),
     };
     match store.supervise_turn(&plan).await {
         Ok(Supervised::Settled) => match store.resume_when_due(&plan).await {
@@ -223,6 +208,24 @@ enum Admission {
 }
 
 impl RunStore {
+    /// This store, launching as the store that launched the turn `plan` supervises, so that an
+    /// automatic resume runs as that store would have run it: supervised, by the same
+    /// executables, under the same policy.
+    fn launching_as(self, plan: &SupervisorPlan) -> Self {
+        match &plan.auto_resume {
+            Some(resume) => {
+                let configured = self
+                    .with_supervisor(&resume.supervisor)
+                    .with_auto_resume(Some(resume.policy));
+                match &resume.codex_driver {
+                    Some(driver) => configured.with_codex_app_server(driver),
+                    None => configured,
+                }
+            }
+            None => self.with_auto_resume(None),
+        }
+    }
+
     async fn supervise_turn(&self, plan: &SupervisorPlan) -> Result<Supervised, RunError> {
         let turn = self.turn_dir(&plan.run_id, plan.turn_index);
         let (delegate, mut input) = match self.admit(plan, &turn)? {
@@ -380,19 +383,21 @@ impl RunStore {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use googletest::prelude::*;
 
     use super::Admission;
-    use crate::delegate::Billing;
+    use crate::delegate::{AccountChoice, Billing, CodexPermissions, Delegate, Isolation, ModelId};
     use crate::launch::Launched;
+    use crate::run::auto_resume::AutoResumeRecord;
     use crate::run::records::{
-        ExitRecord, ProducerCommand, SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json,
-        write_json,
+        ExitRecord, InvocationRecord, LaunchMode, ProducerCommand, SupervisorPhase, SupervisorPlan,
+        SupervisorRecord, read_json, write_json,
     };
-    use crate::run::{RunId, RunStore};
-    use crate::testing::ScriptedLauncher;
+    use crate::run::{Retention, RunId, RunStore, StartRequest};
+    use crate::testing::{Script, ScriptedLauncher};
 
     /// A supervisor that cannot read its consultation's record settles the turn as never started,
     /// before entering the phase that says a delegate may be running.
@@ -445,6 +450,242 @@ mod tests {
             some(eq(SupervisorPhase::Prepared))
         );
         assert_that!(launcher.launches(), is_empty());
+        Ok(())
+    }
+
+    /// The inside of a JSON string holding `path`, for filling in a frozen record.
+    fn json_path(path: &std::path::Path) -> Result<String> {
+        let quoted = serde_json::to_string(path).or_fail()?;
+        Ok(quoted.trim_matches('"').to_owned())
+    }
+
+    /// An agy consultation's `meta.json`, as an earlier agentmux wrote it.
+    const AGY_META: &str = indoc::indoc! {r#"
+        {
+          "run_id": "<run_id>",
+          "delegate": {
+            "vendor": "agy",
+            "model": "gemini-3.8-flash-low",
+            "account": {
+              "kind": "cli_login"
+            },
+            "isolation": "isolated"
+          },
+          "cwd": "<cwd>",
+          "retention": "ttl",
+          "created_at": "2026-11-20T10:00:00Z",
+          "env": {},
+          "billing": "subscription"
+        }
+    "#};
+
+    /// An agy turn's `supervisor-plan.json`, as an earlier agentmux wrote it: its producer names
+    /// no stdin.
+    const AGY_PLAN: &str = indoc::indoc! {r#"
+        {
+          "store_root": "<root>",
+          "run_id": "<run_id>",
+          "turn": 1,
+          "launch_id": "<launch_id>",
+          "producer": {
+            "program": "agy",
+            "args": [
+              "--print=",
+              "--input-format",
+              "stream-json",
+              "--output-format",
+              "stream-json",
+              "--model",
+              "gemini-3.8-flash-low"
+            ],
+            "cwd": "<cwd>",
+            "billing": "subscription"
+          },
+          "auto_resume": null
+        }
+    "#};
+
+    /// A supervisor started from a plan an earlier agentmux wrote, which names no stdin, gives an
+    /// agy delegate its question as the record agy reads.
+    #[gtest]
+    fn a_plan_without_stdin_gives_agy_its_encoded_question() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::default());
+        let store = RunStore::open(dir.path(), launcher.clone(), BTreeMap::new()).or_fail()?;
+        let run_id = RunId::generate();
+        let turn = store.turn_dir(&run_id, 0);
+        std::fs::create_dir_all(&turn.root).or_fail()?;
+        let launch_id = uuid::Uuid::new_v4().simple().to_string();
+        let fill = |text: &str| -> Result<String> {
+            Ok(text
+                .replace("<run_id>", run_id.as_str())
+                .replace("<root>", &json_path(dir.path())?)
+                .replace("<cwd>", &json_path(dir.path())?)
+                .replace("<launch_id>", &launch_id))
+        };
+        std::fs::write(store.run_dir(&run_id).join("meta.json"), fill(AGY_META)?).or_fail()?;
+        let record = "{\"event\":\"user\",\"message\":{\"content\":\"q\"}}\n";
+        std::fs::write(turn.question(), "q").or_fail()?;
+        std::fs::write(turn.encoded_question(), record).or_fail()?;
+        write_json(
+            &turn.supervisor(),
+            &SupervisorRecord {
+                launch_id: launch_id.clone(),
+                launched: Launched {
+                    pid: std::process::id(),
+                    process_group: None,
+                    started: None,
+                },
+                started_at: chrono::Utc::now(),
+                phase: SupervisorPhase::Prepared,
+            },
+        )
+        .or_fail()?;
+        let plan: SupervisorPlan = serde_json::from_str(&fill(AGY_PLAN)?).or_fail()?;
+
+        let admitted = store.admit(&plan, &turn).or_fail()?;
+
+        assert_that!(matches!(admitted, Admission::Running { .. }), eq(true));
+        assert_that!(
+            launcher.launches(),
+            elements_are![field!(crate::testing::RecordedLaunch.question, eq(record))]
+        );
+        Ok(())
+    }
+
+    /// A Codex turn that said something in a session it announced, then failed because the model
+    /// was at capacity.
+    const OVERLOADED: &str = indoc::indoc! {r#"
+        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
+        {"type":"turn.started"}
+        {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Halfway through."}}
+        {"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}
+    "#};
+
+    /// A driven Codex turn's `supervisor-plan.json`, as an earlier agentmux wrote it: its producer
+    /// names no stdin, and its automatic resume names its driver `codex_driver`.
+    const CODEX_PLAN: &str = indoc::indoc! {r#"
+        {
+          "store_root": "<root>",
+          "run_id": "<run_id>",
+          "turn": 1,
+          "launch_id": "<launch_id>",
+          "producer": {
+            "program": "/opt/agentmux",
+            "args": [
+              "codex-app-server",
+              "<turn>/app-server.json"
+            ],
+            "cwd": "/work/project",
+            "billing": "subscription"
+          },
+          "auto_resume": {
+            "policy": {
+              "first_delay": {
+                "secs": 0,
+                "nanos": 0
+              },
+              "longest_delay": {
+                "secs": 0,
+                "nanos": 0
+              },
+              "attempts": 12
+            },
+            "supervisor": "/opt/agentmux",
+            "codex_driver": "/opt/agentmux"
+          }
+        }
+    "#};
+
+    /// A driven Codex turn that failed overloaded under a plan an earlier agentmux wrote settles
+    /// through `status` and `wait`, which read that plan, and its supervisor resumes the
+    /// consultation over the app-server, as the store that wrote the plan drove it.
+    #[gtest]
+    #[tokio::test]
+    async fn an_earlier_plan_settles_and_resumes_over_the_app_server() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let env: BTreeMap<String, String> = [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let launcher = Arc::new(ScriptedLauncher::new([
+            Script::running(OVERLOADED),
+            Script::running(""),
+        ]));
+        let open = || RunStore::open(dir.path(), launcher.clone(), env.clone());
+
+        // The first turn runs over the app-server, directly, and has not gone yet.
+        let started = open()?
+            .with_codex_app_server("/opt/agentmux")
+            .start(&StartRequest {
+                delegate: Delegate::Codex {
+                    model: ModelId::parse("gpt-6-astra").or_fail()?,
+                    effort: None,
+                    permissions: CodexPermissions::default(),
+                    account: AccountChoice::Default,
+                    isolation: Some(Isolation::Inherit),
+                },
+                question: "review this".to_owned(),
+                cwd: PathBuf::from("/work/project"),
+                retention: Retention::Ttl,
+                env: BTreeMap::new(),
+                billing: None,
+                force_codex_exec: false,
+                label: None,
+            })?;
+        let run_id = started.run_id;
+
+        // Its supervisor, this process, ran it under the earlier plan.
+        let turn = open()?.turn_dir(&run_id, 0);
+        let launch_id = uuid::Uuid::new_v4().simple().to_string();
+        let plan_text = CODEX_PLAN
+            .replace("<root>", &json_path(dir.path())?)
+            .replace("<run_id>", run_id.as_str())
+            .replace("<launch_id>", &launch_id)
+            .replace("<turn>", &json_path(&turn.root)?);
+        std::fs::write(turn.supervisor_plan_path(), &plan_text).or_fail()?;
+        write_json(
+            &turn.supervisor(),
+            &SupervisorRecord {
+                launch_id,
+                launched: Launched {
+                    pid: std::process::id(),
+                    process_group: None,
+                    started: None,
+                },
+                started_at: chrono::Utc::now(),
+                phase: SupervisorPhase::Prepared,
+            },
+        )
+        .or_fail()?;
+        launcher.mark_process_gone(launcher.launch_handle(0));
+
+        // A new `status` settles the turn and schedules the resume the plan asks for.
+        open()?.status(&run_id)?;
+        assert_that!(
+            read_json::<AutoResumeRecord>(&turn.auto_resume())?,
+            some(matches_pattern!(AutoResumeRecord::Scheduled {
+                attempt: eq(&1),
+                ..
+            }))
+        );
+        let store = open()?;
+        let settled = store
+            .wait_for_settlement(&store.pin_turn(&run_id, Some(1))?)
+            .await?;
+        assert_that!(settled.turn_number(), eq(1));
+
+        // The supervisor restores the store from the plan and resumes over the app-server.
+        let plan: SupervisorPlan = serde_json::from_str(&plan_text).or_fail()?;
+        let resumer = open()?.launching_as(&plan);
+        assert_that!(
+            resumer.resume_when_due(&plan).await?,
+            eq(&super::Resumption::Resumed)
+        );
+        let resumed =
+            read_json::<InvocationRecord>(&resumer.turn_dir(&run_id, 1).invocation())?.or_fail()?;
+        assert_that!(resumed.launch_mode, eq(LaunchMode::AppServer));
+        assert_that!(resumed.auto_resume, some(anything()));
         Ok(())
     }
 }
