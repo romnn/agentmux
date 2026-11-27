@@ -350,7 +350,9 @@ fn a_codex_rollout_yields_the_window_the_stream_omitted() -> Result<()> {
     )
     .or_fail()?;
 
-    let Some(limits) = agentmux::quota::codex_rollout_rate_limits(home.path(), thread) else {
+    let Some(limits) =
+        agentmux::vendor::codex::quota::codex_rollout_rate_limits(home.path(), thread)
+    else {
         return fail!("the rollout carries rate limits");
     };
 
@@ -370,7 +372,8 @@ fn a_missing_rollout_yields_nothing_rather_than_a_default() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     std::fs::create_dir_all(home.path().join("sessions/2026/09/07")).or_fail()?;
 
-    let limits = agentmux::quota::codex_rollout_rate_limits(home.path(), "no-such-thread");
+    let limits =
+        agentmux::vendor::codex::quota::codex_rollout_rate_limits(home.path(), "no-such-thread");
 
     assert_that!(limits.is_none(), eq(true));
     Ok(())

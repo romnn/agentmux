@@ -1765,22 +1765,28 @@ pub(crate) struct CredentialVars {
     pub(crate) base_url: &'static str,
 }
 
+/// The variables a Claude account's fields map onto.
+pub(crate) const CLAUDE_CREDENTIAL_VARS: CredentialVars = CredentialVars {
+    config_dir: "CLAUDE_CONFIG_DIR",
+    api_key: "ANTHROPIC_API_KEY",
+    auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
+    base_url: "ANTHROPIC_BASE_URL",
+};
+
+/// The variables a Codex account's fields map onto.
+pub(crate) const CODEX_CREDENTIAL_VARS: CredentialVars = CredentialVars {
+    config_dir: "CODEX_HOME",
+    api_key: "OPENAI_API_KEY",
+    auth_token: None,
+    base_url: "OPENAI_BASE_URL",
+};
+
 /// The variables a vendor's account fields map onto, or `None` for agy, which reads neither its
 /// login nor its configuration directory from a variable an account could set.
 pub(crate) fn credential_vars(vendor: Vendor) -> Option<CredentialVars> {
     match vendor {
-        Vendor::Claude => Some(CredentialVars {
-            config_dir: "CLAUDE_CONFIG_DIR",
-            api_key: "ANTHROPIC_API_KEY",
-            auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
-            base_url: "ANTHROPIC_BASE_URL",
-        }),
-        Vendor::Codex => Some(CredentialVars {
-            config_dir: "CODEX_HOME",
-            api_key: "OPENAI_API_KEY",
-            auth_token: None,
-            base_url: "OPENAI_BASE_URL",
-        }),
+        Vendor::Claude => Some(CLAUDE_CREDENTIAL_VARS),
+        Vendor::Codex => Some(CODEX_CREDENTIAL_VARS),
         Vendor::Agy => None,
     }
 }

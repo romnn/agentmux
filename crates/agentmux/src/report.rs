@@ -23,6 +23,7 @@ use crate::run::{
     describe_delegate,
 };
 use crate::transcript::{EarlierFailure, FailureKind, Outcome, UsageWindow};
+use crate::vendor::{agy, claude, codex};
 
 /// Something a reader must be told about a consultation, because it changes how the transcript
 /// reads.
@@ -133,8 +134,9 @@ impl RunStatus {
         // agentmux cannot tell which files that found, so the rule is stated rather than guessed
         // at: a note that fired only when the file sat in `cwd` would read as "there is none"
         // everywhere else.
-        if self.delegate.vendor() == Vendor::Claude {
-            warnings.push(Warning::InstructionFiles { cwd: &self.cwd });
+        match self.delegate.vendor() {
+            Vendor::Claude => warnings.push(Warning::InstructionFiles { cwd: &self.cwd }),
+            Vendor::Codex | Vendor::Agy => {}
         }
         warnings
     }
@@ -735,9 +737,9 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
         }
         Observation::Reported { origin, payload } => {
             lines.push(format!("  {}", describe_origin(origin)));
-            let windows = claude_windows(payload)
-                .or_else(|| codex_windows(payload))
-                .or_else(|| agy_windows(payload))
+            let windows = claude::quota::windows(payload)
+                .or_else(|| codex::quota::windows(payload))
+                .or_else(|| agy::quota::windows(payload))
                 .unwrap_or_default();
             if windows.is_empty() {
                 lines.push("  no window this build recognises; read the payload".to_owned());
@@ -788,114 +790,4 @@ fn describe_refresh(refresh: &Refresh) -> String {
             format!(", and the refresh failed ({reason}) — these figures predate it")
         }
     }
-}
-
-/// Claude reports a `limits` array, each entry a percentage with its own severity.
-fn claude_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
-    let limits = payload.get("utilization")?.get("limits")?.as_array()?;
-    Some(
-        limits
-            .iter()
-            .map(|limit| {
-                let kind = limit
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("window");
-                // The scope names a model, and only by display name: the vendor leaves `id` null,
-                // which is why nothing here tries to match it to the model a caller asked for.
-                let scope = limit
-                    .get("scope")
-                    .and_then(|s| s.get("model"))
-                    .and_then(|m| m.get("display_name"))
-                    .and_then(|n| n.as_str())
-                    .map_or_else(String::new, |name| format!(" ({name})"));
-                let percent = limit
-                    .get("percent")
-                    .and_then(serde_json::Value::as_i64)
-                    .map_or_else(|| "?".to_owned(), |p| format!("{p}%"));
-                let severity = limit
-                    .get("severity")
-                    .and_then(|s| s.as_str())
-                    .filter(|s| *s != "normal")
-                    .map_or_else(String::new, |s| format!(" [{s}]"));
-                let resets = limit
-                    .get("resets_at")
-                    .and_then(|r| r.as_str())
-                    .map_or_else(String::new, |r| format!(", resets {r}"));
-                format!("{kind}{scope}: {percent} used{severity}{resets}")
-            })
-            .collect(),
-    )
-}
-
-/// Codex reports a map of named buckets, each with a primary and optional secondary window.
-fn codex_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
-    let buckets = payload.get("rateLimitsByLimitId")?.as_object()?;
-    Some(
-        buckets
-            .iter()
-            .map(|(id, bucket)| {
-                let name = bucket
-                    .get("limitName")
-                    .and_then(|n| n.as_str())
-                    .map_or_else(String::new, |n| format!(" ({n})"));
-                let windows = ["primary", "secondary"]
-                    .into_iter()
-                    .filter_map(|which| {
-                        let window = bucket.get(which)?;
-                        let percent = window.get("usedPercent")?.as_i64()?;
-                        let minutes = window
-                            .get("windowDurationMins")
-                            .and_then(serde_json::Value::as_i64)
-                            .map_or_else(String::new, |m| format!(" over {m}m"));
-                        Some(format!("{percent}% used{minutes}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{id}{name}: {windows}")
-            })
-            .collect(),
-    )
-}
-
-/// agy reports groups of models, each with buckets naming a window, the fraction of it left and
-/// when it resets.
-///
-/// A window nobody has used yet resets at the Unix epoch, which is said as such rather than as a
-/// reset half a century ago.
-fn agy_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
-    let groups = payload.get("groups")?.as_array()?;
-    Some(
-        groups
-            .iter()
-            .flat_map(|group| {
-                let name = group
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("models");
-                let buckets = group.get("buckets").and_then(|b| b.as_array());
-                buckets.into_iter().flatten().map(move |bucket| {
-                    let window = bucket
-                        .get("window")
-                        .and_then(|w| w.as_str())
-                        .unwrap_or("window");
-                    let used = bucket
-                        .get("remaining_fraction")
-                        .and_then(serde_json::Value::as_f64)
-                        .map_or_else(
-                            || "?".to_owned(),
-                            |left| format!("{:.0}%", (1.0 - left) * 100.0),
-                        );
-                    let resets = match bucket.get("reset_time").and_then(|r| r.as_str()) {
-                        Some(reset) if reset.starts_with("1970-01-01") => {
-                            ", not used yet".to_owned()
-                        }
-                        Some(reset) => format!(", resets {reset}"),
-                        None => String::new(),
-                    };
-                    format!("{name} {window}: {used} used{resets}")
-                })
-            })
-            .collect(),
-    )
 }

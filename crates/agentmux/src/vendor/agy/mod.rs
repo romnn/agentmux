@@ -2,13 +2,29 @@
 //! in, and the arguments and input it runs with.
 
 pub mod fold;
+pub mod quota;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{DelegateError, Effort, ModelId, TurnPlan, Vendor};
+use crate::transcript::Usage;
+
+/// What an agy turn's report says it spent, whichever release wrote it.
+///
+/// Its tokens are its conversation's running total, which `--conversation` carries on from, and
+/// count the cached prompt tokens beside its `input_tokens`.
+/// It reports no price, so a price it did report would be in a scope nothing documents.
+pub(crate) fn read_spend(usage: &Usage, _cli_version: Option<&str>) -> ReadSpend {
+    ReadSpend {
+        tokens: Tokens::cache_beside_input(usage),
+        tokens_cover: Scope::Session,
+        price_covers: None,
+    }
+}
 
 /// Argument vector for the agy CLI.
 ///

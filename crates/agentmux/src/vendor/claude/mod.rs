@@ -1,13 +1,43 @@
 //! Anthropic's `claude` CLI: its permission mode and tool lists, and the arguments it runs with.
 
 pub mod fold;
+pub mod quota;
 
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
+use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    DelegateError, Effort, Isolation, ModelId, TurnPlan, parse_token, string_newtype_conversions,
+    DelegateError, Effort, Isolation, ModelId, TurnPlan, parse_token, release_of,
+    string_newtype_conversions,
 };
+use crate::transcript::Usage;
+
+/// The first Claude Code release whose `total_cost_usd` is the session's running total across
+/// `--resume` rather than the one call's, as Anthropic's cost-tracking documentation says.
+const CLAUDE_SESSION_COST_SINCE: (u64, u64, u64) = (2, 1, 277);
+
+/// What a Claude turn's report, from the release `cli_version` names, says it spent.
+///
+/// Its tokens cover the one call, and count the prompt tokens read from and written to the cache
+/// beside its `input_tokens`.
+/// Its `total_cost_usd` covered the one call until Claude Code 2.1.277, and has been the
+/// session's running total across `--resume` since.
+/// A price whose release cannot be read has no known scope, so it is not counted rather than
+/// guessed at.
+pub(crate) fn read_spend(usage: &Usage, cli_version: Option<&str>) -> ReadSpend {
+    ReadSpend {
+        tokens: Tokens::cache_beside_input(usage),
+        tokens_cover: Scope::Turn,
+        price_covers: cli_version.and_then(release_of).map(|release| {
+            if release < CLAUDE_SESSION_COST_SINCE {
+                Scope::Turn
+            } else {
+                Scope::Session
+            }
+        }),
+    }
+}
 
 /// A Claude permission mode, spelled as `claude --permission-mode` takes it.
 ///

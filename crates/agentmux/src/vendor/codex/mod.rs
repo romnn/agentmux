@@ -2,11 +2,27 @@
 //! `codex app-server` run with.
 
 pub mod fold;
+pub mod quota;
 
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
+use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{Effort, Isolation, ModelId, TurnPlan, release_of};
+use crate::transcript::Usage;
+
+/// What a Codex turn's report says it spent, whichever release wrote it.
+///
+/// Its tokens are its thread's running total, which a resumed thread carries on from, and its
+/// `input_tokens` already count the cached prompt tokens.
+/// It reports no price, so a price it did report would be in a scope nothing documents.
+pub(crate) fn read_spend(usage: &Usage, _cli_version: Option<&str>) -> ReadSpend {
+    ReadSpend {
+        tokens: Tokens::cache_inside_input(usage),
+        tokens_cover: Scope::Session,
+        price_covers: None,
+    }
+}
 
 /// How much of the filesystem a Codex delegate's commands may write.
 ///
