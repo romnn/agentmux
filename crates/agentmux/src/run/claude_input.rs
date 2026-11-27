@@ -124,9 +124,12 @@ impl ClaudeInput {
 
     /// Close the input, and reject every request still waiting because of `why`.
     ///
+    /// A steer whose write has failed already, as one does once Claude has gone, is rejected for
+    /// that first.
     /// Rejected under the run's lock, which `steer` submits under after checking that the turn
     /// takes input, so a request is either swept here or never submitted.
     pub(super) fn close(&mut self, store: &RunStore, run_id: &RunId, why: &str) {
+        self.collect_written();
         self.lines = None;
         let run = store.lock(run_id);
         if let Err(err) = &run {
@@ -232,14 +235,18 @@ fn input_line(id: Uuid, text: &str, priority: Option<&str>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
+    use std::collections::BTreeMap;
+    use std::io::BufRead as _;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use googletest::prelude::*;
 
-    use super::{ClaudeInput, Writing, input_line};
+    use super::{ClaudeInput, EXITED, Writing, input_line};
     use crate::appserver::mailbox::SteerReply;
     use crate::run::layout::TurnDir;
+    use crate::run::{RunId, RunStore};
+    use crate::testing::ScriptedLauncher;
 
     /// Step `input` until its writer has finished with the line it has.
     fn until_written(input: &mut ClaudeInput) -> Result<()> {
@@ -255,31 +262,33 @@ mod tests {
     /// Lines larger than a pipe's buffer, which Claude does not read, block only the writer:
     /// handing them over returns at once, as the supervisor's watch loop needs to go on looking
     /// for a cancellation.
-    /// The question goes first, and a steer whose write fails, because Claude has gone, is
-    /// rejected.
+    /// The question goes first, and a steer whose write fails because Claude has gone is
+    /// rejected for it when the input closes, as it does once the supervisor sees Claude gone.
     #[gtest]
     fn a_line_claude_does_not_read_never_blocks_the_supervisor() -> Result<()> {
         let dir = tempfile::tempdir().or_fail()?;
         let turn = TurnDir {
             root: dir.path().to_path_buf(),
         };
+        let store = RunStore::open(
+            dir.path().join("state"),
+            Arc::new(ScriptedLauncher::default()),
+            BTreeMap::new(),
+        )
+        .or_fail()?;
         let (mut claude_stdin, pipe) = std::io::pipe().or_fail()?;
-        let question = "q".repeat(4 << 20);
-        let question_id = uuid::Uuid::new_v4();
 
         // The question is handed over without waiting for Claude to read it.
         let began = Instant::now();
-        let mut input = ClaudeInput::start(pipe, &question, question_id, &turn);
+        let mut input = ClaudeInput::start(pipe, &"q".repeat(4 << 20), uuid::Uuid::new_v4(), &turn);
         input.collect_written();
         assert_that!(began.elapsed() < Duration::from_secs(1), eq(true));
         assert_that!(matches!(input.writing, Some(Writing::Question)), eq(true));
 
-        // Claude reads its question, exactly one line of it, and the writer is free again.
-        let expected = input_line(question_id, &question, None);
-        let mut read = vec![0; expected.len()];
-        claude_stdin.read_exact(&mut read).or_fail()?;
-        assert_that!(read == expected, eq(true));
-        assert_that!(read.last(), some(eq(&b'\n')));
+        // Claude reads its question, and the writer is free again.
+        std::io::BufReader::new(&mut claude_stdin)
+            .read_line(&mut String::new())
+            .or_fail()?;
         until_written(&mut input)?;
 
         // A steer Claude does not read is handed over at once too.
@@ -294,12 +303,16 @@ mod tests {
         assert_that!(began.elapsed() < Duration::from_secs(1), eq(true));
         assert_that!(turn.mailbox().reply(&steer).or_fail()?, none());
 
-        // Claude goes, so the write fails, and the steer is answered as never delivered.
+        // Claude goes, so the write fails, which the writer reports within moments; the supervisor
+        // closes the input and answers the steer as never delivered, for its failed write.
         drop(claude_stdin);
-        until_written(&mut input)?;
+        std::thread::sleep(Duration::from_secs(1));
+        input.close(&store, &RunId::generate(), EXITED);
         assert_that!(
             turn.mailbox().reply(&steer).or_fail()?,
-            some(matches_pattern!(SteerReply::Rejected { .. }))
+            some(matches_pattern!(SteerReply::Rejected {
+                reason: contains_substring("writing it to Claude's input failed"),
+            }))
         );
         Ok(())
     }

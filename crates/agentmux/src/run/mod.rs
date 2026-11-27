@@ -580,9 +580,10 @@ impl RunStore {
             // Advertised only when a follow-up would actually work, because `next_steps` turns
             // this into a recommendation and a caller that takes it pays for the turn.
             resumable: Self::resumable_session(run_id, &state).is_ok(),
-            steerable: state.newest.as_ref().is_some_and(|newest| {
-                self.accepts_steers(&outcome, newest.launch_mode, newest.input, &turn)
-            }),
+            steerable: state
+                .newest
+                .as_ref()
+                .is_some_and(|newest| self.steer_server(&outcome, newest, &turn).is_ok()),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
             auto_resume: match &state.newest {
@@ -836,6 +837,10 @@ pub(super) struct NewestTurn {
     /// Apart from `settled` only for a cancellation the delegate survived: the turn is frozen
     /// and settled, but the process saving its session is still there.
     pub(super) delegate_gone: bool,
+    /// Its delegate, as its launch record names it.
+    pub(super) delegate: Option<Launched>,
+    /// Its supervisor, as its supervisor record names it.
+    pub(super) supervisor: Option<Launched>,
 }
 
 /// What decided a turn's outcome.

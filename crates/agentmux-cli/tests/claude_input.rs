@@ -32,6 +32,14 @@ const ECHO: &str = r#"echo_input() {
   printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"%s"}]},"parent_tool_use_id":null,"uuid":"%s","isReplay":true}\n' "$text" "$id"
 }"#;
 
+/// A function of the shell script that keeps it running, for a minute at most, so a fake whose
+/// test failed before stopping it leaves on its own.
+/// It sleeps in the background and waits, so a trapped signal is handled at once.
+const LINGER: &str = r#"linger() {
+  i=0
+  while [ "$i" -lt 60 ]; do sleep 1 & wait $!; i=$((i + 1)); done
+}"#;
+
 /// A machine of its own: a `bin` for the fake `claude`, a home, a project and a store.
 struct Machine {
     root: tempfile::TempDir,
@@ -57,6 +65,7 @@ impl Machine {
             #!/bin/sh
             case "$1" in --version) echo "2.1.332 (Claude Code)"; exit 0;; esac
             {ECHO}
+            {LINGER}
             {body}
             "#,
         };
@@ -214,7 +223,7 @@ async fn a_supervisor_writing_to_a_claude_that_does_not_read_still_cancels_it() 
     let machine = Machine::new(
         &indoc::formatdoc! {r#"
             echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'
-            while :; do sleep 1; done
+            linger
             "#,
         },
         None,
@@ -246,11 +255,11 @@ async fn a_cancelled_claude_turn_is_gone_with_its_helpers() -> Result<()> {
     let machine = Machine::new(
         &indoc::formatdoc! {r#"
             echo $$ > '{claude_pid}'
-            sh -c "sleep 120 & echo \$! > '{tool_pid}'"
+            sh -c "sleep 60 & echo \$! > '{tool_pid}'"
             trap 'sleep 2; exit 143' TERM
             read -r question
             echo '{{"type":"system","subtype":"init","session_id":"{SESSION}"}}'
-            while :; do sleep 1 & wait $!; done
+            linger
             "#,
             claude_pid = claude_pid_file.display(),
             tool_pid = tool_pid_file.display(),

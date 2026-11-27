@@ -23,7 +23,7 @@ use agentmux::run::{
     UnsteerableReason,
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
-use agentmux::transcript::TurnState;
+use agentmux::transcript::{Outcome, TurnState};
 use googletest::prelude::*;
 
 /// Where a test pretends the agentmux executable lives.
@@ -747,8 +747,15 @@ impl ClaudeTurn {
     /// started a Claude that has written `events`.
     fn start(supervisor: Script, events: &str) -> Result<Self> {
         let dir = tempfile::tempdir().or_fail()?;
+        // A `claude.exe` on the delegate's `PATH`, which on Windows is what lets Claude read its
+        // input from its supervisor rather than run through a `.cmd` shim.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).or_fail()?;
+        std::fs::write(bin.join("claude.exe"), "").or_fail()?;
+        let mut env = env();
+        env.insert("PATH".to_owned(), bin.display().to_string());
         let launcher = Arc::new(ScriptedLauncher::new([supervisor, Script::running("")]));
-        let store = RunStore::open(dir.path(), launcher.clone(), env())
+        let store = RunStore::open(dir.path(), launcher.clone(), env)
             .or_fail()?
             .with_supervisor(SUPERVISOR_PATH);
         let harness = Harness {
@@ -986,6 +993,35 @@ async fn a_steer_claude_echoes_past_a_frozen_capture_is_not_accepted() -> Result
     assert_that!(
         turn.harness.transcript(&turn.run_id)?,
         not(contains_substring("Narrow it to auth."))
+    );
+    Ok(())
+}
+
+/// A cancel that comes once Claude has exited, before its supervisor has recorded the exit, leaves
+/// the turn to that exit: Claude had reported its result and finished, and a cancellation recorded
+/// over it would read as a turn cut short.
+/// An automatic resume the exit may still call for is stopped all the same.
+#[gtest]
+#[tokio::test]
+async fn a_cancel_after_claude_has_exited_leaves_the_turn_to_its_exit() -> Result<()> {
+    let turn = ClaudeTurn::start(Script::running(""), CLAUDE_INIT)?;
+    append(
+        &turn.dir,
+        "{\"type\":\"result\",\"is_error\":false,\"result\":\"done\"}\n",
+    )?;
+    turn.harness.launcher.mark_process_gone(turn.claude());
+
+    // The supervisor is still there to record the exit, so the turn still runs.
+    let cancelled = turn.harness.store.cancel(&turn.run_id).await?;
+    assert_that!(cancelled.outcome, eq(&Outcome::Running));
+    assert_that!(turn.dir.join("cancelling").exists(), eq(false));
+    assert_that!(turn.dir.join("auto-resume-cancelled").exists(), eq(true));
+
+    // Once it has gone too, the next reader settles the turn from Claude's exit.
+    turn.harness.launcher.mark_process_gone(turn.supervisor());
+    assert_that!(
+        turn.harness.store.status(&turn.run_id)?.outcome,
+        matches_pattern!(Outcome::Completed { .. })
     );
     Ok(())
 }

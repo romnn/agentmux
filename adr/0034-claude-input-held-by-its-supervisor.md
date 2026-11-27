@@ -85,10 +85,11 @@ lock, as every reader does and no further than a settled turn's frozen capture, 
   only between model calls, so it may still arrive and should not be sent again.
 
 The supervisor's death does not end the wait, since Claude may still take a line it was handed.
-`status` offers a steer, and `steer` admits one, on one predicate (`RunStore::accepts_steers`): the
-turn is not over, its input is open (`TurnInput::Open`, from `init` until the first `result`), no
-cancellation is marked, and the supervisor and Claude are both positively alive. A refusal says
-which: still starting, finishing, or out of reach because the supervisor has gone
+`status` offers a steer, and `steer` admits one, on one check (`RunStore::steer_server`) over the
+records one fold read: the turn is not over, its input is open (`TurnInput::Open`, from `init` until
+the first `result`), no cancellation is marked, and the supervisor and Claude are both positively
+alive. The check names the supervisor as the process serving the mailbox, or says why there is
+none: still starting, finishing, or out of reach because the supervisor has gone
 (`UnsteerableReason::ClaudeInputLost`).
 
 **No `result` ends the turn; its exit record does.** A `result` closes the input, and its outcome
@@ -101,7 +102,9 @@ past stays in the transcript as a note. Tokens are summed across the `result`s a
 is kept, whose scope is its release's ([0031](0031-spend-derived-from-vendor-reports.md)). Once the
 exit record is there (`RunStore::settle_outcome`):
 
-- a cancellation of the running turn is the outcome, as is a launch that never happened;
+- a cancellation of the running turn is the outcome, as is a launch that never happened; a
+  `cancel` that comes once Claude has exited, before the exit is recorded, marks nothing, so the
+  exit settles the turn, as for any delegate already gone;
 - an exit known to be abnormal decides over a success, which Claude did not finish, but not over a
   failure Claude reported itself;
 - after a clean exit, or one whose status nobody saw, the candidate stands;

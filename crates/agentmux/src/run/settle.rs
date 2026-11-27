@@ -406,6 +406,22 @@ impl RunStore {
     }
 }
 
+impl NewestTurn {
+    /// What a fold of the turn in `files`, `folded`, established about it, were it the newest.
+    pub(super) fn of(files: &TurnFiles, folded: &FoldedTurn) -> Self {
+        Self {
+            index: files.index,
+            settled_by: folded.settled_by,
+            launch_mode: folded.launch_mode,
+            input: folded.input,
+            settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
+            delegate_gone: folded.delegate_gone,
+            delegate: files.launch.as_ref().map(|record| record.launched),
+            supervisor: files.supervisor.as_ref().map(|record| record.launched),
+        }
+    }
+}
+
 impl LockedRun<'_> {
     /// Rebuild a consultation from its capture files.
     ///
@@ -429,16 +445,9 @@ impl LockedRun<'_> {
         let all_files = self.store.turn_files(&self.run_id)?;
         for files in &all_files {
             let folded = self.fold_turn(meta, files)?;
+            newest = Some(NewestTurn::of(files, &folded));
             pending_rate_limit_lookups.extend(folded.pending_rate_limit_lookup);
             finality.insert(files.index, folded.finality);
-            newest = Some(NewestTurn {
-                index: files.index,
-                settled_by: folded.settled_by,
-                launch_mode: folded.launch_mode,
-                input: folded.input,
-                settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
-                delegate_gone: folded.delegate_gone,
-            });
             if folded.session.is_some() {
                 session = folded.session;
             }
@@ -1162,9 +1171,9 @@ mod tests {
     }
 
     /// A Claude turn reading stream-json input settles with its last `result` only where nothing
-    /// says the turn ended otherwise: a cancellation of the running turn, a launch that never
-    /// happened and an abnormal exit after a success each decide instead, while a failure Claude
-    /// reported itself still stands over the abnormal exit that follows it.
+    /// says the turn ended otherwise: a cancellation of the running turn and an abnormal exit
+    /// after a success each decide instead, while a failure Claude reported itself still stands
+    /// over the abnormal exit that follows it.
     #[gtest]
     fn the_last_result_stands_only_where_the_exit_record_allows() {
         let failed_by_the_record = || {
@@ -1174,20 +1183,13 @@ mod tests {
             })
         };
 
-        // A cancellation, or a launch that never happened, decides over a success.
+        // A cancellation decides over a success.
         assert_that!(
             settled(&ExitRecord::Cancelled { events_len: 0 }, Some(completed())),
             eq(&Settled {
                 outcome: Outcome::Cancelled,
                 by: Some(SettledBy::ExitRecord),
             })
-        );
-        let never_started = ExitRecord::NotStarted {
-            reason: "no pipe".to_owned(),
-        };
-        assert_that!(
-            settled(&never_started, Some(completed())),
-            failed_by_the_record()
         );
 
         // An abnormal exit decides over a success, whether a code or a signal says so.

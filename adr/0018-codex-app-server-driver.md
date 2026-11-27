@@ -67,7 +67,7 @@ starts anything.
 - Once the driver observes the `cancelling` marker, it stops submitting new steers, rejects waiting
   requests, and interrupts a started turn. Requests already in flight are settled separately.
 
-`RunStore::accepts_steers` is the one predicate behind both `RunStatus::steerable` and `steer`'s
+`RunStore::steer_server` is the one check behind both `RunStatus::steerable` and `steer`'s
 admission, and a turn whose capture does not yet say `turn.started` is refused as
 `SteerError::Starting`, so a steer never waits on setup.
 

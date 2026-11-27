@@ -8,12 +8,12 @@ use crate::launch::{Launched, Liveness};
 use crate::stream::TurnInput;
 use crate::transcript::Outcome;
 
-use super::RunStore;
 use super::error::{NotRunningReason, RunError, SteerError, UnsteerableReason};
 use super::id::RunId;
 use super::layout::TurnDir;
-use super::records::{LaunchMode, LaunchRecord, SupervisorRecord, read_json};
+use super::records::LaunchMode;
 use super::status::RunStatus;
+use super::{NewestTurn, RunStore};
 
 impl RunStore {
     /// How long a steered message may wait for the turn's driver to pick it up.
@@ -193,62 +193,38 @@ impl RunStore {
             state,
         };
         let run = self.lock(run_id)?;
-        let Some(newest) = self.turn_files(run_id)?.into_iter().last() else {
+        let Some(files) = self.turn_files(run_id)?.into_iter().last() else {
             return Err(not_running(NotRunningReason::NotLaunched).into());
         };
-        let folded = run.fold_turn(&meta, &newest)?;
-        let outcome = folded.turn.outcome;
-        if outcome.is_terminal() {
-            return Err(not_running(NotRunningReason::Ended(outcome.state())).into());
-        }
-        if folded.launch_mode == LaunchMode::DirectCli {
-            // The running turn's own isolation, which a follow-up may have changed.
-            let current = self.current_delegate(&meta, Some(newest.index))?;
-            return Err(SteerError::NotSteerable {
-                run_id: run_id.clone(),
-                reason: why_not_steerable(&current),
+        let folded = run.fold_turn(&meta, &files)?;
+        let newest = NewestTurn::of(&files, &folded);
+        let server = match self.steer_server(&folded.turn.outcome, &newest, &files.dir) {
+            Ok(server) => server,
+            Err(Refusal::NotRunning(state)) => return Err(not_running(state).into()),
+            Err(Refusal::ReadsQuestionOnce) => {
+                // The running turn's own isolation, which a follow-up may have changed.
+                let current = self.current_delegate(&meta, Some(files.index))?;
+                return Err(SteerError::NotSteerable {
+                    run_id: run_id.clone(),
+                    reason: why_not_steerable(&current),
+                }
+                .into());
             }
-            .into());
-        }
-        if newest.dir.cancelling().exists() {
-            return Err(not_running(NotRunningReason::Cancelling).into());
-        }
-        if folded.input == TurnInput::Closed {
-            return Err(not_running(NotRunningReason::Finishing).into());
-        }
-        if !self.accepts_steers(&outcome, folded.launch_mode, folded.input, &newest.dir) {
-            let claude_open = folded.launch_mode == LaunchMode::ClaudeStreamInput
-                && folded.input == TurnInput::Open;
-            return Err(if claude_open
-                && !self.is_alive(newest.supervisor.as_ref().map(|record| record.launched))
-            {
-                SteerError::NotSteerable {
+            Err(Refusal::ClaudeInputLost) => {
+                return Err(SteerError::NotSteerable {
                     run_id: run_id.clone(),
                     reason: UnsteerableReason::ClaudeInputLost,
                 }
-            } else if claude_open {
-                not_running(NotRunningReason::Finishing)
-            } else {
-                SteerError::Starting {
+                .into());
+            }
+            Err(Refusal::Starting) => {
+                return Err(SteerError::Starting {
                     run_id: run_id.clone(),
                 }
-            }
-            .into());
-        }
-        // The process that answers the mailbox: a Codex turn's driver, which is its delegate, or
-        // a Claude turn's supervisor.
-        let server = match folded.launch_mode {
-            LaunchMode::ClaudeStreamInput => {
-                newest.supervisor.as_ref().map(|record| record.launched)
-            }
-            LaunchMode::DirectCli | LaunchMode::AppServer => {
-                newest.launch.as_ref().map(|record| record.launched)
+                .into());
             }
         };
-        let Some(server) = server else {
-            return Err(not_running(NotRunningReason::NotLaunched).into());
-        };
-        let mailbox = newest.dir.mailbox();
+        let mailbox = files.dir.mailbox();
         let steer_id = mailbox
             .submit(message)
             .map_err(RunError::io("submitting the steered message"))?;
@@ -256,45 +232,55 @@ impl RunStore {
             mailbox,
             steer_id,
             server,
-            turn_index: newest.index,
-            launch_mode: folded.launch_mode,
+            turn_index: files.index,
+            launch_mode: newest.launch_mode,
         })
     }
 
-    /// Whether the newest turn takes a steer: it runs, it takes input now, and nobody has asked
-    /// it to stop.
+    /// The process that serves the newest turn's mailbox, when the turn takes a steer now, or why
+    /// it takes none, from one fold of it.
     ///
     /// The one answer both `status` and `steer` give, so a turn advertised as steerable is one
     /// `steer` will not refuse.
-    /// `input` is whether the turn's capture says it takes input: a Codex turn's driver writes
-    /// the turn's start once it knows the turn and is about to serve its mailbox, and until then
-    /// a steer would only wait there, for as long as opening a long thread or starting the turn
-    /// takes; a Claude turn takes one from its `system`/`init` until its first `result`.
-    /// A Claude turn also needs its supervisor, which holds its input, and Claude itself, both
-    /// positively alive.
-    pub(super) fn accepts_steers(
+    /// The turn must still run, with nobody asking it to stop, and take input as its capture says:
+    /// a Codex turn's driver writes the turn's start once it knows the turn and is about to serve
+    /// its mailbox, which it then does, and until then a steer would only wait there, for as long
+    /// as opening a long thread or starting the turn takes; a Claude turn takes one from its
+    /// `system`/`init` until its first `result`, while its supervisor, which serves its mailbox
+    /// and holds its input, and Claude itself are both positively alive.
+    pub(super) fn steer_server(
         &self,
         outcome: &Outcome,
-        mode: LaunchMode,
-        input: TurnInput,
-        turn: &TurnDir,
-    ) -> bool {
-        let processes_alive = || {
-            let supervisor = read_json::<SupervisorRecord>(&turn.supervisor())
-                .ok()
-                .flatten();
-            let delegate = read_json::<LaunchRecord>(&turn.launch()).ok().flatten();
-            self.is_alive(supervisor.map(|record| record.launched))
-                && self.is_alive(delegate.map(|record| record.launched))
-        };
-        !outcome.is_terminal()
-            && input == TurnInput::Open
-            && !turn.cancelling().exists()
-            && match mode {
-                LaunchMode::DirectCli => false,
-                LaunchMode::AppServer => true,
-                LaunchMode::ClaudeStreamInput => processes_alive(),
+        newest: &NewestTurn,
+        dir: &TurnDir,
+    ) -> Result<Launched, Refusal> {
+        if outcome.is_terminal() {
+            return Err(Refusal::NotRunning(NotRunningReason::Ended(
+                outcome.state(),
+            )));
+        }
+        if newest.launch_mode == LaunchMode::DirectCli {
+            return Err(Refusal::ReadsQuestionOnce);
+        }
+        if dir.cancelling().exists() {
+            return Err(Refusal::NotRunning(NotRunningReason::Cancelling));
+        }
+        match newest.input {
+            TurnInput::Pending => return Err(Refusal::Starting),
+            TurnInput::Closed => return Err(Refusal::NotRunning(NotRunningReason::Finishing)),
+            TurnInput::Open => {}
+        }
+        let server = match newest.launch_mode {
+            LaunchMode::DirectCli | LaunchMode::AppServer => newest.delegate,
+            LaunchMode::ClaudeStreamInput if !self.is_alive(newest.supervisor) => {
+                return Err(Refusal::ClaudeInputLost);
             }
+            LaunchMode::ClaudeStreamInput if !self.is_alive(newest.delegate) => {
+                return Err(Refusal::NotRunning(NotRunningReason::Finishing));
+            }
+            LaunchMode::ClaudeStreamInput => newest.supervisor,
+        };
+        server.ok_or(Refusal::NotRunning(NotRunningReason::NotLaunched))
     }
 
     /// Whether a recorded process is positively alive, rather than gone or unknown.
@@ -312,6 +298,17 @@ struct SubmittedSteer {
     server: Launched,
     turn_index: u32,
     launch_mode: LaunchMode,
+}
+
+/// Why a running turn takes no steer now.
+pub(super) enum Refusal {
+    NotRunning(NotRunningReason),
+    /// Its delegate was launched to read its question once.
+    ReadsQuestionOnce,
+    /// It does not take input yet.
+    Starting,
+    /// Its supervisor, which holds Claude's input, has gone or cannot be checked on.
+    ClaudeInputLost,
 }
 
 /// How far a steer into a Claude turn has got, as the turn's capture says.
