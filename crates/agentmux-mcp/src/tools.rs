@@ -710,7 +710,7 @@ impl AgentMux {
 
     #[tool(
         description = "Report what each configured account has left of its usage windows, for \
-                       both vendors, in the vendor's own numbers. Free and fast: it spends no \
+                       every vendor, in the vendor's own numbers. Free and fast: it spends no \
                        tokens. Use it to choose an `account` before a long consultation, or after \
                        a rate-limited failure to find one that can answer now. Read `severity` \
                        and the per-model windows yourself — agentmux does not rank accounts, \
@@ -1015,11 +1015,14 @@ fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) ->
         {rules}A delegate with `ignore_user_config=false` loads this machine's own CLI
         configuration: its settings, hooks and MCP servers, so a hook can reopen its finished turn
         and its answer can depend on this machine. Pass `ignore_user_config: true` to skip that
-        configuration (a `codex` delegate still applies this machine's exec-policy rules), `false` when the point is to exercise that tooling, and `env`
-        to set variables that tooling reads. Within the limits, `sandbox` and `network_access`
-        choose what a `codex` delegate's commands may do, and `permission_mode`, `tools`,
-        `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted, the
-        default above applies. A value beyond a limit is refused, naming the limit, and never
+        configuration (a `codex` delegate still applies this machine's exec-policy rules, and an
+        `agy` delegate still runs the project's own hooks, MCP servers and plugins, so do not
+        point it at a checkout you do not trust), `false` when the point is to exercise that
+        tooling, and `env` to set variables that tooling reads. Within the limits, `sandbox` and
+        `network_access` choose what a `codex` delegate's commands may do, and `permission_mode`,
+        `tools`, `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted,
+        the default above applies. An `agy` delegate takes none of them: it may read, and its `deny`
+        rules above refuse the rest. A value beyond a limit is refused, naming the limit, and never
         lowered to fit. A limit is a ceiling on what agentmux requests, not on what this machine's
         own Codex `.rules` allow, which can run a matching command outside the sandbox. `follow_up` takes the same fields to change them for the next turn, and
         keeps what the newest turn ran with for any it omits; the limits are rechecked on every
@@ -1088,8 +1091,8 @@ fn roster(config: &agentmux::config::Config) -> String {
 /// The part of the instructions that is the same on every machine.
 ///
 /// [`instructions`] appends the accounts this one has.
-const INSTRUCTIONS: &str = r#"agentmux runs a question past the OTHER vendor's coding agent — `codex` when you are Claude Code,
-`claude` when you are Codex — and keeps the whole transcript. Your own harness already spawns
+const INSTRUCTIONS: &str = r#"agentmux runs a question past ANOTHER vendor's coding agent — `codex` or `agy` when you are Claude
+Code, `claude` or `agy` when you are Codex — and keeps the whole transcript. Your own harness already spawns
 same-vendor subagents natively and more cheaply; agentmux exists to cross the vendor line, which is
 where a disagreement is worth paying for.
 
@@ -1148,7 +1151,8 @@ that a hook reopened after it had finished, and the findings are above all of th
 from the top, or open the file at `transcript:` with your own file tools — the inline text is
 bounded by your host's result limit, the file never is.
 
-Choose a delegate by naming `delegate` (`claude` or `codex`), a `model` and an `effort`. For the
+Choose a delegate by naming `delegate` (`claude`, `codex` or `agy`, Google's Antigravity CLI), a
+`model` and an `effort`. For the
 model, prefer a family alias this machine defines — they are listed below when it defines any, and
 `quota` lists them too — and otherwise name the vendor's own identifier; `opus` and `sol` show an
 alias's shape, not a list of them. agentmux keeps no built-in model roster; this machine's rewrites

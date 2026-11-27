@@ -196,8 +196,8 @@ fn no_tool_schema_needs_a_definitions_table() {
 /// The store refuses the launch either way, so what this buys is that the call is never made: a
 /// model fills in the enum it is shown, and an option whose only outcome is a refusal does not
 /// belong in it.
-/// `quota` keeps both vendors on purpose — reading what an account has left launches nothing, and
-/// an operator watching two accounts still wants both numbers from the host they work in.
+/// `quota` keeps every vendor on purpose — reading what an account has left launches nothing, and
+/// an operator watching several accounts still wants every number from the host they work in.
 #[gtest]
 fn a_denied_vendor_is_not_offered_where_it_would_be_launched() {
     let delegates = |denied: BTreeSet<Vendor>, tool: &str| -> Vec<String> {
@@ -221,28 +221,28 @@ fn a_denied_vendor_is_not_offered_where_it_would_be_launched() {
             })
             .unwrap_or_default()
     };
-    let both = || vec!["claude".to_owned(), "codex".to_owned()];
+    let every = || vec!["claude".to_owned(), "codex".to_owned(), "agy".to_owned()];
 
-    // Under Claude Code, the two tools that spawn a delegate offer only the other vendor.
+    // Under Claude Code, the two tools that spawn a delegate offer only the other vendors.
     let claude_denied = || BTreeSet::from([Vendor::Claude]);
     assert_that!(
         delegates(claude_denied(), "ask"),
-        eq(&vec!["codex".to_owned()])
+        eq(&vec!["codex".to_owned(), "agy".to_owned()])
     );
     assert_that!(
         delegates(claude_denied(), "start"),
-        eq(&vec!["codex".to_owned()])
+        eq(&vec!["codex".to_owned(), "agy".to_owned()])
     );
-    assert_that!(delegates(claude_denied(), "quota"), eq(&both()));
+    assert_that!(delegates(claude_denied(), "quota"), eq(&every()));
 
     // Under Codex, the mirror image.
     assert_that!(
         delegates(BTreeSet::from([Vendor::Codex]), "ask"),
-        eq(&vec!["claude".to_owned()])
+        eq(&vec!["claude".to_owned(), "agy".to_owned()])
     );
 
     // A server that denies nothing advertises everything, which is the terminal's case and the
     // default.
-    assert_that!(delegates(BTreeSet::new(), "ask"), eq(&both()));
-    assert_that!(delegates(BTreeSet::new(), "start"), eq(&both()));
+    assert_that!(delegates(BTreeSet::new(), "ask"), eq(&every()));
+    assert_that!(delegates(BTreeSet::new(), "start"), eq(&every()));
 }

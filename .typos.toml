@@ -19,4 +19,7 @@ extend-ignore-re = [
 
   # Ignore everything between "spellcheck:ignore-start" and "spellcheck:ignore-end".
   "(?s)(#|//|--|<!--)\\s*spellcheck:ignore-start.*?\\n.*?(#|//|--|<!--)\\s*spellcheck:ignore-end",
+
+  # The one chunk of a recorded agy reply that splits a word where it fell.
+  "\"text_delta\":\" command produced the fo\"",
 ]

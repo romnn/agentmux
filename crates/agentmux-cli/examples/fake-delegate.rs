@@ -1,7 +1,7 @@
 //! A stand-in for a delegate CLI, for the tests that run the real `agentmux` against it.
 //!
-//! A test copies it into a directory of its own under the name of the CLI it plays, `claude` or
-//! `codex`, puts that directory on the delegate's `PATH`, and writes beside it the
+//! A test copies it into a directory of its own under the name of the CLI it plays, `claude`,
+//! `codex` or `agy`, puts that directory on the delegate's `PATH`, and writes beside it the
 //! [`FAKE_DELEGATE_CONFIG`] that says what to do.
 //! It reads its configuration from beside its own executable rather than from its environment or
 //! its arguments, because agentmux decides both: the environment is an allowlist and the
@@ -11,6 +11,8 @@
 //! Otherwise it reads its question from stdin: to its end, or as its first line when its
 //! arguments say `--input-format stream-json`, as a Claude turn's do once its supervisor holds its
 //! input open.
+//! Started as agy is, with `--print=`, it reads to the end of its input and refuses anything but
+//! the one stream-json record agy takes, as agy itself would.
 //! It then writes the configured stream and stderr, waits until the configured release file
 //! exists, its directory has gone or [`LONGEST_WAIT`] has passed, writes what it was told to write
 //! last, and exits with the configured status.
@@ -112,6 +114,27 @@ fn record_argv(path: &std::path::Path) -> Result<usize, String> {
     Ok(recorded.lines().count())
 }
 
+/// Refuse an agy question that is not exactly one `{"event":"user","message":{"content":…}}`
+/// record.
+fn check_agy_record(question: &str) -> Result<(), String> {
+    let mut lines = question.lines();
+    let record = lines
+        .next()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| {
+            record.get("event").and_then(serde_json::Value::as_str) == Some("user")
+                && record
+                    .pointer("/message/content")
+                    .is_some_and(serde_json::Value::is_string)
+        });
+    match (record, lines.next()) {
+        (Some(_), None) => Ok(()),
+        _ => Err(format!(
+            "agy takes one stream-json user record, not {question:?}"
+        )),
+    }
+}
+
 fn run() -> Result<u8, String> {
     let config_path = std::env::current_exe()
         .map_err(|err| format!("cannot locate itself: {err}"))?
@@ -123,17 +146,23 @@ fn run() -> Result<u8, String> {
     let number = record_argv(&config_path.with_file_name(FAKE_DELEGATE_ARGV))?;
     let config = config.run(number);
 
+    // agy also takes `--input-format stream-json`, but reads its input to the end, where Claude
+    // reads one line and keeps its input open.
+    let agy = std::env::args().any(|arg| arg == "--print=");
     let streamed = std::env::args()
         .collect::<Vec<_>>()
         .windows(2)
         .any(|pair| pair == ["--input-format", "stream-json"]);
     let mut question = String::new();
-    let read = if streamed {
+    let read = if streamed && !agy {
         std::io::stdin().lock().read_line(&mut question)
     } else {
         std::io::stdin().read_to_string(&mut question)
     };
     read.map_err(|err| format!("cannot read the question: {err}"))?;
+    if agy {
+        check_agy_record(&question)?;
+    }
     let mut stdout = std::io::stdout();
     write!(stdout, "{}", config.stdout).map_err(|err| format!("cannot write stdout: {err}"))?;
     stdout

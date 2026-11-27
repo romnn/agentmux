@@ -1,7 +1,7 @@
 ---
 name: real-cli-testing
 description:
-    Run agentmux's live tests against the real claude and codex CLIs, re-record or add stream
+    Run agentmux's live tests against the real claude, codex and agy CLIs, re-record or add stream
     fixtures under crates/agentmux/fixtures, scrub the recording machine's identity from a capture,
     or decide which test harness a change needs (live, codex-app-server-mock, ScriptedLauncher). Use
     after upgrading either CLI, when a CLI's output format may have changed, when a fixture test
@@ -34,8 +34,9 @@ chosen accounts: the library suite uses the configured default accounts, and
 `AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` select an account only for the CLI
 steering tests.
 
-`crates/agentmux/tests/live.rs` drives real `claude` and `codex` processes. Run it after upgrading
-either CLI:
+`crates/agentmux/tests/live.rs` drives real `claude`, `codex` and `agy` processes; the agy test
+runs a consultation in the user's own home and one in the home agentmux keeps. Run it after
+upgrading a CLI:
 
 ```bash
 cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
@@ -82,7 +83,7 @@ Both check messages against codex's own schema; see ADR
 
 ## Fixture tests
 
-The recorded streams live under `crates/agentmux/fixtures/{claude,codex}/`, registered in
+The recorded streams live under `crates/agentmux/fixtures/{claude,codex,agy}/`, registered in
 `agentmux::testing::fixtures`. They were captured from real runs with the exact flags
 `crates/agentmux/src/delegate.rs` builds. `crates/agentmux/tests/capture.rs` checks them:
 `no_committed_fixture_contains_an_unnamed_event_type` fails if a fixture contains an event type the
@@ -117,11 +118,18 @@ contains several recording-machine details:
 - the session UUID encoded into the memory-directory slug;
 - the list of skills and slash commands you have installed.
 
-Inspect the entire capture for machine identity, including tool arguments and output; Codex captures
-need inspection too. None of it is read by either parser. Replace those fields with mocked values
+Inspect the entire capture for machine identity, including tool arguments and output; Codex and agy
+captures need inspection too.
+An agy capture names the checkout in `init.cwd`, in tool parameters and in the assistant's text,
+which arrives as `text_delta` chunks that can split a path across lines: scrub each step's joined
+text, then split it again, so `result.response` still repeats it exactly. None of it is read by either parser. Replace those fields with mocked values
 before committing, following the committed fixtures: `/work/project` for the checkout, `/home/dev`
 for the home directory, `-work-project` for the memory slug, `/tmp/socket` for a socket path, and an
 empty or stock list of skills and slash commands.
 
-`no_committed_fixture_carries_a_recording_machine_path` rejects several known path markers when the
-capture tests run. It does not replace manual scrubbing.
+`no_committed_fixture_carries_a_recording_machine_path` rejects several known path markers, and
+every home directory other than `/home/dev`, when the capture tests run. It does not replace manual
+scrubbing.
+A chunk that splits a word can trip `task spellcheck`; add a pattern for that one chunk to
+`.typos.toml`'s `extend-ignore-re`, as the one there for `resume.jsonl` does, rather than excluding
+the fixture.

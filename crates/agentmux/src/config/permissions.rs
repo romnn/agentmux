@@ -249,6 +249,36 @@ pub struct CodexLimits {
     pub allow_network: Option<bool>,
 }
 
+/// `[agy]` in a machine file: whether an agy consultation loads the user's configuration by
+/// default, and whether it may.
+///
+/// agy's permissions are fixed, so isolation is all its tables hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyPolicy {
+    /// What a consultation gets when its caller names nothing.
+    #[serde(default)]
+    pub defaults: AgyDefaults,
+    /// What a caller may ask for.
+    #[serde(default)]
+    pub limits: AgyLimits,
+}
+
+/// `[agy.defaults]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyDefaults {
+    /// Whether to run agy in a home of its own rather than the user's; `false` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_user_config: Option<bool>,
+}
+
+/// `[agy.limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgyLimits {
+    /// Whether a delegate may run in the user's own home; `true` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_user_config: Option<bool>,
+}
+
 /// `[claude]` in a machine file: what a Claude consultation gets by default, and may ask for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudePolicy {
@@ -309,7 +339,10 @@ empty_when_default!(
     CodexLimits,
     ClaudePolicy,
     ClaudeDefaults,
-    ClaudeLimits
+    ClaudeLimits,
+    AgyPolicy,
+    AgyDefaults,
+    AgyLimits
 );
 
 impl CodexLimits {
@@ -463,7 +496,7 @@ impl ClaudePolicy {
 
 /// What one vendor's tables say about loading the user's own configuration.
 ///
-/// The part of the policy both vendors share, read through [`super::Config::permissions`].
+/// The part of the policy every vendor shares, read through [`super::Config::permissions`].
 #[derive(Debug, Clone, Copy)]
 pub struct PermissionPolicy<'a> {
     vendor: Vendor,
@@ -627,6 +660,8 @@ pub(super) fn validate(
             .hold(codex.fill(CodexPermissions::default()), Some(path))
             .map(drop),
         Vendor::Claude => claude.hold(&claude.fill(&ClaudePermissions::default()), Some(path)),
+        // Nothing in the file can change what an agy delegate may do.
+        Vendor::Agy => Ok(()),
     }
     .map_err(|refusal| refused(defaults(), refusal))
 }

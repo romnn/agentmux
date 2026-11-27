@@ -475,7 +475,9 @@ pub fn keep_std_handles_from_children() {
 
 /// A recorded event stream, committed under `fixtures/`.
 ///
-/// Every fixture was captured from a real CLI run with the exact flags [`crate::delegate`] builds.
+/// Every fixture was captured from a real CLI run with the exact flags [`crate::delegate`] builds,
+/// or, for agy, with the output flags it builds and the question given as an argument, which agy
+/// answers with the same stream.
 /// They are the only thing that keeps this crate honest about vendor JSON it does not control.
 pub mod fixtures {
     /// A short Claude consultation that answered and finished cleanly.
@@ -557,6 +559,34 @@ pub mod fixtures {
     pub const CODEX_UNSUPPORTED_MODEL: &str =
         include_str!("../fixtures/codex/unsupported-model.jsonl");
 
+    /// An agy turn whose command needed an approval nobody could give: agy denied it, the model
+    /// said nothing more, and the run reported success.
+    pub const AGY_SOFT_DENIED: &str = include_str!("../fixtures/agy/soft-denied.jsonl");
+
+    /// An agy turn launched with its permissions skipped, which ran a command and answered with
+    /// its output.
+    pub const AGY_TOOL_USE: &str = include_str!("../fixtures/agy/tool-use.jsonl");
+
+    /// The follow-up to [`AGY_TOOL_USE`] in the same conversation, whose `result` counts the
+    /// tokens of both turns.
+    pub const AGY_RESUME: &str = include_str!("../fixtures/agy/resume.jsonl");
+
+    /// An agy turn launched with its permissions skipped, whose command ran in the background:
+    /// agy waited for it, answered again, and wrote one `result` holding both answers, with a
+    /// payload-free `error_message` step on the way.
+    pub const AGY_BACKGROUND: &str = include_str!("../fixtures/agy/background.jsonl");
+
+    /// An agy model the CLI does not know: a lone `result` with `status: "ERROR"` and no session.
+    pub const AGY_UNKNOWN_MODEL: &str = include_str!("../fixtures/agy/unknown-model.jsonl");
+
+    /// An agy turn under agentmux's deny rules, read as a stream-json question: its write and its
+    /// command failed as `tool` steps ending `ERROR`, and it answered.
+    pub const AGY_RULE_DENIED: &str = include_str!("../fixtures/agy/rule-denied.jsonl");
+
+    /// What `agy --print /usage --output-format json` printed: the usage groups under
+    /// `command.data`, one of whose windows nobody had used yet.
+    pub const AGY_USAGE: &str = include_str!("../fixtures/agy/usage.json");
+
     /// A committed fixture, and how the turn it was recorded from folds.
     #[derive(Debug, Clone)]
     pub struct Fixture {
@@ -585,7 +615,7 @@ pub mod fixtures {
     /// Every committed fixture.
     #[must_use]
     pub fn all() -> Vec<Fixture> {
-        use crate::delegate::Vendor::{self, Claude, Codex};
+        use crate::delegate::Vendor::{self, Agy, Claude, Codex};
         let fixture = |vendor: Vendor, name, stream| Fixture {
             vendor,
             name,
@@ -615,6 +645,12 @@ pub mod fixtures {
                 CODEX_RESUME_WARNING,
             ),
             fixture(Codex, "codex/unsupported-model", CODEX_UNSUPPORTED_MODEL),
+            fixture(Agy, "agy/soft-denied", AGY_SOFT_DENIED),
+            fixture(Agy, "agy/tool-use", AGY_TOOL_USE),
+            fixture(Agy, "agy/resume", AGY_RESUME),
+            fixture(Agy, "agy/background", AGY_BACKGROUND),
+            fixture(Agy, "agy/unknown-model", AGY_UNKNOWN_MODEL),
+            fixture(Agy, "agy/rule-denied", AGY_RULE_DENIED),
         ]
     }
 }

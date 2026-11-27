@@ -710,8 +710,8 @@ pub fn quota_block(status: &RunStatus) -> Vec<String> {
 /// One account's quota, as lines a reader scans.
 ///
 /// The vendor payloads have nothing in common — Claude reports a `limits` array of percentages,
-/// Codex a map of named buckets — so this reads whichever shape is present and says nothing when
-/// it recognises neither.
+/// Codex a map of named buckets, agy groups of buckets — so this reads whichever shape is present
+/// and says nothing when it recognises none.
 /// It is presentation only: the payload itself is passed through untouched, so a field this
 /// function has never heard of still reaches a caller reading the JSON.
 #[must_use]
@@ -737,6 +737,7 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
             lines.push(format!("  {}", describe_origin(origin)));
             let windows = claude_windows(payload)
                 .or_else(|| codex_windows(payload))
+                .or_else(|| agy_windows(payload))
                 .unwrap_or_default();
             if windows.is_empty() {
                 lines.push("  no window this build recognises; read the payload".to_owned());
@@ -852,6 +853,48 @@ fn codex_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{id}{name}: {windows}")
+            })
+            .collect(),
+    )
+}
+
+/// agy reports groups of models, each with buckets naming a window, the fraction of it left and
+/// when it resets.
+///
+/// A window nobody has used yet resets at the Unix epoch, which is said as such rather than as a
+/// reset half a century ago.
+fn agy_windows(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let groups = payload.get("groups")?.as_array()?;
+    Some(
+        groups
+            .iter()
+            .flat_map(|group| {
+                let name = group
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("models");
+                let buckets = group.get("buckets").and_then(|b| b.as_array());
+                buckets.into_iter().flatten().map(move |bucket| {
+                    let window = bucket
+                        .get("window")
+                        .and_then(|w| w.as_str())
+                        .unwrap_or("window");
+                    let used = bucket
+                        .get("remaining_fraction")
+                        .and_then(serde_json::Value::as_f64)
+                        .map_or_else(
+                            || "?".to_owned(),
+                            |left| format!("{:.0}%", (1.0 - left) * 100.0),
+                        );
+                    let resets = match bucket.get("reset_time").and_then(|r| r.as_str()) {
+                        Some(reset) if reset.starts_with("1970-01-01") => {
+                            ", not used yet".to_owned()
+                        }
+                        Some(reset) => format!(", resets {reset}"),
+                        None => String::new(),
+                    };
+                    format!("{name} {window}: {used} used{resets}")
+                })
             })
             .collect(),
     )

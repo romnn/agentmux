@@ -331,5 +331,6 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
         input,
         last_result: None,
         steers_taken: Vec::new(),
+        unfinished: None,
     }
 }

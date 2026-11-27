@@ -639,6 +639,7 @@ fn fold_with(index: u32, question: &str, events: &str, streamed: Option<&StreamI
         input,
         last_result,
         steers_taken,
+        unfinished: None,
     }
 }
 

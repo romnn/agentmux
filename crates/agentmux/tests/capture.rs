@@ -578,7 +578,7 @@ fn no_committed_fixture_carries_a_recording_machine_path() {
     let machine_identity = [
         "/Users/",
         "/Volumes/",
-        "/private/tmp/claude-",
+        "/tmp/claude-",
         "-scratchpad",
         // A memory slug encodes the absolute checkout path, so any slug that starts at a
         // filesystem root came from a real machine rather than the mocked `-work-project`.
@@ -599,6 +599,19 @@ fn no_committed_fixture_carries_a_recording_machine_path() {
                  replace it with a mocked value before committing"
             );
         }
+        // A home directory is the mocked user's, `/home/dev`, or the recording user's.
+        let foreign_homes: Vec<&str> = stream
+            .match_indices("/home/")
+            .map(|(at, _)| stream.get(at..).unwrap_or_default())
+            .map(|home| home.split(['/', '"', '\\']).nth(2).unwrap_or_default())
+            .filter(|user| *user != "dev")
+            .collect();
+        assert_that!(
+            foreign_homes,
+            is_empty(),
+            "fixture {name} carries a home directory from the machine that recorded it; \
+             replace it with /home/dev before committing"
+        );
     }
 }
 
@@ -1226,4 +1239,237 @@ fn a_rate_limit_warning_leaves_the_window_open() {
     let rendered = agentmux::transcript::render_turn(&turn);
     assert_that!(rendered, contains_substring("five_hour window resets at"));
     assert_that!(rendered, not(contains_substring("reopens")));
+}
+
+/// The report-content messages of a turn, in order.
+fn report(turn: &agentmux::transcript::Turn) -> Vec<String> {
+    turn.messages
+        .iter()
+        .filter(|message| message.is_report_content())
+        .map(|message| message.text.clone())
+        .collect()
+}
+
+/// agentmux's own notes in a turn, in order.
+fn notes(turn: &agentmux::transcript::Turn) -> Vec<String> {
+    turn.messages
+        .iter()
+        .filter(|message| message.source == MessageSource::Synthetic)
+        .map(|message| message.text.clone())
+        .collect()
+}
+
+/// An agy answer streamed in chunks is the step's text, once: the `result` repeating it is not a
+/// second copy.
+#[gtest]
+fn an_agy_answer_is_its_steps_text_once() {
+    let Fold { turn, session, .. } = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_TOOL_USE);
+
+    assert_that!(
+        report(&turn),
+        elements_are![eq("The exact output is:\n\n```\nPROBE_B\n```\n")]
+    );
+    assert_that!(
+        session.map(|session| session.as_str().to_owned()),
+        some(eq("e4c7ded7-2bf0-480b-9326-24191d51e4ba"))
+    );
+    assert_that!(
+        turn.resolved_model.as_deref(),
+        some(eq("gemini-3.8-flash-low"))
+    );
+    // The footer quotes agy's own figures, which count cache reads beside the input.
+    assert_that!(
+        turn.outcome,
+        eq(&Outcome::Completed {
+            usage: Usage {
+                input_tokens: Some(13646),
+                cached_input_tokens: Some(9425),
+                cache_write_input_tokens: None,
+                output_tokens: Some(53),
+                reasoning_output_tokens: Some(0),
+            },
+            cost_usd: None,
+        })
+    );
+}
+
+/// An agy answer that only the `result` carries, because no step said anything, is the answer.
+#[gtest]
+fn an_agy_answer_only_its_result_carries_is_the_answer() {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","init":{"model":"gemini-3.8-flash-low"},"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba"}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"DONE","step_type":"agent_response"}}
+        {"event":"result","result":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","status":"SUCCESS","response":"PELICAN\n"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(report(&turn), elements_are![eq("PELICAN\n")]);
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+}
+
+/// The reply an agy stream ended in the middle of is not in the turn, whose render must only
+/// grow while more of it may arrive, but is handed on for the turn to keep once it has ended.
+#[gtest]
+fn an_agy_reply_the_stream_ended_in_the_middle_of_is_handed_on() {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","init":{"model":"gemini-3.8-flash-low"},"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba"}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Half a "}}
+        {"event":"step_update","step_update":{"conversation_id":"e4c7ded7-2bf0-480b-9326-24191d51e4ba","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"reply"}}
+    "#};
+    let Fold {
+        turn, unfinished, ..
+    } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(report(&turn), is_empty());
+    assert_that!(unfinished.as_deref(), some(eq("Half a reply")));
+}
+
+/// An agy follow-up continues the conversation it resumed.
+#[gtest]
+fn an_agy_resume_continues_its_conversation() {
+    let first = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_TOOL_USE);
+    let second = stream::fold(Vendor::Agy, 1, "q", fixtures::AGY_RESUME);
+
+    assert_that!(second.session, some(anything()));
+    assert_that!(second.session, eq(&first.session));
+    assert_that!(
+        second.turn.outcome,
+        matches_pattern!(Outcome::Completed { .. })
+    );
+    assert_that!(report(&second.turn).len(), eq(1));
+}
+
+/// A call agy denied for want of an approval, after which the model said nothing, is a failed
+/// turn that names the denial, although agy reported success and exited 0.
+#[gtest]
+fn an_agy_soft_denial_without_an_answer_fails_the_turn() {
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_SOFT_DENIED);
+
+    assert_that!(report(&turn), is_empty());
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::Unclassified),
+            detail: contains_substring("agy denied Bash (`command`)")
+        })
+    );
+    // The transcript says what was denied above the failure.
+    assert_that!(
+        notes(&turn),
+        elements_are![contains_substring("Bash (`command`)")]
+    );
+}
+
+/// Calls agentmux's deny rules refused are shown where they failed, and a turn that answered
+/// anyway completed.
+#[gtest]
+fn an_agy_rule_denial_is_shown_and_an_answered_turn_completes() {
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_RULE_DENIED);
+
+    assert_that!(
+        notes(&turn),
+        elements_are![
+            starts_with("the delegate's `write_file` call failed: permission check failed"),
+            starts_with("the delegate's `run_command` call failed: permission check failed"),
+        ]
+    );
+    assert_that!(report(&turn).len(), eq(1));
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+    // The payload-free `error_message` step the run carries is not drift.
+    assert_that!(turn.unrecognised.summary(), none());
+}
+
+/// A failed tool call followed by no answer fails the turn, quoting what the call said.
+#[gtest]
+fn an_agy_failed_call_without_an_answer_fails_the_turn() {
+    let stream = indoc::indoc! {r#"
+        {"event":"init","conversation_id":"c1","init":{"model":"m"}}
+        {"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","error":{"type":"TOOL_ERROR","message":"Permission denied for unsandboxed(cargo test)."}}}}
+        {"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":""}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::Unclassified),
+            detail: contains_substring("Permission denied for unsandboxed(cargo test).")
+        })
+    );
+}
+
+/// agy waits for a backgrounded command before its one `result`, and every answer it gave on
+/// the way is kept, the payload-free `error_message` step in between meaning nothing.
+#[gtest]
+fn an_agy_background_task_keeps_both_answers() {
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_BACKGROUND);
+
+    assert_that!(
+        report(&turn),
+        elements_are![
+            eq("started\n"),
+            eq("The background task has finished successfully with output: `BG_DONE`.\n")
+        ]
+    );
+    assert_that!(turn.outcome, matches_pattern!(Outcome::Completed { .. }));
+}
+
+/// An unknown agy model is a failure of its own kind, with agy's list of models in the detail,
+/// and no session to resume.
+#[gtest]
+fn an_unknown_agy_model_is_model_unavailable() {
+    let Fold { turn, session, .. } = stream::fold(Vendor::Agy, 0, "q", fixtures::AGY_UNKNOWN_MODEL);
+
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            kind: eq(&FailureKind::ModelUnavailable),
+            detail: contains_substring("Available models:")
+        })
+    );
+    assert_that!(session, none());
+}
+
+/// Every other agy error stays unclassified, an overload included: a classified overload would
+/// have agentmux resume the consultation at a cost, on a guess at agy's wording.
+#[gtest]
+fn an_agy_error_other_than_an_unknown_model_is_not_classified() {
+    for error in [
+        // agy's own words for a model out of capacity, as a run reported them.
+        "API error (attempt 2): transport error (Unavailable, HTTP 503): No capacity available \
+         for model gemini-3.8-flash-low on the server",
+        // Words the other vendors' streams are read as an overload by, and agy's are not.
+        "upstream: the model is overloaded",
+    ] {
+        let stream = format!(
+            "{}\n",
+            serde_json::json!({"event": "result", "result": {
+                "conversation_id": "c1", "status": "ERROR", "response": "", "error": error,
+            }})
+        );
+        let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", &stream);
+
+        assert_that!(
+            turn.outcome,
+            eq(&Outcome::Failed {
+                kind: FailureKind::Unclassified,
+                detail: error.to_owned(),
+            }),
+            "{error}"
+        );
+    }
+}
+
+/// A step type the agy parser does not name is counted, not skipped.
+#[gtest]
+fn an_unknown_agy_step_type_is_counted() {
+    let stream = indoc::indoc! {r#"
+        {"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"DONE","step_type":"checkpoint"}}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Agy, 0, "q", stream);
+
+    assert_that!(
+        turn.unrecognised.summary(),
+        some(eq("step_update.checkpoint x1"))
+    );
 }

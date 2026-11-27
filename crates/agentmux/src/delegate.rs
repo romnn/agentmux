@@ -9,8 +9,8 @@
 //! Only the isolation flags depend on a choice, and that choice is recorded with the
 //! consultation.
 //!
-//! Two variants, not a trait: the set is closed at two, and an exhaustive `match` makes the
-//! compiler enumerate every place a third vendor would need handling.
+//! Three variants, not a trait: the set is closed, and an exhaustive `match` makes the compiler
+//! enumerate every place another vendor would need handling.
 //!
 //! # Model identifiers are opaque
 //!
@@ -144,6 +144,27 @@ pub enum DelegateError {
         field: &'static str,
         /// Why the consultation runs on a subscription.
         why: &'static str,
+    },
+
+    /// An isolated agy delegate was built outside the run store, which keeps the home it runs in.
+    #[error(
+        "an isolated agy delegate runs in the home its run store keeps, so it can only be launched \
+         through the store"
+    )]
+    AgyHomeUnknown,
+
+    /// agy's own settings file exists but cannot be read, and its permission rules have to be
+    /// carried into the launch.
+    #[error(
+        "cannot launch agy: agentmux carries the deny and ask rules of {path} into every agy \
+         launch, because the settings it passes replace them, and that file cannot be read: \
+         {reason}. Fix the file or move it aside, then ask again."
+    )]
+    AgySettingsUnreadable {
+        /// The settings file.
+        path: PathBuf,
+        /// Why it could not be read or parsed.
+        reason: String,
     },
 
     /// The caller asked for API pricing, which only an account the machine opted in may give.
@@ -294,7 +315,7 @@ pub struct ModelId(String);
 
 impl ModelId {
     /// Longest identifier accepted.
-    /// Well past anything either vendor ships.
+    /// Well past anything any vendor ships.
     pub const MAX_LEN: usize = 128;
 
     /// Validate a model identifier for argv safety.
@@ -428,7 +449,9 @@ string_newtype_conversions!(AccountAlias);
 ///
 /// Isolation is what makes a consultation a second opinion rather than a second copy of the
 /// caller's own setup: no settings, no hooks, no MCP servers.
-/// It is imposed by argument, not by environment — no variable can switch it on or off.
+/// It is imposed by argument, not by environment — no variable can switch it on or off — except
+/// for agy, which has no such argument and runs in a home the run store keeps for it instead; see
+/// `agy_args`.
 /// The public spelling is `ignore_user_config`: `true` is [`Self::Isolated`], `false` is
 /// [`Self::Inherit`].
 ///
@@ -791,13 +814,14 @@ fn join_tools(tools: &[ClaudeTool]) -> String {
         .join(",")
 }
 
-/// The permission options a front end presents flat, for either vendor.
+/// The permission options a front end presents flat, for every vendor.
 ///
 /// What [`Delegate::from_parts`] builds a request from, and what [`Delegate::with_options`]
 /// applies to a recorded consultation as a follow-up's overrides; an absent value takes the
 /// default there, and keeps the recorded choice here.
-/// Each option belongs to one vendor except the isolation, and one given for the other vendor is
+/// Each option belongs to one vendor except the isolation, and one given for another vendor is
 /// refused rather than ignored.
+/// agy has none of its own: its permissions are fixed, as `agy_args` describes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionOptions {
     /// Whether to skip the user's own configuration; see [`Isolation::from_spellings`].
@@ -817,28 +841,38 @@ pub struct PermissionOptions {
 }
 
 impl PermissionOptions {
-    /// The first option set that belongs to the other vendor than `vendor`, by the name a caller
-    /// spells it.
+    /// The first option set that belongs to another vendor than `vendor`, by the name a caller
+    /// spells it, with the vendor it belongs to.
     fn first_foreign(&self, vendor: Vendor) -> Option<(&'static str, Vendor)> {
-        match vendor {
-            Vendor::Claude => [
-                ("sandbox", self.sandbox.is_some()),
-                ("network_access", self.network_access.is_some()),
-            ]
-            .into_iter()
-            .find_map(|(option, set)| set.then_some((option, Vendor::Codex))),
-            Vendor::Codex => [
-                ("permission_mode", self.permission_mode.is_some()),
-                ("tools", self.tools.is_some()),
-                ("allowed_tools", self.allowed_tools.is_some()),
-                ("disallowed_tools", self.disallowed_tools.is_some()),
-            ]
-            .into_iter()
-            .find_map(|(option, set)| set.then_some((option, Vendor::Claude))),
-        }
+        [
+            ("sandbox", self.sandbox.is_some(), Vendor::Codex),
+            (
+                "network_access",
+                self.network_access.is_some(),
+                Vendor::Codex,
+            ),
+            (
+                "permission_mode",
+                self.permission_mode.is_some(),
+                Vendor::Claude,
+            ),
+            ("tools", self.tools.is_some(), Vendor::Claude),
+            (
+                "allowed_tools",
+                self.allowed_tools.is_some(),
+                Vendor::Claude,
+            ),
+            (
+                "disallowed_tools",
+                self.disallowed_tools.is_some(),
+                Vendor::Claude,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(option, set, owner)| (set && owner != vendor).then_some((option, owner)))
     }
 
-    /// Refuse an option that belongs to the other vendor.
+    /// Refuse an option that belongs to another vendor.
     fn refuse_foreign(&self, vendor: Vendor) -> Result<(), DelegateError> {
         match self.first_foreign(vendor) {
             Some((option, owner)) => Err(DelegateError::NotForVendor {
@@ -904,6 +938,8 @@ pub enum Vendor {
     Claude,
     /// The `codex` CLI from `OpenAI`.
     Codex,
+    /// Google's Antigravity CLI, `agy`.
+    Agy,
 }
 
 impl Vendor {
@@ -912,7 +948,7 @@ impl Vendor {
     /// The one list, so that a third vendor cannot be added to the enum and left out of `quota`,
     /// `accounts` or the server's roster: those iterate this rather than spelling the set again,
     /// and its length is checked against the enum's own.
-    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Agy];
 
     /// The executable name, as found on `PATH`.
     #[must_use]
@@ -920,6 +956,7 @@ impl Vendor {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Agy => "agy",
         }
     }
 
@@ -927,24 +964,27 @@ impl Vendor {
     ///
     /// The directory the vendor's own variable names — `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — or the
     /// CLI's default under the home directory when the variable is unset or empty.
+    /// agy has no such variable and always keeps it at `~/.gemini/antigravity-cli`.
     /// `None` when neither is known, which is a child with no home at all.
     #[must_use]
     pub(crate) fn config_dir(self, env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
-        let configured = env
-            .get(credential_vars(self).config_dir)
+        let configured = credential_vars(self)
+            .and_then(|vars| env.get(vars.config_dir))
             .filter(|dir| !dir.is_empty())
             .map(std::path::PathBuf::from);
         let default_dir = match self {
-            Self::Claude => ".claude",
-            Self::Codex => ".codex",
+            Self::Claude => Path::new(".claude").to_path_buf(),
+            Self::Codex => Path::new(".codex").to_path_buf(),
+            Self::Agy => Path::new(".gemini").join("antigravity-cli"),
         };
         configured.or_else(|| Some(crate::config::home_dir(env)?.join(default_dir)))
     }
 
     /// Where this vendor's CLI saves a session for a later resume, as it resolves it from `env`.
     ///
-    /// Claude keeps a transcript per session under `projects` in its configuration directory, and
-    /// Codex a rollout under `sessions` in `CODEX_HOME`; a resume reads that file back.
+    /// Claude keeps a transcript per session under `projects` in its configuration directory,
+    /// Codex a rollout under `sessions` in `CODEX_HOME`, and agy a database per conversation under
+    /// `conversations`; a resume reads that file back.
     /// Nothing is read from it here: the directory is only named, so agentmux can ask whether the
     /// child will be able to write into it.
     #[must_use]
@@ -955,6 +995,7 @@ impl Vendor {
         let store = match self {
             Self::Claude => "projects",
             Self::Codex => "sessions",
+            Self::Agy => "conversations",
         };
         Some(self.config_dir(env)?.join(store))
     }
@@ -1064,7 +1105,7 @@ mod stored_account {
 /// Each variant carries only what that vendor accepts: a Claude consultation with a sandbox mode
 /// does not compile.
 /// The flat shapes a tool schema or a command line present are turned into this by
-/// [`Delegate::from_parts`], which is where a vendor-specific option given for the other vendor
+/// [`Delegate::from_parts`], which is where a vendor-specific option given for another vendor
 /// is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "vendor", rename_all = "snake_case")]
@@ -1111,6 +1152,27 @@ pub enum Delegate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         isolation: Option<Isolation>,
     },
+    /// Google's Antigravity CLI.
+    ///
+    /// It has no permission options: every launch runs under the fixed policy `agy_args`
+    /// describes.
+    Agy {
+        /// Model identifier, forwarded verbatim.
+        model: ModelId,
+        /// Reasoning effort, forwarded verbatim, or the CLI's own default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+        /// Which account to authenticate as.
+        #[serde(
+            default,
+            skip_serializing_if = "AccountChoice::is_default",
+            with = "stored_account"
+        )]
+        account: AccountChoice,
+        /// Whether to load the user's own settings, or the configured default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<Isolation>,
+    },
 }
 
 impl Delegate {
@@ -1124,7 +1186,7 @@ impl Delegate {
     /// # Errors
     ///
     /// Returns [`DelegateError::Argument`] when the model, effort or alias is not argv-safe, and
-    /// [`DelegateError::NotForVendor`] when `options` sets an option of the other vendor.
+    /// [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
     pub fn from_parts(
         vendor: Vendor,
         model: &str,
@@ -1150,6 +1212,12 @@ impl Delegate {
                 account,
                 isolation: None,
             },
+            Vendor::Agy => Self::Agy {
+                model,
+                effort,
+                account,
+                isolation: None,
+            },
         };
         unset.with_options(options)
     }
@@ -1161,7 +1229,7 @@ impl Delegate {
     ///
     /// # Errors
     ///
-    /// Returns [`DelegateError::NotForVendor`] when `options` sets an option of the other vendor.
+    /// Returns [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
     pub fn with_options(mut self, options: PermissionOptions) -> Result<Self, DelegateError> {
         options.refuse_foreign(self.vendor())?;
         let PermissionOptions {
@@ -1206,6 +1274,7 @@ impl Delegate {
                 permissions.sandbox = sandbox.or(permissions.sandbox);
                 permissions.network_access = network_access.or(permissions.network_access);
             }
+            Self::Agy { isolation, .. } => *isolation = requested_isolation.or(*isolation),
         }
         Ok(self)
     }
@@ -1215,7 +1284,7 @@ impl Delegate {
     /// Only those are taken from `turn`: who is consulted — vendor, model, effort and account —
     /// is fixed when a consultation starts, so a turn's record cannot move a follow-up onto
     /// another.
-    /// A record of the other vendor's delegate carries no permissions this one has, and changes
+    /// A record of another vendor's delegate carries no permissions this one has, and changes
     /// nothing.
     #[must_use]
     pub fn with_settings_of(mut self, turn: &Self) -> Self {
@@ -1250,8 +1319,14 @@ impl Delegate {
                 *isolation = *ran_isolation;
                 *permissions = *ran_permissions;
             }
-            (Self::Claude { .. }, Self::Codex { .. })
-            | (Self::Codex { .. }, Self::Claude { .. }) => {}
+            (
+                Self::Agy { isolation, .. },
+                Self::Agy {
+                    isolation: ran_isolation,
+                    ..
+                },
+            ) => *isolation = *ran_isolation,
+            (Self::Claude { .. } | Self::Codex { .. } | Self::Agy { .. }, _) => {}
         }
         self
     }
@@ -1262,6 +1337,7 @@ impl Delegate {
         match self {
             Self::Claude { .. } => Vendor::Claude,
             Self::Codex { .. } => Vendor::Codex,
+            Self::Agy { .. } => Vendor::Agy,
         }
     }
 
@@ -1269,7 +1345,9 @@ impl Delegate {
     #[must_use]
     pub fn isolation(&self) -> Option<Isolation> {
         match self {
-            Self::Claude { isolation, .. } | Self::Codex { isolation, .. } => *isolation,
+            Self::Claude { isolation, .. }
+            | Self::Codex { isolation, .. }
+            | Self::Agy { isolation, .. } => *isolation,
         }
     }
 
@@ -1281,7 +1359,9 @@ impl Delegate {
     #[must_use]
     pub fn with_isolation(mut self, resolved: Isolation) -> Self {
         match &mut self {
-            Self::Claude { isolation, .. } | Self::Codex { isolation, .. } => {
+            Self::Claude { isolation, .. }
+            | Self::Codex { isolation, .. }
+            | Self::Agy { isolation, .. } => {
                 *isolation = Some(resolved);
             }
         }
@@ -1298,6 +1378,9 @@ impl Delegate {
             Self::Codex {
                 account, isolation, ..
             } => resolve_isolation(*isolation, Vendor::Codex, account, config),
+            Self::Agy {
+                account, isolation, ..
+            } => resolve_isolation(*isolation, Vendor::Agy, account, config),
         }
     }
 
@@ -1306,7 +1389,7 @@ impl Delegate {
     pub fn codex_permissions(&self) -> Option<&CodexPermissions> {
         match self {
             Self::Codex { permissions, .. } => Some(permissions),
-            Self::Claude { .. } => None,
+            Self::Claude { .. } | Self::Agy { .. } => None,
         }
     }
 
@@ -1315,7 +1398,7 @@ impl Delegate {
     pub fn claude_permissions(&self) -> Option<&ClaudePermissions> {
         match self {
             Self::Claude { permissions, .. } => Some(permissions),
-            Self::Codex { .. } => None,
+            Self::Codex { .. } | Self::Agy { .. } => None,
         }
     }
 
@@ -1333,6 +1416,7 @@ impl Delegate {
             Self::Codex { permissions, .. } => {
                 *permissions = config.codex.fill(*permissions);
             }
+            Self::Agy { .. } => {}
         }
         self
     }
@@ -1364,6 +1448,7 @@ impl Delegate {
             Self::Codex { permissions, .. } => {
                 *permissions = config.codex.hold(*permissions, config.source.as_deref())?;
             }
+            Self::Agy { .. } => {}
         }
         Ok(held)
     }
@@ -1377,7 +1462,9 @@ impl Delegate {
     #[must_use]
     pub fn with_account(mut self, choice: AccountChoice) -> Self {
         match &mut self {
-            Self::Claude { account, .. } | Self::Codex { account, .. } => *account = choice,
+            Self::Claude { account, .. }
+            | Self::Codex { account, .. }
+            | Self::Agy { account, .. } => *account = choice,
         }
         self
     }
@@ -1390,7 +1477,9 @@ impl Delegate {
     #[must_use]
     pub fn with_model(mut self, replacement: ModelId) -> Self {
         match &mut self {
-            Self::Claude { model, .. } | Self::Codex { model, .. } => *model = replacement,
+            Self::Claude { model, .. } | Self::Codex { model, .. } | Self::Agy { model, .. } => {
+                *model = replacement;
+            }
         }
         self
     }
@@ -1402,7 +1491,9 @@ impl Delegate {
     #[must_use]
     pub fn with_effort(mut self, chosen: Effort) -> Self {
         match &mut self {
-            Self::Claude { effort, .. } | Self::Codex { effort, .. } => *effort = Some(chosen),
+            Self::Claude { effort, .. } | Self::Codex { effort, .. } | Self::Agy { effort, .. } => {
+                *effort = Some(chosen);
+            }
         }
         self
     }
@@ -1411,7 +1502,9 @@ impl Delegate {
     #[must_use]
     pub fn account(&self) -> &AccountChoice {
         match self {
-            Self::Claude { account, .. } | Self::Codex { account, .. } => account,
+            Self::Claude { account, .. }
+            | Self::Codex { account, .. }
+            | Self::Agy { account, .. } => account,
         }
     }
 
@@ -1419,7 +1512,9 @@ impl Delegate {
     #[must_use]
     pub fn model(&self) -> &ModelId {
         match self {
-            Self::Claude { model, .. } | Self::Codex { model, .. } => model,
+            Self::Claude { model, .. } | Self::Codex { model, .. } | Self::Agy { model, .. } => {
+                model
+            }
         }
     }
 
@@ -1430,7 +1525,9 @@ impl Delegate {
     #[must_use]
     pub fn effort(&self) -> Option<&Effort> {
         match self {
-            Self::Claude { effort, .. } | Self::Codex { effort, .. } => effort.as_ref(),
+            Self::Claude { effort, .. } | Self::Codex { effort, .. } | Self::Agy { effort, .. } => {
+                effort.as_ref()
+            }
         }
     }
 
@@ -1468,6 +1565,19 @@ impl Delegate {
                     describe_isolation(*isolation)
                 )
             }
+            Self::Agy {
+                model,
+                effort,
+                account,
+                isolation,
+            } => {
+                format!(
+                    "agy {model} effort={} account={}{}",
+                    describe_effort(effort.as_ref()),
+                    describe_account(account),
+                    describe_isolation(*isolation)
+                )
+            }
         }
     }
 }
@@ -1498,8 +1608,8 @@ pub struct TurnPlan<'a> {
     pub billing: Option<Billing>,
     /// Directories outside the working directory the delegate must be able to read.
     ///
-    /// Claude reads only its working directory unless granted more, so each is passed as
-    /// `--add-dir`; Codex's sandboxes read everywhere and need nothing.
+    /// Claude and agy read only their working directory unless granted more, so each is passed
+    /// as `--add-dir`; Codex's sandboxes read everywhere and need nothing.
     pub read_dirs: &'a [PathBuf],
 }
 
@@ -1516,7 +1626,7 @@ pub struct SessionRef(String);
 
 impl SessionRef {
     /// Longest identifier accepted.
-    /// Both vendors use UUIDs; this leaves room for a thread name.
+    /// Every vendor uses UUIDs; this leaves room for a thread name.
     pub const MAX_LEN: usize = 200;
 
     /// Wrap an identifier the delegate emitted.
@@ -1740,6 +1850,16 @@ const EXPLICIT_BILLING_ENV_NAMES: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
     "AWS_BEARER_TOKEN_BEDROCK",
     "CODEX_ACCESS_TOKEN",
+    // agy's gateway, which routes it to another backend with headers and a key of its own, the
+    // switch onto another of its logins, and the switch onto Google Cloud's application default
+    // credentials with the file they are read from; named by its binary and its documentation.
+    "AGY_ACCOUNT",
+    "AGY_ADC_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AGY_LLM_GATEWAY_URL",
+    "AGY_LLM_GATEWAY_MODELS",
+    "AGY_LLM_GATEWAY_API_KEY",
+    "AGY_LLM_GATEWAY_HEADERS",
 ];
 
 /// Namespaces whose endpoint and token names reroute a delegate or authenticate it.
@@ -1826,12 +1946,25 @@ impl Delegate {
     /// endpoint without opting into API pricing, [`DelegateError::Environment`] for an account that
     /// is empty, reads a secret from a host variable that is not set, or is otherwise unusable, and
     /// [`DelegateError::Argument`] or [`DelegateError::Environment`] for a request environment
-    /// entry the configuration does not allow.
+    /// entry the configuration does not allow, [`DelegateError::AgySettingsUnreadable`] for an
+    /// agy delegate whose own settings file cannot be read, and [`DelegateError::AgyHomeUnknown`]
+    /// for an isolated agy delegate, which only its run store can launch.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
         config: &Config,
+    ) -> Result<Invocation, DelegateError> {
+        self.invocation_in(plan, host_env, config, None)
+    }
+
+    /// The same, for a run store, which keeps `agy_home` for an isolated agy delegate to run in.
+    pub(crate) fn invocation_in(
+        &self,
+        plan: &TurnPlan<'_>,
+        host_env: &BTreeMap<String, String>,
+        config: &Config,
+        agy_home: Option<&Path>,
     ) -> Result<Invocation, DelegateError> {
         let Identity {
             mut env,
@@ -1850,21 +1983,6 @@ impl Delegate {
         let held = self.held_to_limits(config)?;
         let isolation = held.resolved_isolation(config);
 
-        let args = match &held {
-            Self::Claude {
-                model,
-                effort,
-                permissions,
-                ..
-            } => claude_args(model, effort.as_ref(), permissions, plan, isolation),
-            Self::Codex {
-                model,
-                effort,
-                permissions,
-                ..
-            } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
-        };
-
         let allowed: Vec<&str> = config
             .launch
             .request_env
@@ -1877,6 +1995,16 @@ impl Delegate {
             .map(String::as_str)
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
+
+        // Set over every other layer, so no account or request can move it; see ADR 0035.
+        if let Self::Agy { .. } = held
+            && !isolation.inherits()
+        {
+            use_agy_home(&mut env, agy_home.ok_or(DelegateError::AgyHomeUnknown)?)?;
+        }
+
+        // Built from the complete environment, whose home is where agy reads its own settings.
+        let args = held.args(plan, isolation, &env)?;
 
         // The recursion guard, set last so no layer can change even its value.
         // An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
@@ -1909,15 +2037,34 @@ impl Delegate {
     ///
     /// Crate-private, because only the run store holds an environment this method may be given:
     /// one [`Delegate::invocation`] built, which carries the allowlist and the recursion marker.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::AgySettingsUnreadable`] for an agy delegate whose own settings
+    /// file cannot be read.
     pub(crate) fn continuation(
         &self,
         plan: &TurnPlan<'_>,
         env: BTreeMap<String, String>,
         billing: Billing,
-    ) -> Invocation {
+    ) -> Result<Invocation, DelegateError> {
         let isolation = self.isolation().unwrap_or(Isolation::Isolated);
-        let args = match self {
+        Ok(Invocation {
+            program: self.vendor().program().to_owned(),
+            args: self.args(plan, isolation, &env)?,
+            env,
+            billing,
+        })
+    }
+
+    /// The argument vector for one turn, run under `isolation` in `env`.
+    fn args(
+        &self,
+        plan: &TurnPlan<'_>,
+        isolation: Isolation,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, DelegateError> {
+        Ok(match self {
             Self::Claude {
                 model,
                 effort,
@@ -1930,13 +2077,10 @@ impl Delegate {
                 permissions,
                 ..
             } => codex_args(model, effort.as_ref(), *permissions, plan, isolation),
-        };
-        Invocation {
-            program: self.vendor().program().to_owned(),
-            args,
-            env,
-            billing,
-        }
+            Self::Agy { model, effort, .. } => {
+                agy_args(model, effort.as_ref(), plan, &agy_user_rules(env)?)
+            }
+        })
     }
 
     /// How this delegate's turns run over `codex app-server`, or `None` when they cannot.
@@ -2139,10 +2283,13 @@ pub(crate) fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
     match vendor {
         Vendor::Claude => CLAUDE_CREDENTIAL_ALLOWLIST,
         Vendor::Codex => CODEX_CREDENTIAL_ALLOWLIST,
+        // agy's login is in the operating system's keyring, and every variable it authenticates
+        // with otherwise is a billing name.
+        Vendor::Agy => &[],
     }
 }
 
-/// Whether a name is one either CLI reads a credential from, which a named account withholds.
+/// Whether a name is one any CLI reads a credential from, which a named account withholds.
 #[must_use]
 pub fn is_credential_name(name: &str) -> bool {
     Vendor::ALL
@@ -2165,20 +2312,23 @@ pub(crate) struct CredentialVars {
     pub(crate) base_url: &'static str,
 }
 
-pub(crate) fn credential_vars(vendor: Vendor) -> CredentialVars {
+/// The variables a vendor's account fields map onto, or `None` for agy, which reads neither its
+/// login nor its configuration directory from a variable an account could set.
+pub(crate) fn credential_vars(vendor: Vendor) -> Option<CredentialVars> {
     match vendor {
-        Vendor::Claude => CredentialVars {
+        Vendor::Claude => Some(CredentialVars {
             config_dir: "CLAUDE_CONFIG_DIR",
             api_key: "ANTHROPIC_API_KEY",
             auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
             base_url: "ANTHROPIC_BASE_URL",
-        },
-        Vendor::Codex => CredentialVars {
+        }),
+        Vendor::Codex => Some(CredentialVars {
             config_dir: "CODEX_HOME",
             api_key: "OPENAI_API_KEY",
             auth_token: None,
             base_url: "OPENAI_BASE_URL",
-        },
+        }),
+        Vendor::Agy => None,
     }
 }
 
@@ -2376,7 +2526,10 @@ fn apply_credentials(
     account: &Account,
     host_env: &BTreeMap<String, String>,
 ) -> Result<(), DelegateError> {
-    let vars = credential_vars(vendor);
+    // An agy account holds only a description, which loading the machine file enforces.
+    let Some(vars) = credential_vars(vendor) else {
+        return Ok(());
+    };
     let home = crate::config::home_dir(host_env);
 
     if let Some(dir) = &account.config_dir {
@@ -2759,6 +2912,168 @@ fn codex_app_server_args(effort: Option<&Effort>, permissions: CodexPermissions)
     }
     args.extend(workspace_network_args(permissions));
     args
+}
+
+/// Argument vector for the agy CLI.
+///
+/// - `--print=` with `--input-format stream-json` and `--output-format stream-json`: the question
+///   arrives on stdin as the one record [`agy_input`] writes, so it never enters the argument
+///   vector, and the events stream as they happen.
+///   `--print` takes the prompt as its value, which stream-json input leaves empty.
+/// - `--conversation` on a resume.
+/// - `--model` on every turn, and `--effort` only when one was named, as for the other CLIs.
+/// - `--settings`, always: the permission policy [`agy_settings`] builds.
+/// - `--add-dir`, once for each directory the turn must read outside its working directory.
+///
+/// agy has no argument that skips the user's settings, hooks or MCP servers, so the run store
+/// runs an isolated delegate with `HOME` set to a home it keeps for agy instead, which holds none
+/// of them and no rules of the user's to carry over.
+/// The project's own hooks, MCP servers and plugins load in either mode: agy finds them in any
+/// directory it can read, and nothing turns them off.
+/// ADR 0035 records why.
+fn agy_args(
+    model: &ModelId,
+    effort: Option<&Effort>,
+    plan: &TurnPlan<'_>,
+    user_rules: &AgyPermissionRules,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--print=",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    ]
+    .map(str::to_owned)
+    .into();
+    if let Some(session) = plan.resume {
+        args.push("--conversation".to_owned());
+        args.push(session.as_str().to_owned());
+    }
+    args.push("--model".to_owned());
+    args.push(model.as_str().to_owned());
+    if let Some(effort) = effort {
+        args.push("--effort".to_owned());
+        args.push(effort.as_str().to_owned());
+    }
+    args.push("--settings".to_owned());
+    args.push(agy_settings(user_rules));
+    for dir in plan.read_dirs {
+        args.push("--add-dir".to_owned());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args
+}
+
+/// What an agy delegate may never do, as rules of agy's own: run a command, write a file, call an
+/// MCP tool, drive a browser or download a file.
+pub(crate) const AGY_DENY_RULES: [&str; 5] = [
+    "command(*)",
+    "write_file(*)",
+    "mcp(*)",
+    "execute_url(*)",
+    "download_url(*)",
+];
+
+/// The settings every agy launch overrides, as the one JSON object `--settings` takes.
+///
+/// - `agentMode: ""` selects agy's default execution mode, which headless agy otherwise replaces
+///   with `auto` where its terminal sandbox is available; `--mode` has no value that names it.
+/// - `toolPermission: "request-review"` sends every call that needs approval to a review, which
+///   headless agy denies, whatever preset the user chose.
+/// - `permissions.deny` names [`AGY_DENY_RULES`], which win over any rule allowing the same call,
+///   in every mode.
+/// - `useG1Credits: false` keeps a model whose quota is used up from going on at the price of the
+///   account's AI credits, which a subscription consultation must not spend.
+///
+/// `--settings` replaces the user's whole `permissions` object rather than merging its lists, so
+/// the user's own `deny` and `ask` rules are carried over beside these.
+/// Their `allow` rules are not, since those only widen what a delegate may do.
+/// Reading files and fetching a URL stay at agy's own defaults: a read is allowed, and a fetch
+/// asks, which headless agy denies.
+fn agy_settings(user_rules: &AgyPermissionRules) -> String {
+    let deny: Vec<&str> = AGY_DENY_RULES
+        .into_iter()
+        .chain(user_rules.deny.iter().map(String::as_str))
+        .collect();
+    serde_json::json!({
+        "agentMode": "",
+        "toolPermission": "request-review",
+        "permissions": {"deny": deny, "ask": user_rules.ask},
+        "useG1Credits": false,
+    })
+    .to_string()
+}
+
+/// The part of agy's own `settings.json` that `--settings` would otherwise drop.
+#[derive(Debug, Default, Deserialize)]
+struct AgySettingsFile {
+    #[serde(default)]
+    permissions: AgyPermissionRules,
+}
+
+/// The user's own `deny` and `ask` rules, verbatim.
+#[derive(Debug, Default, Deserialize)]
+struct AgyPermissionRules {
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    ask: Vec<String>,
+}
+
+/// Read the user's own agy rules from the settings file agy reads in `env`, which holds none when
+/// it is missing.
+fn agy_user_rules(env: &BTreeMap<String, String>) -> Result<AgyPermissionRules, DelegateError> {
+    let Some(path) = Vendor::Agy
+        .config_dir(env)
+        .map(|dir| dir.join("settings.json"))
+    else {
+        return Ok(AgyPermissionRules::default());
+    };
+    let unreadable = |reason: String| DelegateError::AgySettingsUnreadable {
+        path: path.clone(),
+        reason,
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgyPermissionRules::default());
+        }
+        Err(err) => return Err(unreadable(err.to_string())),
+    };
+    // agy reads a file saved with a byte-order mark, which JSON itself does not allow.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str::<AgySettingsFile>(text)
+        .map(|settings| settings.permissions)
+        .map_err(|err| unreadable(err.to_string()))
+}
+
+/// Point `env` at `home`, the home an isolated agy delegate runs in, creating it on first use.
+///
+/// Both spellings are set: `HOME`, and `USERPROFILE`, which is where agy looks on Windows.
+fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), DelegateError> {
+    std::fs::create_dir_all(home).map_err(|err| {
+        DelegateError::Environment(format!(
+            "cannot create the home an isolated agy delegate runs in, {}: {err}",
+            home.display()
+        ))
+    })?;
+    let home = home.to_string_lossy().into_owned();
+    for name in ["HOME", "USERPROFILE"] {
+        env.insert(crate::config::canonical_env_name(name), home.clone());
+    }
+    Ok(())
+}
+
+/// What an agy turn reads on stdin: its question as the one stream-json record agy takes.
+///
+/// Its end of input then ends the session once the turn is over.
+#[must_use]
+pub(crate) fn agy_input(question: &str) -> String {
+    let mut line =
+        serde_json::json!({"event": "user", "message": {"content": question}}).to_string();
+    line.push('\n');
+    line
 }
 
 /// Whether the codex that printed `cli_version` for `--version` is one whose `exec` is verified

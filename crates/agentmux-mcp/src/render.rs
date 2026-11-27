@@ -425,7 +425,7 @@ fn recovery_advice(
             return Cow::Owned(format!(
                 "Nothing to fix in your call, {window}. Retry with a different `account` — \
                  {candidates}, listed below with what each has left — or `start` the same \
-                 question against the other vendor."
+                 question against another vendor."
             ));
         }
         if let Some(limit) = exhausted_window {
@@ -488,7 +488,7 @@ fn rate_limit_advice(limit: &UsageWindow) -> String {
     } else {
         format!(
             "Nothing to fix in your call, and waiting is not worth it: the window{window} does \
-             not reopen for {}. `start` the same question against the other vendor, or against a \
+             not reopen for {}. `start` the same question against another vendor, or against a \
              model this account has not exhausted.",
             duration(remaining)
         )
@@ -898,7 +898,7 @@ pub fn list(runs: &[RunSummary], filtered: bool) -> String {
 pub fn quota(report: &QuotaReport) -> String {
     let scope = match report.asked {
         Some(vendor) => format!("for {vendor}"),
-        None => "across both vendors".to_owned(),
+        None => "across every vendor".to_owned(),
     };
     let mut out = String::new();
     let _ = writeln!(

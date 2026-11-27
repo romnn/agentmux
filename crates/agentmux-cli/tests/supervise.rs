@@ -782,6 +782,47 @@ fn the_supervisor_runs_the_permissions_the_launch_recorded() -> Result<()> {
     Ok(())
 }
 
+/// An agy turn's supervisor hands agy its question as the one stream-json record agy reads,
+/// never as the question's own text, which agy would refuse.
+#[gtest]
+fn the_supervisor_hands_agy_its_question_as_a_record() -> Result<()> {
+    let machine = machine(&FakeRun {
+        stdout: fixtures::AGY_TOOL_USE,
+        stderr: "",
+        exit_code: 0,
+    })?;
+    std::fs::copy(
+        fake_delegate()?,
+        machine
+            .bin
+            .join(format!("agy{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .or_fail()?;
+    let started = run_in_background(machine.agentmux(&[
+        "start",
+        "--json",
+        "--delegate",
+        "agy",
+        "--model",
+        "gemini-3.8-flash-low",
+        "Review it.",
+    ]))?
+    .finish(COMMAND_LIMIT)?;
+    let run_id = started_run(&started)?;
+    machine.release()?;
+    assert_that!(
+        until_exists(&machine.marker(&run_id), Duration::from_secs(10)),
+        eq(true)
+    );
+
+    // The fake answers only when its stdin was the one record agy takes, and fails otherwise.
+    let transcript =
+        std::fs::read_to_string(machine.run_dir(&run_id).join("transcript.md")).or_fail()?;
+    assert_that!(transcript, contains_substring("PROBE_B"));
+    assert_that!(transcript, contains_substring("_Turn 1 completed"));
+    Ok(())
+}
+
 /// A Codex turn that fails with the vendor's "at capacity" error, after saying something in a
 /// session it announced.
 const CODEX_OVERLOADED: &str = indoc::indoc! {r#"

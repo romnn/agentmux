@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::appserver::mailbox::Mailbox;
+use crate::delegate::Vendor;
 use crate::launch::Launched;
 
 use super::RunStore;
@@ -22,6 +23,19 @@ pub(crate) struct TurnDir {
 impl TurnDir {
     pub(super) fn question(&self) -> PathBuf {
         self.root.join("question.md")
+    }
+    /// The question as a CLI that reads it as a record takes it, which only an agy turn's launch
+    /// writes.
+    pub(super) fn encoded_question(&self) -> PathBuf {
+        self.root.join("question.jsonl")
+    }
+    /// What a `vendor` delegate reads as its stdin: the encoded question for agy, and the question
+    /// itself for the others.
+    pub(super) fn stdin(&self, vendor: Vendor) -> PathBuf {
+        match vendor {
+            Vendor::Agy => self.encoded_question(),
+            Vendor::Claude | Vendor::Codex => self.question(),
+        }
     }
     pub(super) fn events(&self) -> PathBuf {
         self.root.join("events.jsonl")
@@ -127,6 +141,15 @@ impl RunStore {
 
     pub(super) fn run_dir(&self, run_id: &RunId) -> PathBuf {
         self.runs_dir().join(run_id.as_str())
+    }
+
+    /// The home every isolated agy delegate of this store runs in, which keeps their
+    /// conversations for as long as the store is kept.
+    ///
+    /// One for the store, because agy has one login, which its keyring holds.
+    /// The store owns it: nothing but agy writes there, and nothing else should.
+    pub(super) fn agy_home(&self) -> PathBuf {
+        self.root.join("agy-home")
     }
 
     /// The directory of the turn with zero-based `index`, named by its one-based number, as the

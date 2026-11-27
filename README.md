@@ -22,7 +22,7 @@ part worth having:
   them as terminal turns every successful consultation with a warning into a failed one.
 - An unknown model comes back as an ordinary "success" envelope with an error flag set inside it.
 
-`agentmux` reads the streaming JSON both CLIs already emit, keeps every message with its source
+`agentmux` reads the streaming JSON every CLI already emits, keeps every message with its source
 attached, and never hides a failure by discarding the messages collected before it.
 
 It is deliberately **model-agnostic**: model ids and reasoning-effort values are opaque strings
@@ -43,8 +43,8 @@ cargo install --git https://github.com/romnn/agentmux agentmux-cli
 
 There is no crates.io release: the name is taken by an unrelated crate.
 
-You also need whichever delegate CLIs you intend to use (`claude`, `codex`) on your `PATH`, already
-authenticated.
+You also need whichever delegate CLIs you intend to use (`claude`, `codex`, `agy`) on your `PATH`,
+already authenticated.
 
 ### Use as an MCP server
 
@@ -85,16 +85,16 @@ tool_timeout_sec = 600
 `--deny <vendor>` keeps the server to the job it exists for. Each registration denies the vendor of
 the harness it is registered in, because that harness already spawns same-vendor subagents itself —
 natively, in-process, and under its own supervision, which is cheaper and better managed than
-anything `agentmux` can start for it. So under Claude Code the tools offer `codex` and nothing else,
-and under Codex they offer `claude`.
+anything `agentmux` can start for it. So under Claude Code the tools offer `codex` and `agy`, and
+under Codex they offer `claude` and `agy`.
 
 A denied vendor is left out of the `delegate` choices `ask` and `start` advertise, so a calling
 model does not spend a call discovering it; one that names it anyway is refused before any process
-starts, and so is a `follow_up` that would resume it. `quota` still reports both vendors — denial
+starts, and so is a `follow_up` that would resume it. `quota` still reports every vendor — denial
 restricts consultations, not usage probes, which may start a CLI but never ask a model.
-`--deny claude-code` is accepted as another spelling of `--deny claude`, and denying both vendors is
+`--deny claude-code` is accepted as another spelling of `--deny claude`, and denying every vendor is
 refused rather than served, since it would leave nothing to consult. The flag is a server flag only:
-`agentmux ask` in a terminal still reaches either vendor. Leave it off when the server is how you
+`agentmux ask` in a terminal still reaches any vendor. Leave it off when the server is how you
 reach a second account of your own vendor — it refuses the vendor as a whole, not one account.
 
 ### Tools
@@ -123,7 +123,7 @@ takes; see [Waiting for a consultation](#waiting-for-a-consultation).
 
 ### Use from the command line
 
-The same twelve verbs are available directly, as a unified CLI over both vendors:
+The same twelve verbs are available directly, as a unified CLI over every vendor:
 
 ```bash
 # One consultation, start to finish.
@@ -395,7 +395,8 @@ the reason instead of paying for a resume that cannot work. Two ways to avoid it
 
 - **Launch through the MCP server.** A host runs its MCP servers outside its sandbox.
 - **Grant write access to the session directory alone:** `~/.claude/projects` for Claude,
-  `~/.codex/sessions` for Codex. The rest of each configuration directory holds settings and hooks.
+  `~/.codex/sessions` for Codex, `~/.gemini/antigravity-cli/conversations` for agy. The rest of
+  each configuration directory holds settings and hooks.
 
 A turn that fails for a reason its CLI printed only to stderr has that reason quoted by `status`.
 
@@ -408,7 +409,8 @@ machine's *other* accounts have left, so the next call is obvious.
 
 `agentmux quota` asks the same question at any time. It costs nothing and spends no tokens: Claude
 answers from the cache it keeps itself, refreshed with its own free `/usage`; Codex answers over
-its app-server protocol.
+its app-server protocol; agy answers its own `/usage` locally, with a `reset_time` at the Unix epoch
+for a window nobody has used yet.
 
 The numbers are the vendor's own, passed through unchanged. agentmux does not rank accounts,
 because a percentage means nothing without the plan behind it — every absolute figure comes back
@@ -446,8 +448,8 @@ delegate, model, effort, permissions, working directory, environment and label, 
 question names the old consultation, gives its transcript's path, says the working tree may hold
 its uncommitted work, and then asks the new question. The new consultation's `meta.json` records
 `continues`, the old one's `continued-by.json` names its successor, and each one's `status` points
-at the other. A Claude delegate is given `--add-dir` for the old consultation's directory, so it
-can read the transcript. Why it works this way is in
+at the other. A Claude or agy delegate is given `--add-dir` for the old consultation's directory,
+so it can read the transcript. Why it works this way is in
 [ADR 0029](adr/0029-continue-in-a-fresh-session.md).
 
 ### Environment
@@ -569,7 +571,7 @@ in /home/you/.config/agentmux/agentmux.toml. Request sandbox="workspace_write" o
 the owner can raise this limit.
 ```
 
-With no file, both vendors load the user's configuration, Codex runs read-only with its network
+With no file, every vendor loads the user's configuration, Codex runs read-only with its network
 left to Codex's own configuration, and Claude runs in plan mode with the read-only tool list.
 `danger_full_access` and `bypassPermissions` can be asked for only when the machine file allows
 them, and a default its own limits refuse fails the load. `allow_network = false` also switches the
@@ -607,7 +609,7 @@ sandbox, as in your own sessions. `ignore_user_config: true` does not drop the r
 ### Loading the user's configuration, or not
 
 `ignore_user_config` decides whether a delegate loads the user's own CLI configuration: settings,
-hooks and MCP servers. Both vendors load it unless the machine file or the call says otherwise,
+hooks and MCP servers. Every vendor loads it unless the machine file or the call says otherwise,
 because a delegate that runs as your own CLI runs with the providers, tools and rules you set up
 for it, while what it may *do* is held separately by the permissions above. The older spellings
 still work: `inherit_settings: true` on the MCP tools, `--inherit-settings` and `--isolated` on the
@@ -629,9 +631,10 @@ agentmux ask --delegate claude --model opus --effort xhigh \
 agentmux ask ... --ignore-user-config=false   # load it, even where the machine's default skips it
 ```
 
-Isolation is imposed by *argument*, not by environment — no variable switches it on or off. An
-account a checkout's own `agentmux.toml` selects runs isolated unless the call explicitly asks to
-load the configuration.
+Isolation is imposed by *argument*, not by environment — no variable switches it on or off — except
+for agy, which has no such argument and is isolated by a home of its own (below). An account a
+checkout's own `agentmux.toml` selects runs isolated unless the call explicitly asks to load the
+configuration.
 
 Every delegate is launched with `AGENTMUX_DELEGATE=1`, and `agentmux` refuses to launch a
 delegate — or to serve as an MCP server at all — when it finds itself inside one. An isolated
@@ -646,6 +649,47 @@ one about; with `AGENTMUX_STATE_DIR` or `XDG_STATE_HOME` set to something other 
 platform default, a Codex delegate that loads an MCP configuration naming `agentmux` is
 guarded by the variable alone.
 
+### agy, Google's Antigravity CLI
+
+`--delegate agy` reaches Gemini models, and the others Google's subscription offers, through the
+Antigravity CLI, which is what a Google AI Pro or Ultra subscription runs on; `agy models` lists
+them. It differs from the other two in five ways; how it is isolated and how its permissions are
+pinned is in [ADR 0035](adr/0035-agy-isolation-through-a-home-of-its-own.md):
+
+- **It always runs the project's own tooling.** agy runs the hooks, MCP servers and plugins of the
+  project's `.agents` directory in both modes: agy 1.5.18 loads them from any directory it can
+  read, and no setting turns them off. Do not point agy at a checkout you do not trust.
+- **It is isolated by a home of its own.** agy has no argument that skips its user settings, hooks
+  or MCP servers, so an agy delegate with `ignore_user_config: true` runs with `HOME` set to
+  `agy-home` in agentmux's state directory, which agentmux owns and where its conversations stay
+  too; its login, in the operating system's keyring, still reaches it. That keeps out your own
+  configuration only, which is narrower than Claude's isolation. With `ignore_user_config: false`
+  agy runs in your own home and loads all of it, as the other vendors do, and its own sign-in
+  decides what is billed. A follow-up cannot change which of the two a consultation runs in,
+  because its conversation is kept in that home. `[agy.defaults] ignore_user_config` and
+  `[agy.limits] allow_user_config` work as they do for the other vendors.
+- **Its permissions are fixed.** Every launch passes `--settings` with agy's default execution mode,
+  the `request-review` tool preset, which headless agy turns into a denial, deny rules for
+  commands, file writes, MCP calls, browser actions and downloads, which win over any rule allowing
+  them, and `useG1Credits: false`, so a model whose quota is used up stops rather than spending AI
+  credits. Reading files is allowed, and fetching a URL asks, which headless agy denies.
+  `--settings` replaces your whole `permissions` table, so a delegate in your own home carries over
+  the `deny` and `ask` rules of your `~/.gemini/antigravity-cli/settings.json`, and not its `allow`
+  rules; a file there that cannot be parsed refuses the launch. agy takes none of the `sandbox`,
+  `network_access`, `permission_mode` or tool-list options.
+- **One login, so at most one account.** agy keeps its login in the operating system's keyring,
+  and reads no directory or credential an account could name. An `[accounts.agy.<alias>]` table
+  may only label that login with a `description` and choose `inherit_settings`, there may be one,
+  and it must be the `[defaults.agy]` account.
+- **A turn cannot be steered**, because `agy --print` reads its question once: a stream-json record
+  on stdin, so the question never appears in the argument vector.
+
+A call agy denied ends a run that still reports success; a turn that then gave no answer is reported
+as failed, naming what was denied or what a refused tool call said. agy's failures are quoted as
+they come; only an unknown model is classified, as `model unavailable`, so an overloaded agy model is
+not resumed automatically. Its tokens are its conversation's running total, with cache reads counted
+beside the input, and it reports no price.
+
 ### What the delegate does and does not see
 
 The child environment is built as an **allowlist from empty**, never by filtering a denylist. It
@@ -654,7 +698,7 @@ reads, less the API keys [Billing safety](#billing-safety) removes — and nothi
 launching agent's session identity reaches it
 ([ADR 0022](adr/0022-delegate-env-from-allowlist.md)).
 
-What it loads besides depends on `ignore_user_config`. By default both vendors load the user's own
+What it loads besides depends on `ignore_user_config`. By default every vendor loads the user's own
 configuration, so its settings, hooks and MCP servers are part of the run. An isolated Claude
 delegate runs with `--setting-sources ""`, so no user, project or local settings load and no hook
 can reopen its finished turn, and with `--strict-mcp-config` and an empty MCP config so it cannot
@@ -663,7 +707,9 @@ actually detaches the machine's configured MCP servers — `-c mcp_servers={}` l
 and does not. Measured against codex-cli 0.153.4, a delegate launched with that override still
 called a configured server's tool, so a machine with `agentmux` in its own Codex config could have
 had a delegate call `agentmux` and recurse. It also runs with `features.hooks=false`. It still
-loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions.
+loads the exec-policy rules in `$CODEX_HOME/rules`, as described under Permissions. An isolated
+agy delegate runs in a home of its own, but still runs the project's own hooks, MCP servers and
+plugins, as described under [agy, Google's Antigravity CLI](#agy-googles-antigravity-cli).
 
 Either way, a Claude delegate runs in plan mode and is offered no editing tools, and a Codex
 delegate runs read-only, unless the consultation's permissions say otherwise.

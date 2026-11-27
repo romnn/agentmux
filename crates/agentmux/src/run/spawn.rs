@@ -123,21 +123,22 @@ pub(super) enum Resolution<'a> {
 
 impl Resolution<'_> {
     /// Build `delegate`'s child for `plan`, from `host_env`, the environment the store was opened
-    /// with.
+    /// with, and with `agy_home` as the home an isolated agy delegate runs in.
     fn resolve(
         self,
         delegate: &Delegate,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
+        agy_home: &Path,
     ) -> Result<Resolved, RunError> {
         Ok(match self {
             Self::Configured(config) => Resolved {
-                invocation: delegate.invocation(plan, host_env, config)?,
+                invocation: delegate.invocation_in(plan, host_env, config, Some(agy_home))?,
                 app_server_settings: delegate.app_server_settings(config),
                 auto_resume: None,
             },
             Self::Inherited(Inherited { billing, attempt }) => Resolved {
-                invocation: delegate.continuation(plan, host_env.clone(), billing),
+                invocation: delegate.continuation(plan, host_env.clone(), billing)?,
                 app_server_settings: delegate
                     .app_server_settings_under(delegate.isolation().unwrap_or(Isolation::Isolated)),
                 auto_resume: Some(attempt),
@@ -472,9 +473,10 @@ impl RunStore {
     /// # Errors
     ///
     /// Returns the errors of [`RunStore::follow_up`], [`RunError::Delegate`] with
-    /// [`DelegateError::NotForVendor`] for an override of the other vendor, and with
-    /// [`DelegateError::Permission`] when the turn would exceed the current limits, before the
-    /// turn is claimed.
+    /// [`DelegateError::NotForVendor`] for an override of another vendor, and with
+    /// [`DelegateError::Permission`] when the turn would exceed the current limits, and
+    /// [`NotResumable::AgyIsolationChange`] for an agy consultation asked to change its
+    /// isolation, before the turn is claimed.
     pub fn follow_up_with(
         &self,
         run_id: &RunId,
@@ -506,7 +508,15 @@ impl RunStore {
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
+            let ran_with = delegate.isolation();
             let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
+            // Isolation decides which home agy runs in, and so where its conversation is kept.
+            if delegate.vendor() == Vendor::Agy && delegate.isolation() != ran_with {
+                return Err(NotResumable::AgyIsolationChange {
+                    run_id: run_id.clone(),
+                }
+                .into());
+            }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
                 delegate: &delegate,
@@ -818,8 +828,7 @@ impl RunStore {
             resume,
             label,
         } = *next;
-        std::fs::write(turn.question(), question)
-            .map_err(RunError::io(format!("writing turn {index} question")))?;
+        write_question(turn, delegate.vendor(), index, question)?;
 
         let last_message = turn.last_message();
         // The consultation this one continues holds the transcript its first question points at.
@@ -836,7 +845,7 @@ impl RunStore {
             mut invocation,
             app_server_settings,
             auto_resume,
-        } = resolution.resolve(delegate, &plan, &self.host_env)?;
+        } = resolution.resolve(delegate, &plan, &self.host_env, &self.agy_home())?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
@@ -915,7 +924,7 @@ impl RunStore {
         let launched = self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &meta.cwd,
-            input: LaunchInput::Question(&turn.question()),
+            input: LaunchInput::Question(&turn.stdin(delegate.vendor())),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -1010,6 +1019,28 @@ impl RunStore {
             "supervisor running"
         );
         Ok(())
+    }
+}
+
+/// Write turn `index`'s question, and for a CLI that reads it as a record, the record it reads,
+/// which the transcript never shows.
+fn write_question(
+    turn: &TurnDir,
+    vendor: Vendor,
+    index: u32,
+    question: &str,
+) -> Result<(), RunError> {
+    std::fs::write(turn.question(), question)
+        .map_err(RunError::io(format!("writing turn {index} question")))?;
+    match vendor {
+        Vendor::Agy => std::fs::write(
+            turn.encoded_question(),
+            crate::delegate::agy_input(question),
+        )
+        .map_err(RunError::io(format!(
+            "writing turn {index} encoded question"
+        ))),
+        Vendor::Claude | Vendor::Codex => Ok(()),
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! These are the only tests that spend money and need credentials, so they are `#[ignore]`d and
 //! CI passes without them.
-//! Run them by hand after upgrading either CLI:
+//! Run them by hand after upgrading a CLI:
 //!
 //! ```text
 //! cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
+    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
+    ModelId,
 };
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStore, StartRequest};
@@ -29,6 +30,7 @@ use googletest::prelude::*;
 /// The cheapest model on each side that still exercises the whole path.
 const CLAUDE_MODEL: &str = "haiku";
 const CODEX_MODEL: &str = "gpt-6-luna";
+const AGY_MODEL: &str = "gemini-3.8-flash-low";
 
 /// Start a consultation against the real CLI and wait for it, in a directory that survives the
 /// test so a failure's capture files can be inspected afterwards.
@@ -204,5 +206,117 @@ async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()>
             detail: contains_substring("does-not-exist-9000"),
         })
     );
+    Ok(())
+}
+
+/// The flags agentmux builds still work against today's agy, in the user's own home and in the
+/// one agentmux keeps: the question read as a stream-json record, the pinned permissions refusing
+/// a write in a way the stream reports, and a follow-up resuming the conversation.
+#[gtest]
+#[tokio::test]
+#[ignore = "spends quota and needs a signed-in agy CLI"]
+async fn a_live_agy_consultation_can_be_followed_up_and_writes_nothing() -> Result<()> {
+    for isolation in [Isolation::Inherit, Isolation::Isolated] {
+        live_agy_consultation(isolation).await?;
+    }
+    Ok(())
+}
+
+/// Whether an agy capture shows agy refusing a write to `target`: a tool step it failed with a
+/// permission denial naming the file, or a call its result lists as denied.
+fn agy_refused_write(events: &str, target: &str) -> bool {
+    use serde_json::Value;
+
+    events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            let text = |pointer: &str| event.pointer(pointer).and_then(Value::as_str);
+            let failed_write = text("/step_update/state") == Some("ERROR")
+                && text("/step_update/tool_info/name")
+                    .is_some_and(|name| name.starts_with("write"))
+                && text("/step_update/tool_info/error/message").is_some_and(|message| {
+                    message.contains("Permission denied") && message.contains(target)
+                });
+            let denied = event
+                .pointer("/result/denied_actions")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action.to_string().contains(target))
+                });
+            failed_write || denied
+        })
+}
+
+async fn live_agy_consultation(isolation: Isolation) -> Result<()> {
+    let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-agy-probe");
+    let agy = Delegate::Agy {
+        model: ModelId::parse(AGY_MODEL).or_fail()?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: Some(isolation),
+    };
+    let (store, status) = consult(
+        agy,
+        "Remember the secret word ZEPPELIN. Try once to create the file agentmux-live-agy-probe \
+         in the working directory, then, whether or not that worked, reply with exactly \
+         LIVE_AGY_OK and nothing else.",
+    )
+    .await?;
+
+    assert_that!(
+        status.outcome,
+        matches_pattern!(Outcome::Completed { .. }),
+        "{isolation:?}"
+    );
+    assert_that!(status.resumable, eq(true), "{isolation:?}");
+    assert_that!(
+        status.unrecognised.summary(),
+        none(),
+        "the agy event stream has drifted ({isolation:?})"
+    );
+    assert_that!(
+        probe.exists(),
+        eq(false),
+        "an agy delegate wrote a file ({isolation:?})"
+    );
+    // The refusal is one agy reported for the write to the probe, not one read into the
+    // delegate's prose.
+    let first = store
+        .wait_for_settlement(&store.pin_turn(&status.run_id, Some(1)).or_fail()?)
+        .await
+        .or_fail()?;
+    let events =
+        std::fs::read_to_string(first.marker_path().with_file_name("events.jsonl")).or_fail()?;
+    assert_that!(
+        agy_refused_write(&events, &probe.display().to_string()),
+        eq(true),
+        "{isolation:?}"
+    );
+
+    store
+        .follow_up(
+            &status.run_id,
+            "What was the secret word? Reply with only the word.",
+        )
+        .or_fail()?;
+    let second = store
+        .wait_for_settlement(&store.pin_turn(&status.run_id, Some(2)).or_fail()?)
+        .await
+        .or_fail()?;
+    assert_that!(
+        second.outcome(),
+        matches_pattern!(Outcome::Completed { .. }),
+        "{isolation:?}"
+    );
+    // The follow-up's question does not name the word, so its section names it only if the
+    // delegate recalled it.
+    let second_text = store
+        .page(&status.run_id, second.transcript_start(), usize::MAX)
+        .or_fail()?
+        .text;
+    assert_that!(second_text, contains_substring("ZEPPELIN"), "{isolation:?}");
     Ok(())
 }

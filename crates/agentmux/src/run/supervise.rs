@@ -192,6 +192,12 @@ fn stream_input_setup(plan: &SupervisorPlan, turn: &TurnDir) -> Result<StreamInp
     })
 }
 
+/// Record that `turn` never started, and why, so it settles from that record.
+fn never_started(turn: &TurnDir, reason: String) -> Result<Admission, RunError> {
+    write_json_once(&turn.exit(), &ExitRecord::NotStarted { reason })?;
+    Ok(Admission::Recorded)
+}
+
 /// How a supervision ended.
 enum Supervised {
     /// The turn is settled.
@@ -291,13 +297,16 @@ impl RunStore {
             Some(invocation) if invocation.launch_mode == LaunchMode::ClaudeStreamInput => {
                 match stream_input_setup(plan, turn) {
                     Ok(setup) => Some(setup),
-                    Err(reason) => {
-                        write_json_once(&turn.exit(), &ExitRecord::NotStarted { reason })?;
-                        return Ok(Admission::Recorded);
-                    }
+                    Err(reason) => return never_started(turn, reason),
                 }
             }
             Some(_) | None => None,
+        };
+        // Which file the delegate reads follows from who it is, which the consultation fixed; one
+        // whose record cannot be read is a turn that never started.
+        let stdin = match self.meta(&plan.run_id) {
+            Ok(meta) => turn.stdin(meta.delegate.vendor()),
+            Err(err) => return never_started(turn, err.to_string()),
         };
 
         record.phase = SupervisorPhase::Spawning;
@@ -308,27 +317,18 @@ impl RunStore {
             self.host_env.clone(),
             plan.producer.billing,
         );
-        let question_file = turn.question();
         let launched = match self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &plan.producer.cwd,
             input: match &stream_input {
                 Some(setup) => LaunchInput::Pipe(&setup.claude_stdin),
-                None => LaunchInput::Question(&question_file),
+                None => LaunchInput::Question(&stdin),
             },
             events: &turn.events(),
             stderr: &turn.stderr(),
         }) {
             Ok(launched) => launched,
-            Err(err) => {
-                write_json_once(
-                    &turn.exit(),
-                    &ExitRecord::NotStarted {
-                        reason: err.to_string(),
-                    },
-                )?;
-                return Ok(Admission::Recorded);
-            }
+            Err(err) => return never_started(turn, err.to_string()),
         };
         let recorded = write_json(
             &turn.launch(),
@@ -342,13 +342,7 @@ impl RunStore {
             // its handle is warm, and the turn is recorded as one that never ran.
             self.launcher.terminate(launched);
             self.launcher.kill(launched);
-            write_json_once(
-                &turn.exit(),
-                &ExitRecord::NotStarted {
-                    reason: format!("its launch could not be recorded: {err}"),
-                },
-            )?;
-            return Ok(Admission::Recorded);
+            return never_started(turn, format!("its launch could not be recorded: {err}"));
         }
         // Claude holds the read end now, so once it has gone a write fails rather than waits.
         let input = stream_input.map(|setup| {
@@ -380,5 +374,77 @@ impl RunStore {
                 None => Supervised::Unsettled,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use googletest::prelude::*;
+
+    use super::Admission;
+    use crate::delegate::Billing;
+    use crate::launch::Launched;
+    use crate::run::records::{
+        ExitRecord, ProducerCommand, SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json,
+        write_json,
+    };
+    use crate::run::{RunId, RunStore};
+    use crate::testing::ScriptedLauncher;
+
+    /// A supervisor that cannot read its consultation's record settles the turn as never started,
+    /// before entering the phase that says a delegate may be running.
+    #[gtest]
+    fn a_consultation_whose_record_cannot_be_read_never_starts_its_turn() -> Result<()> {
+        let dir = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::default());
+        let store = RunStore::open(dir.path(), launcher.clone(), BTreeMap::new()).or_fail()?;
+        // A turn prepared for this process, in a consultation that has no record.
+        let run_id = RunId::generate();
+        let turn = store.turn_dir(&run_id, 0);
+        std::fs::create_dir_all(&turn.root).or_fail()?;
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let record = SupervisorRecord {
+            launch_id: launch_id.clone(),
+            launched: Launched {
+                pid: std::process::id(),
+                process_group: None,
+                started: None,
+            },
+            started_at: chrono::Utc::now(),
+            phase: SupervisorPhase::Prepared,
+        };
+        write_json(&turn.supervisor(), &record).or_fail()?;
+        let plan = SupervisorPlan {
+            store_root: dir.path().to_path_buf(),
+            run_id,
+            turn_index: 0,
+            launch_id,
+            producer: ProducerCommand {
+                program: "agy".to_owned(),
+                args: Vec::new(),
+                cwd: dir.path().to_path_buf(),
+                billing: Billing::Subscription,
+            },
+            auto_resume: None,
+        };
+
+        let admitted = store.admit(&plan, &turn).or_fail()?;
+
+        assert_that!(matches!(admitted, Admission::Recorded), eq(true));
+        assert_that!(
+            read_json::<ExitRecord>(&turn.exit()).or_fail()?,
+            some(matches_pattern!(ExitRecord::NotStarted { .. }))
+        );
+        assert_that!(
+            read_json::<SupervisorRecord>(&turn.supervisor())
+                .or_fail()?
+                .map(|record| record.phase),
+            some(eq(SupervisorPhase::Prepared))
+        );
+        assert_that!(launcher.launches(), is_empty());
+        Ok(())
     }
 }
