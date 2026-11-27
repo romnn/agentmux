@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agentmux::delegate::{
     AccountChoice, Billing, CodexPermissions, CodexSandbox, Delegate, Effort, Invocation, ModelId,
 };
-use agentmux::launch::{LaunchSpec, Launcher as _};
+use agentmux::launch::{LaunchInput, LaunchSpec, Launcher as _};
 use agentmux::run::{AutoResume, Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome};
@@ -105,7 +105,7 @@ impl Harness {
             .launch(&LaunchSpec {
                 invocation: &invocation,
                 cwd: &PathBuf::from("/work/project"),
-                question: &dir.join("question.md"),
+                input: LaunchInput::Question(&dir.join("question.md")),
                 events: &dir.join("events.jsonl"),
                 stderr: &dir.join("stderr.log"),
             })

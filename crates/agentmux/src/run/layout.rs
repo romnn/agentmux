@@ -110,7 +110,8 @@ impl TurnDir {
             .iter()
             .any(|record| record.exists())
     }
-    /// Where steered messages wait for the driver of a turn driven over the app-server.
+    /// Where steered messages wait for the driver of a turn driven over the app-server, or for
+    /// the supervisor of a Claude turn that reads its input from it.
     pub(crate) fn steer_dir(&self) -> PathBuf {
         self.root.join("steer")
     }

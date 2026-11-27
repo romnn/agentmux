@@ -1,35 +1,46 @@
-//! A steered consultation against the real `codex app-server`.
+//! Steered consultations against the real `codex app-server` and the real `claude`.
 //!
-//! The only test of this crate that spends a turn and needs a logged-in `codex`, so it is
-//! `#[ignore]`d and CI passes without it.
-//! Run it by hand after upgrading codex, outside any sandbox, because the delegate saves its
-//! session where the sandbox would not let it:
+//! The only tests of this crate that spend a turn and need a logged-in CLI, so they are
+//! `#[ignore]`d and CI passes without them.
+//! Run them by hand after upgrading either CLI, outside any sandbox, because the delegate saves
+//! its session where the sandbox would not let it:
 //!
 //! ```text
-//! AGENTMUX_LIVE_CODEX_ACCOUNT=personal \
+//! AGENTMUX_LIVE_CODEX_ACCOUNT=personal AGENTMUX_LIVE_CLAUDE_ACCOUNT=personal \
 //!   cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
 //! ```
 //!
-//! `AGENTMUX_LIVE_CODEX_ACCOUNT` names the account from the machine's `agentmux.toml`; without it
-//! the file's default, or the CLI's own login, is used.
-//! The driver is the `agentmux` built with this test, never an installed one.
+//! `AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` name each vendor's account from
+//! the machine's `agentmux.toml`; without one the file's default, or the CLI's own login, is
+//! used.
+//! The driver and the supervisor are the `agentmux` built with these tests, never an installed
+//! one.
 //! The store is kept, and its path printed, so a failure's capture can be read afterwards.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentmux::delegate::{
-    AccountAlias, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
+    AccountAlias, ClaudePermissionMode, ClaudePermissions, ClaudeTool, CodexPermissions,
+    CodexSandbox, Delegate, Effort, Isolation, ModelId,
 };
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
 use googletest::prelude::*;
+use serde_json::Value;
 
 /// The cheapest model in codex-cli 0.159.3's own list that still runs a command and follows an
 /// instruction.
 const MODEL: &str = "gpt-6-luna";
+
+/// The cheapest Claude model, which still runs a command and follows an instruction.
+const CLAUDE_MODEL: &str = "haiku";
+
+/// What the Claude test steers its turn with.
+const STEER: &str = "Also put the word STEERED at the end of that line.";
 
 /// Start, steer, finish, follow up, and cancel one consultation over the real app-server.
 #[gtest]
@@ -43,11 +54,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     let store = RunStore::open(root.join("state"), Arc::new(ProcessLauncher::new()), env)
         .or_fail()?
         .with_codex_app_server(env!("CARGO_BIN_EXE_agentmux"));
-    let account = std::env::var("AGENTMUX_LIVE_CODEX_ACCOUNT")
-        .ok()
-        .map(|alias| AccountAlias::parse(&alias))
-        .transpose()
-        .or_fail()?;
+    let account = live_account("AGENTMUX_LIVE_CODEX_ACCOUNT")?;
 
     let started = store.start(&StartRequest {
         delegate: Delegate::Codex {
@@ -151,6 +158,164 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
         "the app-server protocol has drifted"
     );
     Ok(())
+}
+
+/// Steer a real Claude turn while its command runs, through the input its supervisor holds, and
+/// read the steer and the answer it produced back from the transcript.
+/// The steer is sent once Claude has called Bash, and Claude takes it once that call has
+/// returned, before it reports its result.
+///
+/// Isolated, so no hook or setting of the machine's own changes what Claude does, and allowed to
+/// run `sleep` alone.
+#[gtest]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spends a Claude turn and needs a logged-in claude CLI"]
+async fn a_live_claude_turn_is_steered() -> Result<()> {
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let root = tempfile::tempdir().or_fail()?.keep();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).or_fail()?;
+    let store = RunStore::open(root.join("state"), Arc::new(ProcessLauncher::new()), env)
+        .or_fail()?
+        .with_supervisor(env!("CARGO_BIN_EXE_agentmux"));
+
+    let started = store.start(&StartRequest {
+        delegate: Delegate::Claude {
+            model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
+            effort: Some(Effort::parse("low").or_fail()?),
+            permissions: ClaudePermissions {
+                permission_mode: Some(ClaudePermissionMode::Manual),
+                tools: Some(ClaudeTool::parse_all(&["Bash"]).or_fail()?),
+                allowed_tools: Some(ClaudeTool::parse_all(&["Bash(sleep *)"]).or_fail()?),
+                disallowed_tools: None,
+            },
+            account: live_account("AGENTMUX_LIVE_CLAUDE_ACCOUNT")?.into(),
+            isolation: Some(Isolation::Isolated),
+        },
+        question: "Run the shell command `sleep 20` with Bash and wait for it to finish. Then \
+                   reply with one line: LIVE_DONE, followed by anything else you have been asked \
+                   to add."
+            .to_owned(),
+        cwd: project,
+        retention: Retention::UntilReleased,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let id = started.run_id.clone();
+    eprintln!(
+        "live run {id}, transcript {}",
+        started.transcript_path.display()
+    );
+    let run_dir = started.transcript_path.parent().or_fail()?.to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !capture_lines(&run_dir)?
+        .iter()
+        .any(|line| bash_call(line).is_some())
+    {
+        assert_that!(Instant::now() < deadline, eq(true), "Claude never ran Bash");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    store.steer(&id, STEER).await?;
+    store
+        .wait_until_terminal(&id, Duration::from_secs(300))
+        .await?;
+
+    let (status, page) = store.view(&id, 0, usize::MAX)?;
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(page.text, contains_substring("### user (steer)"));
+    // Claude took the steer once Bash had finished, and before it reported its result.
+    let lines = capture_lines(&run_dir)?;
+    let bash = lines.iter().find_map(bash_call).or_fail()?;
+    let finished = lines
+        .iter()
+        .position(|line| returns(line, bash))
+        .or_fail()?;
+    let steered = lines
+        .iter()
+        .position(|line| echoes(line, STEER))
+        .or_fail()?;
+    let reported = lines
+        .iter()
+        .position(|line| line_type(line) == Some("result"))
+        .or_fail()?;
+    assert_that!(finished < steered && steered < reported, eq(true));
+    // The closing reply comes after the steer, and so after everything that asked for it.
+    let (_, reply) = page.text.rsplit_once("### assistant").or_fail()?;
+    assert_that!(reply, not(contains_substring("### user")));
+    assert_that!(reply, contains_substring("LIVE_DONE"));
+    assert_that!(reply, contains_substring("STEERED"));
+    assert_that!(
+        status.unrecognised.summary(),
+        none(),
+        "the Claude event stream has drifted"
+    );
+    Ok(())
+}
+
+/// The lines of the first turn's capture in the consultation at `run_dir`, as far as they are
+/// written, which is none before the supervisor has started Claude.
+fn capture_lines(run_dir: &Path) -> Result<Vec<Value>> {
+    let capture = match std::fs::read_to_string(run_dir.join("turns/0001/events.jsonl")) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.or_fail()?,
+    };
+    Ok(capture
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect())
+}
+
+/// Whether a capture line is Claude's echo of the input message `text`, as it takes it.
+fn echoes(line: &Value, text: &str) -> bool {
+    line.get("isReplay") == Some(&Value::Bool(true))
+        && content_blocks(line, "user")
+            .iter()
+            .any(|block| block.get("text").and_then(Value::as_str) == Some(text))
+}
+
+/// A capture line's `type`.
+fn line_type(line: &Value) -> Option<&str> {
+    line.get("type").and_then(Value::as_str)
+}
+
+/// The content blocks of a capture line of the type `kind`; none for a line of another type.
+fn content_blocks<'line>(line: &'line Value, kind: &str) -> &'line [Value] {
+    if line_type(line) != Some(kind) {
+        return &[];
+    }
+    line.pointer("/message/content")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The id of the Bash call a capture line makes, if it makes one.
+fn bash_call(line: &Value) -> Option<&str> {
+    content_blocks(line, "assistant")
+        .iter()
+        .find(|block| {
+            line_type(block) == Some("tool_use") && block.get("name") == Some(&"Bash".into())
+        })?
+        .get("id")?
+        .as_str()
+}
+
+/// Whether a capture line carries the result of the tool call `id`.
+fn returns(line: &Value, id: &str) -> bool {
+    content_blocks(line, "user").iter().any(|block| {
+        line_type(block) == Some("tool_result")
+            && block.get("tool_use_id").and_then(Value::as_str) == Some(id)
+    })
+}
+
+/// The account the variable `name` names, or `None` for the machine's default.
+fn live_account(name: &str) -> Result<Option<AccountAlias>> {
+    std::env::var(name)
+        .ok()
+        .map(|alias| AccountAlias::parse(&alias))
+        .transpose()
+        .or_fail()
 }
 
 /// Poll the consultation until `ready` holds of its status, failing with `what` after a minute.

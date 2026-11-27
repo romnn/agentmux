@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A running Claude turn can be steered.** Its supervisor holds Claude's input, so `steer` reaches
+  it until Claude reports its result.
+- **A Claude turn ends when Claude exits, and keeps what Claude answers after its first result,**
+  to a late steer or a background task that finished.
+- **Breaking: agentmux v0.0.13 and older cannot read a steerable Claude turn.** Restart every MCP
+  server started before upgrading.
+
 ## v0.0.13
 
 - **The codex app-server protocol is pinned to codex-cli 0.171.0,** up from 0.162.1.

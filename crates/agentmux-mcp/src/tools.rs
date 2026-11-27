@@ -635,12 +635,15 @@ impl AgentMux {
         description = "Add an instruction to a consultation whose turn is still running — a \
                        correction, a narrower scope, \"stop and report what you have\" — which \
                        the delegate sees before its next model call, without waiting for the turn \
-                       to end. Only a turn launched over Codex's app-server takes one, which \
-                       `status` shows as `steerable: yes`; anything else is refused with the \
-                       reason, and a finished consultation takes `follow_up` instead. Returns \
-                       once the delegate has accepted the message, which the transcript then \
-                       records as a `### user (steer)` section where it arrived. It is also how \
-                       to reply to a question the delegate asked mid-turn, which `status` lists."
+                       to end. A `claude` turn takes one until it has reported its result, and \
+                       a `codex` turn launched over Codex's app-server; `status` shows either as \
+                       `steerable: yes`. Anything else is refused with the reason, and a \
+                       finished consultation takes `follow_up` instead. Returns once the \
+                       delegate has taken the message, which the transcript then records as a \
+                       `### user (steer)` section where it arrived; Claude takes one only \
+                       between its model calls, so one it has not taken within 30 seconds is \
+                       reported unconfirmed and may still arrive. It is also how to reply to a \
+                       question the delegate asked mid-turn, which `status` lists."
     )]
     async fn steer(
         &self,
@@ -1120,9 +1123,9 @@ and with `label` and `state` finds the consultations you gave a `label` on `star
 itself cannot go on — a content filter refusing turn after turn however you rephrase —
 `continue_fresh` starts a new consultation that reads the old transcript and working tree. `steer` adds an
 instruction to a turn that is still running, which the delegate sees before its next model call;
-only a turn `status` reports as `steerable: yes` takes one, which today means a `codex`
-consultation that inherits its account's settings, because only those are launched over Codex's
-app-server.
+only a turn `status` reports as `steerable: yes` takes one: a running `claude` turn until it has
+reported its result, and a running `codex` turn whose consultation inherits its account's
+settings, because only those are launched over Codex's app-server.
 
 A `codex` delegate over the app-server can ask you a question mid-turn, and does not wait for the
 answer: it carries on under an assumption of its own, or polls for a reply. The

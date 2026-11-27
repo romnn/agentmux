@@ -683,9 +683,10 @@ correction you notice ten minutes into a review; a new question, once the turn h
 agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 ```
 
-`status` says `steerable: yes` while a turn can take one. Today that is a **Codex delegate that
-loads its account's configuration**, which is the default, because only `codex app-server` accepts
-input for a running turn and only such a delegate can run over it:
+`status` says `steerable: yes` while a turn can take one: a **Claude turn until it has reported
+its result**, and a **Codex turn whose delegate loads its account's configuration**, which is the
+default, because only `codex app-server` accepts input for a running Codex turn and only such a
+delegate can run over it:
 
 - `codex exec`, which reads its prompt once, is what an isolated Codex delegate needs: the
   app-server has no equivalent of `--ignore-user-config` (codex-cli 0.159.3), and a private
@@ -694,8 +695,11 @@ input for a running turn and only such a delegate can run over it:
   would land where your codex cannot find them. So isolation is never traded for steering
   silently: a consultation with `ignore_user_config: true` runs over `codex exec` and cannot be
   steered. The codex release whose app-server takes the flag lifts this.
-- A Claude delegate runs as `claude --print`, which reads its question once and offers no channel
-  into a turn that has started.
+- A Claude turn reads its input as stream-json lines while it runs, and takes a steer once the
+  tool it is running has finished, before its next model call. Once it has reported its result it
+  takes no more; a message sent before then and taken after it is answered as a further turn of
+  its own, and that answer is the turn's. A `claude` found only as a Windows `.cmd` shim runs as
+  `claude --print`, which reads its question once and cannot be steered.
 
 `steerable: yes` appears once the turn is running; for the first seconds, while the delegate opens
 its thread, a steer is refused with a request to send it again shortly.
@@ -704,8 +708,16 @@ Everything else is refused with the reason, and a refused message is never in th
 consultation that is not running or is being cancelled, a delegate launched another way, a message
 the server rejected, and one the turn ended before picking up (it is withdrawn unsent). A message
 that was sent but never answered — the turn or the server ended first, or no answer came within
-30 seconds — is reported as unconfirmed rather than refused, because codex may have taken it; read
-the transcript before sending it again.
+30 seconds — is reported as unconfirmed rather than refused, because the delegate may have taken it,
+and one Claude has not taken within those 30 seconds may still arrive; read the transcript before
+sending it again.
+
+**How a Claude turn takes a steer.** The turn's supervisor starts `claude` with the arguments
+`--print` would have, plus `--input-format stream-json --replay-user-messages`, and holds its input:
+it writes the question, then each steer as a line of its own, and closes the input once Claude has
+reported its result. Claude writes its stream to the turn's capture itself, and echoes each line it
+takes; a steer is delivered once its echo is there, which is also where the transcript shows it.
+[ADR 0034](adr/0034-claude-input-held-by-its-supervisor.md) explains why it is built this way.
 
 **How a driven Codex turn runs.** `agentmux` itself, run as a detached child exactly where
 `codex exec` would be, starts `codex app-server`, runs the one turn with `approvalPolicy: never`,
@@ -721,7 +733,8 @@ is out of reach.
 `crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
-with `codex exec` instead, for a CLI whose app-server cannot run them; nothing is steerable then.
+with `codex exec` instead, for a CLI whose app-server cannot run them; no Codex turn is steerable
+then.
 `codex_exec: true` on `start` or `ask` does the same for one consultation, and its follow-ups keep
 it. When a driven turn fails, or codex sends something agentmux cannot read, the status says so and
 points at these switches: that is what a codex whose app-server protocol has moved looks like.
@@ -788,11 +801,13 @@ stop if it did not, waits a few seconds more, and then records the cancellation.
 `codex app-server` is first interrupted through the protocol and given up to about twenty seconds to
 close and clear up after itself. The record freezes the transcript at what the child had written by
 then: whatever the child wrote before is kept, nothing it writes afterwards is read, and a delegate
-that had already finished its turn when the signal landed is reported as having finished. A
-`status` or `tail` that happens to see the child go first records the same cancellation. The record
-does not prove the child left: one that somehow survives both signals is stopped again by the next
-`cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose process
-is still there — because deleting its record would leave the child running, billing, and
+that had already finished its turn when the signal landed is reported as having finished, but for a
+Claude turn, which ends when Claude exits and may still be answering a steer after its result. A
+delegate that has already exited keeps its exit's outcome; `cancel` still stops a pending automatic
+resume. A `status` or `tail` that happens to see the child go first records the same cancellation.
+The record does not prove the child left: one that somehow survives both signals is stopped again by
+the next `cancel`, and `prune` refuses a running consultation — or a finished or cancelled one whose
+process is still there — because deleting its record would leave the child running, billing, and
 unreachable. On a consultation whose last turn failed because the model was overloaded, `cancel`
 stops the automatic resume agentmux scheduled, before it starts.
 

@@ -20,8 +20,10 @@
 pub mod claude;
 pub mod codex;
 
+use uuid::Uuid;
+
 use crate::delegate::{SessionRef, Vendor};
-use crate::transcript::Turn;
+use crate::transcript::{Outcome, Turn};
 
 /// The result of folding one child process's event stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,11 +35,48 @@ pub struct Fold {
     /// Without this a follow-up is impossible, so it is recovered on every fold rather than
     /// remembered from the launch.
     pub session: Option<SessionRef>,
-    /// Whether the stream said the turn itself began, which only Codex's `turn.started` says.
+    /// Whether the turn takes an instruction now, as its stream says.
     ///
-    /// Over the app-server it is written by the driver once it follows the turn, which is when
-    /// it delivers a steer.
-    pub turn_started: bool,
+    /// Over the app-server it opens at Codex's `turn.started`, which the driver writes once it
+    /// follows the turn and can deliver a steer.
+    /// A Claude turn reading stream-json input takes one from its `system`/`init` until its first
+    /// `result`.
+    pub input: TurnInput,
+    /// What the last `result` of a Claude turn reading stream-json input reported, or `None` when
+    /// there is none or Claude went on past it.
+    ///
+    /// No `result` ends such a turn, so its outcome stays running in [`Self::turn`], and the
+    /// turn's exit record decides whether this one stands.
+    pub last_result: Option<Outcome>,
+    /// The ids of the steers the fold placed in the turn, where Claude's replay of each said it
+    /// took it.
+    pub steers_taken: Vec<Uuid>,
+}
+
+/// Whether a turn takes an instruction now, as its stream says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TurnInput {
+    /// Not yet: Codex's turn has not started, or Claude has not announced its session.
+    ///
+    /// Also what the stream of a turn that read its question once says throughout.
+    #[default]
+    Pending,
+    /// The delegate takes an instruction.
+    Open,
+    /// No longer: Claude has reported its result and takes nothing more while it finishes.
+    Closed,
+}
+
+/// The ids a Claude turn reading stream-json input was sent its question and its steers under.
+///
+/// Claude echoes each input message it takes with the id it was sent under, and these tell the
+/// question's echo and the steers' apart from each other and from anything else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamInput {
+    /// The question's: the turn's launch id, or `None` when none was recorded.
+    pub question: Option<Uuid>,
+    /// The steers': the ids of the requests in the turn's mailbox.
+    pub steers: Vec<Uuid>,
 }
 
 /// Counted under [`Turn::unrecognised`] when a line is not JSON at all.

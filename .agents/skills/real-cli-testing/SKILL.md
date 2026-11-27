@@ -16,13 +16,14 @@ against recorded fixtures.
 
 ## Choosing a harness
 
-| What needs verification               | Harness                                  |
-| -------------------------------------- | ---------------------------------------- |
-| Stream folding and rendering           | Recorded fixtures                        |
-| Run-store behavior                     | `agentmux::testing::ScriptedLauncher`    |
-| Driver protocol ordering and deadlines | A scripted `Peer`                        |
-| Driver process launch and teardown     | The CLI against the mock `codex` binary  |
-| Compatibility with the installed CLIs  | Live tests                               |
+| What needs verification                | Harness                                      |
+| -------------------------------------- | -------------------------------------------- |
+| Stream folding and rendering           | Recorded fixtures                            |
+| Run-store behavior                     | `agentmux::testing::ScriptedLauncher`        |
+| Driver protocol ordering and deadlines | A scripted `Peer`                            |
+| Driver process launch and teardown     | The CLI against the mock `codex` binary      |
+| A Claude turn's input and supervisor   | The CLI against a fake `claude` shell script |
+| Compatibility with the installed CLIs  | Live tests                                   |
 
 ## Live tests
 
@@ -30,7 +31,8 @@ Run live tests where the delegates can write their session stores, normally from
 terminal; see ADR [0016](../../../adr/0016-unsaved-session-store.md). Both CLIs must be logged
 in, and the tests spend money; they are `#[ignore]`d, and CI passes without them. Use the operator's
 chosen accounts: the library suite uses the configured default accounts, and
-`AGENTMUX_LIVE_CODEX_ACCOUNT` selects an account only for the CLI steering test.
+`AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` select an account only for the CLI
+steering tests.
 
 `crates/agentmux/tests/live.rs` drives real `claude` and `codex` processes. Run it after upgrading
 either CLI:
@@ -42,18 +44,18 @@ cargo nextest run -p agentmux --run-ignored all -E 'test(live)'
 The library helper retains its store after startup, waiting, and status retrieval succeed,
 including when later assertions fail. Earlier errors may remove it.
 
-A steered turn over `codex app-server` has a live test of its own in the crate that builds the
-driver, `crates/agentmux-cli/tests/live.rs`, which runs the `agentmux` built with the test as the
-delegate:
+A steered turn of each vendor has a live test of its own in the crate that builds the executable,
+`crates/agentmux-cli/tests/live.rs`, which runs the `agentmux` built with the test as the Codex
+turn's driver and as the Claude turn's supervisor, which holds Claude's input:
 
 ```bash
-AGENTMUX_LIVE_CODEX_ACCOUNT=<chosen-account> \
+AGENTMUX_LIVE_CODEX_ACCOUNT=<chosen-account> AGENTMUX_LIVE_CLAUDE_ACCOUNT=<chosen-account> \
   cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
 ```
 
-`AGENTMUX_LIVE_CODEX_ACCOUNT` names an account from the machine's `agentmux.toml`; without it the
-file's default, or the CLI's own login, is used. The CLI steering test retains its directory before
-launch and prints the transcript's path.
+Each variable names that vendor's account from the machine's `agentmux.toml`; without it the
+file's default, or the CLI's own login, is used. The CLI steering tests retain their directory
+before launch and print the transcript's path.
 
 When a capture reads differently than expected, trace it to what wrote it: each turn's
 `invocation.json` records what the delegate's CLI printed for `--version` (`Launcher::version`,
@@ -67,6 +69,9 @@ asked before the launch with the child's environment) and the agentmux release t
   deadline ends. Each wait requests one line; a timed-out wait leaves that read pending. To simulate
   a server that stops reading, finish any pending read and keep the script blocked without another
   receive. Returning successfully starts the harness's drain loop.
+- `crates/agentmux-cli/tests/claude_input.rs` runs the real `agentmux` as a Claude turn's
+  supervisor against a fake `claude` shell script on the delegate's `PATH`, which reads its input
+  and echoes it as Claude does.
 - `crates/agentmux-cli/tests/steer.rs` runs the real `agentmux` as the driver against the mock's
   `codex` binary, which plays a `scenario` as a process. The test builds that binary with `escargot`
   (nothing else builds another package's binary for a test) and configures it through
@@ -92,7 +97,8 @@ recorded expectations. If the vendor's output did change:
    (under `runs/<id>/turns/<NNNN>/` in the store a live test keeps) is the CLI's stdout verbatim,
    launched with the argv recorded in that turn's `invocation.json`. For Codex, record an `exec`
    turn; a turn driven over `codex app-server` holds the driver's translation, not codex's own
-   output.
+   output. A Claude turn whose supervisor held its input folds by the ids it was sent its input
+   under: its `launch_id` in `supervisor.json`, and the UUID each request stem in `steer/` ends in.
 2. Scrub the capture (below).
 3. Add or replace the fixture, and register a new one in `agentmux::testing::fixtures`: its
    constants and `fixtures::all()`.

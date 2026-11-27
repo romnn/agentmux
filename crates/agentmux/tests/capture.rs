@@ -4,10 +4,14 @@
 //! These are the tests that make the design's claims true.
 
 use agentmux::delegate::Vendor;
-use agentmux::stream::{self, Fold};
-use agentmux::testing::fixtures;
-use agentmux::transcript::{FailureKind, MessageSource, Outcome, Role};
+use agentmux::stream::{self, Fold, StreamInput, TurnInput};
+use agentmux::testing::fixtures::{self, Fixture};
+use agentmux::transcript::{
+    FailureKind, Message, MessageSource, Outcome, Role, Usage, render_turn,
+};
 use googletest::prelude::*;
+use indoc::formatdoc;
+use uuid::Uuid;
 
 /// The reason this project exists.
 ///
@@ -255,6 +259,236 @@ fn a_clean_run_yields_the_answer_and_a_session_to_resume() {
     }
 }
 
+/// The session a hand-written Claude stream announces.
+const SESSION: &str = "85ff2d6a-ec24-47cf-a4f8-486a5bb06814";
+
+/// The id a hand-written stream's question is sent under.
+const QUESTION_ID: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+
+/// The id a hand-written stream's steer is sent under.
+const STEER_ID: &str = "bbbbbbbb-2222-4222-8222-222222222222";
+
+/// The ids a hand-written stream's question and steer are sent under, spelled as agentmux
+/// records them.
+fn stream_input() -> Result<StreamInput> {
+    Ok(StreamInput {
+        question: Some(Uuid::try_parse(QUESTION_ID).or_fail()?),
+        steers: vec![Uuid::try_parse(STEER_ID).or_fail()?],
+    })
+}
+
+/// A Claude turn whose supervisor held its input reads through its `result`: the question's echo
+/// is left out, since the question renders already, and the steer is where Claude's echo says it
+/// took it, after the command it waited for and above the answer it changed.
+/// The ids are compared as UUIDs, so agentmux spelling them unhyphenated does not matter.
+/// The turn runs on past the `result`, whose outcome is left for the turn's exit record to settle.
+#[gtest]
+fn a_steered_claude_turn_shows_the_steer_where_claude_took_it() {
+    let input = fixtures::claude_steered_input();
+    let Fold {
+        turn,
+        input: turn_input,
+        last_result,
+        steers_taken,
+        ..
+    } = stream::claude::fold_stream_input(0, "q", fixtures::CLAUDE_STEERED, &input);
+
+    assert_that!(
+        turn.messages,
+        elements_are![
+            matches_pattern!(Message {
+                source: eq(&MessageSource::Steer),
+                text: eq("Also put the word STEERED at the end of that line."),
+                ..
+            }),
+            matches_pattern!(Message {
+                role: eq(&Role::Assistant),
+                source: eq(&MessageSource::Delegate),
+                text: eq("LIVE_DONE STEERED"),
+                ..
+            }),
+        ]
+    );
+    assert_that!(steers_taken, eq(&input.steers));
+    assert_that!(turn_input, eq(TurnInput::Closed));
+    assert_that!(turn.outcome, eq(&Outcome::Running));
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
+    );
+    assert_that!(turn.unrecognised.summary(), none());
+}
+
+/// An echo whose id names neither the question nor a steer is not a steer, whatever it says: it
+/// renders by its content, as any `user` text does, and no steer is taken by it.
+#[gtest]
+fn a_foreign_echo_is_never_a_steer() {
+    let Fold {
+        turn, steers_taken, ..
+    } = stream::claude::fold_stream_input(
+        0,
+        "q",
+        fixtures::CLAUDE_STEERED,
+        &StreamInput::default(),
+    );
+
+    assert_that!(steers_taken, is_empty());
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|message| message.source == MessageSource::Steer)
+            .count(),
+        eq(0)
+    );
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![
+            starts_with("Run the shell command `sleep 20`"),
+            eq("Also put the word STEERED at the end of that line.")
+        ]
+    );
+}
+
+/// A steer Claude takes after its `result` runs as a further CLI turn, with an `init` and a
+/// `result` of its own: until it is answered no outcome stands, and once it is, its answer is the
+/// turn's, with the tokens of both CLI turns and the process's latest cost.
+#[gtest]
+fn a_steer_taken_after_the_result_is_answered_as_the_turns_answer() -> Result<()> {
+    let first = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"q"}}]}},"parent_tool_use_id":null,"uuid":"{QUESTION_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"A story."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"A story.","usage":{{"input_tokens":1,"output_tokens":10}},"total_cost_usd":0.1}}
+    "#};
+    let went_on = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+    "#};
+    let second = formatdoc! {r#"
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"End it with PELICAN."}}]}},"parent_tool_use_id":null,"uuid":"{STEER_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"A story. PELICAN"}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"A story. PELICAN","usage":{{"input_tokens":2,"output_tokens":20}},"total_cost_usd":0.3}}
+    "#};
+    let input = stream_input()?;
+    let fold = |events: &str| stream::claude::fold_stream_input(0, "q", events, &input);
+
+    // The first `result` closes the input and would stand.
+    let answered = fold(&first);
+    assert_that!(answered.input, eq(TurnInput::Closed));
+    assert_that!(
+        answered.last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
+    );
+    // Claude went on, so it no longer does, and the input stays closed.
+    let going_on = fold(&format!("{first}{went_on}"));
+    assert_that!(going_on.last_result, none());
+    assert_that!(going_on.input, eq(TurnInput::Closed));
+    // The second answers the steer, and stands for both.
+    let Fold {
+        turn, last_result, ..
+    } = fold(&format!("{first}{went_on}{second}"));
+    assert_that!(
+        turn.messages
+            .iter()
+            .map(|message| (message.source, message.text.as_str()))
+            .collect::<Vec<_>>(),
+        elements_are![
+            eq(&(MessageSource::Delegate, "A story.")),
+            eq(&(MessageSource::Steer, "End it with PELICAN.")),
+            eq(&(MessageSource::Delegate, "A story. PELICAN")),
+        ]
+    );
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed {
+            usage: matches_pattern!(Usage {
+                input_tokens: some(eq(&3)),
+                output_tokens: some(eq(&30)),
+                ..
+            }),
+            cost_usd: some(eq(&0.3)),
+        }))
+    );
+    Ok(())
+}
+
+/// A failure Claude reported and then went on past stays in the transcript as a note, so the
+/// success after it cannot hide it; and a `result` that cannot be read leaves no earlier one to
+/// stand, while it still closes the input.
+#[gtest]
+fn a_superseded_failure_is_kept_and_an_unreadable_result_stands_for_nothing() -> Result<()> {
+    let failed_then_answered = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}","apiKeySource":"ANTHROPIC_API_KEY"}}
+        {{"type":"result","is_error":true,"api_error_status":529,"result":"API Error: overloaded_error"}}
+        {{"type":"system","subtype":"init","session_id":"{SESSION}","apiKeySource":"ANTHROPIC_API_KEY"}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"The answer."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"The answer."}}
+    "#};
+    let input = stream_input()?;
+    let Fold {
+        turn, last_result, ..
+    } = stream::claude::fold_stream_input(0, "q", &failed_then_answered, &input);
+    assert_that!(
+        last_result,
+        some(matches_pattern!(Outcome::Completed { .. }))
+    );
+    let rendered = render_turn(&turn);
+    assert_that!(
+        rendered,
+        contains_substring("reported a failure here, then went on: model overloaded")
+    );
+    // Each further CLI turn announces itself again, and the key is noted once.
+    assert_that!(rendered.matches("apiKeySource").count(), eq(1));
+
+    let unreadable = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"result","is_error":false,"result":"The answer."}}
+        {{"type":"result","subtype":{{"kind":"success"}}}}
+    "#};
+    let Fold {
+        turn,
+        input: turn_input,
+        last_result,
+        ..
+    } = stream::claude::fold_stream_input(0, "q", &unreadable, &input);
+    assert_that!(last_result, none());
+    assert_that!(turn_input, eq(TurnInput::Closed));
+    assert_that!(turn.unrecognised.summary(), some(anything()));
+    Ok(())
+}
+
+/// A hook that reopened one CLI turn says nothing of the next: what Claude answered after a
+/// steer it took past that turn's `result` is labelled the answer, where what followed the
+/// reopening is not.
+#[gtest]
+fn a_reopening_ends_with_the_cli_turn_it_reopened() -> Result<()> {
+    let events = formatdoc! {r#"
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"THE_REPORT_BODY"}}]}},"parent_tool_use_id":null}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"Stop hook feedback: reconsider."}}]}},"parent_tool_use_id":null}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"Reconsidered."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"Reconsidered."}}
+        {{"type":"system","subtype":"init","session_id":"{SESSION}"}}
+        {{"type":"user","message":{{"content":[{{"type":"text","text":"Check the tests too."}}]}},"parent_tool_use_id":null,"uuid":"{STEER_ID}","isReplay":true}}
+        {{"type":"assistant","message":{{"content":[{{"type":"text","text":"The tests pass."}}]}},"parent_tool_use_id":null}}
+        {{"type":"result","is_error":false,"result":"The tests pass."}}
+    "#};
+    let Fold { turn, .. } = stream::claude::fold_stream_input(0, "q", &events, &stream_input()?);
+    let rendered = render_turn(&turn);
+    assert_that!(
+        rendered,
+        contains_substring("### assistant (after hook reopen — not the answer)\n\nReconsidered.")
+    );
+    assert_that!(
+        rendered,
+        contains_substring("### assistant\n\nThe tests pass.")
+    );
+    Ok(())
+}
+
 /// A rate limit must be classified from the status code, not from the vendor's wording.
 ///
 /// The recorded refusal says "You've reached your Fable limit", which no rule could match for long:
@@ -317,12 +551,14 @@ fn a_rate_limited_run_keeps_the_window_reopening_time() {
 /// until the parser names it.
 #[gtest]
 fn no_committed_fixture_contains_an_unnamed_event_type() {
-    for (vendor, name, fixture) in fixtures::all() {
-        let Fold { turn, .. } = stream::fold(vendor, 0, "q", fixture);
+    for fixture in fixtures::all() {
+        let Fold { turn, .. } = fixture.fold(fixture.stream);
         assert_that!(
             turn.unrecognised.summary(),
             none(),
-            "fixture {name} carries an event type the {vendor} parser does not name"
+            "fixture {} carries an event type the {} parser does not name",
+            fixture.name,
+            fixture.vendor
         );
     }
 }
@@ -352,12 +588,12 @@ fn no_committed_fixture_carries_a_recording_machine_path() {
         ".claude-personal/projects/-private",
     ];
 
-    for (_, name, fixture) in fixtures::all() {
+    for Fixture { name, stream, .. } in fixtures::all() {
         for marker in machine_identity {
             // Asserting on the boolean rather than the fixture keeps a failure readable; matching
             // the fixture itself would print the whole recorded stream.
             assert_that!(
-                fixture.contains(marker),
+                stream.contains(marker),
                 eq(false),
                 "fixture {name} still carries {marker} from the machine that recorded it; \
                  replace it with a mocked value before committing"
@@ -497,15 +733,21 @@ fn a_genuine_resume_neither_warns_nor_looks_like_a_new_session() {
 /// the render of the shorter prefix is a prefix of the render of the longer one.
 #[gtest]
 fn every_fixture_renders_monotonically_over_its_prefixes() {
-    for (vendor, name, fixture) in fixtures::all() {
-        expect_monotonic_render(vendor, name, fixture);
+    for fixture in fixtures::all() {
+        expect_monotonic_render(&fixture);
     }
     // What the app-server driver writes and `codex exec` never does: questions and a steer.
-    expect_monotonic_render(Vendor::Codex, "driven question capture", DRIVEN_QUESTIONS);
+    expect_monotonic_render(&Fixture {
+        vendor: Vendor::Codex,
+        name: "driven question capture",
+        stream: DRIVEN_QUESTIONS,
+        input: None,
+    });
 }
 
-/// Check that the render of `stream` at every line cut extends the render of the cut before it.
-fn expect_monotonic_render(vendor: Vendor, name: &str, stream: &str) {
+/// Check that the render of `fixture` at every line cut extends the render of the cut before it.
+fn expect_monotonic_render(fixture: &Fixture) {
+    let Fixture { name, stream, .. } = fixture;
     let lines: Vec<&str> = stream.lines().collect();
     let mut previous = String::new();
     for cut in 0..=lines.len() {
@@ -515,7 +757,7 @@ fn expect_monotonic_render(vendor: Vendor, name: &str, stream: &str) {
             .iter()
             .flat_map(|line| [*line, "\n"])
             .collect();
-        let Fold { turn, .. } = stream::fold(vendor, 0, "q", &prefix);
+        let Fold { turn, .. } = fixture.fold(&prefix);
         let rendered = agentmux::transcript::render_turn(&turn);
         expect_that!(
             rendered.starts_with(&previous),
@@ -879,12 +1121,13 @@ fn a_claude_turn_on_an_api_key_is_marked_in_the_transcript() {
     );
 
     // Every committed fixture ran on a subscription, and none of them carries the note.
-    for (vendor, name, fixture) in fixtures::all() {
-        let Fold { turn, .. } = stream::fold(vendor, 0, "q", fixture);
+    for fixture in fixtures::all() {
+        let Fold { turn, .. } = fixture.fold(fixture.stream);
         assert_that!(
             agentmux::transcript::render_turn(&turn),
             not(contains_substring("apiKeySource")),
-            "{name}"
+            "{}",
+            fixture.name
         );
     }
 }

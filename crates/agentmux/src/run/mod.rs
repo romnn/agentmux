@@ -16,7 +16,8 @@
 //!   transcript.md              the rendered transcript, a cache of the fold below
 //!   turns/0001/                one directory per turn, numbered from 1 as the transcript's
 //!                              headings number turns
-//!     question.md              what was asked; also the child's stdin
+//!     question.md              what was asked; also the child's stdin, or the first line its
+//!                              supervisor writes there
 //!     invocation.json          what was run, and the label the turn was given, written before the
 //!                              spawn
 //!     events.jsonl             the delegate's raw event stream, exactly as emitted
@@ -30,7 +31,8 @@
 //!     supervisor.json          the supervisor's own pid and start time, and how far it got
 //!     supervisor.log           what the supervisor printed
 //!     app-server.json          the plan a turn driven over `codex app-server` runs under
-//!     steer/                   messages steered into such a turn, and the driver's replies
+//!     steer/                   messages steered into such a turn, or into a Claude turn's
+//!                              input, and what its driver or supervisor answered
 //!     left-running.json        what such a turn left running once its server had exited, and
 //!                              whether each still ran after being signalled; written once by
 //!                              the driver before it exits, and only when it found anything
@@ -84,6 +86,7 @@
 
 mod auto_resume;
 mod cancel;
+mod claude_input;
 mod continue_fresh;
 mod error;
 mod executable;
@@ -112,6 +115,7 @@ use chrono::{DateTime, Utc};
 use crate::accounting::Accounting;
 use crate::delegate::{AccountChoice, Billing, SessionRef, Vendor};
 use crate::launch::{Launched, Launcher, Liveness};
+use crate::stream::TurnInput;
 use crate::transcript::{Outcome, Transcript};
 
 use executable::Executable;
@@ -576,9 +580,10 @@ impl RunStore {
             // Advertised only when a follow-up would actually work, because `next_steps` turns
             // this into a recommendation and a caller that takes it pays for the turn.
             resumable: Self::resumable_session(run_id, &state).is_ok(),
-            steerable: state.newest.as_ref().is_some_and(|newest| {
-                Self::accepts_steers(&outcome, newest.launch_mode, newest.turn_started, &turn)
-            }),
+            steerable: state
+                .newest
+                .as_ref()
+                .is_some_and(|newest| self.steer_server(&outcome, newest, &turn).is_ok()),
             billing: state.transcript.turns.last().and_then(|turn| turn.billing),
             settled: state.newest.as_ref().is_some_and(|newest| newest.settled),
             auto_resume: match &state.newest {
@@ -822,8 +827,8 @@ pub(super) struct NewestTurn {
     pub(super) settled_by: Option<SettledBy>,
     /// How its delegate was launched.
     pub(super) launch_mode: LaunchMode,
-    /// Whether its capture says the turn itself began.
-    pub(super) turn_started: bool,
+    /// Whether it takes an instruction now, as its capture says.
+    pub(super) input: TurnInput,
     /// Whether it is settled, committed by this fold or an earlier one, which a follow-up waits
     /// for.
     pub(super) settled: bool,
@@ -832,6 +837,10 @@ pub(super) struct NewestTurn {
     /// Apart from `settled` only for a cancellation the delegate survived: the turn is frozen
     /// and settled, but the process saving its session is still there.
     pub(super) delegate_gone: bool,
+    /// Its delegate, as its launch record names it.
+    pub(super) delegate: Option<Launched>,
+    /// Its supervisor, as its supervisor record names it.
+    pub(super) supervisor: Option<Launched>,
 }
 
 /// What decided a turn's outcome.

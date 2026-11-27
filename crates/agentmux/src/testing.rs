@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::delegate::Invocation;
-use crate::launch::{ExitStatus, LaunchError, LaunchSpec, Launched, Launcher, Liveness};
+use crate::launch::{
+    ExitStatus, LaunchError, LaunchInput, LaunchSpec, Launched, Launcher, Liveness,
+};
 
 /// Take a lock, recovering from a poisoned one rather than panicking.
 ///
@@ -183,7 +185,8 @@ pub struct RecordedLaunch {
     pub cwd: PathBuf,
     /// Where the child's event stream was captured.
     pub events: PathBuf,
-    /// The question, read back out of the file that would have been the child's stdin.
+    /// The question, read back out of the file that would have been the child's stdin, or empty
+    /// for a child handed a pipe.
     pub question: String,
 }
 
@@ -398,7 +401,10 @@ impl Launcher for ScriptedLauncher {
             env: spec.invocation.env().clone(),
             cwd: spec.cwd.to_owned(),
             events: spec.events.to_owned(),
-            question: std::fs::read_to_string(spec.question).unwrap_or_default(),
+            question: match spec.input {
+                LaunchInput::Question(path) => std::fs::read_to_string(path).unwrap_or_default(),
+                LaunchInput::Pipe(_) => String::new(),
+            },
         });
 
         Ok(self.launch_handle(index))
@@ -513,6 +519,26 @@ pub mod fixtures {
     /// from.
     pub const CLAUDE_RATE_LIMITED: &str = include_str!("../fixtures/claude/rate-limited.jsonl");
 
+    /// A Claude turn whose supervisor held its input, steered while its command ran.
+    ///
+    /// Claude's own output: the question's echo first, the steer's echo where Claude took it,
+    /// after the command's result, and the `command_lifecycle` events it writes for each input
+    /// message, before and after its `result`.
+    /// It folds under [`claude_steered_input`].
+    pub const CLAUDE_STEERED: &str = include_str!("../fixtures/claude/steered.jsonl");
+
+    /// The ids [`CLAUDE_STEERED`]'s turn was sent its question and its steer under, spelled as
+    /// agentmux records them, which is not as Claude echoes them.
+    #[must_use]
+    pub fn claude_steered_input() -> crate::stream::StreamInput {
+        crate::stream::StreamInput {
+            question: uuid::Uuid::try_parse("2ed4a8c6ab6c4ddbafa974ad5632136f").ok(),
+            steers: uuid::Uuid::try_parse("562bf134d91443ebb26274ccb386e2b8")
+                .into_iter()
+                .collect(),
+        }
+    }
+
     /// A short Codex consultation that answered and finished cleanly.
     pub const CODEX_HAPPY: &str = include_str!("../fixtures/codex/happy.jsonl");
 
@@ -531,29 +557,64 @@ pub mod fixtures {
     pub const CODEX_UNSUPPORTED_MODEL: &str =
         include_str!("../fixtures/codex/unsupported-model.jsonl");
 
-    /// Every committed fixture, paired with the vendor that produced it.
+    /// A committed fixture, and how the turn it was recorded from folds.
+    #[derive(Debug, Clone)]
+    pub struct Fixture {
+        /// The vendor whose CLI wrote it.
+        pub vendor: crate::delegate::Vendor,
+        /// Its path under `fixtures/`, without the extension.
+        pub name: &'static str,
+        /// The recorded stream.
+        pub stream: &'static str,
+        /// The ids its turn was sent its input under, for a Claude turn that read its input as
+        /// stream-json.
+        pub input: Option<crate::stream::StreamInput>,
+    }
+
+    impl Fixture {
+        /// Fold `stream`, all of the fixture's or a prefix of it, as its turn folds.
+        #[must_use]
+        pub fn fold(&self, stream: &str) -> crate::stream::Fold {
+            match &self.input {
+                Some(input) => crate::stream::claude::fold_stream_input(0, "q", stream, input),
+                None => crate::stream::fold(self.vendor, 0, "q", stream),
+            }
+        }
+    }
+
+    /// Every committed fixture.
     #[must_use]
-    pub fn all() -> Vec<(crate::delegate::Vendor, &'static str, &'static str)> {
-        use crate::delegate::Vendor::{Claude, Codex};
+    pub fn all() -> Vec<Fixture> {
+        use crate::delegate::Vendor::{self, Claude, Codex};
+        let fixture = |vendor: Vendor, name, stream| Fixture {
+            vendor,
+            name,
+            stream,
+            input: None,
+        };
         vec![
-            (Claude, "claude/happy", CLAUDE_HAPPY),
-            (Claude, "claude/rate-limited", CLAUDE_RATE_LIMITED),
-            (Claude, "claude/tool-use", CLAUDE_TOOL_USE),
-            (Claude, "claude/resume", CLAUDE_RESUME),
-            (
+            fixture(Claude, "claude/happy", CLAUDE_HAPPY),
+            fixture(Claude, "claude/rate-limited", CLAUDE_RATE_LIMITED),
+            fixture(Claude, "claude/tool-use", CLAUDE_TOOL_USE),
+            fixture(Claude, "claude/resume", CLAUDE_RESUME),
+            fixture(
                 Claude,
                 "claude/stop-hook-reopens-the-turn",
                 CLAUDE_STOP_HOOK,
             ),
-            (Claude, "claude/unknown-model", CLAUDE_UNKNOWN_MODEL),
-            (Codex, "codex/happy", CODEX_HAPPY),
-            (Codex, "codex/tool-use", CODEX_TOOL_USE),
-            (
+            fixture(Claude, "claude/unknown-model", CLAUDE_UNKNOWN_MODEL),
+            Fixture {
+                input: Some(claude_steered_input()),
+                ..fixture(Claude, "claude/steered", CLAUDE_STEERED)
+            },
+            fixture(Codex, "codex/happy", CODEX_HAPPY),
+            fixture(Codex, "codex/tool-use", CODEX_TOOL_USE),
+            fixture(
                 Codex,
                 "codex/resume-with-model-mismatch-warning",
                 CODEX_RESUME_WARNING,
             ),
-            (Codex, "codex/unsupported-model", CODEX_UNSUPPORTED_MODEL),
+            fixture(Codex, "codex/unsupported-model", CODEX_UNSUPPORTED_MODEL),
         ]
     }
 }

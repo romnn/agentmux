@@ -109,3 +109,8 @@ A new decision gets a record with the next number.
   and what a driven turn left running is reported.
 - [0033](0033-delegate-questions-surfaced.md): A delegate's questions are surfaced as asked, never
   as answered, and a wait can return on one.
+
+## Claude integration
+
+- [0034](0034-claude-input-held-by-its-supervisor.md): A Claude turn reads its input from its
+  supervisor, so it takes a steer until its result.

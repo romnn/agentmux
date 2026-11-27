@@ -29,6 +29,12 @@
 //!
 //! A turn that failed because the model was overloaded is not the end of its supervisor's work:
 //! it waits, and resumes the consultation as the next turn, which gets a supervisor of its own.
+//!
+//! A Claude turn reading stream-json input has its supervisor hold its input too: the write end
+//! of the pipe that is Claude's stdin, through which it writes the question and each steer
+//! ([`super::claude_input`]).
+//! Nothing about the turn's completion depends on it either: a supervisor that dies closes
+//! Claude's input, and Claude finishes what it has.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -37,14 +43,15 @@ use std::time::Duration;
 use chrono::Utc;
 
 use crate::delegate::Invocation;
-use crate::launch::{LaunchSpec, Launched, ProcessLauncher};
+use crate::launch::{LaunchInput, LaunchSpec, Launched, ProcessLauncher};
 
 use super::auto_resume::Resumption;
+use super::claude_input::{self, ClaudeInput};
 use super::error::RunError;
 use super::layout::TurnDir;
 use super::records::{
-    ExitRecord, LaunchRecord, SupervisorPhase, SupervisorPlan, SupervisorRecord,
-    read_complete_records, read_json, write_json, write_json_once,
+    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, SupervisorPhase, SupervisorPlan,
+    SupervisorRecord, read_complete_records, read_json, write_json, write_json_once,
 };
 use super::{RunStore, is_this_process};
 
@@ -157,6 +164,34 @@ pub async fn supervise(
     }
 }
 
+/// What a Claude turn reading stream-json input needs before Claude is spawned.
+struct StreamInputSetup {
+    /// The read end of the pipe, Claude's stdin.
+    claude_stdin: std::io::PipeReader,
+    /// The write end, which this supervisor keeps.
+    pipe: std::io::PipeWriter,
+    question: String,
+    /// The id the question is sent under: the turn's launch id.
+    question_id: uuid::Uuid,
+}
+
+/// Make everything a Claude turn reading stream-json input needs before Claude is spawned, or say
+/// why it cannot be made.
+fn stream_input_setup(plan: &SupervisorPlan, turn: &TurnDir) -> Result<StreamInputSetup, String> {
+    let question_id = uuid::Uuid::try_parse(&plan.launch_id)
+        .map_err(|err| format!("its launch id is not a UUID: {err}"))?;
+    let question = std::fs::read_to_string(turn.question())
+        .map_err(|err| format!("its question could not be read: {err}"))?;
+    let (claude_stdin, pipe) = std::io::pipe()
+        .map_err(|err| format!("the pipe for its input could not be made: {err}"))?;
+    Ok(StreamInputSetup {
+        claude_stdin,
+        pipe,
+        question,
+        question_id,
+    })
+}
+
 /// How a supervision ended.
 enum Supervised {
     /// The turn is settled.
@@ -170,8 +205,11 @@ enum Supervised {
 
 /// What admission decided.
 enum Admission {
-    /// The delegate is running and recorded.
-    Running(Launched),
+    /// The delegate is running and recorded, with its input when this supervisor holds it.
+    Running {
+        delegate: Launched,
+        input: Option<Box<ClaudeInput>>,
+    },
     /// Nothing will run, and a record says why, so the turn settles from it.
     Recorded,
     /// The turn is not this supervisor's.
@@ -181,22 +219,32 @@ enum Admission {
 impl RunStore {
     async fn supervise_turn(&self, plan: &SupervisorPlan) -> Result<Supervised, RunError> {
         let turn = self.turn_dir(&plan.run_id, plan.turn_index);
-        let delegate = match self.admit(plan, &turn)? {
-            Admission::Running(delegate) => delegate,
+        let (delegate, mut input) = match self.admit(plan, &turn)? {
+            Admission::Running { delegate, input } => (delegate, input),
             Admission::Recorded => return self.settle_supervised(plan),
             Admission::Refused(reason) => return Ok(Supervised::Refused(reason)),
         };
 
-        // Watch until the delegate has gone, or a cancellation has been carried out.
+        // Watch until the delegate has gone, or a cancellation has been carried out, serving its
+        // input between looks.
         // A cancellation is carried out here as well as by the caller that asked for it, so one
         // that dies part-way still ends the turn; both stops check the delegate's identity.
         while !self.child_has_gone(delegate) {
             if turn.cancelling().exists() {
+                if let Some(input) = &mut input {
+                    input.close(self, &plan.run_id, claude_input::CANCELLING);
+                }
                 self.stop_delegate(&turn, delegate).await?;
                 self.record_cancellation(&plan.run_id, &turn)?;
                 break;
             }
+            if let Some(input) = &mut input {
+                input.step(self, &plan.run_id);
+            }
             tokio::time::sleep(POLL).await;
+        }
+        if let Some(input) = &mut input {
+            input.close(self, &plan.run_id, claude_input::EXITED);
         }
         self.settle_supervised(plan)
     }
@@ -236,6 +284,22 @@ impl RunStore {
             return Ok(Admission::Recorded);
         }
 
+        // A Claude turn reading stream-json input is given its input through a pipe this
+        // supervisor holds, made with everything else that input needs before anything is
+        // spawned, so a failure here is a turn that never started.
+        let stream_input = match read_json::<InvocationRecord>(&turn.invocation())? {
+            Some(invocation) if invocation.launch_mode == LaunchMode::ClaudeStreamInput => {
+                match stream_input_setup(plan, turn) {
+                    Ok(setup) => Some(setup),
+                    Err(reason) => {
+                        write_json_once(&turn.exit(), &ExitRecord::NotStarted { reason })?;
+                        return Ok(Admission::Recorded);
+                    }
+                }
+            }
+            Some(_) | None => None,
+        };
+
         record.phase = SupervisorPhase::Spawning;
         write_json(&turn.supervisor(), &record)?;
         let invocation = Invocation::prepared(
@@ -244,10 +308,14 @@ impl RunStore {
             self.host_env.clone(),
             plan.producer.billing,
         );
+        let question_file = turn.question();
         let launched = match self.launcher.launch(&LaunchSpec {
             invocation: &invocation,
             cwd: &plan.producer.cwd,
-            question: &turn.question(),
+            input: match &stream_input {
+                Some(setup) => LaunchInput::Pipe(&setup.claude_stdin),
+                None => LaunchInput::Question(&question_file),
+            },
             events: &turn.events(),
             stderr: &turn.stderr(),
         }) {
@@ -282,7 +350,21 @@ impl RunStore {
             )?;
             return Ok(Admission::Recorded);
         }
-        Ok(Admission::Running(launched))
+        // Claude holds the read end now, so once it has gone a write fails rather than waits.
+        let input = stream_input.map(|setup| {
+            let StreamInputSetup {
+                claude_stdin,
+                pipe,
+                question,
+                question_id,
+            } = setup;
+            drop(claude_stdin);
+            Box::new(ClaudeInput::start(pipe, &question, question_id, turn))
+        });
+        Ok(Admission::Running {
+            delegate: launched,
+            input,
+        })
     }
 
     /// Settle the turn, once nothing is left to change it.

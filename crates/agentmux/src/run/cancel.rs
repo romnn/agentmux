@@ -49,6 +49,8 @@ impl RunStore {
     /// that sees the child go first records the same cancellation rather than a death.
     /// A child that survives both signals is still stopped by the next `cancel`, which stops
     /// whatever is still running whether or not the turn is already recorded.
+    /// A delegate that has already exited keeps its exit's outcome; `cancel` still stops an
+    /// automatic resume that outcome may call for.
     ///
     /// A consultation whose newest turn failed because the model was overloaded is not running,
     /// but agentmux may be about to resume it; cancelling it stops that resume, which then never
@@ -80,22 +82,29 @@ impl RunStore {
                 }
                 Some(newest) => {
                     let outcome = run.fold_turn(&meta, &newest)?.turn.outcome;
-                    let cancelling = !outcome.is_terminal();
+                    // A delegate that has already exited keeps its exit's outcome, and `cancel`
+                    // still stops an automatic resume it may call for: marked as cancelling, its
+                    // exit would be recorded as this cancellation, over a Claude turn that may
+                    // have finished, since its `result` ends nothing until the exit is recorded.
+                    let cancelling = !outcome.is_terminal() && !self.delegate_has_exited(&newest);
                     if cancelling {
                         File::create(newest.dir.cancelling()).map_err(|source| RunError::Io {
                             context: format!("marking turn {} as cancelling", newest.index),
                             source,
                         })?;
-                    } else if matches!(
-                        outcome,
-                        Outcome::Failed {
-                            kind: FailureKind::Overloaded,
-                            ..
-                        }
-                    ) {
-                        // Its supervisor may be waiting to resume it, and claims the resume under
-                        // this lock only while this marker is absent; marked whether or not the
-                        // resume is decided yet, so one decided after this still never starts.
+                    } else if !outcome.is_terminal()
+                        || matches!(
+                            outcome,
+                            Outcome::Failed {
+                                kind: FailureKind::Overloaded,
+                                ..
+                            }
+                        )
+                    {
+                        // Its supervisor may be waiting to resume it, or decide to once it has
+                        // settled it, and claims the resume under this lock only while this
+                        // marker is absent; marked whether or not the resume is decided yet, so
+                        // one decided after this still never starts.
                         File::create(newest.dir.auto_resume_cancelled()).map_err(|source| {
                             RunError::Io {
                                 context: format!(

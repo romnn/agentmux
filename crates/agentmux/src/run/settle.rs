@@ -55,13 +55,14 @@ use super::layout::TurnDir;
 use super::lock::LockedRun;
 use super::records::{
     ExitRecord, InvocationRecord, LaunchMode, Meta, SettledRecord, SettledTurn, SupervisorPhase,
-    TurnFiles, read_complete_records, read_if_present, read_json, tail_of_file, write_json_once,
+    SupervisorRecord, TurnFiles, read_complete_records, read_if_present, read_json, tail_of_file,
+    write_json_once,
 };
 use super::{NewestTurn, RunError, RunState, RunStore, SettledBy};
 use crate::delegate::{Delegate, SessionRef, Vendor};
 use crate::launch::{ExitStatus, Liveness};
 use crate::left_running::LeftRunning;
-use crate::stream::{self, Fold};
+use crate::stream::{self, Fold, StreamInput, TurnInput};
 use crate::transcript::{FailureKind, Message, Outcome, Transcript, Turn, UsageWindow};
 
 /// How many bytes of a departed child's stderr are kept with its exit record.
@@ -83,8 +84,10 @@ pub(super) struct FoldedTurn {
     pub(super) settled_by: Option<SettledBy>,
     /// How the turn's delegate was launched.
     pub(super) launch_mode: LaunchMode,
-    /// Whether the turn's capture says the turn itself began.
-    pub(super) turn_started: bool,
+    /// Whether the turn takes an instruction now, as its capture says.
+    pub(super) input: TurnInput,
+    /// The ids of the steers its capture shows Claude took.
+    pub(super) steers_taken: Vec<uuid::Uuid>,
     /// Where its usage window is still to be read from, when its stream carried none.
     pub(super) pending_rate_limit_lookup: Option<RateLimitLookup>,
     /// Whether its settlement is committed, can be, or cannot be yet.
@@ -234,6 +237,48 @@ impl LockedRun<'_> {
     }
 }
 
+/// The ids a turn launched as `mode` was sent its input under, which its capture folds by: `None`
+/// but for a Claude turn reading stream-json input, whose question went under its `launch_id`.
+///
+/// Its mailbox is listed after its capture was read, so every steer Claude echoed there is one
+/// this lists, whether or not the run's lock is held: a request is written before anything can
+/// send it.
+///
+/// # Errors
+///
+/// Returns [`RunError::Io`] when the mailbox cannot be listed: a fold that went on without it
+/// would show a steer as something else, and then as a steer again.
+pub(super) fn stream_input(
+    dir: &TurnDir,
+    mode: LaunchMode,
+    supervisor: Option<&SupervisorRecord>,
+) -> Result<Option<StreamInput>, RunError> {
+    if mode != LaunchMode::ClaudeStreamInput {
+        return Ok(None);
+    }
+    Ok(Some(StreamInput {
+        question: supervisor.and_then(|record| uuid::Uuid::try_parse(&record.launch_id).ok()),
+        steers: dir
+            .mailbox()
+            .request_ids()
+            .map_err(RunError::io("listing a turn's steers"))?,
+    }))
+}
+
+/// Fold a turn's capture, read as `input` says it was written when it says anything.
+pub(super) fn fold_events(
+    vendor: Vendor,
+    index: u32,
+    question: &str,
+    events: &str,
+    input: Option<&StreamInput>,
+) -> Fold {
+    match input {
+        Some(input) => stream::claude::fold_stream_input(index, question, events, input),
+        None => stream::fold(vendor, index, question, events),
+    }
+}
+
 /// Whether a turn that asked to continue a session actually did.
 ///
 /// Both CLIs accept a resume against a session they no longer hold and answer from an empty
@@ -361,6 +406,22 @@ impl RunStore {
     }
 }
 
+impl NewestTurn {
+    /// What a fold of the turn in `files`, `folded`, established about it, were it the newest.
+    pub(super) fn of(files: &TurnFiles, folded: &FoldedTurn) -> Self {
+        Self {
+            index: files.index,
+            settled_by: folded.settled_by,
+            launch_mode: folded.launch_mode,
+            input: folded.input,
+            settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
+            delegate_gone: folded.delegate_gone,
+            delegate: files.launch.as_ref().map(|record| record.launched),
+            supervisor: files.supervisor.as_ref().map(|record| record.launched),
+        }
+    }
+}
+
 impl LockedRun<'_> {
     /// Rebuild a consultation from its capture files.
     ///
@@ -384,16 +445,9 @@ impl LockedRun<'_> {
         let all_files = self.store.turn_files(&self.run_id)?;
         for files in &all_files {
             let folded = self.fold_turn(meta, files)?;
+            newest = Some(NewestTurn::of(files, &folded));
             pending_rate_limit_lookups.extend(folded.pending_rate_limit_lookup);
             finality.insert(files.index, folded.finality);
-            newest = Some(NewestTurn {
-                index: files.index,
-                settled_by: folded.settled_by,
-                launch_mode: folded.launch_mode,
-                turn_started: folded.turn_started,
-                settled: matches!(folded.finality, Finality::Committed | Finality::Ready(_)),
-                delegate_gone: folded.delegate_gone,
-            });
             if folded.session.is_some() {
                 session = folded.session;
             }
@@ -461,6 +515,10 @@ impl LockedRun<'_> {
         let dir = &files.dir;
         let question =
             read_if_present(&dir.question(), std::fs::read_to_string)?.unwrap_or_default();
+        // What the launch recorded before the spawn: how the delegate was run, which decides how
+        // its capture folds, which session it asked to resume, and whether the child was ever
+        // going to be able to save its own.
+        let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
         // A settled turn's capture is read only up to the length its records froze: the
         // marker's, which agrees with an exit record's wherever both exist.
         let frozen_len = files
@@ -469,7 +527,10 @@ impl LockedRun<'_> {
             .map(|settled| settled.events_len)
             .or_else(|| files.exit.as_ref().map(ExitRecord::events_len));
         let (events, mut folded_len) = read_complete_records(&dir.events(), frozen_len)?;
-        let mut fold = stream::fold(vendor, files.index, &question, &events);
+        let input = stream_input(dir, invocation.launch_mode, files.supervisor.as_ref())?;
+        let fold_events =
+            |events: &str| fold_events(vendor, files.index, &question, events, input.as_ref());
+        let mut fold = fold_events(&events);
 
         // Reaping goes through the handle this process retained, whatever the turn's state: it
         // costs a lookup, cannot mistake another process for the child, and is what keeps a
@@ -494,7 +555,7 @@ impl LockedRun<'_> {
         }) = &evidence
         {
             if final_events.len() != events.len() {
-                fold = stream::fold(vendor, files.index, &question, final_events);
+                fold = fold_events(final_events);
             }
             folded_len = departure.events_len;
         }
@@ -513,31 +574,21 @@ impl LockedRun<'_> {
         {
             let (frozen, frozen_len) =
                 read_complete_records(&dir.events(), Some(record.events_len()))?;
-            fold = stream::fold(vendor, files.index, &question, &frozen);
+            fold = fold_events(&frozen);
             folded_len = frozen_len;
         }
 
         let Fold {
             mut turn,
             session: turn_session,
-            turn_started,
+            input,
+            last_result,
+            steers_taken,
         } = fold;
-        let settled_by = match &record {
-            Some(record) => {
-                turn.outcome = RunStore::outcome_of(dir, record, vendor);
-                Some(SettledBy::ExitRecord)
-            }
-            None => turn
-                .outcome
-                .is_terminal()
-                .then_some(SettledBy::TerminalEvent),
-        };
+        let settled_by =
+            RunStore::settle_outcome(&mut turn, dir, record.as_ref(), last_result, vendor);
 
-        // What the launch recorded before the spawn: which session it asked to resume, and
-        // whether the child was ever going to be able to save its own.
-        let invocation = read_json::<InvocationRecord>(&dir.invocation())?.unwrap_or_default();
         note_launch_record(&mut turn, &invocation, &meta.delegate);
-        let launch_mode = invocation.launch_mode;
         note_continuity(
             invocation.resumed_from.as_ref(),
             turn_session.as_ref(),
@@ -581,8 +632,9 @@ impl LockedRun<'_> {
             session: turn_session,
             last_activity: last_write(dir),
             settled_by,
-            launch_mode,
-            turn_started,
+            launch_mode: invocation.launch_mode,
+            input,
+            steers_taken,
             pending_rate_limit_lookup,
             finality,
         })
@@ -962,6 +1014,52 @@ impl RunStore {
         }
     }
 
+    /// Say what decided a folded turn's outcome, if anything has, and give a turn an exit
+    /// `record` settles the outcome the record leaves it.
+    ///
+    /// Without a record that is the stream's terminal event, if it has one.
+    /// With one it is the record, but for a Claude turn reading stream-json input whose last
+    /// `result`, `last_result`, still stands:
+    ///
+    /// - A cancellation decides over it, because the turn was still running, and so does a launch
+    ///   that never happened.
+    /// - An exit known to be abnormal decides over a success, which the CLI then did not finish,
+    ///   but not over a failure the CLI reported itself, which says more.
+    /// - After a clean exit, or one whose status nobody saw, it stands.
+    fn settle_outcome(
+        turn: &mut Turn,
+        dir: &TurnDir,
+        record: Option<&ExitRecord>,
+        last_result: Option<Outcome>,
+        vendor: Vendor,
+    ) -> Option<SettledBy> {
+        let Some(record) = record else {
+            return turn
+                .outcome
+                .is_terminal()
+                .then_some(SettledBy::TerminalEvent);
+        };
+        let reported = match (record, last_result) {
+            (ExitRecord::Exited { status, .. }, Some(reported)) => {
+                let abnormal = status.is_some_and(|status| !status.is_success());
+                (!abnormal || matches!(reported, Outcome::Failed { .. })).then_some(reported)
+            }
+            (
+                ExitRecord::Exited { .. }
+                | ExitRecord::Cancelled { .. }
+                | ExitRecord::NotStarted { .. },
+                _,
+            ) => None,
+        };
+        Some(if let Some(reported) = reported {
+            turn.outcome = reported;
+            SettledBy::TerminalEvent
+        } else {
+            turn.outcome = Self::outcome_of(dir, record, vendor);
+            SettledBy::ExitRecord
+        })
+    }
+
     /// What a settled turn's record says happened.
     fn outcome_of(dir: &TurnDir, record: &ExitRecord, vendor: Vendor) -> Outcome {
         match record {
@@ -1031,7 +1129,111 @@ mod tests {
     use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
     use googletest::prelude::*;
 
-    use super::select_rate_limit_window;
+    use super::{ExitRecord, RunStore, SettledBy, TurnDir, select_rate_limit_window};
+    use crate::delegate::Vendor;
+    use crate::launch::ExitStatus;
+    use crate::transcript::{FailureKind, Outcome, Turn, Usage};
+
+    /// How a turn settled: its outcome, and what decided it.
+    #[derive(Debug, PartialEq)]
+    struct Settled {
+        outcome: Outcome,
+        by: Option<SettledBy>,
+    }
+
+    /// How a turn whose last `result` reported `last_result` settles once `record` is known.
+    fn settled(record: &ExitRecord, last_result: Option<Outcome>) -> Settled {
+        let mut turn = Turn::new(0, "q");
+        let dir = TurnDir {
+            root: "/work/turn".into(),
+        };
+        let by =
+            RunStore::settle_outcome(&mut turn, &dir, Some(record), last_result, Vendor::Claude);
+        Settled {
+            outcome: turn.outcome,
+            by,
+        }
+    }
+
+    fn exited(status: Option<ExitStatus>) -> ExitRecord {
+        ExitRecord::Exited {
+            status,
+            events_len: 0,
+            stderr_tail: String::new(),
+        }
+    }
+
+    fn completed() -> Outcome {
+        Outcome::Completed {
+            usage: Usage::default(),
+            cost_usd: None,
+        }
+    }
+
+    /// A Claude turn reading stream-json input settles with its last `result` only where nothing
+    /// says the turn ended otherwise: a cancellation of the running turn and an abnormal exit
+    /// after a success each decide instead, while a failure Claude reported itself still stands
+    /// over the abnormal exit that follows it.
+    #[gtest]
+    fn the_last_result_stands_only_where_the_exit_record_allows() {
+        let failed_by_the_record = || {
+            matches_pattern!(Settled {
+                outcome: matches_pattern!(Outcome::Failed { .. }),
+                by: some(eq(&SettledBy::ExitRecord)),
+            })
+        };
+
+        // A cancellation decides over a success.
+        assert_that!(
+            settled(&ExitRecord::Cancelled { events_len: 0 }, Some(completed())),
+            eq(&Settled {
+                outcome: Outcome::Cancelled,
+                by: Some(SettledBy::ExitRecord),
+            })
+        );
+
+        // An abnormal exit decides over a success, whether a code or a signal says so.
+        let signalled = ExitStatus {
+            code: None,
+            signal: Some(9),
+        };
+        for status in [ExitStatus::from(1), signalled] {
+            assert_that!(
+                settled(&exited(Some(status)), Some(completed())),
+                failed_by_the_record()
+            );
+        }
+
+        // A failure Claude reported stands over the abnormal exit after it.
+        let overloaded = Outcome::Failed {
+            kind: FailureKind::Overloaded,
+            detail: "API Error: overloaded_error".to_owned(),
+        };
+        assert_that!(
+            settled(&exited(Some(1.into())), Some(overloaded.clone())),
+            eq(&Settled {
+                outcome: overloaded,
+                by: Some(SettledBy::TerminalEvent),
+            })
+        );
+
+        // After a clean exit, or one whose status nobody saw, a success stands.
+        for status in [Some(0.into()), None] {
+            assert_that!(
+                settled(&exited(status), Some(completed())),
+                eq(&Settled {
+                    outcome: completed(),
+                    by: Some(SettledBy::TerminalEvent),
+                })
+            );
+        }
+
+        // With no `result` left standing, the exit record explains the turn as it would any.
+        assert_that!(
+            settled(&exited(Some(0.into())), None),
+            failed_by_the_record()
+        );
+    }
 
     fn window(used_percent: f64, resets_at: Option<i64>) -> RateLimitWindow {
         RateLimitWindow {

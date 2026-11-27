@@ -102,8 +102,8 @@ pub enum Command {
     /// Add an instruction to a consultation's running turn, which the delegate sees before its
     /// next model call.
     ///
-    /// Only a turn launched over `codex app-server` takes one; `status` says whether the running
-    /// turn is steerable.
+    /// A Codex turn launched over `codex app-server` takes one, and a Claude turn until it has
+    /// reported its result; `status` says whether the running turn is steerable.
     Steer(SteerArgs),
 
     /// Block until consultations' turns have settled, then print them.

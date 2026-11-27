@@ -66,6 +66,15 @@ pub enum LaunchError {
         /// The directory that was asked for.
         path: PathBuf,
     },
+    /// The pipe the child was to read its input from could not be handed to it.
+    #[error("cannot hand `{program}` its input: {source}")]
+    Input {
+        /// The executable that was to read it.
+        program: String,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// The delegate CLI could not be executed.
     #[error("cannot run `{program}`: {source}. Is it installed and on PATH?")]
     Spawn {
@@ -84,13 +93,23 @@ pub struct LaunchSpec<'a> {
     pub invocation: &'a Invocation,
     /// The directory the delegate reads the project from.
     pub cwd: &'a Path,
-    /// File holding the question, opened as the child's stdin.
-    pub question: &'a Path,
+    /// What the child reads as its stdin.
+    pub input: LaunchInput<'a>,
     /// File the child's stdout is redirected to.
     /// This is the event stream.
     pub events: &'a Path,
     /// File the child's stderr is redirected to.
     pub stderr: &'a Path,
+}
+
+/// What a child reads as its stdin.
+#[derive(Debug, Clone, Copy)]
+pub enum LaunchInput<'a> {
+    /// The file holding the question, which the child reads once.
+    Question(&'a Path),
+    /// The read end of a pipe, which the child reads for as long as whoever holds the write end
+    /// writes to it.
+    Pipe(&'a std::io::PipeReader),
 }
 
 /// A started child, identified well enough to check on and to stop later.
@@ -322,6 +341,12 @@ impl ProcessLauncher {
     }
 }
 
+/// A child's stdin, opened once for every attempt to start it.
+enum OpenedInput<'a> {
+    Question { file: File, path: &'a Path },
+    Pipe(&'a std::io::PipeReader),
+}
+
 fn open_read(path: &Path) -> Result<File, LaunchError> {
     File::open(path).map_err(|source| LaunchError::Io {
         path: path.to_owned(),
@@ -407,7 +432,13 @@ impl Launcher for ProcessLauncher {
                 path: spec.cwd.to_owned(),
             });
         }
-        let stdin = open_read(spec.question)?;
+        let input = match spec.input {
+            LaunchInput::Question(path) => OpenedInput::Question {
+                file: open_read(path)?,
+                path,
+            },
+            LaunchInput::Pipe(pipe) => OpenedInput::Pipe(pipe),
+        };
         let stdout = open_append(spec.events)?;
         let stderr = open_append(spec.stderr)?;
 
@@ -429,7 +460,19 @@ impl Launcher for ProcessLauncher {
             command
                 .args(spec.invocation.args())
                 .current_dir(spec.cwd)
-                .stdin(clone(&stdin, spec.question)?)
+                .stdin(match &input {
+                    OpenedInput::Question { file, path } => {
+                        std::process::Stdio::from(clone(file, path)?)
+                    }
+                    OpenedInput::Pipe(pipe) => {
+                        std::process::Stdio::from(pipe.try_clone().map_err(|source| {
+                            LaunchError::Input {
+                                program: program.to_owned(),
+                                source,
+                            }
+                        })?)
+                    }
+                })
                 .stdout(clone(&stdout, spec.events)?)
                 .stderr(clone(&stderr, spec.stderr)?);
             // env_clear plus the allowlist the delegate built.
@@ -621,6 +664,39 @@ mod identity {
             None => Liveness::Unknown,
         }
     }
+}
+
+/// Whether the launcher starts `invocation`'s program as the process it records, rather than
+/// through a shim.
+///
+/// On Windows an npm-installed CLI is a `.cmd` shim, which the launcher falls back to when the
+/// bare name finds no executable, and whose process is the command interpreter rather than the
+/// CLI.
+/// Only a `.exe` on the child's `PATH`, or named by its path, is taken to start natively.
+#[cfg(windows)]
+pub(crate) fn starts_natively(invocation: &Invocation) -> bool {
+    let program = Path::new(invocation.program());
+    let executable = match program.extension() {
+        None => program.with_extension("exe"),
+        Some(extension) if extension.eq_ignore_ascii_case("exe") => program.to_path_buf(),
+        Some(_) => return false,
+    };
+    if executable.components().count() > 1 {
+        return executable.is_file();
+    }
+    invocation
+        .env()
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .is_some_and(|(_, path)| {
+            std::env::split_paths(path).any(|dir| dir.join(&executable).is_file())
+        })
+}
+
+/// Every program starts natively off Windows.
+#[cfg(not(windows))]
+pub(crate) fn starts_natively(_invocation: &Invocation) -> bool {
+    true
 }
 
 /// Keep this process's own standard handles out of every child it starts.

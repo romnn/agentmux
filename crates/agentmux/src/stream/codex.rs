@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::delegate::SessionRef;
-use crate::stream::{Fold, MALFORMED_LINE, classify_reported, complete_lines};
+use crate::stream::{Fold, MALFORMED_LINE, TurnInput, classify_reported, complete_lines};
 use crate::transcript::{AskedQuestion, Message, Outcome, Role, SpendReport, Turn, Usage};
 
 /// One line of a Codex capture: an event `codex exec --json` writes, or one agentmux adds.
@@ -216,7 +216,7 @@ fn record_questions(turn: &mut Turn, asked: CapturedQuestions) {
 pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     let mut turn = Turn::new(index, question);
     let mut session = None;
-    let mut turn_started = false;
+    let mut input = TurnInput::Pending;
 
     for line in complete_lines(events) {
         // Read as a JSON value first, which settles a key codex writes twice; see
@@ -258,7 +258,7 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
                     session = Some(parsed);
                 }
             }
-            ThreadEvent::TurnStarted(_) => turn_started = true,
+            ThreadEvent::TurnStarted(_) => input = TurnInput::Open,
             ThreadEvent::ItemStarted(_) | ThreadEvent::ItemUpdated(_) => {}
             ThreadEvent::ItemCompleted(completed) => match completed.item.details {
                 ThreadItemDetails::AgentMessage(message) => match message.text {
@@ -328,6 +328,8 @@ pub fn fold(index: u32, question: &str, events: &str) -> Fold {
     Fold {
         turn,
         session,
-        turn_started,
+        input,
+        last_result: None,
+        steers_taken: Vec::new(),
     }
 }

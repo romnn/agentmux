@@ -36,6 +36,11 @@ pub enum LaunchMode {
     DirectCli,
     /// The turn is driven over `codex app-server` by [`crate::appserver`], and can be steered.
     AppServer,
+    /// `claude --print` reading its input as stream-json from the turn's supervisor, which writes
+    /// the question and then each steer, until Claude reports its result.
+    ///
+    /// No `result` in its capture ends the turn: Claude's exit does.
+    ClaudeStreamInput,
 }
 
 /// What agentmux recorded about a consultation when it began.

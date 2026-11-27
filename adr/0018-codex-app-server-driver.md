@@ -6,7 +6,11 @@
 
 `steer` adds an instruction to a turn that is still running. `codex exec` reads its prompt once, and
 `claude --print` offers no channel into a turn that has started; only `codex app-server` accepts
-input for a running turn. A JSON-RPC server needs a client holding its stdin for as long as the turn
+input for a running turn.
+That statement about Claude is superseded by
+[0034](0034-claude-input-held-by-its-supervisor.md): given its input as stream-json,
+`claude --print` takes more.
+A JSON-RPC server needs a client holding its stdin for as long as the turn
 runs, and a consultation must survive the CLI or MCP server that started it. The run store and the
 transcript interface — the fold, `status`, `tail`, `result`, a restarted agentmux — must keep
 working unchanged for a driven turn.
@@ -63,7 +67,7 @@ starts anything.
 - Once the driver observes the `cancelling` marker, it stops submitting new steers, rejects waiting
   requests, and interrupts a started turn. Requests already in flight are settled separately.
 
-`RunStore::accepts_steers` is the one predicate behind both `RunStatus::steerable` and `steer`'s
+`RunStore::steer_server` is the one check behind both `RunStatus::steerable` and `steer`'s
 admission, and a turn whose capture does not yet say `turn.started` is refused as
 `SteerError::Starting`, so a steer never waits on setup.
 
