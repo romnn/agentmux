@@ -1377,40 +1377,6 @@ const CLAUDE_CREDENTIAL_ALLOWLIST: &[&str] = &[
 /// Credential variables the Codex CLI reads, including where its login is kept.
 const CODEX_CREDENTIAL_ALLOWLIST: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"];
 
-/// Variables that make a delegate CLI bill per token or talk to an endpoint other than its
-/// vendor's subscription, beyond what the suffix rules in [`is_billing_env_name`] already catch.
-///
-/// Each is either a credential the CLI prefers over its logged-in profile, a switch onto a cloud
-/// provider's metered API, or a header or endpoint override that can carry a key of its own.
-const EXPLICIT_BILLING_ENV_NAMES: &[&str] = &[
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "CODEX_ACCESS_TOKEN",
-    // agy's gateway, which routes it to another backend with headers and a key of its own, the
-    // switch onto another of its logins, and the switch onto Google Cloud's application default
-    // credentials with the file they are read from; named by its binary and its documentation.
-    "AGY_ACCOUNT",
-    "AGY_ADC_AUTH",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "AGY_LLM_GATEWAY_URL",
-    "AGY_LLM_GATEWAY_MODELS",
-    "AGY_LLM_GATEWAY_API_KEY",
-    "AGY_LLM_GATEWAY_HEADERS",
-];
-
-/// Namespaces whose endpoint and token names reroute a delegate or authenticate it.
-const BILLING_ENV_PREFIXES: &[&str] = &[
-    "ANTHROPIC_",
-    "CLAUDE_",
-    "OPENAI_",
-    "AZURE_OPENAI_",
-    "CODEX_",
-];
-
 /// Whether an environment name can put a delegate on API pricing or another endpoint.
 ///
 /// Matched without regard to case, so a spelling a platform would read as the same variable
@@ -1425,16 +1391,61 @@ const BILLING_ENV_PREFIXES: &[&str] = &[
 #[must_use]
 pub fn is_billing_env_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    let in_vendor_namespace = BILLING_ENV_PREFIXES
-        .iter()
-        .any(|prefix| upper.starts_with(prefix));
-    EXPLICIT_BILLING_ENV_NAMES.contains(&upper.as_str())
-        || upper.ends_with("_API_KEY")
+    upper.ends_with("_API_KEY")
         || upper.ends_with("_API_KEY_FILE")
-        || (in_vendor_namespace
-            && (upper.split('_').any(|segment| segment == "URL")
-                || upper.ends_with("_ISSUER")
-                || upper.ends_with("_AUTH_TOKEN")))
+        || Vendor::VARIANTS
+            .iter()
+            .any(|vendor| is_vendor_billing_env_name(*vendor, &upper))
+}
+
+/// Whether `upper`, a name in upper case, is one of `vendor`'s own billing names, beyond what the
+/// suffix rules in [`is_billing_env_name`] already catch: one it names outright, or an endpoint or
+/// a token in its namespaces.
+///
+/// A name named outright is either a credential the CLI prefers over its logged-in profile, a
+/// switch onto a cloud provider's metered API, or a header or endpoint override that can carry a
+/// key of its own.
+fn is_vendor_billing_env_name(vendor: Vendor, upper: &str) -> bool {
+    match vendor {
+        Vendor::Claude => {
+            [
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_CUSTOM_HEADERS",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "AWS_BEARER_TOKEN_BEDROCK",
+            ]
+            .contains(&upper)
+                || reroutes_within(upper, &["ANTHROPIC_", "CLAUDE_"])
+        }
+        Vendor::Codex => {
+            upper == "CODEX_ACCESS_TOKEN"
+                || reroutes_within(upper, &["OPENAI_", "AZURE_OPENAI_", "CODEX_"])
+        }
+        // agy's gateway, which routes it to another backend with headers and a key of its own, the
+        // switch onto another of its logins, and the switch onto Google Cloud's application default
+        // credentials with the file they are read from; named by its binary and its documentation.
+        Vendor::Agy => [
+            "AGY_ACCOUNT",
+            "AGY_ADC_AUTH",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AGY_LLM_GATEWAY_URL",
+            "AGY_LLM_GATEWAY_MODELS",
+            "AGY_LLM_GATEWAY_API_KEY",
+            "AGY_LLM_GATEWAY_HEADERS",
+        ]
+        .contains(&upper),
+    }
+}
+
+/// Whether `upper` is an endpoint or a token name in one of `namespaces`, the prefixes whose
+/// endpoint and token names reroute a delegate or authenticate it.
+fn reroutes_within(upper: &str, namespaces: &[&str]) -> bool {
+    namespaces.iter().any(|prefix| upper.starts_with(prefix))
+        && (upper.split('_').any(|segment| segment == "URL")
+            || upper.ends_with("_ISSUER")
+            || upper.ends_with("_AUTH_TOKEN"))
 }
 
 /// Remove every variable [`is_billing_env_name`] matches, and return the names removed.

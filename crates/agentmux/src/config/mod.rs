@@ -389,7 +389,7 @@ impl LaunchEnv {
     /// Whether this layer contributes nothing.
     ///
     /// Compared against the empty layer rather than field by field, so a field added later is
-    /// counted by construction; this is the one gate on what a project file may say.
+    /// counted by construction.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -985,16 +985,15 @@ impl Config {
                 continue;
             }
             let project = Self::read(&path)?;
-            if !project.accounts.is_empty()
-                || !project.launch.is_empty()
-                || !project.model_rewrites.is_empty()
-                || !project.effort_defaults.is_empty()
-                || !project.blocked.is_empty()
-                || project.retention.is_some()
-                || !project.codex.is_empty()
-                || !project.claude.is_empty()
-                || !project.agy.is_empty()
-            {
+            // Compared with the only shape a project file may have, rather than table by table,
+            // so a table added later is the machine file's alone until something says otherwise.
+            let selects_only = Self {
+                defaults: project.defaults.clone(),
+                source: project.source.clone(),
+                unknown: project.unknown.clone(),
+                ..Self::default()
+            };
+            if project != selects_only {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
             warn_unknown(&project.unknown);
