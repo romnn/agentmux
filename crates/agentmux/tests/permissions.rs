@@ -1249,30 +1249,33 @@ fn a_refused_start_leaves_no_run() -> Result<()> {
 }
 
 /// Read-only with network over `exec` is refused on a codex whose profile support is not
-/// verified, rather than run under whatever its configuration selects.
+/// verified, a release too old or one whose version cannot be read, rather than run under
+/// whatever its configuration selects.
 #[gtest]
 fn an_unverified_codex_cannot_run_read_only_with_network_over_exec() -> Result<()> {
-    let machine = Machine::new(
-        "",
-        ScriptedLauncher::new(codex_turns(1)).with_cli_version("codex-cli 0.150.0"),
-    )?;
+    for version in ["codex-cli 0.150.0", "codex-cli nightly"] {
+        let machine = Machine::new(
+            "",
+            ScriptedLauncher::new(codex_turns(1)).with_cli_version(version),
+        )?;
 
-    let refused = machine
-        .store
-        .start(&machine.request(codex(Some(CodexSandbox::ReadOnly), Some(true))?))
-        .err()
-        .or_fail()?;
+        let refused = machine
+            .store
+            .start(&machine.request(codex(Some(CodexSandbox::ReadOnly), Some(true))?))
+            .err()
+            .or_fail()?;
 
-    assert_that!(
-        refused.to_string(),
-        contains_substring(
-            "Cannot launch codex exec with sandbox=\"read_only\" and network_access=true: this \
-             Codex installation lacks verified permission-profile support."
-        )
-    );
-    assert_that!(refused.to_string(), contains_substring("codex-cli 0.150.0"));
-    assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
-    assert_that!(machine.launcher.launches(), is_empty());
+        assert_that!(
+            refused.to_string(),
+            contains_substring(
+                "Cannot launch codex exec with sandbox=\"read_only\" and network_access=true: \
+                 this Codex installation lacks verified permission-profile support."
+            )
+        );
+        assert_that!(refused.to_string(), contains_substring(version));
+        assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
+        assert_that!(machine.launcher.launches(), is_empty());
+    }
     Ok(())
 }
 

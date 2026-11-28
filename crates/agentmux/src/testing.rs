@@ -587,6 +587,55 @@ pub mod fixtures {
     /// `command.data`, one of whose windows nobody had used yet.
     pub const AGY_USAGE: &str = include_str!("../fixtures/agy/usage.json");
 
+    /// A vendor's consultation as the lifecycle conformance suite runs it: two recorded turns of
+    /// one session, and how the vendor's CLI is told to resume it.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Conformance {
+        /// A model the vendor's CLI takes.
+        pub model: &'static str,
+        /// A first turn that answered and finished.
+        pub first: &'static str,
+        /// A follow-up that answered in the session `first` opened.
+        pub follow_up: &'static str,
+        /// The session `first` opened.
+        pub session: &'static str,
+        /// The argument the session to resume follows on the CLI's command line.
+        pub resume_arg: &'static str,
+    }
+
+    /// What the lifecycle conformance suite runs a `vendor` consultation with.
+    ///
+    /// Exhaustive, so no vendor joins without passing the suite.
+    #[must_use]
+    pub fn conformance(vendor: crate::delegate::Vendor) -> Conformance {
+        use crate::delegate::Vendor;
+        match vendor {
+            // Claude's one recorded resume serves as its own first turn, so both turns report the
+            // session the follow-up resumes.
+            Vendor::Claude => Conformance {
+                model: "claude-opus-5",
+                first: CLAUDE_RESUME,
+                follow_up: CLAUDE_RESUME,
+                session: "850f440b-be0f-411e-aaf3-bc8fdcc6b6b8",
+                resume_arg: "--resume",
+            },
+            Vendor::Codex => Conformance {
+                model: "gpt-6-astra",
+                first: CODEX_HAPPY,
+                follow_up: CODEX_RESUME_WARNING,
+                session: "01a0784a-915b-7d92-a381-b53d765296c4",
+                resume_arg: "resume",
+            },
+            Vendor::Agy => Conformance {
+                model: "gemini-3.8-flash-low",
+                first: AGY_TOOL_USE,
+                follow_up: AGY_RESUME,
+                session: "e4c7ded7-2bf0-480b-9326-24191d51e4ba",
+                resume_arg: "--conversation",
+            },
+        }
+    }
+
     /// A committed fixture, and how the turn it was recorded from folds.
     #[derive(Debug, Clone)]
     pub struct Fixture {

@@ -16,6 +16,8 @@ use agentmux::quota::{
 #[cfg(unix)]
 use agentmux::quota::Refresh;
 use googletest::prelude::*;
+// Only a test that drives a shell script reads every vendor, so on Windows it would be unused.
+#[cfg(unix)]
 use strum::VariantArray as _;
 
 /// A probe that answers from a script instead of a machine.

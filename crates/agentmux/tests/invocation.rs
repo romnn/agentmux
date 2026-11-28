@@ -1405,6 +1405,33 @@ fn an_agy_delegate_withholds_cloud_credentials_the_machine_layer_forwarded() -> 
     Ok(())
 }
 
+/// An isolated agy delegate runs in a home its run store keeps, so without a store it is refused
+/// rather than launched in the user's own.
+#[gtest]
+fn an_isolated_agy_delegate_needs_a_run_store() -> Result<()> {
+    let requested = BTreeMap::new();
+    let plan = TurnPlan {
+        question_path: Path::new("/runs/r/turns/0001/question.md"),
+        last_message_path: Path::new("/runs/r/turns/0001/last-message.md"),
+        resume: None,
+        extra_env: &requested,
+        billing: None,
+        read_dirs: &[],
+    };
+    let delegate = Delegate {
+        model: model("gemini-3.8-flash-low")?,
+        effort: None,
+        account: AccountChoice::Default,
+        isolation: Some(Isolation::Isolated),
+        permissions: Permissions::Agy,
+    };
+    assert_that!(
+        delegate.invocation(&plan, &host_session_env(), &Config::default()),
+        err(matches_pattern!(DelegateError::AgyHomeUnknown))
+    );
+    Ok(())
+}
+
 /// The billing rule covers every way a vendor namespace names an endpoint or a token, and spares
 /// the names a subscription login itself needs.
 #[gtest]

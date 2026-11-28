@@ -206,44 +206,56 @@ fn an_inheriting_codex_turn_is_launched_through_the_driver() -> Result<()> {
     Ok(())
 }
 
-/// A consultation started by a store that drives nothing, as `--codex-launch exec` or
-/// `AGENTMUX_CODEX_LAUNCH=exec` opens one, stays on `codex exec` when a store that would drive it
-/// follows it up.
+/// A consultation started by a store that runs Codex with `exec`, as `--codex-launch exec` or
+/// `AGENTMUX_CODEX_LAUNCH=exec` opens one, or by a store that drives nothing, runs over
+/// `codex exec`, and stays there when a store that would drive it follows it up.
 #[gtest]
 #[tokio::test]
-async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
-    let dir = tempfile::tempdir().or_fail()?;
-    let first = Arc::new(ScriptedLauncher::new([Script::completed(
-        fixtures::CODEX_HAPPY,
-    )]));
-    let exec_only = RunStore::open(dir.path(), first.clone(), env()).or_fail()?;
-    let started = exec_only.start(&StartRequest {
-        delegate: codex(Isolation::Inherit)?,
-        question: "q".to_owned(),
-        cwd: dir.path().join("project"),
-        retention: Retention::Ttl,
-        env: BTreeMap::new(),
-        billing: None,
-        force_codex_exec: false,
-        label: None,
-    })?;
-    exec_only
-        .wait_until_terminal(&started.run_id, Duration::from_secs(5))
-        .await?;
+async fn a_consultation_started_on_exec_stays_on_exec() -> Result<()> {
+    for drives in [false, true] {
+        let dir = tempfile::tempdir().or_fail()?;
+        let first = Arc::new(ScriptedLauncher::new([Script::completed(
+            fixtures::CODEX_HAPPY,
+        )]));
+        let opened = RunStore::open(dir.path(), first.clone(), env()).or_fail()?;
+        let exec_only = if drives {
+            opened.with_driver(DRIVER_PATH).with_codex_exec(true)
+        } else {
+            opened
+        };
+        let started = exec_only.start(&StartRequest {
+            delegate: codex(Isolation::Inherit)?,
+            question: "q".to_owned(),
+            cwd: dir.path().join("project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })?;
+        exec_only
+            .wait_until_terminal(&started.run_id, Duration::from_secs(5))
+            .await?;
 
-    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
-    let driving = RunStore::open(dir.path(), later.clone(), env())
-        .or_fail()?
-        .with_driver(DRIVER_PATH);
-    driving.follow_up(&started.run_id, "And the session code?")?;
+        let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
+        let driving = RunStore::open(dir.path(), later.clone(), env())
+            .or_fail()?
+            .with_driver(DRIVER_PATH);
+        driving.follow_up(&started.run_id, "And the session code?")?;
 
-    assert_that!(
-        later
+        // Both turns ran the CLI itself rather than the driver.
+        let programs: Vec<String> = first
             .launches()
-            .first()
-            .map(|launch| launch.program.clone()),
-        some(eq("codex"))
-    );
+            .into_iter()
+            .chain(later.launches())
+            .map(|launch| launch.program)
+            .collect();
+        assert_that!(
+            programs,
+            elements_are![eq("codex"), eq("codex")],
+            "with a driver: {drives}"
+        );
+    }
     Ok(())
 }
 
@@ -732,6 +744,90 @@ const SUPERVISOR_PATH: &str = "/opt/agentmux/bin/agentmux";
 const CLAUDE_INIT: &str = indoc::indoc! {r#"
     {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
 "#};
+
+/// A Claude turn reads its input as stream-json only from a supervisor, which can hold it open for
+/// a steer; a store without one runs `claude --print` on the question as asked.
+#[gtest]
+fn a_claude_turn_reads_stream_json_only_from_its_supervisor() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    // A `claude.exe` on the delegate's `PATH`, which on Windows is what lets Claude start as
+    // itself rather than through a `.cmd` shim.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).or_fail()?;
+    std::fs::write(bin.join("claude.exe"), "").or_fail()?;
+    let mut env = env();
+    env.insert("PATH".to_owned(), bin.display().to_string());
+
+    let direct = launched_claude(&RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::running("")])),
+        env.clone(),
+    )?)?;
+    assert_that!(direct["mode"], eq(&serde_json::json!("exec")));
+    assert_that!(
+        direct["args"].as_array().or_fail()?,
+        not(contains(eq(&serde_json::json!("--input-format"))))
+    );
+
+    let supervised = launched_claude(
+        &RunStore::open(
+            dir.path(),
+            Arc::new(ScriptedLauncher::new([Script::running("")])),
+            env,
+        )?
+        .with_supervisor(SUPERVISOR_PATH),
+    )?;
+    assert_that!(
+        supervised["mode"],
+        eq(&serde_json::json!("claude_stream_input"))
+    );
+    assert_that!(
+        supervised["args"].as_array().or_fail()?,
+        contains(eq(&serde_json::json!("--input-format")))
+    );
+    Ok(())
+}
+
+/// A supervised Claude that would start through a Windows `.cmd` shim reads its question once,
+/// because the shim's process is the command interpreter, through which a cancellation could not
+/// stop Claude.
+#[cfg(windows)]
+#[gtest]
+fn a_claude_started_through_a_shim_reads_its_question_once() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let mut env = env();
+    env.insert("PATH".to_owned(), dir.path().display().to_string());
+    let launched = launched_claude(
+        &RunStore::open(
+            dir.path(),
+            Arc::new(ScriptedLauncher::new([Script::running("")])),
+            env,
+        )?
+        .with_supervisor(SUPERVISOR_PATH),
+    )?;
+    assert_that!(launched["mode"], eq(&serde_json::json!("exec")));
+    Ok(())
+}
+
+/// What `store` recorded of the Claude it launched for a new consultation's first turn.
+fn launched_claude(store: &RunStore) -> Result<serde_json::Value> {
+    let started = store.start(&StartRequest {
+        delegate: claude()?,
+        question: "q".to_owned(),
+        cwd: store.root().join("project"),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let record = store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001/invocation.json");
+    serde_json::from_str(&std::fs::read_to_string(record).or_fail()?).or_fail()
+}
 
 /// A Claude turn of a store that supervises its turns, whose supervisor and Claude the test plays.
 ///
