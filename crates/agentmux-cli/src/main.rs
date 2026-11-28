@@ -26,8 +26,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// The consultation `ask` and `start` begin.
 ///
-/// `--codex-launch exec` needs no field here: a store that runs Codex with `exec` records it on
-/// every consultation it starts.
+/// `--codex-launch exec` needs no field here: a store that drives nothing records `exec` on every
+/// consultation it starts.
 fn start_request(delegate: &DelegateArgs, question: &QuestionArgs) -> Result<StartRequest> {
     Ok(StartRequest {
         delegate: delegate.build()?,
@@ -177,14 +177,15 @@ fn open_store(cli: &Cli) -> Result<RunStore> {
     let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
-        .with_supervisor(&executable)
-        .with_driver(&executable)
-        .with_codex_exec(cli.codex_launch == CodexLaunchArg::Exec);
+        .with_supervisor(&executable);
     if let Some(first_delay) = cli.auto_resume_delay {
         store = store.with_auto_resume(Some(AutoResumePolicy {
             first_delay,
             ..AutoResumePolicy::DEFAULT
         }));
+    }
+    if cli.codex_launch == CodexLaunchArg::AppServer {
+        store = store.with_codex_app_server(executable);
     }
     Ok(store)
 }

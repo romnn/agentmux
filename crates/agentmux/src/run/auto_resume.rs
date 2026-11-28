@@ -98,17 +98,9 @@ pub(super) struct AutoResumePlan {
     pub(super) policy: AutoResumePolicy,
     /// The agentmux executable that supervises the resumed turn, as it supervised this one.
     pub(super) supervisor: PathBuf,
-    /// The agentmux executable that runs a driver in place of a vendor's CLI, when the store that
-    /// launched this turn has one.
-    ///
-    /// Named `codex_driver` in a plan an older agentmux wrote, whose store drove only Codex.
-    #[serde(alias = "codex_driver")]
-    pub(super) driver: Option<PathBuf>,
-    /// Whether the store that launched this turn runs every Codex turn with `codex exec`.
-    ///
-    /// Absent from a plan an older agentmux wrote, whose store had no driver when it did.
-    #[serde(default)]
-    pub(super) codex_exec: bool,
+    /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
+    /// that launched this turn drives them.
+    pub(super) codex_driver: Option<PathBuf>,
 }
 
 /// `auto-resume.json`: what was decided as a turn that failed overloaded settled.

@@ -149,8 +149,8 @@
 //! otherwise.
 //! `codex-app-server-codegen refresh` refuses a codex whose app-server accepts
 //! `--ignore-user-config`, so the release that adds it is the one that changes this.
-//! Everything else, and every Codex turn when the store was opened without a driver or with
-//! `codex_exec`, runs over `codex exec` and refuses `steer` with the reason.
+//! Everything else, and every Codex turn when the store was opened without a driver, runs over
+//! `codex exec` and refuses `steer` with the reason.
 //!
 //! # Where the protocol comes from
 //!

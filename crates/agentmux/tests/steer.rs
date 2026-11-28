@@ -78,7 +78,7 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
     let launcher = Arc::new(ScriptedLauncher::new(scripts));
     let store = RunStore::open(dir.path(), launcher.clone(), env())
         .or_fail()?
-        .with_driver(DRIVER_PATH);
+        .with_codex_app_server(DRIVER_PATH);
     Ok(Harness {
         store: Arc::new(store),
         launcher,
@@ -206,56 +206,44 @@ fn an_inheriting_codex_turn_is_launched_through_the_driver() -> Result<()> {
     Ok(())
 }
 
-/// A consultation started by a store that runs Codex with `exec`, as `--codex-launch exec` or
-/// `AGENTMUX_CODEX_LAUNCH=exec` opens one, or by a store that drives nothing, runs over
-/// `codex exec`, and stays there when a store that would drive it follows it up.
+/// A consultation started by a store that drives nothing, as `--codex-launch exec` or
+/// `AGENTMUX_CODEX_LAUNCH=exec` opens one, stays on `codex exec` when a store that would drive it
+/// follows it up.
 #[gtest]
 #[tokio::test]
-async fn a_consultation_started_on_exec_stays_on_exec() -> Result<()> {
-    for drives in [false, true] {
-        let dir = tempfile::tempdir().or_fail()?;
-        let first = Arc::new(ScriptedLauncher::new([Script::completed(
-            fixtures::CODEX_HAPPY,
-        )]));
-        let opened = RunStore::open(dir.path(), first.clone(), env()).or_fail()?;
-        let exec_only = if drives {
-            opened.with_driver(DRIVER_PATH).with_codex_exec(true)
-        } else {
-            opened
-        };
-        let started = exec_only.start(&StartRequest {
-            delegate: codex(Isolation::Inherit)?,
-            question: "q".to_owned(),
-            cwd: dir.path().join("project"),
-            retention: Retention::Ttl,
-            env: BTreeMap::new(),
-            billing: None,
-            force_codex_exec: false,
-            label: None,
-        })?;
-        exec_only
-            .wait_until_terminal(&started.run_id, Duration::from_secs(5))
-            .await?;
+async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let first = Arc::new(ScriptedLauncher::new([Script::completed(
+        fixtures::CODEX_HAPPY,
+    )]));
+    let exec_only = RunStore::open(dir.path(), first.clone(), env()).or_fail()?;
+    let started = exec_only.start(&StartRequest {
+        delegate: codex(Isolation::Inherit)?,
+        question: "q".to_owned(),
+        cwd: dir.path().join("project"),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    exec_only
+        .wait_until_terminal(&started.run_id, Duration::from_secs(5))
+        .await?;
 
-        let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
-        let driving = RunStore::open(dir.path(), later.clone(), env())
-            .or_fail()?
-            .with_driver(DRIVER_PATH);
-        driving.follow_up(&started.run_id, "And the session code?")?;
+    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
+    let driving = RunStore::open(dir.path(), later.clone(), env())
+        .or_fail()?
+        .with_codex_app_server(DRIVER_PATH);
+    driving.follow_up(&started.run_id, "And the session code?")?;
 
-        // Both turns ran the CLI itself rather than the driver.
-        let programs: Vec<String> = first
+    assert_that!(
+        later
             .launches()
-            .into_iter()
-            .chain(later.launches())
-            .map(|launch| launch.program)
-            .collect();
-        assert_that!(
-            programs,
-            elements_are![eq("codex"), eq("codex")],
-            "with a driver: {drives}"
-        );
-    }
+            .first()
+            .map(|launch| launch.program.clone()),
+        some(eq("codex"))
+    );
     Ok(())
 }
 

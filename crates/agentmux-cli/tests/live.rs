@@ -52,7 +52,7 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     std::fs::create_dir_all(&project).or_fail()?;
     let store = RunStore::open(root.join("state"), Arc::new(ProcessLauncher::new()), env)
         .or_fail()?
-        .with_driver(env!("CARGO_BIN_EXE_agentmux"));
+        .with_codex_app_server(env!("CARGO_BIN_EXE_agentmux"));
     let account = live_account("AGENTMUX_LIVE_CODEX_ACCOUNT")?;
 
     let started = store.start(&StartRequest {

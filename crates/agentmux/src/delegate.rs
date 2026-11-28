@@ -1629,11 +1629,10 @@ pub(crate) struct LaunchRequest<'a> {
     pub(crate) store_root: &'a Path,
     /// Whether a supervisor starts the delegate, and so can hold its input.
     pub(crate) supervisor: bool,
-    /// The agentmux executable that runs a driver in place of the vendor's CLI, when the store
-    /// has one.
-    pub(crate) driver: Option<&'a Path>,
-    /// Whether every Codex turn runs with `codex exec`, as the consultation or the store asks;
-    /// only Codex reads it.
+    /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
+    /// drives them.
+    pub(crate) codex_driver: Option<&'a Path>,
+    /// Whether every Codex turn of the consultation runs with `codex exec`; only Codex reads it.
     pub(crate) codex_exec: bool,
 }
 

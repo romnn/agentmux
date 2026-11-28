@@ -216,10 +216,9 @@ impl RunStore {
             Some(resume) => {
                 let configured = self
                     .with_supervisor(&resume.supervisor)
-                    .with_auto_resume(Some(resume.policy))
-                    .with_codex_exec(resume.codex_exec);
-                match &resume.driver {
-                    Some(driver) => configured.with_driver(driver),
+                    .with_auto_resume(Some(resume.policy));
+                match &resume.codex_driver {
+                    Some(driver) => configured.with_codex_app_server(driver),
                     None => configured,
                 }
             }
@@ -571,7 +570,7 @@ mod tests {
     "#};
 
     /// A driven Codex turn's `supervisor-plan.json`, as an earlier agentmux wrote it: its producer
-    /// names no stdin, and its automatic resume names its driver `codex_driver`.
+    /// names no stdin.
     const CODEX_PLAN: &str = indoc::indoc! {r#"
         {
           "store_root": "<root>",
@@ -623,22 +622,24 @@ mod tests {
         let open = || RunStore::open(dir.path(), launcher.clone(), env.clone());
 
         // The first turn runs over the app-server, directly, and has not gone yet.
-        let started = open()?.with_driver("/opt/agentmux").start(&StartRequest {
-            delegate: Delegate {
-                model: ModelId::parse("gpt-6-astra").or_fail()?,
-                effort: None,
-                account: AccountChoice::Default,
-                isolation: Some(Isolation::Inherit),
-                permissions: Permissions::Codex(CodexPermissions::default()),
-            },
-            question: "review this".to_owned(),
-            cwd: PathBuf::from("/work/project"),
-            retention: Retention::Ttl,
-            env: BTreeMap::new(),
-            billing: None,
-            force_codex_exec: false,
-            label: None,
-        })?;
+        let started = open()?
+            .with_codex_app_server("/opt/agentmux")
+            .start(&StartRequest {
+                delegate: Delegate {
+                    model: ModelId::parse("gpt-6-astra").or_fail()?,
+                    effort: None,
+                    account: AccountChoice::Default,
+                    isolation: Some(Isolation::Inherit),
+                    permissions: Permissions::Codex(CodexPermissions::default()),
+                },
+                question: "review this".to_owned(),
+                cwd: PathBuf::from("/work/project"),
+                retention: Retention::Ttl,
+                env: BTreeMap::new(),
+                billing: None,
+                force_codex_exec: false,
+                label: None,
+            })?;
         let run_id = started.run_id;
 
         // Its supervisor, this process, ran it under the earlier plan.

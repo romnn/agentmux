@@ -53,7 +53,7 @@ fn a_replaced_executable_launches_nothing() -> Result<()> {
     let store = RunStore::open(dir.path().join("state"), launcher.clone(), env())
         .or_fail()?
         .with_supervisor(&executable)
-        .with_driver(&executable);
+        .with_codex_app_server(&executable);
     store.start(&request()?)?;
     assert_that!(launcher.launches().len(), eq(1));
 

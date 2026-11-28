@@ -48,7 +48,7 @@ pub(crate) fn prepare(
         billing,
         launcher,
         store_root,
-        driver,
+        codex_driver,
         codex_exec,
         ..
     } = request;
@@ -68,7 +68,7 @@ pub(crate) fn prepare(
     let session_store = Vendor::Codex.session_store(invocation.env());
 
     // Driven over the app-server
-    if let Some(driver) = driver
+    if let Some(driver) = codex_driver
         && isolation.inherits()
         && !codex_exec
     {

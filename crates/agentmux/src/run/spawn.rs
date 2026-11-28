@@ -316,9 +316,9 @@ impl RunStore {
             delegate,
             rewritten_from,
             billing: Some(billing),
-            // A store that runs Codex with `exec`, or drives nothing, says so for the follow-ups,
+            // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
             // whichever store continues the consultation.
-            force_codex_exec: request.force_codex_exec || self.codex_exec || self.driver.is_none(),
+            force_codex_exec: request.force_codex_exec || self.codex_driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -698,7 +698,7 @@ impl RunStore {
     fn refuse_replaced_executables(&self) -> Result<(), RunError> {
         self.supervisor
             .iter()
-            .chain(&self.driver)
+            .chain(&self.codex_driver)
             .try_for_each(super::Executable::refuse_if_replaced)
     }
 }
@@ -815,8 +815,8 @@ impl RunStore {
             launcher: self.launcher.as_ref(),
             store_root: &self.root,
             supervisor: self.supervisor.is_some(),
-            driver: self.driver.as_ref().map(super::Executable::path),
-            codex_exec: meta.force_codex_exec || self.codex_exec,
+            codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
+            codex_exec: meta.force_codex_exec,
         })?;
 
         // Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
@@ -958,11 +958,10 @@ impl RunStore {
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
                     supervisor: supervisor.to_path_buf(),
-                    driver: self
-                        .driver
+                    codex_driver: self
+                        .codex_driver
                         .as_ref()
                         .map(|driver| driver.path().to_path_buf()),
-                    codex_exec: self.codex_exec,
                 }),
             },
         )?;

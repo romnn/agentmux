@@ -153,11 +153,9 @@ pub struct RunStore {
     /// Whether this process runs inside a delegate, decided once: neither witness can change
     /// while the process lives.
     inside_delegate: OnceLock<bool>,
-    /// The agentmux executable that runs a driver in place of a vendor's CLI, as it drives a Codex
-    /// turn over `codex app-server`, when this store launches turns that way.
-    driver: Option<Executable>,
-    /// Whether this store runs every Codex turn with `codex exec`, even one it could drive.
-    codex_exec: bool,
+    /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
+    /// launches such turns that way.
+    codex_driver: Option<Executable>,
     /// The agentmux executable that supervises each turn this store launches, when it launches
     /// them that way.
     supervisor: Option<Executable>,
@@ -211,8 +209,7 @@ impl RunStore {
             inside_delegate: OnceLock::new(),
             // `exec` for every Codex turn until a caller names a driver: embedding this library
             // must not start an executable the embedder did not provide.
-            driver: None,
-            codex_exec: false,
+            codex_driver: None,
             // Unsupervised for the same reason.
             supervisor: None,
             // Resumed only by a supervisor, so nothing runs until one is named.
@@ -228,8 +225,8 @@ impl RunStore {
     /// its delegate leaving, whether or not anything is asking about the consultation.
     /// Without one, the delegate is launched directly and its turn settles when something next
     /// reads it.
-    /// Independent of [`RunStore::with_driver`]: a driven turn's driver is the delegate the
-    /// supervisor starts.
+    /// Independent of [`RunStore::with_codex_app_server`]: a driven turn's driver is the delegate
+    /// the supervisor starts.
     ///
     /// The file is remembered as it is now, and once it changes, as an upgrade changes it under a
     /// running server, every launch is refused with [`RunError::ExecutableReplaced`].
@@ -252,30 +249,19 @@ impl RunStore {
         self
     }
 
-    /// Drive every turn that can be driven through `driver`, as every Codex turn that can run
-    /// over `codex app-server` is, so it can be steered while it runs.
+    /// Drive every Codex turn that can run over `codex app-server` through `driver`, so it can be
+    /// steered while it runs.
     ///
     /// `driver` is an `agentmux` executable: the run store launches it as
     /// `<driver> codex-app-server <plan>`, and it runs [`crate::appserver::drive`].
-    /// Only a Codex delegate that inherits its account's settings runs this way, unless
-    /// [`RunStore::with_codex_exec`] says otherwise, and every other turn still runs over
-    /// `codex exec`, `claude --print` or `agy --print`.
+    /// Only a Codex delegate that inherits its account's settings runs this way — see
+    /// `vendor::codex::prepare` — and every other turn still runs over `codex exec`,
+    /// `claude --print` or `agy --print`.
     /// Like the supervisor, the file is remembered as it is now, and a launch is refused once it
     /// changes.
     #[must_use]
-    pub fn with_driver(mut self, driver: impl Into<PathBuf>) -> Self {
-        self.driver = Some(Executable::new(driver.into()));
-        self
-    }
-
-    /// Run every Codex turn with `codex exec`, even one that could be driven over
-    /// `codex app-server`, when `codex_exec` is set.
-    ///
-    /// For a codex whose app-server protocol no longer matches this agentmux; such a turn cannot
-    /// be steered, and the consultations this store starts keep `exec` for their follow-ups.
-    #[must_use]
-    pub fn with_codex_exec(mut self, codex_exec: bool) -> Self {
-        self.codex_exec = codex_exec;
+    pub fn with_codex_app_server(mut self, driver: impl Into<PathBuf>) -> Self {
+        self.codex_driver = Some(Executable::new(driver.into()));
         self
     }
 
