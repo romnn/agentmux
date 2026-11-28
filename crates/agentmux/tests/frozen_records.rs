@@ -2,10 +2,12 @@
 //!
 //! Each consultation here is started through the scripted launcher, and its `meta.json` and first
 //! `invocation.json` are then replaced with a frozen text.
-//! The texts are what a release that predates every change to the delegate's shape wrote, with
-//! the edges a record can have: a network switched off, an empty tool list, permissions and
-//! isolation left out, an account spelled as an alias or as the CLI's own login, keys this build
-//! does not know, and an invocation record with no delegate in it.
+//! The texts are records agentmux wrote at commit 944b80d, before any change to the delegate's
+//! shape, with the recording machine's paths replaced by placeholders.
+//! Where a test needs an edge none of those records has, its constant is one of them with a
+//! single edit, and the constant's doc names it: an empty tool list, a network a follow-up
+//! switched off, keys this build does not know, and records from before the isolation, the
+//! account or the delegate were kept.
 //! A change that reads any of them differently fails here rather than on a machine with
 //! consultations already on disk.
 
@@ -22,8 +24,8 @@ use agentmux::vendor::claude::ClaudePermissions;
 use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
-/// A machine with one configured Claude account, `work`, and a store that launches every turn
-/// directly, so each turn settles when it is next read.
+/// A machine with the accounts the frozen records name, Claude's `work` and Codex's `personal`,
+/// and a store that launches every turn directly, so each turn settles when it is next read.
 struct Machine {
     store: RunStore,
     launcher: Arc<ScriptedLauncher>,
@@ -37,13 +39,21 @@ impl Machine {
         let state = tempfile::tempdir().or_fail()?;
         let work = home.path().join("claude-work");
         std::fs::create_dir(&work).or_fail()?;
+        let personal = home.path().join("codex-personal");
+        std::fs::create_dir(&personal).or_fail()?;
         let config_path = home.path().join("agentmux.toml");
         agentmux::testing::write_config_file(
             &config_path,
-            format!(
-                "[accounts.claude.work]\nconfig_dir = {}\n",
-                toml_string(&work)?
-            ),
+            indoc::formatdoc! {"
+                [accounts.claude.work]
+                config_dir = {work}
+
+                [accounts.codex.personal]
+                config_dir = {personal}
+                ",
+                work = toml_string(&work)?,
+                personal = toml_string(&personal)?,
+            },
         )
         .or_fail()?;
         let env: BTreeMap<String, String> = [
@@ -89,12 +99,14 @@ impl Machine {
     }
 
     /// Replace the consultation's `meta.json` and its first turn's `invocation.json` with frozen
-    /// texts, `<run_id>` and `<cwd>` filled in.
+    /// texts, `<run_id>`, `<cwd>`, `<home>` and the store's `<root>` filled in.
     fn freeze(&self, run_id: &RunId, meta: &str, invocation: &str) -> Result<()> {
         let fill = |text: &str| -> Result<String> {
             Ok(text
                 .replace("<run_id>", run_id.as_str())
-                .replace("<cwd>", &json_path(self.home.path())?))
+                .replace("<cwd>", &json_path(self.home.path())?)
+                .replace("<home>", &json_path(self.home.path())?)
+                .replace("<root>", &json_path(self.state.path())?))
         };
         let run = self.run_dir(run_id);
         std::fs::write(run.join("meta.json"), fill(meta)?).or_fail()?;
@@ -167,21 +179,25 @@ fn agy() -> Result<Delegate> {
 }
 
 /// A Claude consultation that runs as a named account, loads the user's settings, and chose
-/// every permission, with a key in its delegate this build does not read.
+/// every permission.
+///
+/// Edited from a record agentmux wrote so that its delegate offers no tools at all, which
+/// agentmux records as an empty list.
+/// Its delegate also carries a synthetic key this build does not read, as a newer agentmux could
+/// write.
 const CLAUDE_META: &str = indoc::indoc! {r#"
     {
       "run_id": "<run_id>",
       "delegate": {
         "vendor": "claude",
-        "model": "opus",
-        "effort": "xhigh",
+        "model": "claude-haiku-5-5",
+        "effort": "max",
         "account": "work",
         "isolation": "inherit",
         "permission_mode": "acceptEdits",
         "tools": [],
         "allowed_tools": [
-          "WebFetch",
-          "Bash(cargo check *)"
+          "WebFetch"
         ],
         "disallowed_tools": [
           "Bash(git push *)"
@@ -190,110 +206,252 @@ const CLAUDE_META: &str = indoc::indoc! {r#"
       },
       "cwd": "<cwd>",
       "retention": "ttl",
-      "created_at": "2026-11-20T10:00:00Z",
+      "created_at": "2026-11-28T01:47:11.660880512Z",
       "env": {},
+      "rewritten_from": "haiku",
       "billing": "subscription"
     }
 "#};
 
 /// Its first turn, which ran as the consultation's record says.
+///
+/// Edited from what agentmux wrote only to offer no tools, in its delegate and its `--tools`.
 const CLAUDE_INVOCATION: &str = indoc::indoc! {r#"
     {
       "program": "claude",
-      "args": [],
-      "env_keys": [],
+      "args": [
+        "--print",
+        "--model",
+        "claude-haiku-5-5",
+        "--effort",
+        "max",
+        "--permission-mode",
+        "acceptEdits",
+        "--tools",
+        "",
+        "--allowedTools",
+        "WebFetch",
+        "--disallowedTools",
+        "Bash(git push *)",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--replay-user-messages",
+        "--permission-prompts",
+        "none"
+      ],
+      "env_keys": [
+        "AGENTMUX_DELEGATE",
+        "AGENTMUX_STATE_DIR",
+        "CI",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "USER"
+      ],
       "cwd": "<cwd>",
-      "mode": "exec",
+      "mode": "claude_stream_input",
       "billing": "subscription",
+      "config_dir": "<home>/claude-work",
+      "cli_version": "2.1.277 (Claude Code)",
+      "agentmux_version": "0.0.13",
       "delegate": {
         "vendor": "claude",
-        "model": "opus",
-        "effort": "xhigh",
+        "model": "claude-haiku-5-5",
+        "effort": "max",
         "account": "work",
         "isolation": "inherit",
         "permission_mode": "acceptEdits",
         "tools": [],
         "allowed_tools": [
-          "WebFetch",
-          "Bash(cargo check *)"
+          "WebFetch"
         ],
         "disallowed_tools": [
           "Bash(git push *)"
         ]
-      }
+      },
+      "label": "claude-inherit"
     }
 "#};
 
-/// A Codex consultation on the CLI's own login, started read-only and isolated, with its network
-/// left to Codex.
+/// A Codex consultation as a named account, started isolated in a workspace-write sandbox whose
+/// network is on.
 const CODEX_META: &str = indoc::indoc! {r#"
     {
       "run_id": "<run_id>",
       "delegate": {
         "vendor": "codex",
-        "model": "sol",
-        "effort": "high",
-        "sandbox": "read_only",
-        "account": {
-          "kind": "cli_login"
-        },
+        "model": "gpt-6-luna",
+        "effort": "medium",
+        "sandbox": "workspace_write",
+        "network_access": true,
+        "account": "personal",
         "isolation": "isolated"
       },
       "cwd": "<cwd>",
       "retention": "ttl",
-      "created_at": "2026-11-20T10:00:00Z",
+      "created_at": "2026-11-28T01:47:13.310575724Z",
       "env": {},
+      "rewritten_from": "luna",
       "billing": "subscription"
     }
 "#};
 
-/// Its first turn, which a follow-up moved to a workspace-write sandbox with no network.
+/// Its newest turn, run by a follow-up that switched the network off.
+///
+/// Edited from a first turn agentmux wrote, which kept the network on, in its delegate's
+/// `network_access` and the `--config` that sets it.
+/// None of the recorded consultations has a follow-up that changed the network.
 const CODEX_INVOCATION: &str = indoc::indoc! {r#"
     {
       "program": "codex",
-      "args": [],
-      "env_keys": [],
+      "args": [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--model",
+        "gpt-6-luna",
+        "--config",
+        "model_reasoning_effort=\"medium\"",
+        "--ignore-user-config",
+        "--config",
+        "features.hooks=false",
+        "--sandbox",
+        "workspace-write",
+        "--config",
+        "sandbox_workspace_write.network_access=false",
+        "--config",
+        "approval_policy=\"never\"",
+        "--config",
+        "approvals_reviewer=\"user\"",
+        "--output-last-message",
+        "<root>/runs/<run_id>/turns/0001/last-message.md",
+        "-"
+      ],
+      "env_keys": [
+        "AGENTMUX_DELEGATE",
+        "AGENTMUX_STATE_DIR",
+        "CI",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "USER"
+      ],
       "cwd": "<cwd>",
       "mode": "exec",
       "billing": "subscription",
+      "config_dir": "<home>/codex-personal",
+      "cli_version": "codex-cli 0.163.0",
+      "agentmux_version": "0.0.13",
       "delegate": {
         "vendor": "codex",
-        "model": "sol",
-        "effort": "high",
+        "model": "gpt-6-luna",
+        "effort": "medium",
         "sandbox": "workspace_write",
         "network_access": false,
-        "account": {
-          "kind": "cli_login"
-        },
+        "account": "personal",
         "isolation": "isolated"
-      }
+      },
+      "label": "codex-isolated"
     }
 "#};
 
-/// A Codex consultation whose commands may not reach the network, recorded read-only.
+/// A Codex consultation forced onto `codex exec`, whose commands may not reach the network,
+/// recorded read-only.
 const CODEX_OFFLINE_META: &str = indoc::indoc! {r#"
     {
       "run_id": "<run_id>",
       "delegate": {
         "vendor": "codex",
-        "model": "sol",
+        "model": "gpt-6-luna",
+        "effort": "medium",
         "sandbox": "read_only",
         "network_access": false,
-        "account": {
-          "kind": "cli_login"
-        },
-        "isolation": "isolated"
+        "account": "personal",
+        "isolation": "inherit"
       },
       "cwd": "<cwd>",
       "retention": "ttl",
-      "created_at": "2026-11-20T10:00:00Z",
+      "created_at": "2026-11-28T01:47:13.000746167Z",
       "env": {},
-      "billing": "subscription"
+      "rewritten_from": "luna",
+      "billing": "subscription",
+      "codex_exec": true
     }
 "#};
 
-/// An agy consultation from before the account and the isolation were pinned, with a key in its
-/// delegate this build does not read.
+/// Its first turn, which ran as the consultation's record says.
+const CODEX_OFFLINE_INVOCATION: &str = indoc::indoc! {r#"
+    {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--model",
+        "gpt-6-luna",
+        "--config",
+        "model_reasoning_effort=\"medium\"",
+        "--sandbox",
+        "read-only",
+        "--config",
+        "approval_policy=\"never\"",
+        "--config",
+        "approvals_reviewer=\"user\"",
+        "--output-last-message",
+        "<root>/runs/<run_id>/turns/0001/last-message.md",
+        "-"
+      ],
+      "env_keys": [
+        "AGENTMUX_DELEGATE",
+        "AGENTMUX_STATE_DIR",
+        "CI",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "USER"
+      ],
+      "cwd": "<cwd>",
+      "mode": "exec",
+      "billing": "subscription",
+      "config_dir": "<home>/codex-personal",
+      "cli_version": "codex-cli 0.163.0",
+      "agentmux_version": "0.0.13",
+      "delegate": {
+        "vendor": "codex",
+        "model": "gpt-6-luna",
+        "effort": "medium",
+        "sandbox": "read_only",
+        "network_access": false,
+        "account": "personal",
+        "isolation": "inherit"
+      },
+      "label": "codex-exec"
+    }
+"#};
+
+/// A synthetic agy consultation from before the account and the isolation were pinned, with a
+/// key in its delegate this build does not read.
+///
+/// It is an isolated agy record agentmux wrote, with the delegate's `account` and `isolation`
+/// taken out and the unknown key put in.
 const AGY_META: &str = indoc::indoc! {r#"
     {
       "run_id": "<run_id>",
@@ -304,19 +462,52 @@ const AGY_META: &str = indoc::indoc! {r#"
       },
       "cwd": "<cwd>",
       "retention": "ttl",
-      "created_at": "2026-11-20T10:00:00Z",
-      "env": {}
+      "created_at": "2026-11-28T01:47:13.767901124Z",
+      "env": {},
+      "billing": "subscription"
     }
 "#};
 
-/// An invocation record from before the delegate a turn ran as was kept with it.
+/// A synthetic invocation record from before the delegate a turn ran as was kept with it.
+///
+/// It is the first turn of an isolated agy consultation agentmux wrote, with its `delegate`
+/// taken out.
 const INVOCATION_WITHOUT_DELEGATE: &str = indoc::indoc! {r#"
     {
       "program": "agy",
-      "args": [],
-      "env_keys": [],
+      "args": [
+        "--print=",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--model",
+        "gemini-3.8-flash-low",
+        "--settings",
+        "{\"agentMode\":\"\",\"permissions\":{\"ask\":[],\"deny\":[\"command(*)\",\"write_file(*)\",\"mcp(*)\",\"execute_url(*)\",\"download_url(*)\"]},\"toolPermission\":\"request-review\",\"useG1Credits\":false}"
+      ],
+      "env_keys": [
+        "AGENTMUX_DELEGATE",
+        "AGENTMUX_STATE_DIR",
+        "CI",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "USER",
+        "USERPROFILE"
+      ],
       "cwd": "<cwd>",
-      "mode": "exec"
+      "mode": "exec",
+      "billing": "subscription",
+      "config_dir": "<root>/agy-home/.gemini/antigravity-cli",
+      "cli_version": "1.5.18",
+      "agentmux_version": "0.0.13",
+      "label": "agy-isolated"
     }
 "#};
 
@@ -331,15 +522,19 @@ fn a_frozen_claude_record_keeps_every_permission() -> Result<()> {
     let run_id = machine.start(claude()?)?;
     machine.freeze(&run_id, CLAUDE_META, CLAUDE_INVOCATION)?;
 
-    // `status` and `list` describe what the record says, the key it does not know aside.
-    let summary = "claude opus effort=xhigh permission_mode=acceptEdits tools= \
-                   allowed_tools=WebFetch,Bash(cargo check *) \
-                   disallowed_tools=Bash(git push *) account=work settings=inherited";
+    // `status` and `list` describe what the record says, the key it does not know aside, and
+    // `list` names the model the caller asked for, which the record keeps.
+    let summary = "claude claude-haiku-5-5 effort=max permission_mode=acceptEdits tools= \
+                   allowed_tools=WebFetch disallowed_tools=Bash(git push *) account=work \
+                   settings=inherited";
     assert_that!(
         machine.store.status(&run_id)?.delegate.summary(),
         eq(summary)
     );
-    assert_that!(machine.listed(&run_id)?, eq(summary));
+    assert_that!(
+        machine.listed(&run_id)?,
+        eq(&format!("{summary} (asked for haiku)"))
+    );
 
     machine.store.follow_up(&run_id, "again")?;
 
@@ -348,16 +543,13 @@ fn a_frozen_claude_record_keeps_every_permission() -> Result<()> {
     let session = session_of(Vendor::Claude, fixtures::CLAUDE_HAPPY)?;
     let launch = machine.launch(1)?;
     assert_that!(launch.has_flag_with("--resume", session.as_str()), eq(true));
-    assert_that!(launch.has_flag_with("--effort", "xhigh"), eq(true));
+    assert_that!(launch.has_flag_with("--effort", "max"), eq(true));
     assert_that!(
         launch.has_flag_with("--permission-mode", "acceptEdits"),
         eq(true)
     );
     assert_that!(launch.has_flag_with("--tools", ""), eq(true));
-    assert_that!(
-        launch.has_flag_with("--allowedTools", "WebFetch,Bash(cargo check *)"),
-        eq(true)
-    );
+    assert_that!(launch.has_flag_with("--allowedTools", "WebFetch"), eq(true));
     assert_that!(
         launch.has_flag_with("--disallowedTools", "Bash(git push *)"),
         eq(true)
@@ -387,12 +579,16 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     let run_id = machine.start(codex()?)?;
     machine.freeze(&run_id, CODEX_META, CODEX_INVOCATION)?;
 
-    let summary = "codex sol effort=high sandbox=workspace-write+no-network account=cli-default";
+    let summary =
+        "codex gpt-6-luna effort=medium sandbox=workspace-write+no-network account=personal";
     assert_that!(
         machine.store.status(&run_id)?.delegate.summary(),
         eq(summary)
     );
-    assert_that!(machine.listed(&run_id)?, eq(summary));
+    assert_that!(
+        machine.listed(&run_id)?,
+        eq(&format!("{summary} (asked for luna)"))
+    );
 
     machine.store.follow_up(&run_id, "again")?;
 
@@ -402,7 +598,7 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     let launch = machine.launch(1)?;
     assert_that!(launch.has_flag_with("resume", session.as_str()), eq(true));
     assert_that!(
-        launch.has_flag_with("--config", "model_reasoning_effort=\"high\""),
+        launch.has_flag_with("--config", "model_reasoning_effort=\"medium\""),
         eq(true)
     );
     assert_that!(launch.has_flag("--ignore-user-config"), eq(true));
@@ -413,6 +609,16 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     assert_that!(
         launch.has_flag_with("--config", "sandbox_workspace_write.network_access=false"),
         eq(true)
+    );
+    // It runs as the account the record names.
+    assert_that!(
+        launch.env.get("CODEX_HOME"),
+        some(eq(&machine
+            .home
+            .path()
+            .join("codex-personal")
+            .to_string_lossy()
+            .into_owned()))
     );
     Ok(())
 }
@@ -426,7 +632,7 @@ fn a_partial_override_keeps_a_frozen_network_choice() -> Result<()> {
         Script::completed(fixtures::CODEX_HAPPY),
     ])?;
     let run_id = machine.start(codex()?)?;
-    machine.freeze(&run_id, CODEX_OFFLINE_META, INVOCATION_WITHOUT_DELEGATE)?;
+    machine.freeze(&run_id, CODEX_OFFLINE_META, CODEX_OFFLINE_INVOCATION)?;
 
     machine.store.follow_up_with(
         &run_id,
@@ -449,7 +655,10 @@ fn a_partial_override_keeps_a_frozen_network_choice() -> Result<()> {
     );
     assert_that!(
         machine.store.status(&run_id)?.delegate.summary(),
-        eq("codex sol effort=cli-default sandbox=workspace-write+no-network account=cli-default")
+        eq(
+            "codex gpt-6-luna effort=medium sandbox=workspace-write+no-network account=personal \
+            settings=inherited"
+        )
     );
     Ok(())
 }

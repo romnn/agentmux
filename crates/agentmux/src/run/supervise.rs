@@ -466,7 +466,7 @@ mod tests {
         Ok(quoted.trim_matches('"').to_owned())
     }
 
-    /// An agy consultation's `meta.json`, as an earlier agentmux wrote it.
+    /// An isolated agy consultation's `meta.json`, as agentmux wrote it at commit 944b80d.
     const AGY_META: &str = indoc::indoc! {r#"
         {
           "run_id": "<run_id>",
@@ -480,14 +480,14 @@ mod tests {
           },
           "cwd": "<cwd>",
           "retention": "ttl",
-          "created_at": "2026-11-20T10:00:00Z",
+          "created_at": "2026-11-28T01:47:13.767901124Z",
           "env": {},
           "billing": "subscription"
         }
     "#};
 
-    /// An agy turn's `supervisor-plan.json`, as an earlier agentmux wrote it: its producer names
-    /// no stdin.
+    /// Its first turn's `supervisor-plan.json`, as agentmux wrote it at commit 944b80d: its
+    /// producer names no stdin.
     const AGY_PLAN: &str = indoc::indoc! {r#"
         {
           "store_root": "<root>",
@@ -503,12 +503,28 @@ mod tests {
               "--output-format",
               "stream-json",
               "--model",
-              "gemini-3.8-flash-low"
+              "gemini-3.8-flash-low",
+              "--settings",
+              "{\"agentMode\":\"\",\"permissions\":{\"ask\":[],\"deny\":[\"command(*)\",\"write_file(*)\",\"mcp(*)\",\"execute_url(*)\",\"download_url(*)\"]},\"toolPermission\":\"request-review\",\"useG1Credits\":false}"
             ],
             "cwd": "<cwd>",
             "billing": "subscription"
           },
-          "auto_resume": null
+          "auto_resume": {
+            "policy": {
+              "first_delay": {
+                "secs": 30,
+                "nanos": 0
+              },
+              "longest_delay": {
+                "secs": 900,
+                "nanos": 0
+              },
+              "attempts": 12
+            },
+            "supervisor": "/opt/agentmux",
+            "codex_driver": "/opt/agentmux"
+          }
         }
     "#};
 
@@ -569,8 +585,11 @@ mod tests {
         {"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}
     "#};
 
-    /// A driven Codex turn's `supervisor-plan.json`, as an earlier agentmux wrote it: its producer
-    /// names no stdin.
+    /// A driven Codex turn's `supervisor-plan.json`, as agentmux wrote it at commit 944b80d: its
+    /// producer names no stdin.
+    ///
+    /// Edited only to resume without waiting, where agentmux waited 30 seconds and at most 900,
+    /// so the test need not sleep.
     const CODEX_PLAN: &str = indoc::indoc! {r#"
         {
           "store_root": "<root>",
