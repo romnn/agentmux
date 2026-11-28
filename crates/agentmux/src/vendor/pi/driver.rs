@@ -237,17 +237,20 @@ pub fn drive_with(
         run_started: false,
         question_echoed: false,
         settled: None,
-        settled_line: None,
         in_flight: None,
         queued: VecDeque::new(),
     };
-    let outcome = match driver.set_up(question) {
+    let ended = match driver.set_up(question) {
         Ok(prompt_id) => driver.follow(&prompt_id),
         Err(SetupExit::Cancelled) => Ok(DriverOutcome::Cancelled),
         Err(SetupExit::Failed(reason)) => Err(reason),
-    }
-    .and_then(|outcome| driver.close(outcome))
-    .unwrap_or_else(DriverOutcome::Failed);
+    };
+    // Closed however the turn ended, a pi that died included, and the turn's own failure is the
+    // one reported.
+    let closed = driver.close();
+    let outcome = ended
+        .and_then(|outcome| closed.map(|()| outcome))
+        .unwrap_or_else(DriverOutcome::Failed);
     driver.answer_unsettled_steers(&outcome);
     outcome
 }
@@ -291,6 +294,14 @@ enum SetupExit {
     Failed(String),
 }
 
+/// How pi settled the turn.
+enum Settled {
+    /// On its own, with the `agent_settled` line the capture ends in.
+    Naturally(String),
+    /// Aborted for the cancellation, whose end the store records.
+    Aborted,
+}
+
 /// The steer sent to pi and not answered yet.
 struct InFlight {
     id: String,
@@ -314,10 +325,8 @@ struct TurnDriver<'a> {
     run_started: bool,
     /// Whether pi has started the question's own user message.
     question_echoed: bool,
-    /// How the turn ended, once pi settled it.
-    settled: Option<DriverOutcome>,
-    /// The `agent_settled` line to record last, which a cancelled turn's abort leaves to the store.
-    settled_line: Option<String>,
+    /// How pi settled the turn, once it did.
+    settled: Option<Settled>,
     in_flight: Option<InFlight>,
     /// Steers pi queued and has not taken yet, oldest first.
     queued: VecDeque<ClaimedSteer>,
@@ -396,12 +405,11 @@ impl TurnDriver<'_> {
                 if value.get("aborted") == Some(&Value::Bool(true))
                     && self.cancellation_observed_at.is_some() =>
             {
-                self.settled = Some(DriverOutcome::Cancelled);
+                self.settled = Some(Settled::Aborted);
                 return Ok(());
             }
             "agent_settled" => {
-                self.settled = Some(DriverOutcome::TurnEnded);
-                self.settled_line = Some(line.to_owned());
+                self.settled = Some(Settled::Naturally(line.to_owned()));
                 return Ok(());
             }
             _ => {}
@@ -566,22 +574,29 @@ impl TurnDriver<'_> {
     /// Follow the turn from its question until it settles, steering it and honouring a
     /// cancellation.
     ///
-    /// The question's answer, `prompt_id`'s, fails the turn unless pi started a run for it.
-    /// A cancellation once the question is sent aborts whatever pi is doing, a compaction before
-    /// the run included.
+    /// The question's answer, `prompt_id`'s, fails the turn unless pi started a run for it, and is
+    /// waited for as long as a setup answer is.
+    /// A cancellation aborts the run once pi has said it started; pi takes its commands without
+    /// waiting for the one before, so an earlier `abort` could find it idle and leave the run to
+    /// start anyway.
     fn follow(&mut self, prompt_id: &str) -> Result<DriverOutcome, String> {
+        let prompt_deadline = Instant::now() + self.timeouts.setup_response;
+        let mut run_confirmed = false;
         let mut abort_sent = false;
         let mut last_control_poll_at = Instant::now();
         loop {
             if let Some(response) = self.receive(POLL_INTERVAL)? {
                 if text(&response, "id") == prompt_id {
                     started(&response)?;
+                    run_confirmed = true;
                 } else {
                     self.resolve_steer(&response);
                 }
             }
-            if let Some(outcome) = self.settled.take() {
-                return Ok(outcome);
+            match self.settled {
+                Some(Settled::Naturally(_)) => return Ok(DriverOutcome::TurnEnded),
+                Some(Settled::Aborted) => return Ok(DriverOutcome::Cancelled),
+                None => {}
             }
             // The files are looked at on a clock rather than per event.
             if last_control_poll_at.elapsed() < POLL_INTERVAL {
@@ -592,11 +607,17 @@ impl TurnDriver<'_> {
                 if self.cancellation_grace_over() {
                     return Ok(DriverOutcome::Cancelled);
                 }
-                if !abort_sent {
+                if run_confirmed && !abort_sent {
                     abort_sent = true;
                     self.send(json!({"type": "abort"}))?;
                 }
                 continue;
+            }
+            if !run_confirmed && Instant::now() >= prompt_deadline {
+                return Err(format!(
+                    "pi did not answer `prompt` within {:?}",
+                    self.timeouts.setup_response
+                ));
             }
             if self.run_started
                 && self.in_flight.is_none()
@@ -616,7 +637,7 @@ impl TurnDriver<'_> {
     /// Read from the file's header once the turn is over, because pi appends to the file after it
     /// reports a message, so a turn that saved nothing advertises nothing to resume.
     /// A cancelled turn names it too, which is how the store sees a follow-up kept its session.
-    fn close(&mut self, outcome: DriverOutcome) -> Result<DriverOutcome, String> {
+    fn close(&mut self) -> Result<(), String> {
         let mut header = String::new();
         let saved = std::fs::File::open(&self.plan.session.file)
             .and_then(|file| BufReader::new(file).read_line(&mut header))
@@ -629,37 +650,41 @@ impl TurnDriver<'_> {
         if let (true, Some(id)) = (saved, self.session_id.clone()) {
             self.record(&json!({"type": "session", "id": id}).to_string())?;
         }
-        if let Some(settled) = self.settled_line.take() {
-            self.record(&settled)?;
+        if let Some(Settled::Naturally(line)) = &self.settled {
+            let line = line.clone();
+            self.record(&line)?;
         }
-        Ok(outcome)
+        Ok(())
     }
 
-    /// Answer every steer the turn did not take, and every request still waiting in the mailbox:
-    /// rejected, unless pi went away or the capture failed while one it never answered was in
-    /// flight, which it may have taken.
+    /// Answer every steer pi was sent and was not seen to take, and every request still waiting in
+    /// the mailbox, which is rejected.
+    ///
+    /// A steer sent is rejected only once pi settled the turn without taking it; a turn that ended
+    /// without `agent_settled` may have had it taken unseen, so it is unconfirmed.
     fn answer_unsettled_steers(&mut self, outcome: &DriverOutcome) {
-        let why = match outcome {
-            DriverOutcome::TurnEnded => "the turn settled before pi took it",
-            DriverOutcome::Cancelled => "the consultation was cancelled before pi took it",
-            DriverOutcome::Failed(_) => "the turn broke before pi took it",
+        let why = match (&self.settled, outcome) {
+            (Some(_), _) => "the turn settled before pi took it",
+            (None, DriverOutcome::Failed(_)) => "the turn broke before pi was seen to take it",
+            (None, _) => "the consultation was cancelled before pi was seen to take it",
         };
-        if let Some(InFlight { claim, .. }) = self.in_flight.take() {
-            let reason = why.to_owned();
-            let reply = match outcome {
-                DriverOutcome::Failed(_) => SteerReply::Unconfirmed { reason },
-                DriverOutcome::TurnEnded | DriverOutcome::Cancelled => {
-                    SteerReply::Rejected { reason }
-                }
-            };
-            self.write_steer_reply(&claim, &reply);
-        }
-        let not_taken: Vec<ClaimedSteer> = self
-            .queued
-            .drain(..)
-            .chain(self.mailbox.claim_all())
+        let reason = why.to_owned();
+        let sent_reply = if self.settled.is_some() {
+            SteerReply::Rejected { reason }
+        } else {
+            SteerReply::Unconfirmed { reason }
+        };
+        let sent: Vec<ClaimedSteer> = self
+            .in_flight
+            .take()
+            .map(|in_flight| in_flight.claim)
+            .into_iter()
+            .chain(self.queued.drain(..))
             .collect();
-        for claim in not_taken {
+        for claim in sent {
+            self.write_steer_reply(&claim, &sent_reply);
+        }
+        for claim in self.mailbox.claim_all() {
             self.write_steer_reply(
                 &claim,
                 &SteerReply::Rejected {

@@ -68,8 +68,8 @@ The model must equal exactly one `provider/id` that `get_available_models` lists
 `set_model`.
 An effort is set with `set_thinking_level` and read back, and a level pi changed is a warning in the
 capture.
-Once the question is sent, the driver follows the turn alone: an answer refusing it, or one that
-starts no run, fails the turn with pi's reason on stderr.
+Once the question is sent, the driver follows the turn alone: an answer refusing it, one that
+starts no run, or none within the setup deadline, fails the turn with pi's reason on stderr.
 
 **The capture is pi's events, and the driver adds three of its own.**
 Every event but `response` is kept, streaming deltas included, so an answer the turn ended in the
@@ -86,11 +86,16 @@ not asked for.
 Steering opens at `agent_start`, and the next steer is sent once the one before it was answered.
 With extensions off, every `user` message pi starts after the question is the oldest steer still
 waiting: the driver records it and then answers it accepted.
-At `agent_settled` every steer pi did not take is rejected, the one still unanswered included, and
-so is a request nobody claimed; only a stream that broke, or a capture that could not be written,
-leaves an unanswered steer unconfirmed.
-A cancellation once the question is sent is an `abort`, which also stops a compaction before the
-run; a run it aborted ends as the store records the cancellation, and one that settled on its own
+At `agent_settled` every steer pi did not take is rejected, the one still unanswered included.
+A turn that ends without `agent_settled`, because pi went away or a cancellation's grace ran out,
+leaves every steer pi was sent and not seen to take unconfirmed, since pi may have taken it.
+A request nobody claimed is rejected either way.
+A cancellation is an `abort`, sent only once pi has answered the question `started`: pi takes its
+commands without waiting for the one before, and an `abort` it takes before the run is active finds
+it idle and leaves the run to start anyway.
+Before that answer the driver waits for it within the interrupt grace, and a cancellation during a
+compaction pi runs before the question can therefore take the whole grace.
+A run the abort ended ends as the store records the cancellation, and one that settled on its own
 first ends as pi says, as for Codex.
 
 **pi always runs with the user's configuration, and only reads.**

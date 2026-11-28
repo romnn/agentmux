@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 /// The session the scripted pi runs.
 const SESSION: &str = "01a222df-e34a-76d1-9e3f-380c59ae8f6d";
 
+/// A reply that makes the scripted pi close its output, as a pi that dies does.
+const HANG_UP: &str = "hang up";
+
 /// What a script writes back for one command it received.
 type Script = Box<dyn FnMut(&Value) -> Vec<Value> + Send>;
 
@@ -133,7 +136,7 @@ fn run(plan: &PiPlan, mut script: Script) -> Result<DriverRun> {
                 return;
             };
             for reply in script(&command) {
-                if writeln!(pi_out, "{reply}").is_err() {
+                if reply == HANG_UP || writeln!(pi_out, "{reply}").is_err() {
                     return;
                 }
             }
@@ -151,7 +154,7 @@ fn run(plan: &PiPlan, mut script: Script) -> Result<DriverRun> {
         BufReader::new(from_pi),
         &mut || false,
         DriverTimeouts {
-            setup_response: Duration::from_secs(5),
+            setup_response: Duration::from_secs(1),
             interrupt_completion: Duration::from_secs(2),
             steer_settlement: Duration::from_millis(300),
         },
@@ -426,5 +429,100 @@ fn a_run_that_settles_on_its_own_while_cancelled_keeps_its_end() -> Result<()> {
     expect_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
     expect_that!(driven.command_types().last(), some(eq("abort")));
     expect_that!(driven.captured("agent_settled").len(), eq(1));
+    Ok(())
+}
+
+/// A cancellation before pi has said it started the run sends nothing, because pi takes an
+/// `abort` that arrives first on an idle session and starts the run anyway; with no answer within
+/// the grace, the turn ends cancelled.
+#[gtest]
+fn no_abort_is_sent_before_pi_starts_the_run() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path())?;
+    let marker = dir.path().join("cancelling");
+    let set_up = set_up_then("medium", |_| Vec::new());
+    let script: Script = {
+        let mut set_up = set_up;
+        Box::new(move |command| match command["type"].as_str() {
+            // The caller cancels, and pi never answers the question.
+            Some("prompt") => {
+                if std::fs::write(&marker, "").is_err() {
+                    return vec![json!(HANG_UP)];
+                }
+                Vec::new()
+            }
+            _ => set_up(command),
+        })
+    };
+
+    let driven = run(&plan, script)?;
+
+    expect_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
+    expect_that!(driven.command_types().last(), some(eq("prompt")));
+    Ok(())
+}
+
+/// A question pi never answers fails the turn once a setup answer would have.
+#[gtest]
+fn a_prompt_pi_never_answers_fails_at_its_deadline() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let set_up = set_up_then("medium", |_| Vec::new());
+    let script: Script = {
+        let mut set_up = set_up;
+        Box::new(move |command| match command["type"].as_str() {
+            Some("prompt") => Vec::new(),
+            _ => set_up(command),
+        })
+    };
+
+    let driven = run(&plan(dir.path())?, script)?;
+
+    expect_that!(
+        driven.outcome,
+        matches_pattern!(DriverOutcome::Failed(contains_substring(
+            "did not answer `prompt`"
+        )))
+    );
+    Ok(())
+}
+
+/// A pi that dies mid-answer, after saving its session, fails the turn, and the capture still
+/// names the session, so a follow-up can resume it.
+#[gtest]
+fn a_pi_that_dies_still_names_the_session_it_saved() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path())?;
+    let file = plan.session.file.clone();
+    let set_up = set_up_then("medium", |_| Vec::new());
+    let script: Script = {
+        let mut set_up = set_up;
+        Box::new(move |command| match command["type"].as_str() {
+            Some("prompt") => {
+                let header = json!({"type": "session", "version": 3, "id": SESSION});
+                if std::fs::write(&file, format!("{header}\n")).is_err() {
+                    return vec![json!(HANG_UP)];
+                }
+                let mut replies = set_up(command);
+                replies.extend([
+                    json!({"type": "message_start", "message": {"role": "assistant"}}),
+                    json!({
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "Half"},
+                    }),
+                    json!(HANG_UP),
+                ]);
+                replies
+            }
+            _ => set_up(command),
+        })
+    };
+
+    let driven = run(&plan, script)?;
+
+    expect_that!(driven.outcome, matches_pattern!(DriverOutcome::Failed(_)));
+    expect_that!(
+        driven.captured("session"),
+        elements_are![eq(&json!({"type": "session", "id": SESSION}))]
+    );
     Ok(())
 }
