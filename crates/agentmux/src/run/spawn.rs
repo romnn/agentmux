@@ -272,7 +272,7 @@ impl RunStore {
     /// inside a delegate, the run directory cannot be created, or the delegate cannot be launched
     /// — which includes a working directory that is not there.
     /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
-    /// would run, and [`RunError::Delegate`] with [`DelegateError::Permission`] when the
+    /// would run, and [`RunError::Delegate`] with [`DelegateError::Permission`](crate::delegate::DelegateError::Permission) when the
     /// isolation or a permission exceeds the machine file's limits, both before anything is
     /// written or launched; a follow-up is never refused for a block added after its
     /// consultation started, but is for a limit tightened since.
@@ -482,8 +482,8 @@ impl RunStore {
     /// # Errors
     ///
     /// Returns the errors of [`RunStore::follow_up`], [`RunError::Delegate`] with
-    /// [`DelegateError::NotForVendor`] for an override of another vendor, and with
-    /// [`DelegateError::Permission`] when the turn would exceed the current limits, and
+    /// [`DelegateError::NotForVendor`](crate::delegate::DelegateError::NotForVendor) for an override of another vendor, and with
+    /// [`DelegateError::Permission`](crate::delegate::DelegateError::Permission) when the turn would exceed the current limits, and
     /// [`NotResumable::AgyIsolationChange`] for an agy consultation asked to change its
     /// isolation, before the turn is claimed.
     pub fn follow_up_with(

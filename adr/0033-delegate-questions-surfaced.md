@@ -28,7 +28,7 @@ anybody answering anything.
 **A question is recorded where it was asked.** The translator
 (`crates/agentmux/src/appserver/translate.rs`) writes an `agentMessage` with a non-empty
 `questions` as agentmux's own capture event, `agentmux.question`, with the item id, the server's
-`completedAtMs` as `asked_at`, and the questions. The fold (`stream::codex`) turns it into a
+`completedAtMs` as `asked_at`, and the questions. The fold (`vendor::codex::fold`) turns it into a
 `MessageSource::Question` message, part of the report and rendered as `### assistant (question)` in
 codex's own layout. It also records each question on `Turn::delegate_questions`, numbered from 1 in
 capture order across the turn.

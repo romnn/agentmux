@@ -10,7 +10,7 @@ with models, and a value agentmux chose would silently override the CLI's own de
 
 ## Decision
 
-The effort is optional: `Delegate::effort` returns an `Option<&Effort>`. `[efforts.<vendor>]` in a
+The effort is optional: `Delegate::effort` is an `Option<Effort>`. `[efforts.<vendor>]` in a
 machine file fills it in `RunStore::pin_defaults` through `ModelRules::resolve`, after the model
 rewrite ([0012](0012-model-rewrites.md)) and only when the caller named none. When neither caller
 nor machine configuration supplies an effort, agentmux passes no effort override — no `--effort` and

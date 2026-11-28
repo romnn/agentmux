@@ -13,21 +13,22 @@ none on the stream `codex exec --json` writes.
 
 **Claude** keeps its own figures in `$CLAUDE_CONFIG_DIR/.claude.json` under
 `cachedUsageUtilization`; without a configured directory, the cache is `~/.claude.json`. agentmux
-reads that file (`crates/agentmux/src/quota.rs`), refreshing it with `claude --print /usage` when it
-is older than five minutes, the vendor's own refresh interval. `/usage` is answered locally: the run
-reports `total_cost_usd: 0` and no API duration. Only the cache's `limits[]` carries the per-model
-windows; the printed text omits some of them, so it is discarded and the cache is read.
+reads that file (`crates/agentmux/src/vendor/claude/quota.rs`), refreshing it with `claude --print
+/usage` when it is older than five minutes, the vendor's own refresh interval. `/usage` is answered
+locally: the run reports `total_cost_usd: 0` and no API duration. Only the cache's `limits[]`
+carries the per-model windows; the printed text omits some of them, so it is discarded and the cache
+is read.
 
 **Codex** publishes nothing to disk outside a session rollout, so agentmux asks `codex app-server`
 over JSON-RPC for `account/rateLimits/read`. The server interleaves unsolicited notifications with
 replies, so the response is matched on its request id rather than read as the next line.
 
 **A Codex turn's own window** is recovered after the turn from the session rollout and cached per
-turn in `usage-window.json`, because that search would otherwise run on every `status` and every page
-of a `tail`. The window recorded (`select_rate_limit_window` in `crates/agentmux/src/run/settle.rs`)
-is an exhausted one if any, the one reopening last if several are, and otherwise the fullest. A plan
-with a five-hour and a weekly window is refused against whichever is used up, and advice to wait for
-the other would be refused again.
+turn in `usage-window.json`, because that search would otherwise run on every `status` and every
+page of a `tail`. The window recorded (`select_rate_limit_window` in
+`crates/agentmux/src/vendor/codex/quota.rs`) is an exhausted one if any, the one reopening last if
+several are, and otherwise the fullest. A plan with a five-hour and a weekly window is refused
+against whichever is used up, and advice to wait for the other would be refused again.
 
 **A probe must not report another login's figures.** An account that authenticates with API
 credentials, or that its environment routes to another backend, has no subscription window, and

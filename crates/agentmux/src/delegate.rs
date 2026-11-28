@@ -1,16 +1,18 @@
-//! The closed set of delegates, and the exact argument vector and environment each one needs.
+//! The closed set of delegates: the header every vendor shares, each vendor's permissions, and
+//! the environment a launch starts from.
 //!
 //! This module is the enforcement the whole crate exists for.
-//! A caller does not compose a command line; it fills in a [`Delegate`] and the argument vector
-//! follows as a total function over the enum.
-//! There is no path through [`Delegate::invocation`] that omits the streaming flags, the
-//! permission flags or the recursion marker, because none of them is conditional, or that skips
-//! the machine file's limits, because it holds the delegate to them before building anything.
+//! A caller does not compose a command line; it fills in a [`Delegate`], and its vendor's module
+//! under [`crate::vendor`] builds the launch from it as a total function over [`Permissions`].
+//! There is no path through [`Delegate::invocation`], or through a run store's launch, that omits
+//! the streaming flags, the permission flags or the recursion marker, because none of them is
+//! conditional, or that skips the machine file's limits, because the delegate is held to them
+//! before anything is built.
 //! Only the isolation flags depend on a choice, and that choice is recorded with the
 //! consultation.
 //!
-//! Three variants, not a trait: the set is closed, and an exhaustive `match` makes the compiler
-//! enumerate every place another vendor would need handling.
+//! An enum of vendors' permissions, not a trait: the set is closed, and an exhaustive `match` on
+//! [`Permissions`] makes the compiler enumerate every place another vendor would need handling.
 //!
 //! # Model identifiers are opaque
 //!

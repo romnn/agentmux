@@ -17,7 +17,7 @@ reported only once something reads it, long after `start` returned an id.
 ## Decision
 
 **A store remembers each agentmux executable it was given as the file was then, and launches no
-turn once the file has changed.** `RunStore::with_supervisor` and `RunStore::with_codex_app_server`
+turn once the file has changed.** `RunStore::with_supervisor` and `RunStore::with_driver`
 record the file's size and modification time (`crates/agentmux/src/run/executable.rs`). As the
 launch decides what to run, after the delegate CLI's version probe, which can take seconds, it
 compares them with the file as it is now, and refuses with `RunError::ExecutableReplaced` when

@@ -61,7 +61,7 @@ end as stdin (`LaunchInput::Pipe`) and keeps the write end (`run::claude_input`)
   the requests still waiting are rejected under the run's lock, which `steer` submits under. A
   cancellation and Claude's exit close it too. The supervisor and the fold read the input's
   boundaries the same way, from a line's `type` and a `system` line's `subtype` alone
-  (`stream::claude::InputBoundary`).
+  (`vendor::claude::fold::InputBoundary`).
 - The supervisor answers a request only to reject it, when it was never written.
 
 Without a supervisor, as for a library embedder, or where `claude` is found only as a Windows
