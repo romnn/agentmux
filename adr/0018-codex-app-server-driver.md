@@ -47,6 +47,8 @@ without it, or with `RunStore::with_codex_exec`, every Codex turn is `exec`.
 Under a supervisor ([0025](0025-eager-settlement-and-terminal-waiting.md)) the driver is the
 delegate the supervisor starts and records, and the supervisor settles the turn once the driver has
 gone; nothing about the driver changes.
+The process around the conversation is `crate::driver`'s, which the pi driver shares
+([0037](0037-pi-driven-over-rpc-with-the-users-configuration.md)).
 
 **One driver runs one turn and exits.** Follow-ups resume the persisted thread through a new driver;
 keeping a server idle between turns would leave a process per retained consultation without being
