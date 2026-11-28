@@ -3,13 +3,16 @@
 pub mod fold;
 pub mod quota;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch, TurnPlan,
-    parse_token, release_of, string_newtype_conversions,
+    CredentialVars, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId,
+    PreparedLaunch, TurnPlan, parse_token, release_of, reroutes_within, string_newtype_conversions,
 };
 use crate::run::LaunchMode;
 use crate::transcript::Usage;
@@ -75,6 +78,69 @@ pub(crate) fn read_spend(usage: &Usage, cli_version: Option<&str>) -> ReadSpend 
             }
         }),
     }
+}
+
+/// Credential variables the Claude CLI reads.
+///
+/// Withheld when an account is named, so the account authenticates as itself rather than as
+/// whatever key is exported.
+/// With no account named they are not forwarded either, because every one of them is a
+/// [billing name](crate::delegate::is_billing_env_name) and a delegate without an account runs on
+/// its subscription.
+///
+/// `CLAUDE_CONFIG_DIR` is deliberately not among them, although it is where a login lives.
+/// The process that launches agentmux is usually a Claude Code session, and that variable is how
+/// such a session names its *own* identity; a delegate started from it must not quietly become a
+/// second session on the same login.
+/// A no-account Claude delegate therefore runs against the CLI's default directory, and any other
+/// login is reached by naming an account.
+/// Codex is the other way round: `CODEX_HOME` is forwarded, because a Codex session does not set
+/// it for itself and it is the only way a relocated Codex login is found at all.
+pub(crate) const CREDENTIAL_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+];
+
+/// The variables a Claude account's fields map onto.
+pub(crate) const CREDENTIAL_VARS: CredentialVars = CredentialVars {
+    config_dir: "CLAUDE_CONFIG_DIR",
+    api_key: "ANTHROPIC_API_KEY",
+    auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
+    base_url: "ANTHROPIC_BASE_URL",
+};
+
+/// Whether `upper`, a name in upper case, puts Claude on API pricing or another endpoint, beyond
+/// what [`crate::delegate::is_billing_env_name`] catches for every vendor.
+///
+/// That is a name it reads outright: a bearer token it prefers over its logged-in profile, a
+/// header override that can carry a key of its own, or a switch onto a cloud provider's metered
+/// API; or an endpoint or a token among its own variables.
+pub(crate) fn is_billing_env_name(upper: &str) -> bool {
+    [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ]
+    .contains(&upper)
+        || reroutes_within(upper, &["ANTHROPIC_", "CLAUDE_"])
+}
+
+/// Claude's configuration directory, as it resolves it from `env`: `CLAUDE_CONFIG_DIR`, or
+/// `~/.claude` when that is unset or empty.
+pub(crate) fn config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    env.get(CREDENTIAL_VARS.config_dir)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(crate::config::home_dir(env)?.join(".claude")))
+}
+
+/// Where Claude keeps a transcript per session, which `--resume` reads back.
+pub(crate) fn session_store(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    Some(config_dir(env)?.join("projects"))
 }
 
 /// A Claude permission mode, spelled as `claude --permission-mode` takes it.

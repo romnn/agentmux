@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::home_dir;
-use crate::delegate::{CLAUDE_CREDENTIAL_VARS, Vendor, is_billing_env_name};
+use crate::delegate::{Vendor, is_billing_env_name};
 use crate::quota::{
     Observation, Origin, PROBE_TIMEOUT, ProbeRequest, ProbeTarget, Refresh, probe_command,
 };
@@ -25,7 +25,7 @@ pub(crate) fn probe_target(env: &BTreeMap<String, String>) -> ProbeTarget {
     }
     ProbeTarget::Window {
         config_dir: env
-            .get(CLAUDE_CREDENTIAL_VARS.config_dir)
+            .get(super::CREDENTIAL_VARS.config_dir)
             .map(PathBuf::from),
     }
 }

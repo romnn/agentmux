@@ -4,6 +4,9 @@
 pub mod fold;
 pub mod quota;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
@@ -11,8 +14,8 @@ use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::appserver::DriverPlan;
 use crate::config::PermissionRefusal;
 use crate::delegate::{
-    Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch,
-    TurnPlan, Vendor, release_of,
+    CredentialVars, Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId,
+    PreparedLaunch, TurnPlan, Vendor, release_of, reroutes_within,
 };
 use crate::run::LaunchMode;
 use crate::transcript::Usage;
@@ -114,6 +117,39 @@ pub(crate) fn read_spend(usage: &Usage) -> ReadSpend {
         tokens_cover: Scope::Session,
         price_covers: None,
     }
+}
+
+/// Credential variables the Codex CLI reads, including where its login is kept.
+pub(crate) const CREDENTIAL_KEYS: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"];
+
+/// The variables a Codex account's fields map onto.
+pub(crate) const CREDENTIAL_VARS: CredentialVars = CredentialVars {
+    config_dir: "CODEX_HOME",
+    api_key: "OPENAI_API_KEY",
+    auth_token: None,
+    base_url: "OPENAI_BASE_URL",
+};
+
+/// Whether `upper`, a name in upper case, puts Codex on API pricing or another endpoint, beyond
+/// what [`crate::delegate::is_billing_env_name`] catches for every vendor: an access token it
+/// prefers over its logged-in profile, or an endpoint or a token among its own variables and
+/// `OpenAI`'s.
+pub(crate) fn is_billing_env_name(upper: &str) -> bool {
+    upper == "CODEX_ACCESS_TOKEN" || reroutes_within(upper, &["OPENAI_", "AZURE_OPENAI_", "CODEX_"])
+}
+
+/// Codex's configuration directory, as it resolves it from `env`: `CODEX_HOME`, or `~/.codex`
+/// when that is unset or empty.
+pub(crate) fn config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    env.get(CREDENTIAL_VARS.config_dir)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(crate::config::home_dir(env)?.join(".codex")))
+}
+
+/// Where Codex keeps a rollout per session, which `codex exec resume` reads back.
+pub(crate) fn session_store(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    Some(config_dir(env)?.join("sessions"))
 }
 
 /// How much of the filesystem a Codex delegate's commands may write.

@@ -9,7 +9,7 @@ use codex_app_server_protocol::rollout::{
 };
 
 use crate::config::home_dir;
-use crate::delegate::{CODEX_CREDENTIAL_VARS, Vendor};
+use crate::delegate::Vendor;
 use crate::quota::{Observation, Origin, PROBE_TIMEOUT, ProbeRequest, ProbeTarget, probe_command};
 use crate::transcript::UsageWindow;
 
@@ -21,7 +21,7 @@ pub(crate) fn probe_target(
     env: &BTreeMap<String, String>,
     host_env: &BTreeMap<String, String>,
 ) -> ProbeTarget {
-    let vars = CODEX_CREDENTIAL_VARS;
+    let vars = super::CREDENTIAL_VARS;
     let config_dir = env.get(vars.config_dir).map(PathBuf::from);
     // An endpoint of the identity's own is not the vendor's window whatever the login says, so it
     // answers before the login is consulted at all.

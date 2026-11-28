@@ -731,44 +731,29 @@ impl Vendor {
         }
     }
 
-    /// This vendor's configuration directory, as its CLI resolves it from `env`.
-    ///
-    /// The directory the vendor's own variable names — `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — or the
-    /// CLI's default under the home directory when the variable is unset or empty.
-    /// agy has no such variable and always keeps it at `~/.gemini/antigravity-cli`.
-    /// `None` when neither is known, which is a child with no home at all.
+    /// This vendor's configuration directory, as its CLI resolves it from `env`, or `None` when
+    /// the child has no home to find it under.
     #[must_use]
-    pub(crate) fn config_dir(self, env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
-        let configured = credential_vars(self)
-            .and_then(|vars| env.get(vars.config_dir))
-            .filter(|dir| !dir.is_empty())
-            .map(std::path::PathBuf::from);
-        let default_dir = match self {
-            Self::Claude => Path::new(".claude").to_path_buf(),
-            Self::Codex => Path::new(".codex").to_path_buf(),
-            Self::Agy => Path::new(".gemini").join("antigravity-cli"),
-        };
-        configured.or_else(|| Some(crate::config::home_dir(env)?.join(default_dir)))
+    pub(crate) fn config_dir(self, env: &BTreeMap<String, String>) -> Option<PathBuf> {
+        match self {
+            Self::Claude => claude::config_dir(env),
+            Self::Codex => codex::config_dir(env),
+            Self::Agy => agy::config_dir(env),
+        }
     }
 
     /// Where this vendor's CLI saves a session for a later resume, as it resolves it from `env`.
     ///
-    /// Claude keeps a transcript per session under `projects` in its configuration directory,
-    /// Codex a rollout under `sessions` in `CODEX_HOME`, and agy a database per conversation under
-    /// `conversations`; a resume reads that file back.
+    /// A resume reads the session back from there.
     /// Nothing is read from it here: the directory is only named, so agentmux can ask whether the
     /// child will be able to write into it.
     #[must_use]
-    pub(crate) fn session_store(
-        self,
-        env: &BTreeMap<String, String>,
-    ) -> Option<std::path::PathBuf> {
-        let store = match self {
-            Self::Claude => "projects",
-            Self::Codex => "sessions",
-            Self::Agy => "conversations",
-        };
-        Some(self.config_dir(env)?.join(store))
+    pub(crate) fn session_store(self, env: &BTreeMap<String, String>) -> Option<PathBuf> {
+        match self {
+            Self::Claude => claude::session_store(env),
+            Self::Codex => codex::session_store(env),
+            Self::Agy => agy::session_store(env),
+        }
     }
 }
 
@@ -1318,30 +1303,6 @@ const PLATFORM_ALLOWLIST: &[&str] = &[];
 /// Read before every launch to refuse a delegate spawned from inside one.
 pub const DELEGATE_MARKER: &str = "AGENTMUX_DELEGATE";
 
-/// Credential variables the Claude CLI reads.
-///
-/// Withheld when an account is named, so the account authenticates as itself rather than as
-/// whatever key is exported.
-/// With no account named they are not forwarded either, because every one of them is a
-/// [billing name](is_billing_env_name) and a delegate without an account runs on its subscription.
-///
-/// `CLAUDE_CONFIG_DIR` is deliberately not among them, although it is where a login lives.
-/// The process that launches agentmux is usually a Claude Code session, and that variable is how
-/// such a session names its *own* identity; a delegate started from it must not quietly become a
-/// second session on the same login.
-/// A no-account Claude delegate therefore runs against the CLI's default directory, and any other
-/// login is reached by naming an account.
-/// Codex is the other way round: `CODEX_HOME` is forwarded, because a Codex session does not set
-/// it for itself and it is the only way a relocated Codex login is found at all.
-const CLAUDE_CREDENTIAL_ALLOWLIST: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-];
-
-/// Credential variables the Codex CLI reads, including where its login is kept.
-const CODEX_CREDENTIAL_ALLOWLIST: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"];
-
 /// Whether an environment name can put a delegate on API pricing or another endpoint.
 ///
 /// Matched without regard to case, so a spelling a platform would read as the same variable
@@ -1364,49 +1325,18 @@ pub fn is_billing_env_name(name: &str) -> bool {
 }
 
 /// Whether `upper`, a name in upper case, is one of `vendor`'s own billing names, beyond what the
-/// suffix rules in [`is_billing_env_name`] already catch: one it names outright, or an endpoint or
-/// a token in its namespaces.
-///
-/// A name named outright is either a credential the CLI prefers over its logged-in profile, a
-/// switch onto a cloud provider's metered API, or a header or endpoint override that can carry a
-/// key of its own.
+/// suffix rules in [`is_billing_env_name`] already catch.
 fn is_vendor_billing_env_name(vendor: Vendor, upper: &str) -> bool {
     match vendor {
-        Vendor::Claude => {
-            [
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_CUSTOM_HEADERS",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-                "AWS_BEARER_TOKEN_BEDROCK",
-            ]
-            .contains(&upper)
-                || reroutes_within(upper, &["ANTHROPIC_", "CLAUDE_"])
-        }
-        Vendor::Codex => {
-            upper == "CODEX_ACCESS_TOKEN"
-                || reroutes_within(upper, &["OPENAI_", "AZURE_OPENAI_", "CODEX_"])
-        }
-        // agy's gateway, which routes it to another backend with headers and a key of its own, the
-        // switch onto another of its logins, and the switch onto Google Cloud's application default
-        // credentials with the file they are read from; named by its binary and its documentation.
-        Vendor::Agy => [
-            "AGY_ACCOUNT",
-            "AGY_ADC_AUTH",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "AGY_LLM_GATEWAY_URL",
-            "AGY_LLM_GATEWAY_MODELS",
-            "AGY_LLM_GATEWAY_API_KEY",
-            "AGY_LLM_GATEWAY_HEADERS",
-        ]
-        .contains(&upper),
+        Vendor::Claude => claude::is_billing_env_name(upper),
+        Vendor::Codex => codex::is_billing_env_name(upper),
+        Vendor::Agy => agy::is_billing_env_name(upper),
     }
 }
 
 /// Whether `upper` is an endpoint or a token name in one of `namespaces`, the prefixes whose
 /// endpoint and token names reroute a delegate or authenticate it.
-fn reroutes_within(upper: &str, namespaces: &[&str]) -> bool {
+pub(crate) fn reroutes_within(upper: &str, namespaces: &[&str]) -> bool {
     namespaces.iter().any(|prefix| upper.starts_with(prefix))
         && (upper.split('_').any(|segment| segment == "URL")
             || upper.ends_with("_ISSUER")
@@ -1745,11 +1675,9 @@ pub(crate) fn base_env(host_env: &BTreeMap<String, String>) -> BTreeMap<String, 
 /// switched accounts while spending the other one.
 pub(crate) fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
     match vendor {
-        Vendor::Claude => CLAUDE_CREDENTIAL_ALLOWLIST,
-        Vendor::Codex => CODEX_CREDENTIAL_ALLOWLIST,
-        // agy's login is in the operating system's keyring, and every variable it authenticates
-        // with otherwise is a billing name.
-        Vendor::Agy => &[],
+        Vendor::Claude => claude::CREDENTIAL_KEYS,
+        Vendor::Codex => codex::CREDENTIAL_KEYS,
+        Vendor::Agy => agy::CREDENTIAL_KEYS,
     }
 }
 
@@ -1776,28 +1704,12 @@ pub(crate) struct CredentialVars {
     pub(crate) base_url: &'static str,
 }
 
-/// The variables a Claude account's fields map onto.
-pub(crate) const CLAUDE_CREDENTIAL_VARS: CredentialVars = CredentialVars {
-    config_dir: "CLAUDE_CONFIG_DIR",
-    api_key: "ANTHROPIC_API_KEY",
-    auth_token: Some("ANTHROPIC_AUTH_TOKEN"),
-    base_url: "ANTHROPIC_BASE_URL",
-};
-
-/// The variables a Codex account's fields map onto.
-pub(crate) const CODEX_CREDENTIAL_VARS: CredentialVars = CredentialVars {
-    config_dir: "CODEX_HOME",
-    api_key: "OPENAI_API_KEY",
-    auth_token: None,
-    base_url: "OPENAI_BASE_URL",
-};
-
 /// The variables a vendor's account fields map onto, or `None` for agy, which reads neither its
 /// login nor its configuration directory from a variable an account could set.
 pub(crate) fn credential_vars(vendor: Vendor) -> Option<CredentialVars> {
     match vendor {
-        Vendor::Claude => Some(CLAUDE_CREDENTIAL_VARS),
-        Vendor::Codex => Some(CODEX_CREDENTIAL_VARS),
+        Vendor::Claude => Some(claude::CREDENTIAL_VARS),
+        Vendor::Codex => Some(codex::CREDENTIAL_VARS),
         Vendor::Agy => None,
     }
 }

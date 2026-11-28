@@ -5,14 +5,13 @@ pub mod fold;
 pub mod quota;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
     DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch, TurnPlan,
-    Vendor,
 };
 use crate::run::LaunchMode;
 use crate::transcript::Usage;
@@ -72,6 +71,45 @@ pub(crate) fn read_spend(usage: &Usage) -> ReadSpend {
         tokens_cover: Scope::Session,
         price_covers: None,
     }
+}
+
+/// Credential variables agy reads, of which there are none: its login is in the operating
+/// system's keyring, and every variable it authenticates with otherwise is a
+/// [billing name](crate::delegate::is_billing_env_name).
+pub(crate) const CREDENTIAL_KEYS: &[&str] = &[];
+
+/// Whether `upper`, a name in upper case, puts agy on another pricing or backend, beyond what
+/// [`crate::delegate::is_billing_env_name`] catches for every vendor.
+///
+/// These are agy's gateway, which routes it to another backend with headers and a key of its own,
+/// the switch onto another of its logins, and the switch onto Google Cloud's application default
+/// credentials with the file they are read from; named by its binary and its documentation.
+pub(crate) fn is_billing_env_name(upper: &str) -> bool {
+    [
+        "AGY_ACCOUNT",
+        "AGY_ADC_AUTH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_LLM_GATEWAY_MODELS",
+        "AGY_LLM_GATEWAY_API_KEY",
+        "AGY_LLM_GATEWAY_HEADERS",
+    ]
+    .contains(&upper)
+}
+
+/// agy's configuration directory, which it always keeps at `~/.gemini/antigravity-cli`: it has no
+/// variable that moves it.
+pub(crate) fn config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    Some(
+        crate::config::home_dir(env)?
+            .join(".gemini")
+            .join("antigravity-cli"),
+    )
+}
+
+/// Where agy keeps a database per conversation, which `--conversation` reads back.
+pub(crate) fn session_store(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    Some(config_dir(env)?.join("conversations"))
 }
 
 /// Argument vector for the agy CLI.
@@ -184,10 +222,7 @@ struct AgyPermissionRules {
 /// Read the user's own agy rules from the settings file agy reads in `env`, which holds none when
 /// it is missing.
 fn agy_user_rules(env: &BTreeMap<String, String>) -> Result<AgyPermissionRules, DelegateError> {
-    let Some(path) = Vendor::Agy
-        .config_dir(env)
-        .map(|dir| dir.join("settings.json"))
-    else {
+    let Some(path) = config_dir(env).map(|dir| dir.join("settings.json")) else {
         return Ok(AgyPermissionRules::default());
     };
     let unreadable = |reason: String| DelegateError::AgySettingsUnreadable {
