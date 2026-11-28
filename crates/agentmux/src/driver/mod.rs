@@ -2,7 +2,8 @@
 //!
 //! A driver is the `agentmux` executable launched as a turn's delegate in its CLI's place: it
 //! runs the CLI as its own child, the *server*, and speaks to it over stdio.
-//! [`crate::appserver`] drives Codex over `codex app-server`.
+//! [`crate::appserver`] drives Codex over `codex app-server`, and [`crate::vendor::pi::driver`] drives
+//! pi over `pi --mode rpc`.
 //! What a driver asks of its server and what it records of the turn are its own; the process
 //! around that conversation is here:
 //!
@@ -45,9 +46,10 @@
 mod leftovers;
 pub mod mailbox;
 
-use std::io::PipeWriter;
+use std::io::{PipeWriter, Write};
 use std::path::Path;
 use std::process::{Child, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::delegate::{Billing, scrub_billing_env};
@@ -94,6 +96,59 @@ pub const STOP_BUDGET: Duration = INTERRUPT_GRACE
     .saturating_add(SWEEP_GRACE)
     .saturating_add(KILL_GRACE)
     .saturating_add(REPORT_SETTLE);
+
+/// How long the driver waits on the server at each point where it waits for an answer.
+///
+/// [`DriverTimeouts::default`] is what every driven turn runs with; a test shortens them to reach
+/// the paths a deadline ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverTimeouts {
+    /// How long one setup request may go unanswered.
+    ///
+    /// Generous, because resuming a long session reads all of it before the server answers.
+    pub setup_response: Duration,
+    /// How long an interrupted turn, or a cancelled one still being started, is given to close
+    /// before the driver leaves anyway.
+    pub interrupt_completion: Duration,
+    /// How long, once the turn has ended, a steer the server has not answered yet is waited for.
+    pub steer_settlement: Duration,
+}
+
+impl Default for DriverTimeouts {
+    fn default() -> Self {
+        Self {
+            setup_response: Duration::from_secs(120),
+            interrupt_completion: INTERRUPT_GRACE,
+            steer_settlement: Duration::from_secs(2),
+        }
+    }
+}
+
+/// How a driven turn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverOutcome {
+    /// The turn closed and the capture ends in the terminal event that says how.
+    TurnEnded,
+    /// The caller cancelled the turn; the capture carries no terminal event, so the store's own
+    /// record of the cancellation decides it.
+    Cancelled,
+    /// The turn never reached an end the capture could record: the server could not be started,
+    /// refused to set the turn up, went away part-way through, or the capture could not be
+    /// written.
+    Failed(String),
+}
+
+impl DriverOutcome {
+    /// The driver's exit status: zero when the capture or the store says how the turn ended,
+    /// non-zero when only stderr does.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::TurnEnded | Self::Cancelled => 0,
+            Self::Failed(_) => 1,
+        }
+    }
+}
 
 /// How long a driver waits for its turn's launch record to name it before it gives the turn up.
 ///
@@ -170,6 +225,18 @@ pub(crate) fn confirm_launch(turn: &TurnDir, wait: Duration) -> Result<(), Strin
                 ));
             }
             Err(err) => return Err(format!("cannot read the turn's launch record: {err}")),
+        }
+    }
+}
+
+/// Write each queued line to the server, and close its input once the queue is closed and empty.
+pub(crate) fn write_server(mut to_server: impl Write, queue: &Receiver<String>) {
+    for line in queue {
+        if writeln!(to_server, "{line}")
+            .and_then(|()| to_server.flush())
+            .is_err()
+        {
+            return;
         }
     }
 }

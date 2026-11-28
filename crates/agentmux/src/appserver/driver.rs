@@ -26,8 +26,9 @@ use super::protocol::{ThreadId, TurnId, TurnTarget};
 use super::translate::{self, Translator, TurnEndStatus};
 use crate::driver::mailbox::{ClaimedSteer, Mailbox, SteerReply};
 use crate::driver::{
-    DescendantMonitor, INTERRUPT_GRACE, LAUNCH_RECORD_WAIT, POLL_INTERVAL, Server, adopt_orphans,
-    confirm_launch, contain_descendants, keep_left_running, spawn_server, stop_server,
+    DescendantMonitor, DriverOutcome, DriverTimeouts, LAUNCH_RECORD_WAIT, POLL_INTERVAL, Server,
+    adopt_orphans, confirm_launch, contain_descendants, keep_left_running, spawn_server,
+    stop_server, write_server,
 };
 use crate::vendor::codex::fold::CaptureEvent;
 
@@ -36,59 +37,6 @@ use crate::vendor::codex::fold::CaptureEvent;
 /// What it wrote last may still be on its way through the pipe, and a terminal event among it is
 /// how the turn ended.
 const EXIT_DRAIN: Duration = POLL_INTERVAL.saturating_mul(3);
-
-/// How long the driver waits on the server at each point where it waits for an answer.
-///
-/// [`DriverTimeouts::default`] is what every driven turn runs with; a test shortens them to reach
-/// the paths a deadline ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DriverTimeouts {
-    /// How long one setup request may go unanswered.
-    ///
-    /// Generous, because resuming a long thread reads its whole rollout before it answers.
-    pub setup_response: Duration,
-    /// How long an interrupted turn, or a cancelled one still being started, is given to close
-    /// before the driver leaves anyway.
-    pub interrupt_completion: Duration,
-    /// How long, once the turn has ended, a steer the server has not answered yet is waited for.
-    pub steer_settlement: Duration,
-}
-
-impl Default for DriverTimeouts {
-    fn default() -> Self {
-        Self {
-            setup_response: Duration::from_secs(120),
-            interrupt_completion: INTERRUPT_GRACE,
-            steer_settlement: Duration::from_secs(2),
-        }
-    }
-}
-
-/// How a driven turn ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverOutcome {
-    /// The turn closed and the capture ends in the terminal event that says how.
-    TurnEnded,
-    /// The caller cancelled the turn; the capture carries no terminal event, so the store's own
-    /// record of the cancellation decides it.
-    Cancelled,
-    /// The turn never reached an end the capture could record: the server could not be started,
-    /// refused to set the turn up, went away part-way through, or the capture could not be
-    /// written.
-    Failed(String),
-}
-
-impl DriverOutcome {
-    /// The driver's exit status: zero when the capture or the store says how the turn ended,
-    /// non-zero when only stderr does.
-    #[must_use]
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Self::TurnEnded | Self::Cancelled => 0,
-            Self::Failed(_) => 1,
-        }
-    }
-}
 
 /// Run the turn a plan describes, as the `codex-app-server` subcommand.
 ///
@@ -278,18 +226,6 @@ fn read_server(mut from_server: impl BufRead, inbox: &Sender<Event>) {
                 let _ = inbox.send(Event::OutputClosed(format!(": {error}")));
                 return;
             }
-        }
-    }
-}
-
-/// Write each queued line to the server, and close its input once the queue is closed and empty.
-fn write_server(mut to_server: impl Write, queue: &Receiver<String>) {
-    for line in queue {
-        if writeln!(to_server, "{line}")
-            .and_then(|()| to_server.flush())
-            .is_err()
-        {
-            return;
         }
     }
 }

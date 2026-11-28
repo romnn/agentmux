@@ -155,7 +155,8 @@ use crate::delegate::{Billing, SessionRef};
 use crate::run::layout::TurnDir;
 use crate::vendor::codex::AppServerSettings;
 
-pub use driver::{DriverOutcome, DriverTimeouts, drive, drive_with};
+pub use crate::driver::{DriverOutcome, DriverTimeouts};
+pub use driver::{drive, drive_with};
 pub(crate) use protocol::initialize_params;
 
 /// What to do when a driven Codex turn fails or codex sends what agentmux cannot read: run the
