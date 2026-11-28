@@ -11,10 +11,10 @@ use serde::Deserialize;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    Delegate, DelegateError, Effort, Invocation, LaunchRequest, ModelId, PreparedLaunch, Stdin,
-    TurnPlan, Vendor,
+    DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch, TurnPlan,
+    Vendor,
 };
-use crate::run::{LaunchMode, RunStore};
+use crate::run::LaunchMode;
 use crate::transcript::Usage;
 
 /// The home every isolated agy delegate of a run store runs in, under the store's root, which
@@ -24,53 +24,41 @@ use crate::transcript::Usage;
 /// The store owns it: nothing but agy writes there, and nothing else should.
 const HOME_IN_STORE: &str = "agy-home";
 
-/// Prepare an agy turn's launch, as `delegate`.
-///
-/// An isolated delegate runs in the home its store keeps for it, and every turn reads its
-/// question as the one stream-json record [`agy_input`] writes.
+/// agy's own arguments for one turn under `isolation`, with `env` pointed at the home an isolated
+/// delegate runs in, the one the run store at `store_root` keeps for it.
 ///
 /// # Errors
 ///
-/// Returns [`DelegateError::Environment`] when the home an isolated delegate runs in cannot be
-/// made, and [`DelegateError::AgySettingsUnreadable`] when agy's own settings file in the home
-/// the delegate runs in cannot be read.
-pub(crate) fn prepare(
-    delegate: &Delegate,
-    request: LaunchRequest<'_>,
-) -> Result<PreparedLaunch, DelegateError> {
-    let LaunchRequest {
-        plan,
-        question,
-        cwd,
-        mut env,
-        billing,
-        launcher,
-        store_root,
-        ..
-    } = request;
+/// Returns [`DelegateError::AgyHomeUnknown`] for an isolated delegate without a run store,
+/// [`DelegateError::Environment`] when its home cannot be made, and
+/// [`DelegateError::AgySettingsUnreadable`] when agy's own settings file in the home the delegate
+/// runs in cannot be read.
+pub(crate) fn native_args(
+    model: &ModelId,
+    effort: Option<&Effort>,
+    plan: &TurnPlan<'_>,
+    isolation: Isolation,
+    env: &mut BTreeMap<String, String>,
+    store_root: Option<&Path>,
+) -> Result<Vec<String>, DelegateError> {
     // Set over every other layer, so no account or request can move it; see ADR 0035.
-    if !delegate.pinned_isolation().inherits() {
-        use_agy_home(&mut env, &store_root.join(HOME_IN_STORE))?;
+    if !isolation.inherits() {
+        let store_root = store_root.ok_or(DelegateError::AgyHomeUnknown)?;
+        use_agy_home(env, &store_root.join(HOME_IN_STORE))?;
     }
     // Built from the complete environment, whose home is where agy reads its own settings.
-    let args = agy_args(
-        &delegate.model,
-        delegate.effort.as_ref(),
-        plan,
-        &agy_user_rules(&env)?,
-    );
-    let mut invocation = Invocation::of_delegate(Vendor::Agy, args, env, billing);
-    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
-    let cli_version = launcher.version(&invocation, cwd);
-    Ok(PreparedLaunch {
-        config_dir: Vendor::Agy.config_dir(invocation.env()),
-        session_store: Vendor::Agy.session_store(invocation.env()),
+    Ok(agy_args(model, effort, plan, &agy_user_rules(env)?))
+}
+
+/// How a run store launches `invocation`, agy's own CLI for one turn: directly, reading its
+/// question as the one stream-json record [`agy_input`] writes.
+pub(crate) fn prepare(invocation: Invocation, request: &LaunchRequest<'_>) -> PreparedLaunch {
+    PreparedLaunch {
         invocation,
-        stdin: Stdin::Record(agy_input(question)),
-        plan_file: None,
         mode: LaunchMode::DirectCli,
-        cli_version,
-    })
+        encoded_question: Some(agy_input(request.question)),
+        driver_plan: None,
+    }
 }
 
 /// What an agy turn's report says it spent, whichever release wrote it.
@@ -78,7 +66,7 @@ pub(crate) fn prepare(
 /// Its tokens are its conversation's running total, which `--conversation` carries on from, and
 /// count the cached prompt tokens beside its `input_tokens`.
 /// It reports no price, so a price it did report would be in a scope nothing documents.
-pub(crate) fn read_spend(usage: &Usage, _cli_version: Option<&str>) -> ReadSpend {
+pub(crate) fn read_spend(usage: &Usage) -> ReadSpend {
     ReadSpend {
         tokens: Tokens::cache_beside_input(usage),
         tokens_cover: Scope::Session,
@@ -103,7 +91,7 @@ pub(crate) fn read_spend(usage: &Usage, _cli_version: Option<&str>) -> ReadSpend
 /// The project's own hooks, MCP servers and plugins load in either mode: agy finds them in any
 /// directory it can read, and nothing turns them off.
 /// ADR 0035 records why.
-pub(crate) fn agy_args(
+fn agy_args(
     model: &ModelId,
     effort: Option<&Effort>,
     plan: &TurnPlan<'_>,
@@ -186,7 +174,7 @@ struct AgySettingsFile {
 
 /// The user's own `deny` and `ask` rules, verbatim.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct AgyPermissionRules {
+struct AgyPermissionRules {
     #[serde(default)]
     deny: Vec<String>,
     #[serde(default)]
@@ -195,9 +183,7 @@ pub(crate) struct AgyPermissionRules {
 
 /// Read the user's own agy rules from the settings file agy reads in `env`, which holds none when
 /// it is missing.
-pub(crate) fn agy_user_rules(
-    env: &BTreeMap<String, String>,
-) -> Result<AgyPermissionRules, DelegateError> {
+fn agy_user_rules(env: &BTreeMap<String, String>) -> Result<AgyPermissionRules, DelegateError> {
     let Some(path) = Vendor::Agy
         .config_dir(env)
         .map(|dir| dir.join("settings.json"))
@@ -242,8 +228,7 @@ fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), D
 /// What an agy turn reads on stdin: its question as the one stream-json record agy takes.
 ///
 /// Its end of input then ends the session once the turn is over.
-#[must_use]
-pub(crate) fn agy_input(question: &str) -> String {
+fn agy_input(question: &str) -> String {
     let mut line =
         serde_json::json!({"event": "user", "message": {"content": question}}).to_string();
     line.push('\n');

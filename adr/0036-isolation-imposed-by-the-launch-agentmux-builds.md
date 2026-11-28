@@ -10,7 +10,7 @@ environment reached the child.
 agy has no argument that skips its user settings, and is isolated by a `HOME` agentmux sets
 ([0035](0035-agy-isolation-through-a-home-of-its-own.md)), which 0005's rule does not allow.
 More vendors are coming (issue #42), each with means of its own, and each vendor's module now
-prepares its whole launch (`vendor::<vendor>::prepare`).
+builds its own command (`Delegate::native`) and decides how it runs (`vendor::<vendor>::prepare`).
 
 ## Decision
 
@@ -21,7 +21,8 @@ of the user's login, whose hazards [0018](0018-codex-app-server-driver.md) recor
 
 Each vendor's own record names its means and what they leave out: Claude and Codex isolate by
 argument, as 0005 describes, and agy by its home, as 0035 describes.
-The vendor's launch preparation is the one place its means are applied.
+The vendor's own command, which every launch builds through `Delegate::native`, is the one place
+its means are applied.
 
 A new vendor is offered an isolated launch only once it has proved, against its pinned release:
 

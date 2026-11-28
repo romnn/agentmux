@@ -36,11 +36,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
+use crate::appserver::DriverPlan;
 use crate::config::{Account, ChosenBy, Config, Secret};
-use crate::launch::Launcher;
 use crate::run::LaunchMode;
 use crate::run::layout::TurnDir;
-use crate::vendor::agy::{self, agy_args, agy_user_rules};
+use crate::vendor::agy;
 use crate::vendor::claude::{
     self, ClaudePermissionMode, ClaudePermissions, ClaudeTool, claude_args,
 };
@@ -1178,12 +1178,10 @@ impl Invocation {
 
     /// `vendor`'s CLI with `args`, in `env`, marked as a delegate.
     ///
-    /// The recursion guard is set last, so no layer can change even its value.
-    /// An isolated delegate cannot reach agentmux because it loads no MCP servers, but an
-    /// inheriting one loads the operator's own — and if agentmux is among them, a delegate can
-    /// consult a delegate until something runs out.
-    /// The marker makes the depth visible to the next agentmux, which refuses rather than relying
-    /// on isolation it may not have.
+    /// The recursion marker is set after every other layer, so no account or request can change
+    /// even its value.
+    /// It is how a nested agentmux learns that it runs inside a delegate, and refuses to launch
+    /// another.
     pub(crate) fn of_delegate(
         vendor: Vendor,
         args: Vec<String>,
@@ -1436,8 +1434,8 @@ impl Delegate {
     ///
     /// `host_env` is the environment agentmux itself was launched with; only the variables named
     /// in the allowlists above are carried into the child.
-    /// This is the delegate's CLI as a caller with no run store would run it; a store prepares
-    /// its launches with the same arguments, and decides how each runs.
+    /// This is the delegate's CLI as a caller with no run store would run it; a store launches the
+    /// same command, and its vendor decides how that runs.
     ///
     /// # Errors
     ///
@@ -1460,34 +1458,14 @@ impl Delegate {
             delegate,
             env,
             billing,
+            isolation,
         } = self.admitted(plan, host_env, config)?;
-        let isolation = delegate.resolved_isolation(config);
-        let Self { model, effort, .. } = &delegate;
-        let args = match &delegate.permissions {
-            Permissions::Claude(permissions) => {
-                claude_args(model, effort.as_ref(), permissions, plan, isolation)
-            }
-            Permissions::Codex(permissions) => {
-                codex_args(model, effort.as_ref(), *permissions, plan, isolation)
-            }
-            // The home an isolated agy delegate runs in is its run store's; see ADR 0035.
-            Permissions::Agy if !isolation.inherits() => {
-                return Err(DelegateError::AgyHomeUnknown);
-            }
-            // Built from the complete environment, whose home is where agy reads its own settings.
-            Permissions::Agy => agy_args(model, effort.as_ref(), plan, &agy_user_rules(&env)?),
-        };
-        Ok(Invocation::of_delegate(
-            delegate.vendor(),
-            args,
-            env,
-            billing,
-        ))
+        delegate.native(plan, isolation, env, billing, None)
     }
 
-    /// This delegate, held to the machine file's limits, with the environment and the pricing a
-    /// launch of it starts from: its identity's layers and its request's, and nothing its vendor
-    /// sets.
+    /// This delegate, held to the machine file's limits, with the environment, the pricing and the
+    /// isolation a launch of it starts from: its identity's layers and its request's, and nothing
+    /// its vendor sets.
     ///
     /// # Errors
     ///
@@ -1522,39 +1500,73 @@ impl Delegate {
             .collect();
         apply_request_env(&mut env, plan.extra_env, &allowed, billing)?;
         Ok(Admitted {
+            isolation: delegate.resolved_isolation(config),
             delegate,
             env,
             billing,
         })
     }
 
-    /// The isolation a launch of this delegate runs under once it is pinned: its own, or isolated
-    /// for a record from before isolation was pinned.
-    #[must_use]
-    pub(crate) fn pinned_isolation(&self) -> Isolation {
-        self.isolation.unwrap_or(Isolation::Isolated)
-    }
-
-    /// Prepare one turn's launch for a run store: the delegate's vendor builds all of it and says
-    /// how it runs.
+    /// This delegate's own CLI for `plan` under `isolation`, in `env` as its vendor completes it,
+    /// marked as a delegate: the one place each vendor's command is built, for a run store's
+    /// launch and for [`Delegate::invocation`] alike.
     ///
-    /// `self` is held to the machine file's limits by whoever admitted the turn, and its
-    /// [pinned isolation](Delegate::pinned_isolation) is the one the turn runs under.
+    /// `store_root` is the run store's root, where an isolated agy delegate's home is kept.
     ///
     /// # Errors
     ///
-    /// Returns [`DelegateError::AgySettingsUnreadable`] for an agy delegate whose own settings
-    /// file cannot be read, [`DelegateError::Environment`] when the home an isolated agy delegate
-    /// runs in cannot be made, and [`DelegateError::Permission`] for a `codex exec` turn that
-    /// needs a permission profile from a codex not verified to honour one.
+    /// Returns agy's errors: [`DelegateError::AgyHomeUnknown`] for an isolated delegate without a
+    /// store, [`DelegateError::Environment`] when its home cannot be made, and
+    /// [`DelegateError::AgySettingsUnreadable`] when its own settings file cannot be read.
+    pub(crate) fn native(
+        &self,
+        plan: &TurnPlan<'_>,
+        isolation: Isolation,
+        mut env: BTreeMap<String, String>,
+        billing: Billing,
+        store_root: Option<&Path>,
+    ) -> Result<Invocation, DelegateError> {
+        let Self {
+            model,
+            effort,
+            permissions,
+            ..
+        } = self;
+        let effort = effort.as_ref();
+        let args = match permissions {
+            Permissions::Claude(permissions) => {
+                claude_args(model, effort, permissions, plan, isolation)
+            }
+            Permissions::Codex(permissions) => {
+                codex_args(model, effort, *permissions, plan, isolation)
+            }
+            Permissions::Agy => {
+                agy::native_args(model, effort, plan, isolation, &mut env, store_root)?
+            }
+        };
+        Ok(Invocation::of_delegate(self.vendor(), args, env, billing))
+    }
+
+    /// How a run store launches `invocation`, this delegate's own CLI as [`Delegate::native`]
+    /// built it for one turn: its vendor decides.
+    ///
+    /// `self` is held to the machine file's limits by whoever admitted the turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegateError::Permission`] for a `codex exec` turn that needs a permission
+    /// profile from a codex not verified to honour one.
     pub(crate) fn prepare(
         &self,
-        request: LaunchRequest<'_>,
+        invocation: Invocation,
+        request: &LaunchRequest<'_>,
     ) -> Result<PreparedLaunch, DelegateError> {
         match &self.permissions {
-            Permissions::Claude(permissions) => Ok(claude::prepare(self, permissions, request)),
-            Permissions::Codex(permissions) => codex::prepare(self, *permissions, request),
-            Permissions::Agy => agy::prepare(self, request),
+            Permissions::Claude(_) => Ok(claude::prepare(invocation, request)),
+            Permissions::Codex(permissions) => {
+                codex::prepare(self, *permissions, invocation, request)
+            }
+            Permissions::Agy => Ok(agy::prepare(invocation, request)),
         }
     }
 }
@@ -1567,31 +1579,25 @@ pub(crate) struct Admitted {
     pub(crate) env: BTreeMap<String, String>,
     /// The pricing it may run on.
     pub(crate) billing: Billing,
+    /// The isolation it runs under.
+    pub(crate) isolation: Isolation,
 }
 
-/// What a run store gives a delegate's vendor to prepare one turn's launch from.
+/// What a run store tells a delegate's vendor about one turn, so the vendor can decide how its
+/// CLI runs.
 pub(crate) struct LaunchRequest<'a> {
-    /// The turn: its files, the session it resumes and the directories it reads.
-    pub(crate) plan: &'a TurnPlan<'a>,
     /// The question, for a CLI that reads it as a record of its own.
     pub(crate) question: &'a str,
     /// The turn's directory, where a driver's plan is kept.
     pub(crate) turn: &'a TurnDir,
-    /// The directory the delegate reads the project from, where its CLI is asked its version too.
+    /// The directory the delegate reads the project from.
     pub(crate) cwd: &'a Path,
-    /// The environment the launch starts from: its identity's layers and its request's, or the
-    /// one the turn an automatic resume continues ran in.
-    pub(crate) env: BTreeMap<String, String>,
-    /// The pricing the delegate may run on.
-    pub(crate) billing: Billing,
-    /// What asks the delegate's CLI for its version.
-    pub(crate) launcher: &'a dyn Launcher,
-    /// The run store's root, resolved, which the child is told and where agy's isolated home is.
-    ///
-    /// Told rather than left to whatever the host exported: an agentmux started underneath the
-    /// delegate has to open the same store to recognise the delegate as its ancestor, and the
-    /// platform default can differ between the two environments.
-    pub(crate) store_root: &'a Path,
+    /// The delegate's own session the turn continues, for a follow-up.
+    pub(crate) resume: Option<&'a SessionRef>,
+    /// The isolation the turn runs under.
+    pub(crate) isolation: Isolation,
+    /// The CLI's version, as it printed it, or `None` when it could not say.
+    pub(crate) cli_version: Option<&'a str>,
     /// Whether a supervisor starts the delegate, and so can hold its input.
     pub(crate) supervisor: bool,
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
@@ -1605,26 +1611,14 @@ pub(crate) struct LaunchRequest<'a> {
 pub(crate) struct PreparedLaunch {
     /// What to run: the vendor's CLI, or the driver that stands in for it.
     pub(crate) invocation: Invocation,
-    /// What the delegate reads on stdin.
-    pub(crate) stdin: Stdin,
-    /// The plan a driver runs under, serialised, which the store writes into the turn's directory.
-    pub(crate) plan_file: Option<String>,
     /// How the delegate runs, which the store records and every later reader goes by.
     pub(crate) mode: LaunchMode,
-    /// The CLI's version, as it printed it, or `None` when it could not say.
-    pub(crate) cli_version: Option<String>,
-    /// Where the launch keeps its configuration, when it is known.
-    pub(crate) config_dir: Option<PathBuf>,
-    /// Where it saves its session, which the store asks whether the child could write into.
-    pub(crate) session_store: Option<PathBuf>,
-}
-
-/// What a delegate reads on stdin.
-pub(crate) enum Stdin {
-    /// The turn's question, as it was asked.
-    Question,
-    /// A record of the CLI's own carrying the question, which the store writes beside it.
-    Record(String),
+    /// The question as the record the CLI reads in its place, when it reads one, which the store
+    /// writes beside the question.
+    pub(crate) encoded_question: Option<String>,
+    /// The plan the driver that stands in for the CLI runs under, which the store writes into
+    /// the turn's directory.
+    pub(crate) driver_plan: Option<DriverPlan>,
 }
 
 impl Delegate {

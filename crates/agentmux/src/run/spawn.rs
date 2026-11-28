@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
+use crate::appserver::DriverPlan;
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Admitted, Billing, Delegate, Isolation, LaunchRequest, ModelId,
-    PermissionOptions, Permissions, PreparedLaunch, SessionRef, Stdin, TurnPlan, Vendor,
+    AccountChoice, Admitted, Billing, Delegate, Invocation, Isolation, LaunchRequest, ModelId,
+    PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -129,44 +130,21 @@ impl Resolution<'_> {
         delegate: &Delegate,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
-    ) -> Result<Resolved, RunError> {
+    ) -> Result<Admitted, RunError> {
         Ok(match self {
-            Self::Configured(config) => {
-                let Admitted {
-                    delegate,
-                    env,
-                    billing,
-                } = delegate.admitted(plan, host_env, config)?;
-                Resolved {
-                    delegate,
-                    env,
-                    billing,
-                    auto_resume: None,
-                }
-            }
-            // Nothing is resolved again: the identity, the request's environment, the billing
-            // scrub and the recursion marker are already in the environment the supervisor holds,
-            // and the delegate is held to the limits the turn it continues was admitted under.
-            Self::Inherited(Inherited { billing, attempt }) => Resolved {
+            Self::Configured(config) => delegate.admitted(plan, host_env, config)?,
+            // Nothing is resolved again: the identity, the request's environment, the billing scrub
+            // and the recursion marker are already in the environment the supervisor holds, and
+            // the delegate is held to the limits the turn it continues was admitted under.
+            Self::Inherited(Inherited { billing, .. }) => Admitted {
                 delegate: delegate.clone(),
                 env: host_env.clone(),
                 billing,
-                auto_resume: Some(attempt),
+                // A record from before isolation was pinned could only have run isolated.
+                isolation: delegate.isolation.unwrap_or(Isolation::Isolated),
             },
         })
     }
-}
-
-/// What a turn's launch starts from, as a [`Resolution`] resolved it.
-struct Resolved {
-    /// The delegate the turn runs as.
-    delegate: Delegate,
-    /// The environment its vendor completes.
-    env: BTreeMap<String, String>,
-    /// The pricing it may run on.
-    billing: Billing,
-    /// Which automatic resume it is, when it is one.
-    auto_resume: Option<ResumeAttempt>,
 }
 
 /// What an automatic resume carries over from the turn it continues.
@@ -757,10 +735,11 @@ impl RunStore {
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
-    /// [`Delegate::admitted`] holds it once more as it builds the launch's environment, and its
-    /// vendor prepares the rest.
+    /// [`Delegate::admitted`] holds it once more as it builds the launch's environment.
     /// An automatic resume runs as the turn it continues ran, held to the limits that turn was
     /// admitted under, because its supervisor has no configuration to hold it to.
+    /// Every vendor's CLI is built, marked, told this store and asked its version here alike, and
+    /// its vendor then decides how it runs.
     pub(super) fn launch_into(
         &self,
         turn: &TurnDir,
@@ -778,58 +757,70 @@ impl RunStore {
         std::fs::write(turn.question(), question)
             .map_err(RunError::io(format!("writing turn {index} question")))?;
 
-        let last_message = turn.last_message();
         // The consultation this one continues holds the transcript its first question points at.
         let read_dirs: Vec<PathBuf> = meta.continues.iter().map(|id| self.run_dir(id)).collect();
         let plan = TurnPlan {
             question_path: &turn.question(),
-            last_message_path: &last_message,
+            last_message_path: &turn.last_message(),
             resume,
             extra_env: &meta.env,
             billing: meta.billing,
             read_dirs: &read_dirs,
         };
-        let Resolved {
+        let auto_resume = match resolution {
+            Resolution::Configured(_) => None,
+            Resolution::Inherited(inherited) => Some(inherited.attempt),
+        };
+        let Admitted {
             delegate: admitted,
             env,
             billing,
-            auto_resume,
+            isolation,
         } = resolution.resolve(delegate, &plan, &self.host_env)?;
+
+        let mut invocation = admitted.native(&plan, isolation, env, billing, Some(&self.root))?;
+        // The store's own root, resolved, rather than whatever the host exported: an agentmux
+        // started underneath this delegate has to open the same store to recognise the delegate
+        // as its ancestor, and the platform default can differ between the two environments.
+        invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
+        // Asked of the delegate's own CLI before its vendor can put a driver in its place.
+        let cli_version = self.launcher.version(&invocation, &meta.cwd);
+        // Asked after the version probe, which can take seconds, because an upgrade during it
+        // would otherwise launch the new build with the plan this one writes; the caller gives
+        // the claimed turn back.
+        self.refuse_replaced_executables()?;
         let PreparedLaunch {
             invocation,
-            stdin,
-            plan_file,
             mode: launch_mode,
-            cli_version,
-            config_dir,
-            session_store,
-        } = admitted.prepare(LaunchRequest {
-            plan: &plan,
-            question,
-            turn,
-            cwd: &meta.cwd,
-            env,
-            billing,
-            launcher: self.launcher.as_ref(),
-            store_root: &self.root,
-            supervisor: self.supervisor.is_some(),
-            codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
-            codex_exec: meta.force_codex_exec,
-        })?;
-
-        // Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
-        // during it would otherwise launch the new build with the plan this one writes; the caller
-        // gives the claimed turn back.
-        self.refuse_replaced_executables()?;
-        let stdin = write_prepared_files(turn, index, stdin, plan_file)?;
+            encoded_question,
+            driver_plan,
+        } = admitted.prepare(
+            invocation,
+            &LaunchRequest {
+                question,
+                turn,
+                cwd: &meta.cwd,
+                resume,
+                isolation,
+                cli_version: cli_version.as_deref(),
+                supervisor: self.supervisor.is_some(),
+                codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
+                codex_exec: meta.force_codex_exec,
+            },
+        )?;
+        let stdin = write_prepared_files(turn, index, encoded_question, driver_plan.as_ref())?;
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
         // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
-        let config_dir = config_dir.map(|dir| meta.cwd.join(dir));
-        let unsaved_session_store = session_store
+        let vendor = admitted.vendor();
+        let config_dir = vendor
+            .config_dir(invocation.env())
+            .map(|dir| meta.cwd.join(dir));
+        let unsaved_session_store = vendor
+            .session_store(invocation.env())
             .map(|store| meta.cwd.join(store))
             .filter(|store| !can_create_files_in(store));
         if let Some(store) = &unsaved_session_store {
@@ -890,7 +881,7 @@ impl RunStore {
         turn: &TurnDir,
         meta: &Meta,
         index: u32,
-        invocation: &crate::delegate::Invocation,
+        invocation: &Invocation,
         stdin: &Path,
     ) -> Result<(), RunError> {
         if let Some(supervisor) = &self.supervisor {
@@ -933,7 +924,7 @@ impl RunStore {
         turn: &TurnDir,
         meta: &Meta,
         index: u32,
-        delegate: &crate::delegate::Invocation,
+        delegate: &Invocation,
         stdin: &Path,
         supervisor: &Path,
     ) -> Result<(), RunError> {
@@ -1007,24 +998,19 @@ impl RunStore {
 fn write_prepared_files(
     turn: &TurnDir,
     index: u32,
-    stdin: Stdin,
-    plan_file: Option<String>,
+    encoded_question: Option<String>,
+    driver_plan: Option<&DriverPlan>,
 ) -> Result<PathBuf, RunError> {
-    let stdin = match stdin {
-        Stdin::Question => turn.question(),
-        Stdin::Record(record) => {
-            std::fs::write(turn.encoded_question(), record).map_err(RunError::io(format!(
-                "writing turn {index} encoded question"
-            )))?;
-            turn.encoded_question()
-        }
-    };
-    if let Some(plan_file) = plan_file {
-        let path = turn.app_server_plan_path();
-        crate::atomic_file::write_whole(&path, plan_file.as_bytes())
-            .map_err(RunError::io(format!("writing {}", path.display())))?;
+    if let Some(driver_plan) = driver_plan {
+        write_json(&turn.app_server_plan_path(), driver_plan)?;
     }
-    Ok(stdin)
+    let Some(record) = encoded_question else {
+        return Ok(turn.question());
+    };
+    std::fs::write(turn.encoded_question(), record).map_err(RunError::io(format!(
+        "writing turn {index} encoded question"
+    )))?;
+    Ok(turn.encoded_question())
 }
 
 /// Claim a turn index by creating its directory.

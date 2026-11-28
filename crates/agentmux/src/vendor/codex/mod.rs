@@ -12,16 +12,17 @@ use crate::appserver::DriverPlan;
 use crate::config::PermissionRefusal;
 use crate::delegate::{
     Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch,
-    Stdin, TurnPlan, Vendor, release_of,
+    TurnPlan, Vendor, release_of,
 };
-use crate::run::{LaunchMode, RunStore};
+use crate::run::LaunchMode;
 use crate::transcript::Usage;
 
-/// Prepare a Codex turn's launch, as `delegate` with `permissions`.
+/// How a run store launches `invocation`, Codex's own CLI for one turn of `delegate` with
+/// `permissions`.
 ///
 /// It runs over `codex app-server`, driven by agentmux so that it can be steered, when it loads
-/// its account's settings, the store has a driver, and neither the consultation nor the store
-/// asked for `codex exec`.
+/// its account's settings, the store has a driver, and the consultation did not ask for
+/// `codex exec`.
 /// The isolation every other consultation gets rests on `codex exec --ignore-user-config`, and
 /// `codex app-server` has no equivalent: codex-cli 0.159.3 refuses that flag there, its protocol
 /// schema has no field that skips `$CODEX_HOME/config.toml`, and a `-c` override merges into the
@@ -38,34 +39,19 @@ use crate::transcript::Usage;
 pub(crate) fn prepare(
     delegate: &Delegate,
     permissions: CodexPermissions,
-    request: LaunchRequest<'_>,
+    mut invocation: Invocation,
+    request: &LaunchRequest<'_>,
 ) -> Result<PreparedLaunch, DelegateError> {
-    let LaunchRequest {
-        plan,
+    let &LaunchRequest {
         turn,
         cwd,
-        env,
-        billing,
-        launcher,
-        store_root,
+        resume,
+        isolation,
+        cli_version,
         codex_driver,
         codex_exec,
         ..
     } = request;
-    let isolation = delegate.pinned_isolation();
-    let args = codex_args(
-        &delegate.model,
-        delegate.effort.as_ref(),
-        permissions,
-        plan,
-        isolation,
-    );
-    let mut invocation = Invocation::of_delegate(Vendor::Codex, args, env, billing);
-    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
-    // Asked of the CLI itself, before a driver can take its place.
-    let cli_version = launcher.version(&invocation, cwd);
-    let config_dir = Vendor::Codex.config_dir(invocation.env());
-    let session_store = Vendor::Codex.session_store(invocation.env());
 
     // Driven over the app-server
     if let Some(driver) = codex_driver
@@ -81,13 +67,10 @@ pub(crate) fn prepare(
                 network_access: permissions.network_access,
             },
             cwd: cwd.to_path_buf(),
-            resume_thread_id: plan.resume.cloned(),
+            resume_thread_id: resume.cloned(),
             billing: invocation.billing(),
             turn_dir: turn.root.clone(),
         };
-        let plan_file = serde_json::to_string_pretty(&driver_plan).map_err(|err| {
-            DelegateError::Environment(format!("cannot write the app-server driver's plan: {err}"))
-        })?;
         invocation.set_driver_command(
             driver,
             crate::appserver::SUBCOMMAND,
@@ -95,12 +78,9 @@ pub(crate) fn prepare(
         );
         return Ok(PreparedLaunch {
             invocation,
-            stdin: Stdin::Question,
-            plan_file: Some(plan_file),
             mode: LaunchMode::AppServer,
-            cli_version,
-            config_dir,
-            session_store,
+            encoded_question: None,
+            driver_plan: Some(driver_plan),
         });
     }
 
@@ -108,23 +88,18 @@ pub(crate) fn prepare(
     // profile: a codex that does not honour one would replace it with whatever its configuration
     // selects.
     // The app-server sets the same policy as a field of the turn instead, and needs no profile.
-    if permissions.needs_permission_profile()
-        && !codex_supports_permission_profiles(cli_version.as_deref())
-    {
+    if permissions.needs_permission_profile() && !codex_supports_permission_profiles(cli_version) {
         return Err(DelegateError::Permission(
             PermissionRefusal::PermissionProfileUnsupported {
-                version: cli_version,
+                version: cli_version.map(ToOwned::to_owned),
             },
         ));
     }
     Ok(PreparedLaunch {
         invocation,
-        stdin: Stdin::Question,
-        plan_file: None,
         mode: LaunchMode::DirectCli,
-        cli_version,
-        config_dir,
-        session_store,
+        encoded_question: None,
+        driver_plan: None,
     })
 }
 
@@ -133,7 +108,7 @@ pub(crate) fn prepare(
 /// Its tokens are its thread's running total, which a resumed thread carries on from, and its
 /// `input_tokens` already count the cached prompt tokens.
 /// It reports no price, so a price it did report would be in a scope nothing documents.
-pub(crate) fn read_spend(usage: &Usage, _cli_version: Option<&str>) -> ReadSpend {
+pub(crate) fn read_spend(usage: &Usage) -> ReadSpend {
     ReadSpend {
         tokens: Tokens::cache_inside_input(usage),
         tokens_cover: Scope::Session,

@@ -456,15 +456,14 @@ impl Accounting {
                 continue;
             };
 
-            let cli_version = cli_version.as_deref();
             let ReadSpend {
                 tokens: reported_tokens,
                 tokens_cover,
                 price_covers,
             } = match vendor {
-                Vendor::Claude => claude::read_spend(usage, cli_version),
-                Vendor::Codex => codex::read_spend(usage, cli_version),
-                Vendor::Agy => agy::read_spend(usage, cli_version),
+                Vendor::Claude => claude::read_spend(usage, cli_version.as_deref()),
+                Vendor::Codex => codex::read_spend(usage),
+                Vendor::Agy => agy::read_spend(usage),
             };
             // Token scopes are fixed per vendor, so no token figure is refused today; one that
             // were refused would still be a figure the totals leave out.

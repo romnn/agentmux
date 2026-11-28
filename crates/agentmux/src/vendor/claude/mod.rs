@@ -8,10 +8,10 @@ use strum::VariantArray;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch,
-    Stdin, TurnPlan, Vendor, parse_token, release_of, string_newtype_conversions,
+    DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch, TurnPlan,
+    parse_token, release_of, string_newtype_conversions,
 };
-use crate::run::{LaunchMode, RunStore};
+use crate::run::LaunchMode;
 use crate::transcript::Usage;
 
 /// What a Claude turn whose supervisor holds its input runs with, beside the arguments
@@ -31,50 +31,23 @@ const CLAUDE_STREAM_INPUT_ARGS: [&str; 5] = [
     "none",
 ];
 
-/// Prepare a Claude turn's launch, as `delegate` with `permissions`.
+/// How a run store launches `invocation`, Claude's own CLI for one turn.
 ///
 /// The turn reads its input as stream-json from its supervisor, when it has one and the CLI
 /// starts as itself rather than through a Windows `.cmd` shim, whose process a cancellation could
 /// not stop the CLI through; otherwise it reads its question once.
-pub(crate) fn prepare(
-    delegate: &Delegate,
-    permissions: &ClaudePermissions,
-    request: LaunchRequest<'_>,
-) -> PreparedLaunch {
-    let LaunchRequest {
-        plan,
-        cwd,
-        env,
-        billing,
-        launcher,
-        store_root,
-        supervisor,
-        ..
-    } = request;
-    let args = claude_args(
-        &delegate.model,
-        delegate.effort.as_ref(),
-        permissions,
-        plan,
-        delegate.pinned_isolation(),
-    );
-    let mut invocation = Invocation::of_delegate(Vendor::Claude, args, env, billing);
-    invocation.set_state_dir_env(RunStore::STATE_DIR_ENV, store_root);
-    let cli_version = launcher.version(&invocation, cwd);
-    let mode = if supervisor && crate::launch::starts_natively(&invocation) {
+pub(crate) fn prepare(mut invocation: Invocation, request: &LaunchRequest<'_>) -> PreparedLaunch {
+    let mode = if request.supervisor && crate::launch::starts_natively(&invocation) {
         invocation.push_args(&CLAUDE_STREAM_INPUT_ARGS);
         LaunchMode::ClaudeStreamInput
     } else {
         LaunchMode::DirectCli
     };
     PreparedLaunch {
-        config_dir: Vendor::Claude.config_dir(invocation.env()),
-        session_store: Vendor::Claude.session_store(invocation.env()),
         invocation,
-        stdin: Stdin::Question,
-        plan_file: None,
         mode,
-        cli_version,
+        encoded_question: None,
+        driver_plan: None,
     }
 }
 
