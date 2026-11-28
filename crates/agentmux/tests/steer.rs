@@ -776,13 +776,14 @@ fn a_claude_turn_reads_stream_json_only_from_its_supervisor() -> Result<()> {
     Ok(())
 }
 
-/// A supervised Claude that would start through a Windows `.cmd` shim reads its question once,
-/// because the shim's process is the command interpreter, through which a cancellation could not
-/// stop Claude.
+/// A supervised Claude that would start through a Windows `.cmd` shim runs in exec mode rather
+/// than on stream-json input, because the shim's process is the command interpreter, through which
+/// a cancellation could not stop Claude.
 #[cfg(windows)]
 #[gtest]
-fn a_claude_started_through_a_shim_reads_its_question_once() -> Result<()> {
+fn a_supervised_claude_that_would_start_through_a_shim_runs_in_exec_mode() -> Result<()> {
     let dir = tempfile::tempdir().or_fail()?;
+    // A `PATH` with no `claude.exe` on it, where only a shim could start Claude.
     let mut env = env();
     env.insert("PATH".to_owned(), dir.path().display().to_string());
     let launched = launched_claude(

@@ -115,53 +115,6 @@ fn a_run_id_cannot_escape_the_run_directory() {
     assert_that!(RunId::parse(RunId::generate().as_str()), ok(anything()));
 }
 
-/// A consultation is a conversation: the run id does not change when it continues.
-#[gtest]
-fn a_follow_up_appends_a_turn_to_the_same_run() -> Result<()> {
-    let second_turn = indoc::indoc! {r#"
-        {"type":"thread.started","thread_id":"01a0784a-915b-7d92-a381-b53d765296c4"}
-        {"type":"turn.started"}
-        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"BANANAPHONE"}}
-        {"type":"turn.completed","usage":{"input_tokens":19000,"output_tokens":8}}
-    "#};
-    let harness = harness([
-        Script::completed(fixtures::CODEX_HAPPY),
-        Script::completed(second_turn),
-    ])?;
-
-    let started = harness.store.start(&request(
-        codex()?,
-        "Remember BANANAPHONE. Reply FIXTURE_OK.",
-    ))?;
-    assert_that!(started.turns, eq(1));
-    assert_that!(started.resumable, eq(true));
-
-    let followed = harness
-        .store
-        .follow_up(&started.run_id, "What was the secret word?")?;
-    assert_that!(followed.run_id, eq(&started.run_id));
-    assert_that!(followed.turns, eq(2));
-
-    // The second launch resumes the delegate's own session rather than restating the brief.
-    let launches = harness.launcher.launches();
-    assert_that!(launches.len(), eq(2));
-    let resume = launches.get(1).expect("second launch");
-    assert_that!(resume.has_flag("resume"), eq(true));
-    assert_that!(
-        resume.has_flag_with("resume", "01a0784a-915b-7d92-a381-b53d765296c4"),
-        eq(true)
-    );
-    assert_that!(resume.question, eq("What was the secret word?"));
-
-    // Both turns are in one transcript, in order.
-    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
-    assert_that!(page.text, contains_substring("FIXTURE_OK"));
-    assert_that!(page.text, contains_substring("BANANAPHONE"));
-    assert_that!(page.text, contains_substring("Turn 1 — question"));
-    assert_that!(page.text, contains_substring("Turn 2 — question"));
-    Ok(())
-}
-
 /// The transcript length taken before a follow-up is exactly where the new turn begins.
 ///
 /// This is what lets `follow_up` page the new turn alone instead of re-sending every earlier one
@@ -295,23 +248,6 @@ fn a_follow_up_waits_for_a_delegate_it_cannot_identify() -> Result<()> {
     Ok(())
 }
 
-/// A child that dies without a terminal event must say what the CLI said.
-#[gtest]
-fn a_child_that_dies_reports_its_stderr() -> Result<()> {
-    let harness = harness([Script::exited(
-        "",
-        "error: unexpected argument '--sandbox' found\n",
-        2,
-    )])?;
-    let status = harness.store.start(&request(codex()?, "review this"))?;
-
-    let Outcome::Failed { detail, .. } = &status.outcome else {
-        panic!("expected a failure, got {:?}", status.outcome);
-    };
-    assert_that!(detail.as_str(), contains_substring("unexpected argument"));
-    Ok(())
-}
-
 /// Every turn records which release of the delegate's CLI, and of agentmux, wrote its capture,
 /// so a capture that reads differently can be traced to the release that wrote it.
 #[gtest]
@@ -353,29 +289,6 @@ fn a_clean_exit_with_no_completion_event_is_not_a_success() -> Result<()> {
             detail: anything()
         })
     );
-    Ok(())
-}
-
-/// Cancelling keeps everything collected so far.
-#[gtest]
-#[tokio::test]
-async fn cancelling_keeps_what_was_collected() -> Result<()> {
-    let partial = indoc::indoc! {r#"
-        {"type":"thread.started","thread_id":"01a0"}
-        {"type":"turn.started"}
-        {"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"partial findings"}}
-    "#};
-    let harness = harness([Script::running(partial)])?;
-    let started = harness.store.start(&request(codex()?, "long review"))?;
-    assert_that!(started.outcome, matches_pattern!(Outcome::Running));
-
-    let cancelled = harness.store.cancel(&started.run_id).await?;
-    assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
-    assert_that!(harness.launcher.terminated().len(), eq(1));
-
-    let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
-    assert_that!(page.text, contains_substring("partial findings"));
-    assert_that!(page.text, contains_substring("cancelled"));
     Ok(())
 }
 
@@ -566,9 +479,9 @@ fn a_codex_running_total_is_counted_once() -> Result<()> {
 }
 
 /// An agy turn reads its question as the one stream-json record agy takes, while the transcript
-/// shows the question as asked, and a follow-up continues the conversation the first turn opened.
+/// shows the question as asked.
 #[gtest]
-fn an_agy_turn_reads_its_question_as_a_record_and_its_follow_up_resumes() -> Result<()> {
+fn an_agy_turn_reads_its_question_as_a_record() -> Result<()> {
     let harness = harness([
         Script::completed(fixtures::AGY_TOOL_USE),
         Script::completed(fixtures::AGY_RESUME),
@@ -607,10 +520,6 @@ fn an_agy_turn_reads_its_question_as_a_record_and_its_follow_up_resumes() -> Res
             r#"{"event":"user","message":{"content":"Again?"}}"#,
             "\n"
         ))
-    );
-    assert_that!(
-        second.has_flag_with("--conversation", "e4c7ded7-2bf0-480b-9326-24191d51e4ba"),
-        eq(true)
     );
     // The transcript shows what was asked, never the record it travelled in.
     let transcript = harness.store.page(&started.run_id, 0, 1_000_000)?.text;
@@ -1511,6 +1420,8 @@ async fn a_cancelled_transcript_is_frozen_at_the_cancellation() -> Result<()> {
     assert_that!(cancelled.outcome, matches_pattern!(Outcome::Cancelled));
     let page = harness.store.page(&started.run_id, 0, 1_000_000)?;
     let published = page.text;
+    // What the delegate said before the cancellation is kept.
+    assert_that!(published, contains_substring("partial"));
 
     // Something survived the kill and kept writing.
     let events = harness

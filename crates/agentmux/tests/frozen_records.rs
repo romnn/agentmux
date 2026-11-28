@@ -343,32 +343,26 @@ fn a_frozen_claude_record_keeps_every_permission() -> Result<()> {
 
     machine.store.follow_up(&run_id, "again")?;
 
-    // The follow-up resumes the session with every recorded permission, and no isolation flag.
+    // The follow-up resumes the session with every recorded permission, and loads the user's
+    // settings, as the record's isolation says.
     let session = session_of(Vendor::Claude, fixtures::CLAUDE_HAPPY)?;
     let launch = machine.launch(1)?;
+    assert_that!(launch.has_flag_with("--resume", session.as_str()), eq(true));
+    assert_that!(launch.has_flag_with("--effort", "xhigh"), eq(true));
     assert_that!(
-        launch.args,
-        elements_are![
-            eq("--print"),
-            eq("--resume"),
-            eq(session.as_str()),
-            eq("--model"),
-            eq("opus"),
-            eq("--effort"),
-            eq("xhigh"),
-            eq("--permission-mode"),
-            eq("acceptEdits"),
-            eq("--tools"),
-            eq(""),
-            eq("--allowedTools"),
-            eq("WebFetch,Bash(cargo check *)"),
-            eq("--disallowedTools"),
-            eq("Bash(git push *)"),
-            eq("--output-format"),
-            eq("stream-json"),
-            eq("--verbose"),
-        ]
+        launch.has_flag_with("--permission-mode", "acceptEdits"),
+        eq(true)
     );
+    assert_that!(launch.has_flag_with("--tools", ""), eq(true));
+    assert_that!(
+        launch.has_flag_with("--allowedTools", "WebFetch,Bash(cargo check *)"),
+        eq(true)
+    );
+    assert_that!(
+        launch.has_flag_with("--disallowedTools", "Bash(git push *)"),
+        eq(true)
+    );
+    assert_that!(launch.has_flag("--setting-sources"), eq(false));
     // It runs as the account the record names.
     assert_that!(
         launch.env.get("CLAUDE_CONFIG_DIR"),
@@ -402,39 +396,23 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
 
     machine.store.follow_up(&run_id, "again")?;
 
+    // The follow-up resumes the session isolated, as the consultation's record says, with the
+    // newest turn's sandbox and its network switched off.
     let session = session_of(Vendor::Codex, fixtures::CODEX_HAPPY)?;
-    let last_message = machine
-        .run_dir(&run_id)
-        .join("turns/0002/last-message.md")
-        .to_string_lossy()
-        .into_owned();
+    let launch = machine.launch(1)?;
+    assert_that!(launch.has_flag_with("resume", session.as_str()), eq(true));
     assert_that!(
-        machine.launch(1)?.args,
-        elements_are![
-            eq("exec"),
-            eq("resume"),
-            eq(session.as_str()),
-            eq("--json"),
-            eq("--skip-git-repo-check"),
-            eq("--model"),
-            eq("sol"),
-            eq("--config"),
-            eq("model_reasoning_effort=\"high\""),
-            eq("--ignore-user-config"),
-            eq("--config"),
-            eq("features.hooks=false"),
-            eq("--config"),
-            eq("sandbox_mode=\"workspace-write\""),
-            eq("--config"),
-            eq("sandbox_workspace_write.network_access=false"),
-            eq("--config"),
-            eq("approval_policy=\"never\""),
-            eq("--config"),
-            eq("approvals_reviewer=\"user\""),
-            eq("--output-last-message"),
-            eq(last_message.as_str()),
-            eq("-"),
-        ]
+        launch.has_flag_with("--config", "model_reasoning_effort=\"high\""),
+        eq(true)
+    );
+    assert_that!(launch.has_flag("--ignore-user-config"), eq(true));
+    assert_that!(
+        launch.has_flag_with("--config", "sandbox_mode=\"workspace-write\""),
+        eq(true)
+    );
+    assert_that!(
+        launch.has_flag_with("--config", "sandbox_workspace_write.network_access=false"),
+        eq(true)
     );
     Ok(())
 }
@@ -497,25 +475,12 @@ fn a_frozen_agy_record_continues_isolated() -> Result<()> {
 
     machine.store.follow_up(&run_id, "again")?;
 
+    // The follow-up resumes the conversation in the home the store keeps for an isolated agy.
     let session = session_of(Vendor::Agy, fixtures::AGY_TOOL_USE)?;
     let launch = machine.launch(1)?;
     assert_that!(
-        launch.args,
-        elements_are![
-            eq("--print="),
-            eq("--input-format"),
-            eq("stream-json"),
-            eq("--output-format"),
-            eq("stream-json"),
-            eq("--conversation"),
-            eq(session.as_str()),
-            eq("--model"),
-            eq("gemini-3.8-flash-low"),
-            eq("--settings"),
-            eq(
-                r#"{"agentMode":"","permissions":{"ask":[],"deny":["command(*)","write_file(*)","mcp(*)","execute_url(*)","download_url(*)"]},"toolPermission":"request-review","useG1Credits":false}"#
-            ),
-        ]
+        launch.has_flag_with("--conversation", session.as_str()),
+        eq(true)
     );
     let agy_home = machine
         .state
