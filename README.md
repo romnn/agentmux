@@ -182,7 +182,7 @@ is the map between the two, so one prompt works everywhere:
 # Applied to every delegate launch, before any account chooses an identity.
 [launch]
 env = { DISABLE_HOOKS = "true" }
-env_passthrough = ["AWS_PROFILE"]
+env_passthrough = ["AWS_REGION"]
 # The only names a single call's `env` may set. Nothing, unless listed here.
 request_env = ["REVIEW_MODE"]
 
