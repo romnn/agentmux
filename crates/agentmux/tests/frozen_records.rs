@@ -176,8 +176,14 @@ fn a_frozen_claude_record_keeps_every_permission() -> Result<()> {
             permissions: Permissions::Claude(permissions.clone()),
         })
     );
-    // It continues as well as it reads, as the account it names.
+    // It continues as well as it reads: the follow-up resumes the session its turn opened.
     machine.store.follow_up(&run_id, "again")?;
+    assert_that!(
+        machine
+            .launch(1)?
+            .has_flag_with("--resume", "85ff2d6a-ec24-47cf-a4f8-486a5bb06814"),
+        eq(true)
+    );
 
     // Synthetic: agentmux writes an empty tool list as `tools: []`, which no captured record
     // offers, and a newer agentmux may add a key to a delegate that this build has to skip.
@@ -196,22 +202,38 @@ fn a_frozen_claude_record_keeps_every_permission() -> Result<()> {
     Ok(())
 }
 
-/// A follow-up of a frozen Codex record continues with the network its newest turn ran with,
-/// though the consultation's record says otherwise, and keeps it switched off when it changes
-/// only the sandbox, rather than leaving the network to Codex's own configuration.
+/// A frozen Codex record continues its session, read-only and offline as it was written, and a
+/// follow-up continues with the network its newest turn ran with, though the consultation's
+/// record says otherwise, and keeps it switched off when it changes only the sandbox, rather
+/// than leaving the network to Codex's own configuration.
 #[gtest]
 fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     let machine = Machine::new([
         Script::completed(fixtures::CODEX_HAPPY),
         Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
+        Script::completed(fixtures::CODEX_HAPPY),
     ])?;
+    let codex = || delegate("sol", Permissions::Codex(CodexPermissions::default()));
+
+    let (mut meta, invocation) = records(Vendor::Codex)?;
+    let run_id = machine.frozen(codex()?, &meta, &invocation)?;
+    machine.store.follow_up(&run_id, "again")?;
+    let resumed = machine.launch(1)?;
+    assert_that!(
+        resumed.has_flag_with("resume", "01a0784a-915b-7d92-a381-b53d765296c4"),
+        eq(true)
+    );
+    assert_that!(
+        resumed.has_flag_with("--config", "sandbox_mode=\"read-only\""),
+        eq(true)
+    );
+
     // Synthetic: a follow-up that switches the network off records that in its turn alone, and
     // none of the captured consultations has one, so the consultation's record is edited to the
     // network it would have started with.
-    let (mut meta, invocation) = records(Vendor::Codex)?;
     meta["delegate"]["network_access"] = json!(true);
-    let codex = delegate("sol", Permissions::Codex(CodexPermissions::default()))?;
-    let run_id = machine.frozen(codex, &meta, &invocation)?;
+    let run_id = machine.frozen(codex()?, &meta, &invocation)?;
 
     machine.store.follow_up_with(
         &run_id,
@@ -224,7 +246,7 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     )?;
 
     // The sandbox is the one asked for, and the network the one the newest turn ran with.
-    let launch = machine.launch(1)?;
+    let launch = machine.launch(3)?;
     assert_that!(
         launch.has_flag_with("--config", "sandbox_mode=\"workspace-write\""),
         eq(true)
@@ -236,28 +258,52 @@ fn a_frozen_codex_record_continues_as_its_newest_turn_ran() -> Result<()> {
     Ok(())
 }
 
-/// A frozen agy record from before the account and the isolation were pinned, whose turn did not
-/// keep the delegate it ran as, reads as the consultation's record says with the CLI's own login,
-/// and its follow-up resumes isolated, in the home the store keeps, as it could only have run.
+/// A frozen agy record continues its conversation isolated, in the home the store keeps, and so
+/// does one from before the account and the isolation were pinned, whose turn did not keep the
+/// delegate it ran as: it reads as the consultation's record says with the CLI's own login, and
+/// resumes isolated, as it could only have run.
 #[gtest]
 fn a_frozen_agy_record_continues_isolated() -> Result<()> {
     let machine = Machine::new([
         Script::completed(fixtures::AGY_TOOL_USE),
         Script::completed(fixtures::AGY_RESUME),
+        Script::completed(fixtures::AGY_TOOL_USE),
+        Script::completed(fixtures::AGY_RESUME),
     ])?;
+    let agy = || delegate("gemini-3.8-flash-low", Permissions::Agy);
+    let agy_home = machine.state.path().join("agy-home");
+
+    let (mut meta, mut invocation) = records(Vendor::Agy)?;
+    let run_id = machine.frozen(agy()?, &meta, &invocation)?;
+    assert_that!(
+        machine.store.status(&run_id)?.delegate,
+        eq(&Delegate {
+            model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
+            effort: None,
+            account: AccountChoice::CliLogin,
+            isolation: Some(Isolation::Isolated),
+            permissions: Permissions::Agy,
+        })
+    );
+    machine.store.follow_up(&run_id, "again")?;
+    let resumed = machine.launch(1)?;
+    assert_that!(
+        resumed.has_flag_with("--conversation", "e4c7ded7-2bf0-480b-9326-24191d51e4ba"),
+        eq(true)
+    );
+    assert_that!(
+        resumed.env.get("HOME").map(PathBuf::from),
+        some(eq(&agy_home))
+    );
+
     // Synthetic: an earlier agentmux wrote neither the account nor the isolation, nor the
     // delegate in a turn's invocation, and a newer one may add a key this build has to skip.
-    let (mut meta, mut invocation) = records(Vendor::Agy)?;
     let written = meta["delegate"].as_object_mut().or_fail()?;
     written.remove("account");
     written.remove("isolation");
     written.insert("written_by_a_newer_agentmux".to_owned(), json!("yes"));
     invocation.as_object_mut().or_fail()?.remove("delegate");
-    let run_id = machine.frozen(
-        delegate("gemini-3.8-flash-low", Permissions::Agy)?,
-        &meta,
-        &invocation,
-    )?;
+    let run_id = machine.frozen(agy()?, &meta, &invocation)?;
 
     assert_that!(
         machine.store.status(&run_id)?.delegate,
@@ -271,9 +317,8 @@ fn a_frozen_agy_record_continues_isolated() -> Result<()> {
     );
 
     machine.store.follow_up(&run_id, "again")?;
-    let agy_home = machine.state.path().join("agy-home");
     assert_that!(
-        machine.launch(1)?.env.get("HOME").map(PathBuf::from),
+        machine.launch(3)?.env.get("HOME").map(PathBuf::from),
         some(eq(&agy_home))
     );
     Ok(())
