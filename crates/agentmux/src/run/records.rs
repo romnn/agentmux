@@ -173,13 +173,6 @@ pub(super) struct ProducerCommand {
     pub(super) args: Vec<String>,
     pub(super) cwd: PathBuf,
     pub(super) billing: Billing,
-    /// The file the delegate reads as its stdin, always written.
-    ///
-    /// Absent from a plan an older agentmux wrote, which [`super::layout::TurnDir::stdin`]
-    /// answers; optional, because whoever settles a turn reads its plan, and a plan that did not
-    /// parse would stop that turn from settling.
-    #[serde(default)]
-    pub(super) stdin: Option<PathBuf>,
 }
 
 /// How a turn's child ended, as far as agentmux could tell.

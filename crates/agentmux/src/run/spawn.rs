@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::appserver::DriverPlan;
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
     AccountChoice, Admitted, Billing, Delegate, Invocation, Isolation, LaunchRequest, ModelId,
@@ -754,8 +753,8 @@ impl RunStore {
             resume,
             label,
         } = *next;
-        std::fs::write(turn.question(), question)
-            .map_err(RunError::io(format!("writing turn {index} question")))?;
+        // Asked of the consultation's vendor, as its supervisor asks when it picks the file.
+        write_question(turn, index, meta.delegate.vendor(), question)?;
 
         // The consultation this one continues holds the transcript its first question points at.
         let read_dirs: Vec<PathBuf> = meta.continues.iter().map(|id| self.run_dir(id)).collect();
@@ -792,12 +791,10 @@ impl RunStore {
         let PreparedLaunch {
             invocation,
             mode: launch_mode,
-            encoded_question,
             driver_plan,
         } = admitted.prepare(
             invocation,
             &LaunchRequest {
-                question,
                 turn,
                 cwd: &meta.cwd,
                 resume,
@@ -808,7 +805,9 @@ impl RunStore {
                 codex_exec: meta.force_codex_exec,
             },
         )?;
-        let stdin = write_prepared_files(turn, index, encoded_question, driver_plan.as_ref())?;
+        if let Some(driver_plan) = &driver_plan {
+            write_json(&turn.app_server_plan_path(), driver_plan)?;
+        }
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
@@ -871,26 +870,25 @@ impl RunStore {
             "launching delegate",
         );
 
-        self.start_child(turn, meta, index, &invocation, &stdin)
+        self.start_child(turn, meta, index, &invocation)
     }
 
-    /// Start turn `index`'s delegate as `invocation`, reading `stdin`, under its supervisor when
-    /// this store supervises its turns, and record it.
+    /// Start turn `index`'s delegate as `invocation`, under its supervisor when this store
+    /// supervises its turns, and record it.
     fn start_child(
         &self,
         turn: &TurnDir,
         meta: &Meta,
         index: u32,
         invocation: &Invocation,
-        stdin: &Path,
     ) -> Result<(), RunError> {
         if let Some(supervisor) = &self.supervisor {
-            return self.launch_supervisor(turn, meta, index, invocation, stdin, supervisor.path());
+            return self.launch_supervisor(turn, meta, index, invocation, supervisor.path());
         }
         let launched = self.launcher.launch(&LaunchSpec {
             invocation,
             cwd: &meta.cwd,
-            input: LaunchInput::Question(stdin),
+            input: LaunchInput::Question(&turn.stdin(meta.delegate.vendor())),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -925,7 +923,6 @@ impl RunStore {
         meta: &Meta,
         index: u32,
         delegate: &Invocation,
-        stdin: &Path,
         supervisor: &Path,
     ) -> Result<(), RunError> {
         let launch_id = uuid::Uuid::new_v4().simple().to_string();
@@ -942,7 +939,6 @@ impl RunStore {
                     args: delegate.args().to_vec(),
                     cwd: meta.cwd.clone(),
                     billing: delegate.billing(),
-                    stdin: Some(stdin.to_path_buf()),
                 },
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
@@ -990,27 +986,22 @@ impl RunStore {
     }
 }
 
-/// Write what turn `index`'s prepared launch reads beside its question, and say which file is its
-/// stdin.
-///
-/// That is the record a CLI reads in place of its question, which the transcript never shows, and
-/// a driver's plan.
-fn write_prepared_files(
+/// Write turn `index`'s question, and beside it the record a `vendor` CLI reads in its place when
+/// it reads one, which the transcript never shows.
+fn write_question(
     turn: &TurnDir,
     index: u32,
-    encoded_question: Option<String>,
-    driver_plan: Option<&DriverPlan>,
-) -> Result<PathBuf, RunError> {
-    if let Some(driver_plan) = driver_plan {
-        write_json(&turn.app_server_plan_path(), driver_plan)?;
+    vendor: Vendor,
+    question: &str,
+) -> Result<(), RunError> {
+    std::fs::write(turn.question(), question)
+        .map_err(RunError::io(format!("writing turn {index} question")))?;
+    if let Some(encode) = vendor.question_encoder() {
+        std::fs::write(turn.encoded_question(), encode(question)).map_err(RunError::io(
+            format!("writing turn {index} encoded question"),
+        ))?;
     }
-    let Some(record) = encoded_question else {
-        return Ok(turn.question());
-    };
-    std::fs::write(turn.encoded_question(), record).map_err(RunError::io(format!(
-        "writing turn {index} encoded question"
-    )))?;
-    Ok(turn.encoded_question())
+    Ok(())
 }
 
 /// Claim a turn index by creating its directory.

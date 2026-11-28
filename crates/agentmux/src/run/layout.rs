@@ -25,17 +25,17 @@ impl TurnDir {
         self.root.join("question.md")
     }
     /// The question as a CLI that reads it as a record takes it, which only a launch whose vendor
-    /// asks for one writes.
+    /// has a [`Vendor::question_encoder`] writes.
     pub(super) fn encoded_question(&self) -> PathBuf {
         self.root.join("question.jsonl")
     }
-    /// What a `vendor` delegate read as its stdin under a supervisor plan that names none, as an
-    /// older agentmux wrote them: the encoded question for agy, and the question itself for the
-    /// others.
+    /// What a `vendor` delegate reads as its stdin, unless its supervisor holds a pipe in its
+    /// place: the encoded question for a vendor with a [`Vendor::question_encoder`], and the
+    /// question itself for the others.
     pub(super) fn stdin(&self, vendor: Vendor) -> PathBuf {
-        match vendor {
-            Vendor::Agy => self.encoded_question(),
-            Vendor::Claude | Vendor::Codex => self.question(),
+        match vendor.question_encoder() {
+            Some(_) => self.encoded_question(),
+            None => self.question(),
         }
     }
     pub(super) fn events(&self) -> PathBuf {

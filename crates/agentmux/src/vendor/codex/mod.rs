@@ -82,7 +82,6 @@ pub(crate) fn prepare(
         return Ok(PreparedLaunch {
             invocation,
             mode: LaunchMode::AppServer,
-            encoded_question: None,
             driver_plan: Some(driver_plan),
         });
     }
@@ -101,7 +100,6 @@ pub(crate) fn prepare(
     Ok(PreparedLaunch {
         invocation,
         mode: LaunchMode::DirectCli,
-        encoded_question: None,
         driver_plan: None,
     })
 }

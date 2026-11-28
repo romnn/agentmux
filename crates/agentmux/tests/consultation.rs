@@ -669,43 +669,6 @@ fn an_isolated_agy_consultation_runs_every_turn_in_the_stores_agy_home() -> Resu
     Ok(())
 }
 
-/// An agy turn's supervisor is told to give agy its question as the record agy reads, and a
-/// Claude turn's its question as asked.
-#[gtest]
-fn a_supervisor_plan_names_the_file_its_delegate_reads() -> Result<()> {
-    let dir = tempfile::tempdir().or_fail()?;
-    let launcher = Arc::new(ScriptedLauncher::new([
-        Script::running(""),
-        Script::running(""),
-    ]));
-    let store = RunStore::open(dir.path(), launcher, env())
-        .or_fail()?
-        .with_supervisor("/opt/agentmux/bin/agentmux");
-    let agy = Delegate {
-        model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
-        effort: None,
-        account: AccountChoice::Default,
-        isolation: None,
-        permissions: Permissions::Agy,
-    };
-
-    for (delegate, read) in [(agy, "question.jsonl"), (claude()?, "question.md")] {
-        let started = store.start(&request(delegate, "review this"))?;
-        let turn = dir
-            .path()
-            .join("runs")
-            .join(started.run_id.as_str())
-            .join("turns/0001");
-        let plan: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(turn.join("supervisor-plan.json"))?)?;
-        assert_that!(
-            plan["producer"]["stdin"].as_str().map(PathBuf::from),
-            some(eq(&turn.join(read)))
-        );
-    }
-    Ok(())
-}
-
 /// A label given at `start` names the consultation everywhere a caller looks, a follow-up's own
 /// label takes over from its turn on, and a follow-up that names none keeps the current one.
 #[gtest]

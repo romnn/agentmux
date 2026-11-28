@@ -305,15 +305,10 @@ impl RunStore {
             }
             Some(_) | None => None,
         };
-        // The file the delegate reads is the one its plan names, or for a plan that names none
-        // follows from who it is, which the consultation fixed; a turn whose record cannot be
-        // read never starts.
+        // The file the delegate reads follows from who it is, which the consultation fixed; a
+        // turn whose record cannot be read never starts.
         let stdin = match self.meta(&plan.run_id) {
-            Ok(meta) => plan
-                .producer
-                .stdin
-                .clone()
-                .unwrap_or_else(|| turn.stdin(meta.delegate.vendor())),
+            Ok(meta) => turn.stdin(meta.delegate.vendor()),
             Err(err) => return never_started(turn, err.to_string()),
         };
 
@@ -438,7 +433,6 @@ mod tests {
                 args: Vec::new(),
                 cwd: dir.path().to_path_buf(),
                 billing: Billing::Subscription,
-                stdin: None,
             },
             auto_resume: None,
         };
@@ -466,116 +460,6 @@ mod tests {
         Ok(quoted.trim_matches('"').to_owned())
     }
 
-    /// An isolated agy consultation's `meta.json`, as agentmux wrote it at commit 944b80d.
-    const AGY_META: &str = indoc::indoc! {r#"
-        {
-          "run_id": "<run_id>",
-          "delegate": {
-            "vendor": "agy",
-            "model": "gemini-3.8-flash-low",
-            "account": {
-              "kind": "cli_login"
-            },
-            "isolation": "isolated"
-          },
-          "cwd": "<cwd>",
-          "retention": "ttl",
-          "created_at": "2026-11-28T01:47:13.767901124Z",
-          "env": {},
-          "billing": "subscription"
-        }
-    "#};
-
-    /// Its first turn's `supervisor-plan.json`, as agentmux wrote it at commit 944b80d: its
-    /// producer names no stdin.
-    const AGY_PLAN: &str = indoc::indoc! {r#"
-        {
-          "store_root": "<root>",
-          "run_id": "<run_id>",
-          "turn": 1,
-          "launch_id": "<launch_id>",
-          "producer": {
-            "program": "agy",
-            "args": [
-              "--print=",
-              "--input-format",
-              "stream-json",
-              "--output-format",
-              "stream-json",
-              "--model",
-              "gemini-3.8-flash-low",
-              "--settings",
-              "{\"agentMode\":\"\",\"permissions\":{\"ask\":[],\"deny\":[\"command(*)\",\"write_file(*)\",\"mcp(*)\",\"execute_url(*)\",\"download_url(*)\"]},\"toolPermission\":\"request-review\",\"useG1Credits\":false}"
-            ],
-            "cwd": "<cwd>",
-            "billing": "subscription"
-          },
-          "auto_resume": {
-            "policy": {
-              "first_delay": {
-                "secs": 30,
-                "nanos": 0
-              },
-              "longest_delay": {
-                "secs": 900,
-                "nanos": 0
-              },
-              "attempts": 12
-            },
-            "supervisor": "/opt/agentmux",
-            "codex_driver": "/opt/agentmux"
-          }
-        }
-    "#};
-
-    /// A supervisor started from a plan an earlier agentmux wrote, which names no stdin, gives an
-    /// agy delegate its question as the record agy reads.
-    #[gtest]
-    fn a_plan_without_stdin_gives_agy_its_encoded_question() -> Result<()> {
-        let dir = tempfile::tempdir().or_fail()?;
-        let launcher = Arc::new(ScriptedLauncher::default());
-        let store = RunStore::open(dir.path(), launcher.clone(), BTreeMap::new()).or_fail()?;
-        let run_id = RunId::generate();
-        let turn = store.turn_dir(&run_id, 0);
-        std::fs::create_dir_all(&turn.root).or_fail()?;
-        let launch_id = uuid::Uuid::new_v4().simple().to_string();
-        let fill = |text: &str| -> Result<String> {
-            Ok(text
-                .replace("<run_id>", run_id.as_str())
-                .replace("<root>", &json_path(dir.path())?)
-                .replace("<cwd>", &json_path(dir.path())?)
-                .replace("<launch_id>", &launch_id))
-        };
-        std::fs::write(store.run_dir(&run_id).join("meta.json"), fill(AGY_META)?).or_fail()?;
-        let record = "{\"event\":\"user\",\"message\":{\"content\":\"q\"}}\n";
-        std::fs::write(turn.question(), "q").or_fail()?;
-        std::fs::write(turn.encoded_question(), record).or_fail()?;
-        write_json(
-            &turn.supervisor(),
-            &SupervisorRecord {
-                launch_id: launch_id.clone(),
-                launched: Launched {
-                    pid: std::process::id(),
-                    process_group: None,
-                    started: None,
-                },
-                started_at: chrono::Utc::now(),
-                phase: SupervisorPhase::Prepared,
-            },
-        )
-        .or_fail()?;
-        let plan: SupervisorPlan = serde_json::from_str(&fill(AGY_PLAN)?).or_fail()?;
-
-        let admitted = store.admit(&plan, &turn).or_fail()?;
-
-        assert_that!(matches!(admitted, Admission::Running { .. }), eq(true));
-        assert_that!(
-            launcher.launches(),
-            elements_are![field!(crate::testing::RecordedLaunch.question, eq(record))]
-        );
-        Ok(())
-    }
-
     /// A Codex turn that said something in a session it announced, then failed because the model
     /// was at capacity.
     const OVERLOADED: &str = indoc::indoc! {r#"
@@ -585,8 +469,7 @@ mod tests {
         {"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}
     "#};
 
-    /// A driven Codex turn's `supervisor-plan.json`, as agentmux wrote it at commit 944b80d: its
-    /// producer names no stdin.
+    /// A driven Codex turn's `supervisor-plan.json`, as agentmux wrote it at commit 944b80d.
     ///
     /// Edited only to resume without waiting, where agentmux waited 30 seconds and at most 900,
     /// so the test need not sleep.

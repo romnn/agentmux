@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
 use crate::delegate::{
-    DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId, PreparedLaunch, TurnPlan,
+    DelegateError, Effort, Invocation, Isolation, ModelId, PreparedLaunch, TurnPlan,
 };
 use crate::run::LaunchMode;
 use crate::transcript::Usage;
@@ -51,11 +51,10 @@ pub(crate) fn native_args(
 
 /// How a run store launches `invocation`, agy's own CLI for one turn: directly, reading its
 /// question as the one stream-json record [`agy_input`] writes.
-pub(crate) fn prepare(invocation: Invocation, request: &LaunchRequest<'_>) -> PreparedLaunch {
+pub(crate) fn prepare(invocation: Invocation) -> PreparedLaunch {
     PreparedLaunch {
         invocation,
         mode: LaunchMode::DirectCli,
-        encoded_question: Some(agy_input(request.question)),
         driver_plan: None,
     }
 }
@@ -263,7 +262,7 @@ fn use_agy_home(env: &mut BTreeMap<String, String>, home: &Path) -> Result<(), D
 /// What an agy turn reads on stdin: its question as the one stream-json record agy takes.
 ///
 /// Its end of input then ends the session once the turn is over.
-fn agy_input(question: &str) -> String {
+pub(crate) fn agy_input(question: &str) -> String {
     let mut line =
         serde_json::json!({"event": "user", "message": {"content": question}}).to_string();
     line.push('\n');

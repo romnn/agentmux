@@ -49,7 +49,6 @@ pub(crate) fn prepare(mut invocation: Invocation, request: &LaunchRequest<'_>) -
     PreparedLaunch {
         invocation,
         mode,
-        encoded_question: None,
         driver_plan: None,
     }
 }

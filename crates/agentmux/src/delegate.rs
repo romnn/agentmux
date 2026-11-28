@@ -755,6 +755,18 @@ impl Vendor {
             Self::Agy => agy::session_store(env),
         }
     }
+
+    /// How this vendor's CLI reads its question on stdin: the encoder that turns it into the
+    /// record the CLI reads in its place, or `None` for a CLI that reads the question as asked.
+    ///
+    /// The store writes the encoded question beside the question, and every launch, a
+    /// supervisor's included, picks the file the delegate reads from this alone.
+    pub(crate) fn question_encoder(self) -> Option<fn(&str) -> String> {
+        match self {
+            Self::Agy => Some(agy::agy_input),
+            Self::Claude | Self::Codex => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Vendor {
@@ -1496,7 +1508,7 @@ impl Delegate {
             Permissions::Codex(permissions) => {
                 codex::prepare(self, *permissions, invocation, request)
             }
-            Permissions::Agy => Ok(agy::prepare(invocation, request)),
+            Permissions::Agy => Ok(agy::prepare(invocation)),
         }
     }
 }
@@ -1516,8 +1528,6 @@ pub(crate) struct Admitted {
 /// What a run store tells a delegate's vendor about one turn, so the vendor can decide how its
 /// CLI runs.
 pub(crate) struct LaunchRequest<'a> {
-    /// The question, for a CLI that reads it as a record of its own.
-    pub(crate) question: &'a str,
     /// The turn's directory, where a driver's plan is kept.
     pub(crate) turn: &'a TurnDir,
     /// The directory the delegate reads the project from.
@@ -1543,9 +1553,6 @@ pub(crate) struct PreparedLaunch {
     pub(crate) invocation: Invocation,
     /// How the delegate runs, which the store records and every later reader goes by.
     pub(crate) mode: LaunchMode,
-    /// The question as the record the CLI reads in its place, when it reads one, which the store
-    /// writes beside the question.
-    pub(crate) encoded_question: Option<String>,
     /// The plan the driver that stands in for the CLI runs under, which the store writes into
     /// the turn's directory.
     pub(crate) driver_plan: Option<DriverPlan>,
