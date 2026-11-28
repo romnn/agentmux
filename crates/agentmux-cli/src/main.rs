@@ -173,15 +173,16 @@ fn open_store(cli: &Cli) -> Result<RunStore> {
     let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
-        .with_supervisor(&executable);
+        .with_supervisor(&executable)
+        .with_driver(&executable);
     if let Some(first_delay) = cli.auto_resume_delay {
         store = store.with_auto_resume(Some(AutoResumePolicy {
             first_delay,
             ..AutoResumePolicy::DEFAULT
         }));
     }
-    if cli.codex_launch == CodexLaunchArg::AppServer {
-        store = store.with_codex_app_server(executable);
+    if cli.codex_launch == CodexLaunchArg::Exec {
+        store = store.with_codex_exec();
     }
     Ok(store)
 }

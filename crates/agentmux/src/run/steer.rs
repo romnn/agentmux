@@ -31,8 +31,8 @@ impl RunStore {
     /// Add an instruction to a consultation's running turn, for the delegate to see before its
     /// next model call.
     ///
-    /// A turn driven over `codex app-server` takes one, and so does a Claude turn reading
-    /// stream-json input until it has reported its result.
+    /// A turn an agentmux driver runs takes one, such as a Codex turn over `codex app-server`, and
+    /// so does a Claude turn reading stream-json input until it has reported its result.
     /// The message travels through the turn's mailbox: to the Codex turn's driver, which hands it
     /// to the server as `turn/steer` and records it in the capture once the server has accepted
     /// it, or to the Claude turn's supervisor, which writes it to Claude's input, where Claude
@@ -271,7 +271,7 @@ impl RunStore {
             TurnInput::Open => {}
         }
         let server = match newest.launch_mode {
-            LaunchMode::DirectCli | LaunchMode::AppServer => newest.delegate,
+            LaunchMode::DirectCli | LaunchMode::Driven => newest.delegate,
             LaunchMode::ClaudeStreamInput if !self.is_alive(newest.supervisor) => {
                 return Err(Refusal::ClaudeInputLost);
             }

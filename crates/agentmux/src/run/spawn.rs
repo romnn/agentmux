@@ -293,9 +293,9 @@ impl RunStore {
             delegate,
             rewritten_from,
             billing: Some(billing),
-            // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
-            // whichever store continues the consultation.
-            force_codex_exec: request.force_codex_exec || self.codex_driver.is_none(),
+            // A store that runs Codex with `exec` says so for the follow-ups, whichever store
+            // continues the consultation.
+            force_codex_exec: request.force_codex_exec || self.codex_exec || self.driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -673,7 +673,7 @@ impl RunStore {
     fn refuse_replaced_executables(&self) -> Result<(), RunError> {
         self.supervisor
             .iter()
-            .chain(&self.codex_driver)
+            .chain(&self.driver)
             .try_for_each(super::Executable::refuse_if_replaced)
     }
 }
@@ -801,8 +801,8 @@ impl RunStore {
                 isolation,
                 cli_version: cli_version.as_deref(),
                 supervisor: self.supervisor.is_some(),
-                codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
-                codex_exec: meta.force_codex_exec,
+                driver: self.driver.as_ref().map(super::Executable::path),
+                codex_exec: meta.force_codex_exec || self.codex_exec,
             },
         )?;
         if let Some(driver_plan) = &driver_plan {
@@ -943,9 +943,12 @@ impl RunStore {
                 auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
                     policy,
                     supervisor: supervisor.to_path_buf(),
+                    // Named only when Codex turns are driven, the meaning an earlier agentmux
+                    // reading this plan gives it.
                     codex_driver: self
-                        .codex_driver
+                        .driver
                         .as_ref()
+                        .filter(|_| !self.codex_exec)
                         .map(|driver| driver.path().to_path_buf()),
                 }),
             },

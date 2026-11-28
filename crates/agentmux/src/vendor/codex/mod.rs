@@ -51,13 +51,13 @@ pub(crate) fn prepare(
         resume,
         isolation,
         cli_version,
-        codex_driver,
+        driver,
         codex_exec,
         ..
     } = request;
 
     // Driven over the app-server
-    if let Some(driver) = codex_driver
+    if let Some(driver) = driver
         && isolation.inherits()
         && !codex_exec
     {
@@ -81,7 +81,7 @@ pub(crate) fn prepare(
         );
         return Ok(PreparedLaunch {
             invocation,
-            mode: LaunchMode::AppServer,
+            mode: LaunchMode::Driven,
             driver_plan: Some(driver_plan),
         });
     }

@@ -954,8 +954,7 @@ fn driver_plan(delegate: Delegate) -> Result<DriverPlan> {
     let state = tempfile::tempdir().or_fail()?;
     let host_env = BTreeMap::from([("HOME".to_owned(), "/home/dev".to_owned())]);
     let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
-    let store =
-        RunStore::open(state.path(), launcher, host_env)?.with_codex_app_server("/opt/agentmux");
+    let store = RunStore::open(state.path(), launcher, host_env)?.with_driver("/opt/agentmux");
     let started = store.start(&StartRequest {
         delegate,
         question: "q".to_owned(),

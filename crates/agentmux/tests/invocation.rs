@@ -1643,7 +1643,7 @@ fn only_an_inheriting_codex_delegate_runs_over_the_app_server() -> Result<()> {
         let state = tempfile::tempdir().or_fail()?;
         let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
         let store = RunStore::open(state.path(), launcher, host_session_env())?
-            .with_codex_app_server("/opt/agentmux");
+            .with_driver("/opt/agentmux");
         let started = store.start(&StartRequest {
             delegate,
             question: "q".to_owned(),

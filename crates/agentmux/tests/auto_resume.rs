@@ -285,3 +285,38 @@ fn an_unsupervised_store_never_schedules_a_resume() -> Result<()> {
     assert_that!(status.auto_resume, none());
     Ok(())
 }
+
+/// A turn's supervisor plan names the driver to resume with only when the store drives Codex
+/// turns, so a store that runs Codex with `exec` resumes over `exec` too, whatever agentmux reads
+/// the plan.
+#[gtest]
+fn the_supervisor_plan_names_the_driver_only_when_codex_turns_are_driven() -> Result<()> {
+    for (codex_exec, expected) in [(false, Some("/opt/agentmux/bin/agentmux")), (true, None)] {
+        let dir = tempfile::tempdir().or_fail()?;
+        let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
+        let store = RunStore::open(dir.path(), launcher, env())
+            .or_fail()?
+            .with_supervisor("/opt/agentmux/bin/agentmux")
+            .with_driver("/opt/agentmux/bin/agentmux");
+        let store = if codex_exec {
+            store.with_codex_exec()
+        } else {
+            store
+        };
+        let run_id = store.start(&request()?).or_fail()?.run_id;
+
+        let plan_path = dir
+            .path()
+            .join("runs")
+            .join(run_id.as_str())
+            .join("turns/0001/supervisor-plan.json");
+        let plan: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plan_path).or_fail()?).or_fail()?;
+        let driver = plan
+            .get("auto_resume")
+            .and_then(|resume| resume.get("codex_driver"))
+            .and_then(serde_json::Value::as_str);
+        assert_that!(driver, eq(expected), "codex_exec: {codex_exec}");
+    }
+    Ok(())
+}

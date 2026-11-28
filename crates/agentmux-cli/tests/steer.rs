@@ -122,7 +122,7 @@ fn cli_harness_playing(scenario: Scenario) -> Result<CliTestHarness> {
         host_env.clone(),
     )
     .or_fail()?
-    .with_codex_app_server(env!("CARGO_BIN_EXE_agentmux"))
+    .with_driver(env!("CARGO_BIN_EXE_agentmux"))
     .with_supervisor(env!("CARGO_BIN_EXE_agentmux"));
     Ok(CliTestHarness {
         _root: root,

@@ -100,6 +100,8 @@ pub(super) struct AutoResumePlan {
     pub(super) supervisor: PathBuf,
     /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
     /// that launched this turn drives them.
+    ///
+    /// `None` means that store ran every Codex turn with `codex exec`.
     pub(super) codex_driver: Option<PathBuf>,
 }
 

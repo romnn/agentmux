@@ -153,9 +153,11 @@ pub struct RunStore {
     /// Whether this process runs inside a delegate, decided once: neither witness can change
     /// while the process lives.
     inside_delegate: OnceLock<bool>,
-    /// The agentmux executable that drives a Codex turn over `codex app-server`, when this store
-    /// launches such turns that way.
-    codex_driver: Option<Executable>,
+    /// The agentmux executable that drives a delegate's CLI in its place, when this store has
+    /// one.
+    driver: Option<Executable>,
+    /// Whether every Codex turn this store launches runs with `codex exec`, even with a driver.
+    codex_exec: bool,
     /// The agentmux executable that supervises each turn this store launches, when it launches
     /// them that way.
     supervisor: Option<Executable>,
@@ -209,7 +211,8 @@ impl RunStore {
             inside_delegate: OnceLock::new(),
             // `exec` for every Codex turn until a caller names a driver: embedding this library
             // must not start an executable the embedder did not provide.
-            codex_driver: None,
+            driver: None,
+            codex_exec: false,
             // Unsupervised for the same reason.
             supervisor: None,
             // Resumed only by a supervisor, so nothing runs until one is named.
@@ -225,7 +228,7 @@ impl RunStore {
     /// its delegate leaving, whether or not anything is asking about the consultation.
     /// Without one, the delegate is launched directly and its turn settles when something next
     /// reads it.
-    /// Independent of [`RunStore::with_codex_app_server`]: a driven turn's driver is the delegate
+    /// Independent of [`RunStore::with_driver`]: a driven turn's driver is the delegate
     /// the supervisor starts.
     ///
     /// The file is remembered as it is now, and once it changes, as an upgrade changes it under a
@@ -257,11 +260,24 @@ impl RunStore {
     /// Only a Codex delegate that inherits its account's settings runs this way — see
     /// `vendor::codex::prepare` — and every other turn still runs over `codex exec`,
     /// `claude --print` or `agy --print`.
+    /// [`RunStore::with_codex_exec`] keeps Codex turns on `codex exec` all the same.
     /// Like the supervisor, the file is remembered as it is now, and a launch is refused once it
     /// changes.
     #[must_use]
-    pub fn with_codex_app_server(mut self, driver: impl Into<PathBuf>) -> Self {
-        self.codex_driver = Some(Executable::new(driver.into()));
+    pub fn with_driver(mut self, driver: impl Into<PathBuf>) -> Self {
+        self.driver = Some(Executable::new(driver.into()));
+        self
+    }
+
+    /// Run every Codex turn with `codex exec`, whether or not this store has a driver.
+    ///
+    /// A consultation this store starts records the choice, so its follow-ups run over `exec`
+    /// through any store.
+    /// A follow-up this store launches runs over `exec` too, even of a consultation another store
+    /// started driven.
+    #[must_use]
+    pub fn with_codex_exec(mut self) -> Self {
+        self.codex_exec = true;
         self
     }
 
