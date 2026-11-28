@@ -637,7 +637,7 @@ pub(super) fn validate(
             .map(drop),
         Vendor::Claude => claude.hold(&claude.fill(&ClaudePermissions::default()), Some(path)),
         // Nothing in the file can change what an agy delegate may do.
-        Vendor::Agy => Ok(()),
+        Vendor::Agy | Vendor::Pi => Ok(()),
     }
     .map_err(|refusal| refused(defaults(), refusal))
 }

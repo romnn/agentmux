@@ -1,7 +1,8 @@
-//! Steered consultations against the real `codex app-server` and the real `claude`.
+//! Steered consultations against the real `codex app-server`, the real `claude` and the real
+//! `pi`.
 //!
-//! The only tests of this crate that spend a turn and need a logged-in CLI, so they are
-//! `#[ignore]`d and CI passes without them.
+//! The only tests of this crate that spend a turn and need a logged-in CLI, or for pi a model it
+//! can reach, so they are `#[ignore]`d and CI passes without them.
 //! Run them by hand after upgrading either CLI, outside any sandbox, because the delegate saves
 //! its session where the sandbox would not let it:
 //!
@@ -13,6 +14,8 @@
 //! `AGENTMUX_LIVE_CODEX_ACCOUNT` and `AGENTMUX_LIVE_CLAUDE_ACCOUNT` name each vendor's account from
 //! the machine's `agentmux.toml`; without one the file's default, or the CLI's own login, is
 //! used.
+//! The pi test runs [`PI_MODEL`] through pi's own configuration, which `PI_CODING_AGENT_DIR` can
+//! point at a directory whose `models.json` names it.
 //! The driver and the supervisor are the `agentmux` built with these tests, never an installed
 //! one.
 //! The store is kept, and its path printed, so a failure's capture can be read afterwards.
@@ -22,7 +25,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Permissions};
+use agentmux::delegate::{
+    AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions,
+};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
@@ -37,6 +42,9 @@ const MODEL: &str = "gpt-6-luna";
 
 /// The cheapest Claude model, which still runs a command and follows an instruction.
 const CLAUDE_MODEL: &str = "haiku";
+
+/// The pi model the pi test runs: a local Ollama model, which pi's own configuration names.
+const PI_MODEL: &str = "ollama/qwen3.6:27b-64k";
 
 /// What the Claude test steers its turn with.
 const STEER: &str = "Also put the word STEERED at the end of that line.";
@@ -330,4 +338,147 @@ async fn wait_for_status(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Ok(())
+}
+
+/// Start, steer, finish, follow up, and cancel one pi consultation over the real `pi --mode rpc`,
+/// and leave no pi running.
+#[gtest]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs pi and the model it names in its configuration"]
+async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let root = tempfile::tempdir().or_fail()?.keep();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).or_fail()?;
+    std::fs::write(
+        project.join("notes.txt"),
+        "The colour of the sky is TEAL.\n",
+    )
+    .or_fail()?;
+    let store = RunStore::open(root.join("state"), Arc::new(ProcessLauncher::new()), env)
+        .or_fail()?
+        .with_driver(env!("CARGO_BIN_EXE_agentmux"));
+
+    let started = store.start(&StartRequest {
+        delegate: Delegate {
+            model: ModelId::parse(PI_MODEL).or_fail()?,
+            effort: Some(Effort::parse("off").or_fail()?),
+            account: AccountChoice::Default,
+            isolation: None,
+            permissions: Permissions::Pi,
+        },
+        question:
+            "Read the file notes.txt with your read tool. Then reply with one line: LIVE_DONE, \
+                   followed by anything else you have been asked to add."
+                .to_owned(),
+        cwd: project,
+        retention: Retention::UntilReleased,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let id = started.run_id.clone();
+    eprintln!(
+        "live run {id}, transcript {}",
+        started.transcript_path.display()
+    );
+    let run_dir = started.transcript_path.parent().or_fail()?.to_path_buf();
+    // Sent once pi runs its tool, after its first model call, which on a local model can take
+    // longer than a steer waits to be confirmed; pi takes it before its next one.
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while !capture_lines(&run_dir)?
+        .iter()
+        .any(|line| line_type(line) == Some("tool_execution_start"))
+    {
+        assert_that!(Instant::now() < deadline, eq(true), "pi never ran its tool");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    store.steer(&id, STEER).await?;
+    store
+        .wait_until_terminal(&id, Duration::from_secs(300))
+        .await?;
+    let (status, page) = store.view(&id, 0, usize::MAX)?;
+    assert_that!(status.outcome, matches_pattern!(Outcome::Completed { .. }));
+    assert_that!(page.text, contains_substring("### user (steer)"));
+    let (_, reply) = page.text.rsplit_once("### assistant").or_fail()?;
+    assert_that!(reply, contains_substring("LIVE_DONE"));
+    assert_that!(reply, contains_substring("STEERED"));
+
+    // A follow-up continues the session pi saved in the consultation's directory.
+    wait_for_status(&store, &id, "the driver never left", |status| {
+        status.resumable
+    })
+    .await?;
+    store.follow_up(&id, "Reply with exactly LIVE_AGAIN and nothing else.")?;
+    store
+        .wait_until_terminal(&id, Duration::from_secs(300))
+        .await?;
+    let (followed, page) = store.view(&id, status.transcript_bytes, usize::MAX)?;
+    assert_that!(
+        followed.outcome,
+        matches_pattern!(Outcome::Completed { .. })
+    );
+    assert_that!(followed.broke_continuity, eq(false));
+    let (_, replies) = page.text.split_once("### assistant").or_fail()?;
+    assert_that!(replies, contains_substring("LIVE_AGAIN"));
+
+    // A long turn is aborted over RPC once it runs, and nothing of pi's is left running.
+    wait_for_status(&store, &id, "the driver never left", |status| {
+        status.resumable
+    })
+    .await?;
+    store.follow_up(
+        &id,
+        "Count from one to five hundred in words, one number per line, then reply LIVE_LATE.",
+    )?;
+    wait_for_status(&store, &id, "the turn never started", |status| {
+        status.steerable
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let cancel_started_at = Instant::now();
+    let cancelled = store.cancel(&id).await?;
+    eprintln!("cancel took {:?}", cancel_started_at.elapsed());
+    assert_that!(cancelled.outcome, eq(&Outcome::Cancelled));
+    let page = store.page(&id, followed.transcript_bytes, usize::MAX)?;
+    assert_that!(page.text, contains_substring("_Turn 3 cancelled."));
+    // The aborted turn keeps what pi streamed, and never got to its answer.
+    let replies = page
+        .text
+        .split_once("### assistant")
+        .map_or("", |(_, replies)| replies);
+    assert_that!(replies, not(contains_substring("LIVE_LATE")));
+    assert_that!(processes_naming(&run_dir)?, is_empty());
+    assert_that!(
+        cancelled.unrecognised.summary(),
+        none(),
+        "pi's events have drifted"
+    );
+    Ok(())
+}
+
+/// The pid of every process whose command line names `path`, which for a pi turn's driver and
+/// pi is its consultation's directory; Linux only, where `/proc` says.
+fn processes_naming(path: &Path) -> Result<Vec<u32>> {
+    let path = path.to_string_lossy();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").or_fail()? {
+        let entry = entry.or_fail()?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        // A process that exited since the listing has no command line any more.
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline).contains(path.as_ref()) {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }

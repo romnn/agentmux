@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config};
 use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars, scrub_billing_env};
-use crate::vendor::{agy, claude, codex};
+use crate::vendor::{agy, claude, codex, pi};
 
 /// How long a single account's probe may take before it is abandoned.
 ///
@@ -186,8 +186,9 @@ impl ProbeTarget {
             Vendor::Claude => claude::quota::probe_target(&env),
             Vendor::Codex => codex::quota::probe_target(&env, host_env),
             // agy reads no key or endpoint an account could set, and its gateway variables are
-            // withheld from a subscription identity, so its one login is all there is to read.
-            Vendor::Agy => Self::Window { config_dir: None },
+            // withheld from a subscription identity, so its one login is all there is to read;
+            // pi has no account, and its probe says it reads no window.
+            Vendor::Agy | Vendor::Pi => Self::Window { config_dir: None },
         })
     }
 
@@ -366,6 +367,7 @@ impl QuotaProbe for SystemProbe {
             Vendor::Claude => claude::quota::probe(request),
             Vendor::Codex => codex::quota::probe(request),
             Vendor::Agy => agy::quota::probe(request),
+            Vendor::Pi => pi::quota::probe(),
         }
     }
 }

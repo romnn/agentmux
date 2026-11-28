@@ -409,6 +409,8 @@ pub enum UnsteerableReason {
     CodexIsolated,
     /// An agy delegate, which reads its question once.
     AgyPrint,
+    /// A pi turn that did not run under agentmux's driver.
+    PiUndriven,
 }
 
 impl std::fmt::Display for UnsteerableReason {
@@ -436,6 +438,10 @@ impl std::fmt::Display for UnsteerableReason {
                  consultation that loads it runs over it: one with `ignore_user_config: false`, \
                  which is the default unless this machine's agentmux.toml says otherwise, and \
                  which a follow-up may also ask for"
+            }
+            Self::PiUndriven => {
+                "its turn was not driven over `pi --mode rpc` by agentmux, which is the only way \
+                 a pi turn takes a steer"
             }
             Self::AgyPrint => {
                 "its turn was launched as `agy --print`, which reads its question once and offers \

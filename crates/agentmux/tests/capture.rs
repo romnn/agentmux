@@ -1475,3 +1475,154 @@ fn an_unknown_agy_step_type_is_counted() {
         some(eq("step_update.checkpoint x1"))
     );
 }
+
+/// A pi turn is the text of each answer pi completed, once, from the session pi saved, by the
+/// model that answered; its spend is both model calls', the cache counted beside the input.
+#[gtest]
+fn a_pi_turn_is_its_completed_answers_once() {
+    let Fold {
+        turn,
+        session,
+        input,
+        ..
+    } = stream::fold(Vendor::Pi, 0, "q", fixtures::PI_TOOL_USE);
+
+    assert_that!(
+        report(&turn),
+        elements_are![eq("The file mentions the colour teal.")]
+    );
+    assert_that!(
+        session.map(|session| session.as_str().to_owned()),
+        some(eq("01a222df-e34a-76d1-9e3f-380c59ae8f6d"))
+    );
+    assert_that!(
+        turn.resolved_model.as_deref(),
+        some(eq("ollama/qwen3.6:27b-64k"))
+    );
+    assert_that!(input, eq(TurnInput::Closed));
+    assert_that!(
+        turn.outcome,
+        eq(&Outcome::Completed {
+            usage: Usage {
+                input_tokens: Some(4164),
+                cached_input_tokens: Some(4252),
+                cache_write_input_tokens: Some(0),
+                output_tokens: Some(146),
+                reasoning_output_tokens: Some(0),
+            },
+            cost_usd: None,
+        })
+    );
+}
+
+/// A pi turn takes a steer from its run's start until it settles, and an answer still streaming
+/// when the capture ends is not in the turn but handed on, for the turn to keep once it has ended.
+#[gtest]
+fn a_running_pi_turn_takes_input_and_hands_on_its_streaming_answer() -> Result<()> {
+    let lines: Vec<&str> = fixtures::PI_TOOL_USE.lines().collect();
+    // Up to the closing answer's last delta, before pi completes it.
+    let cut = lines
+        .iter()
+        .rposition(|line| line.contains(r#""type":"text_delta""#))
+        .or_fail()?;
+    let stream = format!("{}\n", lines.get(..=cut).or_fail()?.join("\n"));
+    let Fold {
+        turn,
+        input,
+        unfinished,
+        ..
+    } = stream::fold(Vendor::Pi, 0, "q", &stream);
+
+    assert_that!(input, eq(TurnInput::Open));
+    assert_that!(turn.outcome, eq(&Outcome::Running));
+    assert_that!(report(&turn), is_empty());
+    assert_that!(
+        unfinished.as_deref(),
+        some(starts_with("The file mentions"))
+    );
+    Ok(())
+}
+
+/// A pi turn whose last answer is a provider error fails with pi's own message once it settles,
+/// after the retries pi announced, which stay in the turn as warnings; one pi aborted fails too.
+#[gtest]
+fn a_settled_pi_turn_fails_with_its_last_answers_error() {
+    let failed = indoc::indoc! {r#"
+        {"type":"agent_start"}
+        {"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Connection error.: bad port"}}
+        {"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"Connection error.: bad port"}
+        {"type":"auto_retry_end","success":false,"attempt":3,"finalError":"Connection error.: bad port"}
+        {"type":"agent_settled","aborted":false}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Pi, 0, "q", failed);
+
+    assert_that!(
+        turn.outcome,
+        eq(&Outcome::Failed {
+            kind: FailureKind::Unclassified,
+            detail: "Connection error.: bad port".to_owned(),
+        })
+    );
+    assert_that!(
+        notes(&turn),
+        elements_are![
+            contains_substring("pi retries, attempt 1 of 3"),
+            contains_substring("pi gave up retrying")
+        ]
+    );
+
+    let aborted = indoc::indoc! {r#"
+        {"type":"agent_start"}
+        {"type":"agent_settled","aborted":true}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Pi, 0, "q", aborted);
+    assert_that!(
+        turn.outcome,
+        matches_pattern!(Outcome::Failed {
+            detail: eq("pi aborted the turn"),
+            ..
+        })
+    );
+}
+
+/// What a pi turn spent is every usage pi reported, each once: a completed answer's, a
+/// compaction's and a cache refresh's, never a streaming update's running figure; a steer the
+/// driver recorded is the caller's, where pi took it.
+#[gtest]
+fn every_usage_a_pi_turn_reports_counts_once() {
+    let stream = indoc::indoc! {r#"
+        {"type":"agent_start"}
+        {"type":"message_update","usage":{"input":10,"output":1},"assistantMessageEvent":{"type":"text_delta","delta":"A"}}
+        {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"A"}],"stopReason":"stop","usage":{"input":10,"output":2}}}
+        {"type":"message_start","message":{"role":"user","content":"Also B."}}
+        {"type":"agentmux.steer","text":"Also B."}
+        {"type":"entry_appended","entry":{"type":"context_edit","id":"e1"}}
+        {"type":"entry_appended","entry":{"type":"usage","kind":"cache_warm","usage":{"cacheRead":50}}}
+        {"type":"compaction_end","reason":"threshold","result":{"summary":"s","usage":{"input":5,"output":1}},"aborted":false,"willRetry":false}
+        {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"B"}],"stopReason":"stop"}}
+        {"type":"agent_settled","aborted":false}
+    "#};
+    let Fold { turn, .. } = stream::fold(Vendor::Pi, 0, "q", stream);
+
+    assert_that!(
+        turn.messages
+            .iter()
+            .filter(|message| message.source == MessageSource::Steer)
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>(),
+        elements_are![eq("Also B.")]
+    );
+    assert_that!(
+        turn.outcome,
+        eq(&Outcome::Completed {
+            usage: Usage {
+                input_tokens: Some(15),
+                cached_input_tokens: Some(50),
+                cache_write_input_tokens: None,
+                output_tokens: Some(3),
+                reasoning_output_tokens: None,
+            },
+            cost_usd: None,
+        })
+    );
+}

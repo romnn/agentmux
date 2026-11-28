@@ -7,8 +7,8 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Admitted, Billing, Delegate, Invocation, Isolation, LaunchRequest, ModelId,
-    PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
+    AccountChoice, Admitted, Billing, Delegate, DriverPlan, Invocation, Isolation, LaunchRequest,
+    ModelId, PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -504,7 +504,10 @@ impl RunStore {
                     }
                     .into());
                 }
-                Permissions::Claude(_) | Permissions::Codex(_) | Permissions::Agy => {}
+                Permissions::Claude(_)
+                | Permissions::Codex(_)
+                | Permissions::Agy
+                | Permissions::Pi => {}
             }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
@@ -730,6 +733,14 @@ impl LockedRun<'_> {
     }
 }
 
+/// Write the plan a turn's driver runs under where that driver reads it.
+fn write_driver_plan(turn: &TurnDir, plan: &DriverPlan) -> Result<(), RunError> {
+    match plan {
+        DriverPlan::Codex(plan) => write_json(&turn.app_server_plan_path(), plan),
+        DriverPlan::Pi(plan) => write_json(&turn.pi_plan_path(), plan),
+    }
+}
+
 impl RunStore {
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
@@ -796,6 +807,7 @@ impl RunStore {
             invocation,
             &LaunchRequest {
                 turn,
+                run_dir: &self.run_dir(&meta.run_id),
                 cwd: &meta.cwd,
                 resume,
                 isolation,
@@ -806,7 +818,7 @@ impl RunStore {
             },
         )?;
         if let Some(driver_plan) = &driver_plan {
-            write_json(&turn.app_server_plan_path(), driver_plan)?;
+            write_driver_plan(turn, driver_plan)?;
         }
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
@@ -940,17 +952,21 @@ impl RunStore {
                     cwd: meta.cwd.clone(),
                     billing: delegate.billing(),
                 },
-                auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
-                    policy,
-                    supervisor: supervisor.to_path_buf(),
-                    // Named only when Codex turns are driven, the meaning an earlier agentmux
-                    // reading this plan gives it.
-                    codex_driver: self
-                        .driver
-                        .as_ref()
-                        .filter(|_| !self.codex_exec)
-                        .map(|driver| driver.path().to_path_buf()),
-                }),
+                // pi retries an overloaded model itself.
+                auto_resume: self
+                    .auto_resume
+                    .filter(|_| meta.delegate.vendor() != Vendor::Pi)
+                    .map(|policy| AutoResumePlan {
+                        policy,
+                        supervisor: supervisor.to_path_buf(),
+                        // Named only when Codex turns are driven, the meaning an earlier agentmux
+                        // reading this plan gives it.
+                        codex_driver: self
+                            .driver
+                            .as_ref()
+                            .filter(|_| !self.codex_exec)
+                            .map(|driver| driver.path().to_path_buf()),
+                    }),
             },
         )?;
         let mut invocation = delegate.clone();

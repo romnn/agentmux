@@ -330,5 +330,6 @@ pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
             Some(Isolation::Isolated) | None => UnsteerableReason::CodexIsolated,
         },
         Permissions::Agy => UnsteerableReason::AgyPrint,
+        Permissions::Pi => UnsteerableReason::PiUndriven,
     }
 }

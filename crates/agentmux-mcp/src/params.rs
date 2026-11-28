@@ -76,6 +76,8 @@ pub struct DelegateParams {
     /// Which CLI to run.
     /// Choose the vendor you are NOT: your own harness already spawns same-vendor subagents
     /// natively, so agentmux is for the cross-vendor second opinion.
+    /// `pi` reaches whichever providers its own configuration names, and takes its `model` as
+    /// `provider/id`.
     #[schemars(schema_with = "vendor_schema")]
     pub delegate: Vendor,
 
@@ -163,6 +165,7 @@ pub struct PermissionParams {
     /// user's configuration only: agy runs the project's own hooks, MCP servers and plugins in
     /// both modes, so do not point it at a checkout you do not trust.
     /// A follow-up cannot change it for an `agy` consultation.
+    /// A `pi` consultation refuses `true`: pi always loads the user's configuration.
     #[serde(default)]
     #[schemars(with = "bool")]
     pub ignore_user_config: Option<bool>,
@@ -260,7 +263,7 @@ pub(crate) fn invalid_delegate(error: &DelegateError) -> ErrorData {
         }
         DelegateError::NotForVendor { .. } => {
             " `sandbox` and `network_access` are Codex's; `permission_mode` and the tool lists are \
-             Claude's; agy takes none of them."
+             Claude's; agy and pi take none of them."
         }
         _ => "",
     };

@@ -61,6 +61,9 @@ async fn main() -> Result<()> {
     if let Command::CodexAppServer(args) = &cli.command {
         std::process::exit(agentmux::appserver::drive(&args.plan_path));
     }
+    if let Command::PiRpc(args) = &cli.command {
+        std::process::exit(agentmux::vendor::pi::driver::drive(&args.plan_path));
+    }
     // So is the supervisor: the store it opens is the one its plan names, and the environment it
     // was started with is its delegate's, which it hands on.
     if let Command::Supervise(args) = &cli.command {
@@ -142,7 +145,7 @@ async fn main() -> Result<()> {
             report::list(&runs, filter.filters(), cli.json)
         }
         // Dispatched before the store was opened.
-        Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
+        Command::CodexAppServer(_) | Command::PiRpc(_) | Command::Supervise(_) => Ok(()),
         Command::Prune(args) => {
             if let Some(run_id) = args.run_id {
                 store.remove(run_id.id())?;

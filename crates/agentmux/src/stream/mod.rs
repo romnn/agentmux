@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::delegate::{SessionRef, Vendor};
 use crate::transcript::{Outcome, Turn};
-use crate::vendor::{agy, claude, codex};
+use crate::vendor::{agy, claude, codex, pi};
 
 /// The result of folding one child process's event stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +39,7 @@ pub struct Fold {
     /// Over the app-server it opens at Codex's `turn.started`, which the driver writes once it
     /// follows the turn and can deliver a steer.
     /// A Claude turn reading stream-json input takes one from its `system`/`init` until its first
-    /// `result`.
+    /// `result`, and a pi turn from its first `agent_start` until `agent_settled`.
     pub input: TurnInput,
     /// What the last `result` of a Claude turn reading stream-json input reported, or `None` when
     /// there is none or Claude went on past it.
@@ -50,7 +50,7 @@ pub struct Fold {
     /// The ids of the steers the fold placed in the turn, where Claude's replay of each said it
     /// took it.
     pub steers_taken: Vec<Uuid>,
-    /// The text of an agy reply the stream ended in the middle of.
+    /// The text of an agy or pi reply the stream ended in the middle of.
     ///
     /// Not in [`Self::turn`], whose render must only grow at its end while more of the same reply
     /// may still arrive; the turn keeps it once it has ended without finishing it.
@@ -67,7 +67,8 @@ pub enum TurnInput {
     Pending,
     /// The delegate takes an instruction.
     Open,
-    /// No longer: Claude has reported its result and takes nothing more while it finishes.
+    /// No longer: Claude has reported its result, or pi has settled, and takes nothing more while
+    /// it finishes.
     Closed,
 }
 
@@ -100,6 +101,7 @@ pub fn fold(vendor: Vendor, index: u32, question: &str, events: &str) -> Fold {
         Vendor::Claude => claude::fold::fold(index, question, events),
         Vendor::Codex => codex::fold::fold(index, question, events),
         Vendor::Agy => agy::fold::fold(index, question, events),
+        Vendor::Pi => pi::fold::fold(index, question, events),
     }
 }
 

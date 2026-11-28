@@ -244,7 +244,7 @@ pub struct Usage {
     /// Prompt tokens.
     ///
     /// Codex: every prompt token, those read from the cache included.
-    /// Claude and agy: only the prompt tokens the cache played no part in.
+    /// Claude, agy and pi: only the prompt tokens the cache played no part in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// Prompt tokens read from the provider's cache.
@@ -252,12 +252,14 @@ pub struct Usage {
     /// Codex: a part of `input_tokens`.
     /// Claude: its `cache_read_input_tokens`, counted beside `input_tokens`.
     /// agy: its `cache_read_tokens`, counted beside `input_tokens`.
+    /// pi: its `cacheRead`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
     /// Prompt tokens written into the provider's cache.
     ///
     /// Codex: read as a part of `input_tokens`, as its cache reads are.
     /// Claude: its `cache_creation_input_tokens`, counted beside `input_tokens`.
+    /// pi: its `cacheWrite`, counted beside `input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_input_tokens: Option<u64>,
     /// Tokens the model emitted, reasoning included for every vendor.
@@ -267,6 +269,7 @@ pub struct Usage {
     ///
     /// Claude: its `output_tokens_details.thinking_tokens`.
     /// agy: its `thinking_tokens`.
+    /// pi: its `reasoning`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
 }

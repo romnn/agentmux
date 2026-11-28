@@ -93,6 +93,10 @@ impl TurnDir {
     pub(crate) fn app_server_plan_path(&self) -> PathBuf {
         self.root.join("app-server.json")
     }
+    /// The plan a pi turn's driver runs under.
+    pub(crate) fn pi_plan_path(&self) -> PathBuf {
+        self.root.join("pi-rpc.json")
+    }
     /// The plan the turn's supervisor runs under.
     pub(super) fn supervisor_plan_path(&self) -> PathBuf {
         self.root.join("supervisor-plan.json")
@@ -125,8 +129,8 @@ impl TurnDir {
             .iter()
             .any(|record| record.exists())
     }
-    /// Where steered messages wait for the driver of a turn driven over the app-server, or for
-    /// the supervisor of a Claude turn that reads its input from it.
+    /// Where steered messages wait for the driver of a driven Codex or pi turn, or for the
+    /// supervisor of a Claude turn that reads its input from it.
     pub(crate) fn steer_dir(&self) -> PathBuf {
         self.root.join("steer")
     }

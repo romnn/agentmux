@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 use crate::accounting::{ReadSpend, Scope, Tokens};
-use crate::appserver::DriverPlan;
 use crate::config::PermissionRefusal;
 use crate::delegate::{
-    CredentialVars, Delegate, DelegateError, Effort, Invocation, Isolation, LaunchRequest, ModelId,
-    PreparedLaunch, TurnPlan, Vendor, release_of, reroutes_within,
+    CredentialVars, Delegate, DelegateError, DriverPlan, Effort, Invocation, Isolation,
+    LaunchRequest, ModelId, PreparedLaunch, TurnPlan, Vendor, release_of, reroutes_within,
 };
 use crate::run::LaunchMode;
 use crate::transcript::Usage;
@@ -61,7 +60,7 @@ pub(crate) fn prepare(
         && isolation.inherits()
         && !codex_exec
     {
-        let driver_plan = DriverPlan {
+        let driver_plan = crate::appserver::DriverPlan {
             settings: AppServerSettings {
                 program: Vendor::Codex.program().to_owned(),
                 args: codex_app_server_args(delegate.effort.as_ref(), permissions),
@@ -82,7 +81,7 @@ pub(crate) fn prepare(
         return Ok(PreparedLaunch {
             invocation,
             mode: LaunchMode::Driven,
-            driver_plan: Some(driver_plan),
+            driver_plan: Some(DriverPlan::Codex(driver_plan)),
         });
     }
 

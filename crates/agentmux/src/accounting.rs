@@ -51,7 +51,7 @@ use serde::Serialize;
 
 use crate::delegate::Vendor;
 use crate::transcript::{SpendReport, Turn, Usage};
-use crate::vendor::{agy, claude, codex};
+use crate::vendor::{agy, claude, codex, pi};
 
 /// Token counts in one set of categories whatever the vendor.
 ///
@@ -464,6 +464,7 @@ impl Accounting {
                 Vendor::Claude => claude::read_spend(usage, cli_version.as_deref()),
                 Vendor::Codex => codex::read_spend(usage),
                 Vendor::Agy => agy::read_spend(usage),
+                Vendor::Pi => pi::read_spend(usage),
             };
             // Token scopes are fixed per vendor, so no token figure is refused today; one that
             // were refused would still be a figure the totals leave out.

@@ -75,6 +75,13 @@ fn every_delegate() -> Result<Vec<Delegate>> {
             isolation: Some(Isolation::Inherit),
             permissions: Permissions::Agy,
         },
+        Delegate {
+            model: model("ollama/qwen3.6:27b-64k")?,
+            effort: Some(effort("low")?),
+            account: AccountChoice::Default,
+            isolation: Some(Isolation::Inherit),
+            permissions: Permissions::Pi,
+        },
     ])
 }
 
@@ -269,6 +276,23 @@ fn every_delegate_captures_its_whole_stream() -> Result<()> {
                         "download_url(*)"
                     ]))
                 );
+            }
+            agentmux::delegate::Vendor::Pi => {
+                // Every event streams over RPC, nothing loads that could queue a message, and
+                // the tools only read.
+                assert_that!(has_pair(args, "--mode", "rpc"), eq(true), "{label}");
+                assert_that!(
+                    args.contains(&"--no-extensions".to_owned()),
+                    eq(true),
+                    "{label}"
+                );
+                assert_that!(
+                    has_pair(args, "--tools", "read,grep,find,ls"),
+                    eq(true),
+                    "{label}"
+                );
+                // The model and the effort are sent over RPC, as its driver's plan names them.
+                continue;
             }
         }
 
@@ -1319,6 +1343,13 @@ fn delegate_on_account(vendor: Vendor, alias: &str) -> Result<Delegate> {
             isolation: None,
             permissions: Permissions::Agy,
         },
+        Vendor::Pi => Delegate {
+            model: model("ollama/qwen3.6:27b-64k")?,
+            effort: None,
+            account,
+            isolation: None,
+            permissions: Permissions::Pi,
+        },
     })
 }
 
@@ -1462,6 +1493,10 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "AGY_LLM_GATEWAY_HEADERS",
         "AGY_ADC_AUTH",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "HF_TOKEN",
+        "AWS_PROFILE",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "KIMI_OAUTH_HOST",
     ] {
         expect_that!(
             agentmux::delegate::is_billing_env_name(name),
@@ -1473,7 +1508,8 @@ fn the_billing_rule_names_endpoints_and_tokens_but_not_a_login() {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
-        "AWS_PROFILE",
+        "PI_CODING_AGENT_DIR",
+        "AWS_REGION",
         "CODEX_URLS_SEEN",
         "HTTPS_PROXY",
     ] {
@@ -1962,6 +1998,94 @@ fn an_agy_settings_file_is_read_as_agy_reads_it() -> Result<()> {
     assert_that!(
         machine.launch(Isolation::Inherit)?.map(|_| ()),
         err(displays_as(contains_substring("cannot be read")))
+    );
+    Ok(())
+}
+
+/// A pi turn on its subscription carries no credential anywhere a launch writes it down or hands
+/// it on: not in the driver's command line, not in the plan the driver reads, and not in the
+/// environment it runs with, which is the one pi is started in.
+/// The machine layer forwards every kind of name pi reads a credential or an endpoint from, and
+/// the host exports each with a sentinel value; only pi's own configuration directory arrives.
+/// A store without a driver refuses the launch.
+#[gtest]
+fn a_pi_turn_carries_no_credential_into_its_launch() -> Result<()> {
+    let state = tempfile::tempdir().or_fail()?;
+    let credentials = [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_PROFILE",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "HF_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "KIMI_OAUTH_HOST",
+    ];
+    let config = state.path().join("agentmux.toml");
+    std::fs::write(
+        &config,
+        indoc::formatdoc! {"
+            [launch]
+            env_passthrough = {credentials:?}
+        "},
+    )
+    .or_fail()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).or_fail()?;
+    }
+    let mut host_env: BTreeMap<String, String> = credentials
+        .iter()
+        .map(|name| ((*name).to_owned(), format!("sentinel-{name}")))
+        .collect();
+    host_env.extend([
+        ("HOME".to_owned(), "/home/dev".to_owned()),
+        (
+            "PI_CODING_AGENT_DIR".to_owned(),
+            "/home/dev/pi-agent".to_owned(),
+        ),
+        (
+            agentmux::config::CONFIG_PATH_ENV.to_owned(),
+            config.display().to_string(),
+        ),
+    ]);
+    let request = StartRequest {
+        delegate: Delegate {
+            model: model("ollama/qwen3.6:27b-64k")?,
+            effort: None,
+            account: AccountChoice::Default,
+            isolation: None,
+            permissions: Permissions::Pi,
+        },
+        question: "q".to_owned(),
+        cwd: state.path().to_path_buf(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    };
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
+    let store = RunStore::open(
+        state.path().join("state"),
+        launcher.clone(),
+        host_env.clone(),
+    )?;
+    assert_that!(
+        store.start(&request),
+        err(displays_as(contains_substring("has no driver")))
+    );
+
+    let store = store.with_driver("/opt/agentmux");
+    store.start(&request)?;
+    let launch = launcher.launches().into_iter().next().or_fail()?;
+    let plan = std::fs::read_to_string(launch.args.get(1).or_fail()?).or_fail()?;
+    let written = format!("{:?} {plan} {:?}", launch.args, launch.env);
+    expect_that!(written, not(contains_substring("sentinel")));
+    expect_that!(
+        launch.env.get("PI_CODING_AGENT_DIR").map(String::as_str),
+        some(eq("/home/dev/pi-agent"))
     );
     Ok(())
 }

@@ -1026,8 +1026,9 @@ fn permissions(machine: &agentmux::config::Config, denied: &BTreeSet<Vendor>) ->
         `network_access` choose what a `codex` delegate's commands may do, and `permission_mode`,
         `tools`, `allowed_tools` and `disallowed_tools` what a `claude` delegate may do; omitted,
         the default above applies. An `agy` delegate takes none of them: it may read, and its `deny`
-        rules above refuse the rest. A value beyond a limit is refused, naming the limit, and never
-        lowered to fit. A limit is a ceiling on what agentmux requests, not on what this machine's
+        rules above refuse the rest. A `pi` delegate takes none of them either, and always loads
+        this machine's pi configuration: it may only read, search and list files. A value beyond a
+        limit is refused, naming the limit, and never lowered to fit. A limit is a ceiling on what agentmux requests, not on what this machine's
         own Codex `.rules` allow, which can run a matching command outside the sandbox. `follow_up` takes the same fields to change them for the next turn, and
         keeps what the newest turn ran with for any it omits; the limits are rechecked on every
         turn, and `quota` reports them as they are now."
@@ -1095,8 +1096,8 @@ fn roster(config: &agentmux::config::Config) -> String {
 /// The part of the instructions that is the same on every machine.
 ///
 /// [`instructions`] appends the accounts this one has.
-const INSTRUCTIONS: &str = r#"agentmux runs a question past ANOTHER vendor's coding agent — `codex` or `agy` when you are Claude
-Code, `claude` or `agy` when you are Codex — and keeps the whole transcript. Your own harness already spawns
+const INSTRUCTIONS: &str = r#"agentmux runs a question past ANOTHER vendor's coding agent — `codex`, `agy` or `pi` when you are
+Claude Code, `claude`, `agy` or `pi` when you are Codex — and keeps the whole transcript. Your own harness already spawns
 same-vendor subagents natively and more cheaply; agentmux exists to cross the vendor line, which is
 where a disagreement is worth paying for.
 
@@ -1131,8 +1132,10 @@ itself cannot go on — a content filter refusing turn after turn however you re
 `continue_fresh` starts a new consultation that reads the old transcript and working tree. `steer` adds an
 instruction to a turn that is still running, which the delegate sees before its next model call;
 only a turn `status` reports as `steerable: yes` takes one: a running `claude` turn until it has
-reported its result, and a running `codex` turn whose consultation inherits its account's
-settings, because only those are launched over Codex's app-server.
+reported its result, a running `codex` turn whose consultation inherits its account's
+settings, because only those are launched over Codex's app-server, and a running `pi` turn until
+it settles. A `pi` turn takes a steer only between its model calls, so `steer` may report one it
+has not taken yet as unconfirmed, and it still arrives.
 
 A `codex` delegate over the app-server can ask you a question mid-turn, and does not wait for the
 answer: it carries on under an assumption of its own, or polls for a reply. The
@@ -1155,8 +1158,8 @@ that a hook reopened after it had finished, and the findings are above all of th
 from the top, or open the file at `transcript:` with your own file tools — the inline text is
 bounded by your host's result limit, the file never is.
 
-Choose a delegate by naming `delegate` (`claude`, `codex` or `agy`, Google's Antigravity CLI), a
-`model` and an `effort`. For the
+Choose a delegate by naming `delegate` (`claude`, `codex`, `agy`, Google's Antigravity CLI, or
+`pi`, whose model is `provider/id` from pi's own configuration), a `model` and an `effort`. For the
 model, prefer a family alias this machine defines — they are listed below when it defines any, and
 `quota` lists them too — and otherwise name the vendor's own identifier; `opus` and `sol` show an
 alias's shape, not a list of them. agentmux keeps no built-in model roster; this machine's rewrites

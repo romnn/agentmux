@@ -572,7 +572,7 @@ impl LockedRun<'_> {
                 invocation.config_dir.as_deref(),
                 delegate_gone,
             ),
-            Vendor::Claude | Vendor::Agy => None,
+            Vendor::Claude | Vendor::Agy | Vendor::Pi => None,
         };
 
         let finality = self.settle_inputs(
@@ -1101,7 +1101,7 @@ fn keep_unfinished(turn: &mut Turn, unfinished: Option<String>) {
 fn classify_exit(vendor: Vendor, detail: &str) -> FailureKind {
     let kind = match vendor {
         Vendor::Agy => crate::vendor::agy::fold::classify(detail),
-        Vendor::Claude | Vendor::Codex => stream::classify(detail),
+        Vendor::Claude | Vendor::Codex | Vendor::Pi => stream::classify(detail),
     };
     match kind {
         FailureKind::Unclassified => FailureKind::LaunchFailed,
