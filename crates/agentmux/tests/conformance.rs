@@ -137,7 +137,7 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
         expect_that!(followed.turns, eq(2), "{vendor}");
 
         // The follow-up resumes the delegate's own session rather than restating the brief, so
-        // its input carries the new question and not the notice the first turn was given.
+        // its input is the new question alone; agy reads it inside the record it takes.
         let launches = harness.launcher.launches();
         let resumed = launches.get(1).or_fail()?;
         expect_that!(
@@ -146,14 +146,15 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
             "{vendor} did not resume {}",
             case.session
         );
-        expect_that!(
-            resumed.question,
-            all![
-                contains_substring("And the tests?"),
-                not(contains_substring("Note from agentmux"))
-            ],
-            "{vendor}"
-        );
+        let asked = match vendor {
+            Vendor::Agy => serde_json::from_str::<serde_json::Value>(&resumed.question)
+                .or_fail()?["message"]["content"]
+                .as_str()
+                .or_fail()?
+                .to_owned(),
+            Vendor::Claude | Vendor::Codex => resumed.question.clone(),
+        };
+        expect_that!(asked, eq("And the tests?"), "{vendor}");
 
         // What a reader saw before the follow-up is still the transcript's start.
         let after = harness.store.page(&started.run_id, 0, usize::MAX)?.text;
