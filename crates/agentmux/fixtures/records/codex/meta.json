@@ -1,0 +1,19 @@
+{
+  "run_id": "<run_id>",
+  "delegate": {
+    "vendor": "codex",
+    "model": "gpt-6-luna",
+    "effort": "medium",
+    "sandbox": "read_only",
+    "network_access": false,
+    "account": "personal",
+    "isolation": "inherit"
+  },
+  "cwd": "<cwd>",
+  "retention": "ttl",
+  "created_at": "2026-11-28T01:47:13.000746167Z",
+  "env": {},
+  "rewritten_from": "luna",
+  "billing": "subscription",
+  "codex_exec": true
+}
