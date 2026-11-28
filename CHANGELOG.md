@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **pi is a fourth delegate, and its running turns can be steered.** `--delegate pi`
+  (`delegate: "pi"`) runs `pi --mode rpc` with your pi configuration, read-only, on the model
+  named as `provider/id`.
 - **agy, Google's Antigravity CLI, is a third delegate.** `--delegate agy` (`delegate: "agy"`)
   reaches Gemini models on a Google AI subscription, read-only; it always runs the project's own
   `.agents` tooling, and `ignore_user_config` keeps out only the user's.

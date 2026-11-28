@@ -186,8 +186,9 @@ impl ProbeTarget {
             Vendor::Claude => claude::quota::probe_target(&env),
             Vendor::Codex => codex::quota::probe_target(&env, host_env),
             // agy reads no key or endpoint an account could set, and its gateway variables are
-            // withheld from a subscription identity, so its one login is all there is to read.
-            Vendor::Agy => Self::Window { config_dir: None },
+            // withheld from a subscription identity, so its one login is all there is to read;
+            // pi has no account, and its probe says it reads no window.
+            Vendor::Agy | Vendor::Pi => Self::Window { config_dir: None },
         })
     }
 
@@ -366,6 +367,9 @@ impl QuotaProbe for SystemProbe {
             Vendor::Claude => claude::quota::probe(request),
             Vendor::Codex => codex::quota::probe(request),
             Vendor::Agy => agy::quota::probe(request),
+            Vendor::Pi => Observation::Unavailable {
+                reason: "pi reports no usage window for the providers it reaches".to_owned(),
+            },
         }
     }
 }

@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::appserver::mailbox::{ClaimedSteer, Mailbox, SteerReply};
+use crate::driver::mailbox::{ClaimedSteer, Mailbox, SteerReply};
 use crate::vendor::claude::fold::InputBoundary;
 
 use super::RunStore;
@@ -242,7 +242,7 @@ mod tests {
     use googletest::prelude::*;
 
     use super::{ClaudeInput, EXITED, Writing, input_line};
-    use crate::appserver::mailbox::SteerReply;
+    use crate::driver::mailbox::SteerReply;
     use crate::run::layout::TurnDir;
     use crate::run::{RunId, RunStore};
     use crate::testing::ScriptedLauncher;

@@ -583,6 +583,10 @@ pub mod fixtures {
     /// command failed as `tool` steps ending `ERROR`, and it answered.
     pub const AGY_RULE_DENIED: &str = include_str!("../fixtures/agy/rule-denied.jsonl");
 
+    /// A pi turn the driver ran against a local model at thinking level `low`: it read a file and
+    /// answered, and the capture names the session pi saved.
+    pub const PI_TOOL_USE: &str = include_str!("../fixtures/pi/tool-use.jsonl");
+
     /// What `agy --print /usage --output-format json` printed: the usage groups under
     /// `command.data`, one of whose windows nobody had used yet.
     pub const AGY_USAGE: &str = include_str!("../fixtures/agy/usage.json");
@@ -617,7 +621,7 @@ pub mod fixtures {
     /// Every committed fixture.
     #[must_use]
     pub fn all() -> Vec<Fixture> {
-        use crate::delegate::Vendor::{self, Agy, Claude, Codex};
+        use crate::delegate::Vendor::{self, Agy, Claude, Codex, Pi};
         let fixture = |vendor: Vendor, name, stream| Fixture {
             vendor,
             name,
@@ -653,6 +657,7 @@ pub mod fixtures {
             fixture(Agy, "agy/background", AGY_BACKGROUND),
             fixture(Agy, "agy/unknown-model", AGY_UNKNOWN_MODEL),
             fixture(Agy, "agy/rule-denied", AGY_RULE_DENIED),
+            fixture(Pi, "pi/tool-use", PI_TOOL_USE),
         ]
     }
 }

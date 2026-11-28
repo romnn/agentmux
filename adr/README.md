@@ -80,6 +80,8 @@ A new decision gets a record with the next number.
   of its own.
 - [0036](0036-isolation-imposed-by-the-launch-agentmux-builds.md): Isolation is imposed by the
   launch agentmux builds: by argument, or by environment it sets after every other layer.
+- [0037](0037-pi-driven-over-rpc-with-the-users-configuration.md): A pi turn is driven over
+  `pi --mode rpc`, read-only, with the user's own configuration.
 
 ## Run lifecycle and transcripts
 

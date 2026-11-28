@@ -1,7 +1,7 @@
 ---
 name: real-cli-testing
 description:
-    Run agentmux's live tests against the real claude, codex and agy CLIs, re-record or add stream
+    Run agentmux's live tests against the real claude, codex, agy and pi CLIs, re-record or add stream
     fixtures under crates/agentmux/fixtures, scrub the recording machine's identity from a capture,
     or decide which test harness a change needs (live, codex-app-server-mock, ScriptedLauncher). Use
     after upgrading either CLI, when a CLI's output format may have changed, when a fixture test
@@ -20,7 +20,7 @@ against recorded fixtures.
 | -------------------------------------- | -------------------------------------------- |
 | Stream folding and rendering           | Recorded fixtures                            |
 | Run-store behavior                     | `agentmux::testing::ScriptedLauncher`        |
-| Driver protocol ordering and deadlines | A scripted `Peer`                            |
+| Driver protocol ordering and deadlines | A scripted `Peer`; for pi, `tests/pi.rs`     |
 | Driver process launch and teardown     | The CLI against the mock `codex` binary      |
 | A Claude turn's input and supervisor   | The CLI against a fake `claude` shell script |
 | Compatibility with the installed CLIs  | Live tests                                   |
@@ -47,10 +47,14 @@ including when later assertions fail. Earlier errors may remove it.
 
 A steered turn of each vendor has a live test of its own in the crate that builds the executable,
 `crates/agentmux-cli/tests/live.rs`, which runs the `agentmux` built with the test as the Codex
-turn's driver and as the Claude turn's supervisor, which holds Claude's input:
+and pi turns' driver and as the Claude turn's supervisor, which holds Claude's input.
+The pi test runs a local Ollama model, `ollama/qwen3.6:27b-64k`, which pi's configuration must
+name: point `PI_CODING_AGENT_DIR` at a directory whose `models.json` does, never at a copy of a
+real `auth.json`.
 
 ```bash
 AGENTMUX_LIVE_CODEX_ACCOUNT=<chosen-account> AGENTMUX_LIVE_CLAUDE_ACCOUNT=<chosen-account> \
+  PI_CODING_AGENT_DIR=<agent-dir-naming-the-model> \
   cargo nextest run -p agentmux-cli --run-ignored all -E 'test(live)' --no-capture
 ```
 
@@ -83,7 +87,7 @@ Both check messages against codex's own schema; see ADR
 
 ## Fixture tests
 
-The recorded streams live under `crates/agentmux/fixtures/{claude,codex,agy}/`, registered in
+The recorded streams live under `crates/agentmux/fixtures/{claude,codex,agy,pi}/`, registered in
 `agentmux::testing::fixtures`. They were captured from real runs with the exact flags
 each vendor's module under `crates/agentmux/src/vendor/` builds.
 `crates/agentmux/tests/capture.rs` checks them:
@@ -101,6 +105,8 @@ recorded expectations. If the vendor's output did change:
    turn; a turn driven over `codex app-server` holds the driver's translation, not codex's own
    output. A Claude turn whose supervisor held its input folds by the ids it was sent its input
    under: its `launch_id` in `supervisor.json`, and the UUID each request stem in `steer/` ends in.
+   A pi turn is always the driver's capture, which is pi's events verbatim plus the driver's own
+   records, so record it through `agentmux`.
 2. Scrub the capture (below).
 3. Add or replace the fixture, and register a new one in `agentmux::testing::fixtures`: its
    constants and `fixtures::all()`.
@@ -123,7 +129,10 @@ Inspect the entire capture for machine identity, including tool arguments and ou
 captures need inspection too.
 An agy capture names the checkout in `init.cwd`, in tool parameters and in the assistant's text,
 which arrives as `text_delta` chunks that can split a path across lines: scrub each step's joined
-text, then split it again, so `result.response` still repeats it exactly. None of it is read by either parser. Replace those fields with mocked values
+text, then split it again, so `result.response` still repeats it exactly.
+A pi capture's `system` message lists the recording machine's skills and documentation paths in its
+`sections`, which a fixture replaces with pi's stock `preamble`, `tools` and `rules`, and its
+`thinking_delta` and `text_delta` chunks split paths the same way, to be scrubbed per message. None of it is read by either parser. Replace those fields with mocked values
 before committing, following the committed fixtures: `/work/project` for the checkout, `/home/dev`
 for the home directory, `-work-project` for the memory slug, `/tmp/socket` for a socket path, and an
 empty or stock list of skills and slash commands.

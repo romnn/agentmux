@@ -218,8 +218,8 @@ impl RunStore {
                     .with_supervisor(&resume.supervisor)
                     .with_auto_resume(Some(resume.policy));
                 match &resume.codex_driver {
-                    Some(driver) => configured.with_codex_app_server(driver),
-                    None => configured,
+                    Some(driver) => configured.with_driver(driver),
+                    None => configured.with_codex_exec(),
                 }
             }
             None => self.with_auto_resume(None),
@@ -524,24 +524,22 @@ mod tests {
         let open = || RunStore::open(dir.path(), launcher.clone(), env.clone());
 
         // The first turn runs over the app-server, directly, and has not gone yet.
-        let started = open()?
-            .with_codex_app_server("/opt/agentmux")
-            .start(&StartRequest {
-                delegate: Delegate {
-                    model: ModelId::parse("gpt-6-astra").or_fail()?,
-                    effort: None,
-                    account: AccountChoice::Default,
-                    isolation: Some(Isolation::Inherit),
-                    permissions: Permissions::Codex(CodexPermissions::default()),
-                },
-                question: "review this".to_owned(),
-                cwd: PathBuf::from("/work/project"),
-                retention: Retention::Ttl,
-                env: BTreeMap::new(),
-                billing: None,
-                force_codex_exec: false,
-                label: None,
-            })?;
+        let started = open()?.with_driver("/opt/agentmux").start(&StartRequest {
+            delegate: Delegate {
+                model: ModelId::parse("gpt-6-astra").or_fail()?,
+                effort: None,
+                account: AccountChoice::Default,
+                isolation: Some(Isolation::Inherit),
+                permissions: Permissions::Codex(CodexPermissions::default()),
+            },
+            question: "review this".to_owned(),
+            cwd: PathBuf::from("/work/project"),
+            retention: Retention::Ttl,
+            env: BTreeMap::new(),
+            billing: None,
+            force_codex_exec: false,
+            label: None,
+        })?;
         let run_id = started.run_id;
 
         // Its supervisor, this process, ran it under the earlier plan.
@@ -593,7 +591,7 @@ mod tests {
         );
         let resumed =
             read_json::<InvocationRecord>(&resumer.turn_dir(&run_id, 1).invocation())?.or_fail()?;
-        assert_that!(resumed.launch_mode, eq(LaunchMode::AppServer));
+        assert_that!(resumed.launch_mode, eq(LaunchMode::Driven));
         assert_that!(resumed.auto_resume, some(anything()));
         Ok(())
     }

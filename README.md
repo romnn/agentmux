@@ -43,8 +43,8 @@ cargo install --git https://github.com/romnn/agentmux agentmux-cli
 
 There is no crates.io release: the name is taken by an unrelated crate.
 
-You also need whichever delegate CLIs you intend to use (`claude`, `codex`, `agy`) on your `PATH`,
-already authenticated.
+You also need whichever delegate CLIs you intend to use (`claude`, `codex`, `agy`, `pi`) on your
+`PATH`, already authenticated.
 
 ### Use as an MCP server
 
@@ -85,8 +85,8 @@ tool_timeout_sec = 600
 `--deny <vendor>` keeps the server to the job it exists for. Each registration denies the vendor of
 the harness it is registered in, because that harness already spawns same-vendor subagents itself —
 natively, in-process, and under its own supervision, which is cheaper and better managed than
-anything `agentmux` can start for it. So under Claude Code the tools offer `codex` and `agy`, and
-under Codex they offer `claude` and `agy`.
+anything `agentmux` can start for it. So under Claude Code the tools offer `codex`, `agy` and `pi`,
+and under Codex they offer `claude`, `agy` and `pi`.
 
 A denied vendor is left out of the `delegate` choices `ask` and `start` advertise, so a calling
 model does not spend a call discovering it; one that names it anyway is refused before any process
@@ -182,7 +182,7 @@ is the map between the two, so one prompt works everywhere:
 # Applied to every delegate launch, before any account chooses an identity.
 [launch]
 env = { DISABLE_HOOKS = "true" }
-env_passthrough = ["AWS_PROFILE"]
+env_passthrough = ["AWS_REGION"]
 # The only names a single call's `env` may set. Nothing, unless listed here.
 request_env = ["REVIEW_MODE"]
 
@@ -690,6 +690,33 @@ they come; only an unknown model is classified, as `model unavailable`, so an ov
 not resumed automatically. Its tokens are its conversation's running total, with cache reads counted
 beside the input, and it reports no price.
 
+### pi, the pi coding agent
+
+`--delegate pi` runs [pi](https://pi.dev) 1.6.0 against whichever providers its own configuration
+names: `--model` is `provider/id`, exactly as one of the models `pi --list-models` lists, such as
+`ollama/qwen3.6:27b-64k` for a local Ollama model. Why it runs the way it does is in
+[ADR 0037](adr/0037-pi-driven-over-rpc-with-the-users-configuration.md):
+
+- **It always loads your configuration.** No flag of pi's skips its `settings.json` or the system
+  prompt files of its configuration directory, so a pi consultation runs with your login, models,
+  settings, skills, prompt templates and context files, and `ignore_user_config: true` is refused.
+  Every launch passes `--no-extensions`, so no extension, MCP server or pi's own built-in ones run,
+  and `--offline`, so pi installs nothing and refreshes no model catalog. `PI_CODING_AGENT_DIR`
+  is forwarded, so a relocated configuration is found.
+- **It only reads.** Its tools are `read`, `grep`, `find` and `ls`: it runs no command and writes
+  no file, and takes none of the `sandbox`, `network_access`, `permission_mode` or tool-list
+  options.
+- **There are no pi accounts.** pi runs as your own login; an `[accounts.pi.<alias>]` table is
+  refused, and `quota` reports pi as unavailable, because pi reports no usage window.
+- **A turn can be steered** until it settles; agentmux drives every pi turn over `pi --mode rpc`,
+  as it drives a Codex turn over its app-server.
+- **Its session is kept with the consultation**, in `pi/session.jsonl` of its directory, which a
+  follow-up resumes; `continue_fresh` starts another.
+
+pi retries an overloaded provider itself, so agentmux does not resume a failed pi turn. A turn's
+spend is every usage pi reported during it, with cache reads and writes counted beside the input;
+pi's price is an estimate from its model catalog and is not kept.
+
 ### What the delegate does and does not see
 
 The child environment is built as an **allowlist from empty**, never by filtering a denylist. It
@@ -730,9 +757,9 @@ agentmux steer <run-id> 'Leave the tests alone; the bug is in src/run.rs.'
 ```
 
 `status` says `steerable: yes` while a turn can take one: a **Claude turn until it has reported
-its result**, and a **Codex turn whose delegate loads its account's configuration**, which is the
-default, because only `codex app-server` accepts input for a running Codex turn and only such a
-delegate can run over it:
+its result**, a **pi turn until it settles**, and a **Codex turn whose delegate loads its account's
+configuration**, which is the default, because only `codex app-server` accepts input for a running
+Codex turn and only such a delegate can run over it:
 
 - `codex exec`, which reads its prompt once, is what an isolated Codex delegate needs: the
   app-server has no equivalent of `--ignore-user-config` (codex-cli 0.159.3), and a private
@@ -776,7 +803,13 @@ commands it left running are stopped too, within a time budget and on a best-eff
 macOS, a command started by a crashed server's command after the driver's last once-a-second check
 is out of reach.
 [ADR 0018](adr/0018-codex-app-server-driver.md) explains why it is built this way, and
-`crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
+`crates/agentmux/src/driver/mod.rs` how the process tree is found on each platform.
+
+**How a pi turn takes a steer.** A steer is confirmed when pi takes it, between its model calls,
+which on a slow model can take longer than `steer` waits; an unconfirmed steer may still be taken,
+so read the transcript before sending it again. A steer that arrives after the turn has settled is
+refused. `cancel` aborts the run over RPC.
+[ADR 0037](adr/0037-pi-driven-over-rpc-with-the-users-configuration.md) explains why.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
 with `codex exec` instead, for a CLI whose app-server cannot run them; no Codex turn is steerable

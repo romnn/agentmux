@@ -41,12 +41,14 @@ becomes follows codex's own exec client, written as the `codex_app_server_protoc
 Codex's launch preparation (`vendor::codex::prepare`) is the one place that decides a delegate can
 run this way — Codex and `Isolation::Inherit` only, which is what a Codex consultation gets unless
 the caller or the machine file chooses `ignore_user_config = true`
-([0026](0026-delegate-permissions.md)) — and `RunStore::with_codex_app_server` opts a store in;
-without it every Codex turn is `exec`.
+([0026](0026-delegate-permissions.md)) — and `RunStore::with_driver` opts a store in;
+without it, or with `RunStore::with_codex_exec`, every Codex turn is `exec`.
 
 Under a supervisor ([0025](0025-eager-settlement-and-terminal-waiting.md)) the driver is the
 delegate the supervisor starts and records, and the supervisor settles the turn once the driver has
 gone; nothing about the driver changes.
+The process around the conversation is `crate::driver`'s, which the pi driver shares
+([0037](0037-pi-driven-over-rpc-with-the-users-configuration.md)).
 
 **One driver runs one turn and exits.** Follow-ups resume the persisted thread through a new driver;
 keeping a server idle between turns would leave a process per retained consultation without being
@@ -57,7 +59,7 @@ starts anything.
 
 **Steering and cancelling go through files**, so a restarted agentmux can reach a running driver:
 
-- The turn's mailbox (`appserver::mailbox`) gives each request one decision file, which exactly one
+- The turn's mailbox (`driver::mailbox`) gives each request one decision file, which exactly one
   of the driver (claiming) and the caller (withdrawing) can create. A withdrawn request is never
   sent.
 - Every steer carries `expectedTurnId`, so a late request cannot open another turn. Acceptance is
@@ -88,13 +90,13 @@ error, because a consultation has nobody available to answer them.
 **What the turn left running is stopped, within a budget, and reported.** Cleanup is bounded and
 best effort: the driver reads its descendants with their parents and closes the server's input to
 allow session saving, then signals and rescans surviving descendants within its cleanup budget
-(`appserver::STOP_BUDGET`), and looks once more after its last signal. What survived the server
+(`driver::STOP_BUDGET`), and looks once more after its last signal. What survived the server
 from outside its process tree, as it stood before the server was asked to leave, is kept in the
 turn's `left-running.json` and reported in the transcript and `status`
 ([0032](0032-leftover-processes-reported.md)). The store allows that budget plus a margin before
 falling back to signalling the driver. The platform mechanisms —
 adopting orphans on Linux, a once-a-second record elsewhere, a job object on Windows — are
-documented in `crates/agentmux/src/appserver/mod.rs`.
+documented in `crates/agentmux/src/driver/mod.rs`.
 
 ## Consequences
 

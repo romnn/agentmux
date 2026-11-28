@@ -724,7 +724,11 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
 fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    for &vendor in Vendor::VARIANTS {
+    // pi's quota is unavailable without asking anything, so no child of its probe exists.
+    for &vendor in Vendor::VARIANTS
+        .iter()
+        .filter(|vendor| **vendor != Vendor::Pi)
+    {
         let root = tempfile::tempdir().or_fail()?;
         let config_dir = root.path().join("config");
         let bin = root.path().join("bin");

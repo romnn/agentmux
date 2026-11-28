@@ -221,24 +221,24 @@ fn a_denied_vendor_is_not_offered_where_it_would_be_launched() {
             })
             .unwrap_or_default()
     };
-    let every = || vec!["claude".to_owned(), "codex".to_owned(), "agy".to_owned()];
+    let every = || ["claude", "codex", "agy", "pi"].map(str::to_owned).to_vec();
 
     // Under Claude Code, the two tools that spawn a delegate offer only the other vendors.
     let claude_denied = || BTreeSet::from([Vendor::Claude]);
     assert_that!(
         delegates(claude_denied(), "ask"),
-        eq(&vec!["codex".to_owned(), "agy".to_owned()])
+        eq(&["codex", "agy", "pi"].map(str::to_owned).to_vec())
     );
     assert_that!(
         delegates(claude_denied(), "start"),
-        eq(&vec!["codex".to_owned(), "agy".to_owned()])
+        eq(&["codex", "agy", "pi"].map(str::to_owned).to_vec())
     );
     assert_that!(delegates(claude_denied(), "quota"), eq(&every()));
 
     // Under Codex, the mirror image.
     assert_that!(
         delegates(BTreeSet::from([Vendor::Codex]), "ask"),
-        eq(&vec!["claude".to_owned(), "agy".to_owned()])
+        eq(&["claude", "agy", "pi"].map(str::to_owned).to_vec())
     );
 
     // A server that denies nothing advertises everything, which is the terminal's case and the

@@ -24,7 +24,7 @@ use crate::left_running::{LeftProcess, LeftRunning, ProcessFate};
 /// A process recognised by its pid and its start time, so a later holder of the pid is told
 /// apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ProcessIdentity {
+pub(crate) struct ProcessIdentity {
     pub(super) pid: u32,
     pub(super) start_time_secs: u64,
 }

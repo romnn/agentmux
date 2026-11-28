@@ -36,15 +36,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
-use crate::appserver::DriverPlan;
 use crate::config::{Account, ChosenBy, Config, Secret};
 use crate::run::LaunchMode;
 use crate::run::layout::TurnDir;
-use crate::vendor::agy;
 use crate::vendor::claude::{
     self, ClaudePermissionMode, ClaudePermissions, ClaudeTool, claude_args,
 };
 use crate::vendor::codex::{self, CodexPermissions, CodexSandbox, codex_args};
+use crate::vendor::{agy, pi};
 
 /// A delegate argument that could not be used.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -176,6 +175,21 @@ pub enum DelegateError {
         /// Why it could not be read or parsed.
         reason: String,
     },
+
+    /// A pi delegate was asked to skip the user's configuration, which pi cannot do.
+    #[error(
+        "pi cannot run with ignore_user_config=true: no flag of pi 1.6.0 skips its settings.json \
+         or the system prompt files in its configuration directory, so a pi consultation always \
+         loads the user's configuration. Ask with ignore_user_config=false, or leave it unset."
+    )]
+    PiIsolated,
+
+    /// A pi delegate was launched by a run store without the driver every pi turn runs under.
+    #[error(
+        "a pi delegate is driven over `pi --mode rpc` by the agentmux executable, and this run \
+         store has no driver; run it through the agentmux command or its MCP server"
+    )]
+    PiUndriven,
 
     /// The caller asked for API pricing, which only an account the machine opted in may give.
     #[error(
@@ -619,6 +633,7 @@ impl PermissionOptions {
             Vendor::Claude => Permissions::Claude(self.claude()),
             Vendor::Codex => Permissions::Codex(self.codex()),
             Vendor::Agy => Permissions::Agy,
+            Vendor::Pi => Permissions::Pi,
         })
     }
 
@@ -697,7 +712,8 @@ impl std::fmt::Display for Billing {
 /// It is also where the roster of vendors is spelled, once: [`Vendor`] is derived from it, and
 /// `Vendor::VARIANTS` is what `quota`, `accounts` and the server's roster fan out over, so a
 /// vendor cannot be added here and left out there.
-/// agy has no permission options: every launch runs under the fixed policy `agy_args` describes.
+/// agy and pi have no permission options: every launch runs under the fixed policy their modules
+/// describe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
 #[serde(tag = "vendor", rename_all = "snake_case")]
 #[strum_discriminants(
@@ -718,6 +734,8 @@ pub enum Permissions {
     Codex(CodexPermissions),
     /// Google's Antigravity CLI, `agy`.
     Agy,
+    /// The pi coding agent, `pi`, which reaches the providers its own configuration names.
+    Pi,
 }
 
 impl Vendor {
@@ -728,6 +746,7 @@ impl Vendor {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Agy => "agy",
+            Self::Pi => "pi",
         }
     }
 
@@ -739,6 +758,7 @@ impl Vendor {
             Self::Claude => claude::config_dir(env),
             Self::Codex => codex::config_dir(env),
             Self::Agy => agy::config_dir(env),
+            Self::Pi => pi::config_dir(env),
         }
     }
 
@@ -753,6 +773,8 @@ impl Vendor {
             Self::Claude => claude::session_store(env),
             Self::Codex => codex::session_store(env),
             Self::Agy => agy::session_store(env),
+            // A pi turn saves its session in the consultation's own directory.
+            Self::Pi => None,
         }
     }
 
@@ -764,7 +786,7 @@ impl Vendor {
     pub(crate) fn question_encoder(self) -> Option<fn(&str) -> String> {
         match self {
             Self::Agy => Some(agy::agy_input),
-            Self::Claude | Self::Codex => None,
+            Self::Claude | Self::Codex | Self::Pi => None,
         }
     }
 }
@@ -958,6 +980,7 @@ impl Delegate {
                 Permissions::Codex(recorded.overridden_by(options.codex()))
             }
             Permissions::Agy => Permissions::Agy,
+            Permissions::Pi => Permissions::Pi,
         };
         Ok(self)
     }
@@ -1003,6 +1026,7 @@ impl Delegate {
             }
             Permissions::Codex(permissions) => Permissions::Codex(config.codex.fill(permissions)),
             Permissions::Agy => Permissions::Agy,
+            Permissions::Pi => Permissions::Pi,
         };
         self
     }
@@ -1033,7 +1057,7 @@ impl Delegate {
             Permissions::Codex(permissions) => {
                 *permissions = config.codex.hold(*permissions, config.source.as_deref())?;
             }
-            Permissions::Agy => {}
+            Permissions::Agy | Permissions::Pi => {}
         }
         Ok(held)
     }
@@ -1051,7 +1075,7 @@ impl Delegate {
         let permissions = match permissions {
             Permissions::Claude(permissions) => permissions.describe(),
             Permissions::Codex(permissions) => format!(" sandbox={}", permissions.describe()),
-            Permissions::Agy => String::new(),
+            Permissions::Agy | Permissions::Pi => String::new(),
         };
         format!(
             "{} {model} effort={}{permissions} account={}{}",
@@ -1343,6 +1367,7 @@ fn is_vendor_billing_env_name(vendor: Vendor, upper: &str) -> bool {
         Vendor::Claude => claude::is_billing_env_name(upper),
         Vendor::Codex => codex::is_billing_env_name(upper),
         Vendor::Agy => agy::is_billing_env_name(upper),
+        Vendor::Pi => pi::is_billing_env_name(upper),
     }
 }
 
@@ -1388,8 +1413,9 @@ impl Delegate {
     /// is empty, reads a secret from a host variable that is not set, or is otherwise unusable, and
     /// [`DelegateError::Argument`] or [`DelegateError::Environment`] for a request environment
     /// entry the configuration does not allow, [`DelegateError::AgySettingsUnreadable`] for an
-    /// agy delegate whose own settings file cannot be read, and [`DelegateError::AgyHomeUnknown`]
-    /// for an isolated agy delegate, which only its run store can launch.
+    /// agy delegate whose own settings file cannot be read, [`DelegateError::AgyHomeUnknown`]
+    /// for an isolated agy delegate, which only its run store can launch, and
+    /// [`DelegateError::PiIsolated`] for an isolated pi delegate.
     pub fn invocation(
         &self,
         plan: &TurnPlan<'_>,
@@ -1459,7 +1485,8 @@ impl Delegate {
     ///
     /// Returns agy's errors: [`DelegateError::AgyHomeUnknown`] for an isolated delegate without a
     /// store, [`DelegateError::Environment`] when its home cannot be made, and
-    /// [`DelegateError::AgySettingsUnreadable`] when its own settings file cannot be read.
+    /// [`DelegateError::AgySettingsUnreadable`] when its own settings file cannot be read; and
+    /// [`DelegateError::PiIsolated`] for an isolated pi delegate.
     pub(crate) fn native(
         &self,
         plan: &TurnPlan<'_>,
@@ -1485,6 +1512,7 @@ impl Delegate {
             Permissions::Agy => {
                 agy::native_args(model, effort, plan, isolation, &mut env, store_root)?
             }
+            Permissions::Pi => pi::native_args(isolation)?,
         };
         Ok(Invocation::of_delegate(self.vendor(), args, env, billing))
     }
@@ -1497,7 +1525,8 @@ impl Delegate {
     /// # Errors
     ///
     /// Returns [`DelegateError::Permission`] for a `codex exec` turn that needs a permission
-    /// profile from a codex not verified to honour one.
+    /// profile from a codex not verified to honour one, and [`DelegateError::PiUndriven`] for a
+    /// pi turn of a store without a driver.
     pub(crate) fn prepare(
         &self,
         invocation: Invocation,
@@ -1509,6 +1538,7 @@ impl Delegate {
                 codex::prepare(self, *permissions, invocation, request)
             }
             Permissions::Agy => Ok(agy::prepare(invocation)),
+            Permissions::Pi => pi::prepare(self, invocation, request),
         }
     }
 }
@@ -1530,6 +1560,8 @@ pub(crate) struct Admitted {
 pub(crate) struct LaunchRequest<'a> {
     /// The turn's directory, where a driver's plan is kept.
     pub(crate) turn: &'a TurnDir,
+    /// The consultation's directory, which holds every turn's and keeps a pi session.
+    pub(crate) run_dir: &'a Path,
     /// The directory the delegate reads the project from.
     pub(crate) cwd: &'a Path,
     /// The delegate's own session the turn continues, for a follow-up.
@@ -1540,10 +1572,9 @@ pub(crate) struct LaunchRequest<'a> {
     pub(crate) cli_version: Option<&'a str>,
     /// Whether a supervisor starts the delegate, and so can hold its input.
     pub(crate) supervisor: bool,
-    /// The agentmux executable that drives a Codex turn over `codex app-server`, when the store
-    /// drives them.
-    pub(crate) codex_driver: Option<&'a Path>,
-    /// Whether every Codex turn of the consultation runs with `codex exec`; only Codex reads it.
+    /// The agentmux executable that drives a delegate's CLI in its place, when the store has one.
+    pub(crate) driver: Option<&'a Path>,
+    /// Whether this Codex turn runs with `codex exec` even with a driver; only Codex reads it.
     pub(crate) codex_exec: bool,
 }
 
@@ -1556,6 +1587,14 @@ pub(crate) struct PreparedLaunch {
     /// The plan the driver that stands in for the CLI runs under, which the store writes into
     /// the turn's directory.
     pub(crate) driver_plan: Option<DriverPlan>,
+}
+
+/// The plan of a driver that stands in for a vendor's CLI, by the driver that reads it.
+pub(crate) enum DriverPlan {
+    /// `codex-app-server`'s.
+    Codex(crate::appserver::DriverPlan),
+    /// `pi-rpc`'s.
+    Pi(pi::driver::PiPlan),
 }
 
 impl Delegate {
@@ -1685,6 +1724,7 @@ pub(crate) fn credential_keys(vendor: Vendor) -> &'static [&'static str] {
         Vendor::Claude => claude::CREDENTIAL_KEYS,
         Vendor::Codex => codex::CREDENTIAL_KEYS,
         Vendor::Agy => agy::CREDENTIAL_KEYS,
+        Vendor::Pi => pi::CREDENTIAL_KEYS,
     }
 }
 
@@ -1712,12 +1752,13 @@ pub(crate) struct CredentialVars {
 }
 
 /// The variables a vendor's account fields map onto, or `None` for agy, which reads neither its
-/// login nor its configuration directory from a variable an account could set.
+/// login nor its configuration directory from a variable an account could set, and for pi, which
+/// has no accounts.
 pub(crate) fn credential_vars(vendor: Vendor) -> Option<CredentialVars> {
     match vendor {
         Vendor::Claude => Some(claude::CREDENTIAL_VARS),
         Vendor::Codex => Some(codex::CREDENTIAL_VARS),
-        Vendor::Agy => None,
+        Vendor::Agy | Vendor::Pi => None,
     }
 }
 
@@ -2091,7 +2132,12 @@ mod tests {
             .or_fail()?;
         assert_that!(
             names,
-            elements_are![eq(&json!("claude")), eq(&json!("codex")), eq(&json!("agy"))]
+            elements_are![
+                eq(&json!("claude")),
+                eq(&json!("codex")),
+                eq(&json!("agy")),
+                eq(&json!("pi"))
+            ]
         );
         assert_that!(
             serde_json::from_value::<Vendor>(json!("agy")).or_fail()?,

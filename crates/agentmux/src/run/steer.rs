@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Delegate, Isolation, Permissions};
+use crate::driver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::launch::{Launched, Liveness};
 use crate::stream::TurnInput;
 use crate::transcript::Outcome;
@@ -31,8 +31,8 @@ impl RunStore {
     /// Add an instruction to a consultation's running turn, for the delegate to see before its
     /// next model call.
     ///
-    /// A turn driven over `codex app-server` takes one, and so does a Claude turn reading
-    /// stream-json input until it has reported its result.
+    /// A turn an agentmux driver runs takes one, such as a Codex turn over `codex app-server`, and
+    /// so does a Claude turn reading stream-json input until it has reported its result.
     /// The message travels through the turn's mailbox: to the Codex turn's driver, which hands it
     /// to the server as `turn/steer` and records it in the capture once the server has accepted
     /// it, or to the Claude turn's supervisor, which writes it to Claude's input, where Claude
@@ -204,9 +204,12 @@ impl RunStore {
             Err(Refusal::ReadsQuestionOnce) => {
                 // The running turn's own isolation, which a follow-up may have changed.
                 let current = self.current_delegate(&meta, Some(files.index))?;
-                return Err(SteerError::NotSteerable {
-                    run_id: run_id.clone(),
-                    reason: why_not_steerable(&current),
+                return Err(match why_not_steerable(&current) {
+                    Some(reason) => SteerError::NotSteerable {
+                        run_id: run_id.clone(),
+                        reason,
+                    },
+                    None => not_running(NotRunningReason::NotLaunched),
                 }
                 .into());
             }
@@ -271,7 +274,7 @@ impl RunStore {
             TurnInput::Open => {}
         }
         let server = match newest.launch_mode {
-            LaunchMode::DirectCli | LaunchMode::AppServer => newest.delegate,
+            LaunchMode::DirectCli | LaunchMode::Driven => newest.delegate,
             LaunchMode::ClaudeStreamInput if !self.is_alive(newest.supervisor) => {
                 return Err(Refusal::ClaudeInputLost);
             }
@@ -321,14 +324,16 @@ enum ClaudeProgress {
     TurnEnded,
 }
 
-/// Why a turn of this delegate that was launched to read its question once offers no way in.
-pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
-    match delegate.permissions {
+/// Why a turn of this delegate that was launched to read its question once offers no way in, or
+/// `None` for pi, whose every turn is driven, so its record names no such launch.
+pub(super) fn why_not_steerable(delegate: &Delegate) -> Option<UnsteerableReason> {
+    Some(match delegate.permissions {
         Permissions::Claude(_) => UnsteerableReason::ClaudePrint,
         Permissions::Codex(_) => match delegate.isolation {
             Some(Isolation::Inherit) => UnsteerableReason::CodexExec,
             Some(Isolation::Isolated) | None => UnsteerableReason::CodexIsolated,
         },
         Permissions::Agy => UnsteerableReason::AgyPrint,
-    }
+        Permissions::Pi => return None,
+    })
 }

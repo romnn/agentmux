@@ -61,6 +61,9 @@ async fn main() -> Result<()> {
     if let Command::CodexAppServer(args) = &cli.command {
         std::process::exit(agentmux::appserver::drive(&args.plan_path));
     }
+    if let Command::PiRpc(args) = &cli.command {
+        std::process::exit(agentmux::vendor::pi::driver::drive(&args.plan_path));
+    }
     // So is the supervisor: the store it opens is the one its plan names, and the environment it
     // was started with is its delegate's, which it hands on.
     if let Command::Supervise(args) = &cli.command {
@@ -142,7 +145,7 @@ async fn main() -> Result<()> {
             report::list(&runs, filter.filters(), cli.json)
         }
         // Dispatched before the store was opened.
-        Command::CodexAppServer(_) | Command::Supervise(_) => Ok(()),
+        Command::CodexAppServer(_) | Command::PiRpc(_) | Command::Supervise(_) => Ok(()),
         Command::Prune(args) => {
             if let Some(run_id) = args.run_id {
                 store.remove(run_id.id())?;
@@ -173,15 +176,16 @@ fn open_store(cli: &Cli) -> Result<RunStore> {
     let executable = std::env::current_exe().wrap_err("locating the agentmux executable")?;
     let mut store = RunStore::open(root, Arc::new(ProcessLauncher::new()), host_env)?
         .with_quota_probe(Arc::new(agentmux::quota::SystemProbe))
-        .with_supervisor(&executable);
+        .with_supervisor(&executable)
+        .with_driver(&executable);
     if let Some(first_delay) = cli.auto_resume_delay {
         store = store.with_auto_resume(Some(AutoResumePolicy {
             first_delay,
             ..AutoResumePolicy::DEFAULT
         }));
     }
-    if cli.codex_launch == CodexLaunchArg::AppServer {
-        store = store.with_codex_app_server(executable);
+    if cli.codex_launch == CodexLaunchArg::Exec {
+        store = store.with_codex_exec();
     }
     Ok(store)
 }

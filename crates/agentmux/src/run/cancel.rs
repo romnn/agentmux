@@ -28,13 +28,13 @@ impl RunStore {
     /// How often a cancellation checks whether the child has gone.
     pub(super) const STOP_POLL: Duration = Duration::from_millis(100);
 
-    /// How long a cancelled turn driven over the app-server is given to interrupt itself and
+    /// How long a cancelled turn run by an agentmux driver is given to interrupt itself and
     /// leave, before it is signalled like any other child.
     ///
-    /// The driver takes at most [`crate::appserver::STOP_BUDGET`] to interrupt the turn, let the
+    /// The driver takes at most [`crate::driver::STOP_BUDGET`] to interrupt the turn, let the
     /// server exit and stop what it left running, so this outlasts all of it.
     pub(super) const DRIVER_EXIT_GRACE: Duration =
-        crate::appserver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
+        crate::driver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
 
     /// Stop a running consultation.
     ///
@@ -146,9 +146,9 @@ impl RunStore {
         dir: &TurnDir,
         launched: Launched,
     ) -> Result<(), RunError> {
-        let uses_app_server = read_json::<InvocationRecord>(&dir.invocation())?
-            .is_some_and(|invocation| invocation.launch_mode == LaunchMode::AppServer);
-        if uses_app_server {
+        let driven = read_json::<InvocationRecord>(&dir.invocation())?
+            .is_some_and(|invocation| invocation.launch_mode == LaunchMode::Driven);
+        if driven {
             self.wait_for_delegate_exit(launched, Self::DRIVER_EXIT_GRACE)
                 .await;
         }

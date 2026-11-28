@@ -136,7 +136,7 @@ impl RunStatus {
         // everywhere else.
         match self.delegate.vendor() {
             Vendor::Claude => warnings.push(Warning::InstructionFiles { cwd: &self.cwd }),
-            Vendor::Codex | Vendor::Agy => {}
+            Vendor::Codex | Vendor::Agy | Vendor::Pi => {}
         }
         warnings
     }
@@ -741,6 +741,8 @@ pub fn quota_report(entry: &AccountQuota) -> Vec<String> {
                 Vendor::Claude => claude::quota::windows(payload),
                 Vendor::Codex => codex::quota::windows(payload),
                 Vendor::Agy => agy::quota::windows(payload),
+                // pi never reports a window.
+                Vendor::Pi => None,
             }
             .unwrap_or_default();
             if windows.is_empty() {

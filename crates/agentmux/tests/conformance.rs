@@ -5,12 +5,13 @@
 //! without it passes here by design.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use agentmux::delegate::{Delegate, PermissionOptions, Vendor};
+use agentmux::delegate::{Delegate, PermissionOptions, SessionRef, Vendor};
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::pi::driver::PiPlan;
 use googletest::prelude::*;
 use strum::VariantArray as _;
 
@@ -26,7 +27,8 @@ struct Conformance {
     follow_up: &'static str,
     /// The session `first` opened.
     session: &'static str,
-    /// The argument the session to resume follows on the CLI's command line.
+    /// The argument the session to resume follows on the CLI's command line; pi's driver gives
+    /// it the session file its plan names, which every turn shares.
     resume_arg: &'static str,
 }
 
@@ -58,10 +60,19 @@ fn conformance(vendor: Vendor) -> Conformance {
             session: "e4c7ded7-2bf0-480b-9326-24191d51e4ba",
             resume_arg: "--conversation",
         },
+        // The one recorded pi turn serves as its own follow-up, as Claude's does.
+        Vendor::Pi => Conformance {
+            model: "ollama/qwen3.6:27b-64k",
+            first: fixtures::PI_TOOL_USE,
+            follow_up: fixtures::PI_TOOL_USE,
+            session: "01a222df-e34a-76d1-9e3f-380c59ae8f6d",
+            resume_arg: "--session",
+        },
     }
 }
 
-/// A store over a fresh directory, whose launcher plays `scripts`.
+/// A store over a fresh directory, whose launcher plays `scripts`, with a driver for the vendors
+/// that are always driven and Codex kept on `codex exec`.
 struct Harness {
     store: RunStore,
     launcher: std::sync::Arc<ScriptedLauncher>,
@@ -75,7 +86,10 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
         ("PATH".to_owned(), "/usr/bin".to_owned()),
         ("HOME".to_owned(), "/home/dev".to_owned()),
     ]);
-    let store = RunStore::open(dir.path(), launcher.clone(), env).or_fail()?;
+    let store = RunStore::open(dir.path(), launcher.clone(), env)
+        .or_fail()?
+        .with_driver("/opt/agentmux")
+        .with_codex_exec();
     Ok(Harness {
         store,
         launcher,
@@ -140,8 +154,24 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
         // its input is the new question alone; agy reads it inside the record it takes.
         let launches = harness.launcher.launches();
         let resumed = launches.get(1).or_fail()?;
+        let resumes = match vendor {
+            // pi's command is in its driver's plan, which names the session's file and the
+            // session the driver checks the file holds.
+            Vendor::Pi => {
+                let plan = |launch: usize| -> Result<PiPlan> {
+                    let path = launches.get(launch).or_fail()?.args.get(1).or_fail()?;
+                    PiPlan::read(Path::new(path)).or_fail()
+                };
+                let (first, resumed) = (plan(0)?, plan(1)?);
+                resumed.session.expect_id.as_ref().map(SessionRef::as_str) == Some(case.session)
+                    && resumed.session.file == first.session.file
+            }
+            Vendor::Claude | Vendor::Codex | Vendor::Agy => {
+                resumed.has_flag_with(case.resume_arg, case.session)
+            }
+        };
         expect_that!(
-            resumed.has_flag_with(case.resume_arg, case.session),
+            resumes,
             eq(true),
             "{vendor} did not resume {}",
             case.session
@@ -152,7 +182,7 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
                 .as_str()
                 .or_fail()?
                 .to_owned(),
-            Vendor::Claude | Vendor::Codex => resumed.question.clone(),
+            Vendor::Claude | Vendor::Codex | Vendor::Pi => resumed.question.clone(),
         };
         expect_that!(asked, eq("And the tests?"), "{vendor}");
 
@@ -165,8 +195,10 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
 }
 
 /// A turn cancelled while its delegate runs ends cancelled, its delegate stopped.
+///
+/// Paused time skips the wait a driven turn's driver is given to leave on its own.
 #[gtest]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn every_vendor_ends_a_cancelled_turn_cancelled() -> Result<()> {
     for vendor in Vendor::VARIANTS.iter().copied() {
         // The delegate has announced its session and is still at work.

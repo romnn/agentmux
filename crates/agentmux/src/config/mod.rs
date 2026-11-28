@@ -1166,6 +1166,16 @@ impl Config {
             }
         }
         self.validate_agy_accounts(path)?;
+        // pi runs with the user's own login and configuration, which no account can choose.
+        if let Some(alias) = self.accounts(Vendor::Pi).keys().next() {
+            return Err(ConfigError::InvalidName {
+                path: path.to_path_buf(),
+                what: "the account",
+                value: format!("{}.{alias}", Vendor::Pi),
+                reason: "is a pi account, but pi always runs with the user's own login and \
+                         configuration, which no account can choose",
+            });
+        }
         for &vendor in Vendor::VARIANTS {
             self.model_rules(vendor).validate(path)?;
         }
@@ -1267,6 +1277,8 @@ impl Config {
                 self.agy.defaults.ignore_user_config,
                 self.agy.limits.allow_user_config,
             ),
+            // pi always loads the user's configuration, which nothing in the file can change.
+            Vendor::Pi => (None, None),
         };
         PermissionPolicy::new(
             vendor,
@@ -1287,6 +1299,7 @@ impl Config {
             Vendor::Claude => self.claude.describe(),
             Vendor::Codex => self.codex.describe(),
             Vendor::Agy => format!("deny={}", crate::vendor::agy::AGY_DENY_RULES.join(",")),
+            Vendor::Pi => "tools=read,grep,find,ls".to_owned(),
         };
         format!("{} {vendor_rules}", self.permissions(vendor).describe())
     }

@@ -7,8 +7,8 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Admitted, Billing, Delegate, Invocation, Isolation, LaunchRequest, ModelId,
-    PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
+    AccountChoice, Admitted, Billing, Delegate, DriverPlan, Invocation, Isolation, LaunchRequest,
+    ModelId, PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -293,9 +293,9 @@ impl RunStore {
             delegate,
             rewritten_from,
             billing: Some(billing),
-            // A store that drives nothing runs Codex with `exec`, and says so for the follow-ups,
-            // whichever store continues the consultation.
-            force_codex_exec: request.force_codex_exec || self.codex_driver.is_none(),
+            // A store that runs Codex with `exec` says so for the follow-ups, whichever store
+            // continues the consultation.
+            force_codex_exec: request.force_codex_exec || self.codex_exec || self.driver.is_none(),
             cwd,
             retention: request.retention,
             created_at: Utc::now(),
@@ -504,7 +504,10 @@ impl RunStore {
                     }
                     .into());
                 }
-                Permissions::Claude(_) | Permissions::Codex(_) | Permissions::Agy => {}
+                Permissions::Claude(_)
+                | Permissions::Codex(_)
+                | Permissions::Agy
+                | Permissions::Pi => {}
             }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
@@ -673,7 +676,7 @@ impl RunStore {
     fn refuse_replaced_executables(&self) -> Result<(), RunError> {
         self.supervisor
             .iter()
-            .chain(&self.codex_driver)
+            .chain(&self.driver)
             .try_for_each(super::Executable::refuse_if_replaced)
     }
 }
@@ -727,6 +730,14 @@ impl LockedRun<'_> {
                 .ok();
         }
         launched
+    }
+}
+
+/// Write the plan a turn's driver runs under where that driver reads it.
+fn write_driver_plan(turn: &TurnDir, plan: &DriverPlan) -> Result<(), RunError> {
+    match plan {
+        DriverPlan::Codex(plan) => write_json(&turn.app_server_plan_path(), plan),
+        DriverPlan::Pi(plan) => write_json(&turn.pi_plan_path(), plan),
     }
 }
 
@@ -796,17 +807,18 @@ impl RunStore {
             invocation,
             &LaunchRequest {
                 turn,
+                run_dir: &self.run_dir(&meta.run_id),
                 cwd: &meta.cwd,
                 resume,
                 isolation,
                 cli_version: cli_version.as_deref(),
                 supervisor: self.supervisor.is_some(),
-                codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
-                codex_exec: meta.force_codex_exec,
+                driver: self.driver.as_ref().map(super::Executable::path),
+                codex_exec: meta.force_codex_exec || self.codex_exec,
             },
         )?;
         if let Some(driver_plan) = &driver_plan {
-            write_json(&turn.app_server_plan_path(), driver_plan)?;
+            write_driver_plan(turn, driver_plan)?;
         }
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
@@ -940,14 +952,21 @@ impl RunStore {
                     cwd: meta.cwd.clone(),
                     billing: delegate.billing(),
                 },
-                auto_resume: self.auto_resume.map(|policy| AutoResumePlan {
-                    policy,
-                    supervisor: supervisor.to_path_buf(),
-                    codex_driver: self
-                        .codex_driver
-                        .as_ref()
-                        .map(|driver| driver.path().to_path_buf()),
-                }),
+                // pi retries an overloaded model itself.
+                auto_resume: self
+                    .auto_resume
+                    .filter(|_| meta.delegate.vendor() != Vendor::Pi)
+                    .map(|policy| AutoResumePlan {
+                        policy,
+                        supervisor: supervisor.to_path_buf(),
+                        // Named only when Codex turns are driven, the meaning an earlier agentmux
+                        // reading this plan gives it.
+                        codex_driver: self
+                            .driver
+                            .as_ref()
+                            .filter(|_| !self.codex_exec)
+                            .map(|driver| driver.path().to_path_buf()),
+                    }),
             },
         )?;
         let mut invocation = delegate.clone();

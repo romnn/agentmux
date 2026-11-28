@@ -200,6 +200,8 @@ fn reported(vendor: Vendor, alias: &str, percent: i64) -> Result<AccountQuota> {
                 ]}]
             })
         }
+        // pi reports no window, so nothing it could report has a shape.
+        Vendor::Pi => serde_json::Value::Null,
     };
     Ok(AccountQuota {
         vendor,

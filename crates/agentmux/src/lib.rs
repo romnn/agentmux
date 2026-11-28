@@ -17,6 +17,8 @@
 //! - [`accounting`] — what a consultation spent, derived from what its vendor reported.
 //! - [`launch`] — turns a prepared invocation into a detached child writing to files.
 //! - [`left_running`] — what a turn left running when it ended.
+//! - [`driver`] — what every driver does as a process: start the CLI it runs in the CLI's place,
+//!   contain what that CLI starts, and stop it.
 //! - [`appserver`] — the driver that runs a Codex turn over `codex app-server`, so the turn can
 //!   be steered while it runs.
 //! - [`run`] — run directories, ids, lifecycle, retention and resume state.
@@ -25,8 +27,9 @@
 //!
 //! The dependency direction is one way: `transcript`, `left_running` and `delegate` import
 //! nothing heavy; `stream` imports `transcript`; `accounting` imports `transcript` and
-//! `delegate`; `appserver` imports `stream` and `delegate`; `run` imports `launch`, `stream`,
-//! `appserver`, `accounting` and `delegate`.
+//! `delegate`; `driver` imports `delegate` and `left_running`; `appserver` imports `driver`,
+//! `stream` and `delegate`; `run` imports `launch`, `stream`, `driver`, `appserver`, `accounting`
+//! and `delegate`.
 //! Nothing here knows about MCP, which is what makes the whole pipeline testable without a client.
 //!
 //! # Example
@@ -75,6 +78,7 @@ pub mod appserver;
 mod atomic_file;
 pub mod config;
 pub mod delegate;
+pub mod driver;
 pub mod launch;
 pub mod left_running;
 pub mod quota;

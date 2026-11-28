@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::appserver::mailbox::{Mailbox, SteerReply};
-use agentmux::appserver::{DriverPlan, STOP_BUDGET};
+use agentmux::appserver::DriverPlan;
 use agentmux::delegate::{
     AccountChoice, Billing, Delegate, Effort, Isolation, ModelId, Permissions,
 };
+use agentmux::driver::STOP_BUDGET;
+use agentmux::driver::mailbox::{Mailbox, SteerReply};
 use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
     NotRunningReason, Retention, RunError, RunId, RunStatus, RunStore, StartRequest, SteerError,
@@ -78,7 +79,7 @@ fn harness(scripts: impl IntoIterator<Item = Script>) -> Result<Harness> {
     let launcher = Arc::new(ScriptedLauncher::new(scripts));
     let store = RunStore::open(dir.path(), launcher.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER_PATH);
+        .with_driver(DRIVER_PATH);
     Ok(Harness {
         store: Arc::new(store),
         launcher,
@@ -234,7 +235,7 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
     let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
     let driving = RunStore::open(dir.path(), later.clone(), env())
         .or_fail()?
-        .with_codex_app_server(DRIVER_PATH);
+        .with_driver(DRIVER_PATH);
     driving.follow_up(&started.run_id, "And the session code?")?;
 
     assert_that!(
@@ -244,6 +245,92 @@ async fn a_consultation_started_without_a_driver_stays_on_exec() -> Result<()> {
             .map(|launch| launch.program.clone()),
         some(eq("codex"))
     );
+    Ok(())
+}
+
+/// A consultation started by a store that has a driver but runs Codex with `exec`, as
+/// `--codex-launch exec` opens one, stays on `codex exec` when a store that would drive it
+/// follows it up.
+#[gtest]
+#[tokio::test]
+async fn a_consultation_started_by_an_exec_store_with_a_driver_stays_on_exec() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let first = Arc::new(ScriptedLauncher::new([Script::completed(
+        fixtures::CODEX_HAPPY,
+    )]));
+    let exec_store = RunStore::open(dir.path(), first.clone(), env())
+        .or_fail()?
+        .with_driver(DRIVER_PATH)
+        .with_codex_exec();
+    let started = exec_store.start(&StartRequest {
+        delegate: codex(Isolation::Inherit)?,
+        question: "q".to_owned(),
+        cwd: dir.path().join("project"),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    exec_store
+        .wait_until_terminal(&started.run_id, Duration::from_secs(5))
+        .await?;
+
+    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
+    let driving = RunStore::open(dir.path(), later.clone(), env())
+        .or_fail()?
+        .with_driver(DRIVER_PATH);
+    driving.follow_up(&started.run_id, "And the session code?")?;
+
+    // Both turns ran `codex` itself rather than the driver.
+    let programs: Vec<String> = first
+        .launches()
+        .into_iter()
+        .chain(later.launches())
+        .map(|launch| launch.program)
+        .collect();
+    assert_that!(programs, elements_are![eq("codex"), eq("codex")]);
+    Ok(())
+}
+
+/// A driven consultation followed up through a store that runs Codex with `exec` runs the
+/// follow-up with `codex exec`, which cannot be steered.
+#[gtest]
+#[tokio::test]
+async fn a_driven_consultation_followed_up_by_an_exec_store_runs_over_exec() -> Result<()> {
+    let harness = harness([Script::completed(fixtures::CODEX_HAPPY)])?;
+    let started = harness
+        .store
+        .start(&harness.request(codex(Isolation::Inherit)?))?;
+    harness
+        .store
+        .wait_until_terminal(&started.run_id, Duration::from_secs(5))
+        .await?;
+
+    let later = Arc::new(ScriptedLauncher::new([Script::running(RUNNING_CAPTURE)]));
+    let exec_store = RunStore::open(harness.dir.path(), later.clone(), env())
+        .or_fail()?
+        .with_driver(DRIVER_PATH)
+        .with_codex_exec();
+    let followed = exec_store.follow_up(&started.run_id, "And the session code?")?;
+
+    // The first turn ran through the driver and the follow-up ran `codex` itself.
+    assert_that!(
+        harness
+            .launcher
+            .launches()
+            .first()
+            .map(|launch| launch.program.clone()),
+        some(eq(DRIVER_PATH))
+    );
+    assert_that!(
+        later
+            .launches()
+            .first()
+            .map(|launch| launch.program.clone()),
+        some(eq("codex"))
+    );
+    assert_that!(followed.steerable, eq(false));
     Ok(())
 }
 

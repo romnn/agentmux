@@ -283,7 +283,7 @@ async fn no_layer_can_hand_a_subscription_delegate_a_key() -> Result<()> {
     for (name, value) in [
         ("MY_PROVIDER_API_KEY", "sk-provider-passthrough"),
         ("openai_api_key_file", "/keys/openai-passthrough"),
-        ("AWS_PROFILE", "dev-profile-kept"),
+        ("AWS_REGION", "dev-region-kept"),
         (
             "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
             "https://refresh-passthrough.example",
@@ -297,7 +297,7 @@ async fn no_layer_can_hand_a_subscription_delegate_a_key() -> Result<()> {
         indoc::indoc! {r#"
             [launch]
             env = {{ CODEX_API_KEY = "sk-launch-env", Anthropic_Base_Url = "https://launch.example", CODEX_REVOKE_TOKEN_URL_OVERRIDE = "https://revoke-launch.example" }}
-            env_passthrough = ["MY_PROVIDER_API_KEY", "openai_api_key_file", "AWS_PROFILE", "CODEX_REFRESH_TOKEN_URL_OVERRIDE"]
+            env_passthrough = ["MY_PROVIDER_API_KEY", "openai_api_key_file", "AWS_REGION", "CODEX_REFRESH_TOKEN_URL_OVERRIDE"]
 
             [accounts.claude.personal]
             config_dir = "{profile}"
@@ -331,7 +331,7 @@ async fn no_layer_can_hand_a_subscription_delegate_a_key() -> Result<()> {
     }
     assert_that!(
         delegate_env_dump,
-        contains_substring("AWS_PROFILE=dev-profile-kept")
+        contains_substring("AWS_REGION=dev-region-kept")
     );
     assert_that!(status.billing, some(eq(Billing::Subscription)));
     Ok(())

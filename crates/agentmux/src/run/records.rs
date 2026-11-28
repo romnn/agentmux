@@ -34,8 +34,11 @@ pub enum LaunchMode {
     #[default]
     #[serde(rename = "exec")]
     DirectCli,
-    /// The turn is driven over `codex app-server` by [`crate::appserver`], and can be steered.
-    AppServer,
+    /// The turn is run by an agentmux driver in the CLI's place, and can be steered.
+    ///
+    /// A Codex turn is driven over `codex app-server` by [`crate::appserver`].
+    #[serde(rename = "app_server")]
+    Driven,
     /// `claude --print` reading its input as stream-json from the turn's supervisor, which writes
     /// the question and then each steer, until Claude reports its result.
     ///
