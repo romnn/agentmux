@@ -12,12 +12,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, Billing, CodexPermissions, CodexSandbox, Delegate, Effort, Invocation, ModelId,
+    AccountChoice, Billing, Delegate, Effort, Invocation, ModelId, Permissions,
 };
 use agentmux::launch::{LaunchInput, LaunchSpec, Launcher as _};
 use agentmux::run::{AutoResume, Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher};
 use agentmux::transcript::{FailureKind, Outcome};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// A Codex turn that said something in a session it announced, then failed because the model
@@ -38,15 +39,15 @@ fn env() -> BTreeMap<String, String> {
 
 fn request() -> Result<StartRequest> {
     Ok(StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "review this".to_owned(),
         cwd: PathBuf::from("/work/project"),

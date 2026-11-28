@@ -28,7 +28,8 @@ is the one place that derives what each turn spent from them.**
   `Turn::spend_report` (`SpendReport` in `crates/agentmux/src/transcript.rs`), which is neither
   serialised nor rendered. The release is the one Claude's stream names, else the one
   `invocation.json` recorded.
-- The vendor's semantics live in `accounting` alone: Codex tokens are session-cumulative and it
+- The vendor's semantics are each vendor's `read_spend` (`vendor::<vendor>`), which only
+  `accounting` asks: Codex tokens are session-cumulative and it
   reports no price; Claude tokens are per turn, and its price is per turn before 2.1.277 and
   session-cumulative from it. A price whose release cannot be read has an unknown scope and is not
   counted. Figures are normalised into `Tokens`, whose input counts every prompt token with the

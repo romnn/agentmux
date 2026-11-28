@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux::config::{BlockedModel, Config, expand_tilde};
-use agentmux::delegate::{ClaudePermissions, ModelId, Vendor};
+use agentmux::delegate::{ModelId, Permissions, Vendor};
+use agentmux::vendor::claude::ClaudePermissions;
 use googletest::prelude::*;
 
 /// A host environment with `HOME` pointing where the test wants it.
@@ -765,12 +766,12 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
         some(matches_pattern!(agentmux::config::ChosenBy::Project(_)))
     );
 
-    let chosen_by_the_checkout = Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    let chosen_by_the_checkout = Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     };
     assert_that!(
         chosen_by_the_checkout.resolved_isolation(&config),
@@ -779,17 +780,20 @@ fn a_project_file_cannot_switch_on_inheritance() -> Result<()> {
 
     // Named by the caller, it is still the checkout's choice: a follow-up names the default it
     // resolved, and the checkout's instructions could name it too.
-    let named = Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    let named = Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     };
     assert_that!(named.resolved_isolation(&config), eq(Isolation::Isolated));
 
     // Only the caller asking for it outright switches it on.
-    let inheriting_delegate = named.with_isolation(Isolation::Inherit);
+    let inheriting_delegate = Delegate {
+        isolation: Some(Isolation::Inherit),
+        ..named
+    };
     assert_that!(
         inheriting_delegate.resolved_isolation(&config),
         eq(Isolation::Inherit)

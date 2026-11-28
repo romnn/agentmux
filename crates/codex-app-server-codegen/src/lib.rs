@@ -113,8 +113,8 @@ pub enum Error {
     /// The codex on `PATH` can isolate an app-server, which changes what agentmux may drive.
     #[error(
         "codex app-server {version} accepts --ignore-user-config, so isolated consultations can \
-         now be driven and steered: pass it in Delegate::app_server_settings, drop the isolation \
-         condition there, then remove this check"
+         now be driven and steered: pass it in agentmux's vendor::codex::prepare, drop the \
+         isolation condition there, then remove this check"
     )]
     AppServerIsolationAvailable {
         /// The release that accepts it.

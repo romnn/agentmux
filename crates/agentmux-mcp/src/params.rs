@@ -4,19 +4,19 @@
 //!
 //! # Why the delegate is flat here and an enum inside
 //!
-//! [`agentmux::delegate::Delegate`] is an enum whose variants carry only what that vendor accepts,
-//! so a Codex consultation with a Claude account does not compile.
+//! [`agentmux::delegate::Delegate`] keeps each vendor's permissions in an enum whose variants carry
+//! only what that vendor accepts, so a Codex consultation with a Claude permission mode does not
+//! compile.
 //! A JSON Schema cannot express that without a discriminated union, and a discriminated union is
 //! the shape language models fill in wrong most often.
 //! So the wire shape is flat and [`DelegateParams::build`] is the parse step: one place, one error
 //! message, and the enum's guarantee intact everywhere behind it.
 
-use agentmux::delegate::{
-    Billing, ClaudePermissionMode, ClaudeTool, CodexSandbox, Delegate, DelegateError, Isolation,
-    PermissionOptions, Vendor,
-};
+use agentmux::delegate::{Billing, Delegate, DelegateError, Isolation, PermissionOptions, Vendor};
 use agentmux::run::{Retention, RunId, RunLabel};
 use agentmux::transcript::TurnState;
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudeTool};
+use agentmux::vendor::codex::CodexSandbox;
 use rmcp::ErrorData;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};

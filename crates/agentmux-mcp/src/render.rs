@@ -354,7 +354,7 @@ fn failure_advice(status: &RunStatus, kind: FailureKind) -> Cow<'static, str> {
             status.exhausted_window(),
             &status.quota,
             status.delegate.vendor(),
-            status.delegate.account().alias(),
+            status.delegate.account.alias(),
         ),
     }
 }

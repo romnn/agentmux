@@ -1,0 +1,51 @@
+{
+  "program": "codex",
+  "args": [
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "--model",
+    "gpt-6-luna",
+    "--config",
+    "model_reasoning_effort=\"medium\"",
+    "--sandbox",
+    "read-only",
+    "--config",
+    "approval_policy=\"never\"",
+    "--config",
+    "approvals_reviewer=\"user\"",
+    "--output-last-message",
+    "<root>/runs/<run_id>/turns/0001/last-message.md",
+    "-"
+  ],
+  "env_keys": [
+    "AGENTMUX_DELEGATE",
+    "AGENTMUX_STATE_DIR",
+    "CI",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NO_COLOR",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "USER"
+  ],
+  "cwd": "<cwd>",
+  "mode": "exec",
+  "billing": "subscription",
+  "config_dir": "<home>/codex-personal",
+  "cli_version": "codex-cli 0.163.0",
+  "agentmux_version": "0.0.13",
+  "delegate": {
+    "vendor": "codex",
+    "model": "gpt-6-luna",
+    "effort": "medium",
+    "sandbox": "read_only",
+    "network_access": false,
+    "account": "personal",
+    "isolation": "inherit"
+  },
+  "label": "codex-exec"
+}

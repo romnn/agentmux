@@ -14,6 +14,7 @@ use agentmux::launch::ProcessLauncher;
 use agentmux::run::{AutoResumePolicy, RunStore, StartRequest};
 use clap::Parser as _;
 use color_eyre::eyre::{Result, WrapErr as _, bail};
+use strum::VariantArray as _;
 
 use crate::cli::{Cli, CodexLaunchArg, Command, DelegateArgs, McpArgs, QuestionArgs};
 
@@ -215,7 +216,10 @@ async fn serve(store: RunStore, args: &McpArgs) -> Result<()> {
     // Serving with every vendor denied would refuse every call it accepted.
     // A host surfaces a server that will not start, where it would quietly swallow one that
     // answers nothing.
-    if Vendor::ALL.iter().all(|vendor| denied.contains(vendor)) {
+    if Vendor::VARIANTS
+        .iter()
+        .all(|vendor| denied.contains(vendor))
+    {
         bail!(
             "--deny names every vendor, which leaves nothing to consult. Deny the vendor of the \
              harness this server is registered in — `--deny claude` under Claude Code, `--deny \

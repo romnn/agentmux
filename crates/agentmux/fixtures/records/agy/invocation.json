@@ -1,0 +1,44 @@
+{
+  "program": "agy",
+  "args": [
+    "--print=",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "gemini-3.8-flash-low",
+    "--settings",
+    "{\"agentMode\":\"\",\"permissions\":{\"ask\":[],\"deny\":[\"command(*)\",\"write_file(*)\",\"mcp(*)\",\"execute_url(*)\",\"download_url(*)\"]},\"toolPermission\":\"request-review\",\"useG1Credits\":false}"
+  ],
+  "env_keys": [
+    "AGENTMUX_DELEGATE",
+    "AGENTMUX_STATE_DIR",
+    "CI",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NO_COLOR",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "USER",
+    "USERPROFILE"
+  ],
+  "cwd": "<cwd>",
+  "mode": "exec",
+  "billing": "subscription",
+  "config_dir": "<root>/agy-home/.gemini/antigravity-cli",
+  "cli_version": "1.5.18",
+  "agentmux_version": "0.0.13",
+  "delegate": {
+    "vendor": "agy",
+    "model": "gemini-3.8-flash-low",
+    "account": {
+      "kind": "cli_login"
+    },
+    "isolation": "isolated"
+  },
+  "label": "agy-isolated"
+}

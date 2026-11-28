@@ -74,15 +74,14 @@ impl RunStore {
         }
         let mut delegate = self.current_delegate(&meta, Some(newest.index))?;
         // A record from before isolation was pinned could only have run isolated.
-        if delegate.isolation().is_none() {
-            delegate = delegate.with_isolation(Isolation::Isolated);
+        if delegate.isolation.is_none() {
+            delegate.isolation = Some(Isolation::Isolated);
         }
-        let asked_for = meta
-            .rewritten_from
-            .clone()
-            .unwrap_or_else(|| delegate.model().clone());
+        if let Some(asked_for) = &meta.rewritten_from {
+            delegate.model.clone_from(asked_for);
+        }
         let request = StartRequest {
-            delegate: delegate.with_model(asked_for),
+            delegate,
             question: brief(
                 run_id,
                 &self.transcript_path(run_id),

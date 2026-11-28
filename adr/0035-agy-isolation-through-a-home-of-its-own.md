@@ -6,6 +6,8 @@
 
 Isolation is imposed by argument ([0005](0005-isolation-by-argument.md)): `--setting-sources ""`
 with an empty strict MCP configuration for Claude, `--ignore-user-config` for Codex.
+[0036](0036-isolation-imposed-by-the-launch-agentmux-builds.md) has since made the rule the launch
+agentmux builds, which this record's home is an instance of.
 agy, Google's Antigravity CLI, has no such argument.
 Probes of agy 1.5.18 established what it has instead:
 
@@ -62,7 +64,7 @@ Isolation therefore keeps out the user's own configuration only, which is narrow
 an agy delegate is not to be pointed at a checkout the user does not trust.
 
 **What it may do is pinned by argument in both modes.**
-`agy_args` passes `--settings` on every launch, with `agentMode: ""`, `toolPermission:
+`vendor::agy::agy_args` passes `--settings` on every launch, with `agentMode: ""`, `toolPermission:
 "request-review"`, deny rules for commands, file writes, MCP calls, browser actions and downloads
 (`AGY_DENY_RULES`), and `useG1Credits: false`, which stops a model whose quota is used up from
 going on at the price of the account's AI credits.

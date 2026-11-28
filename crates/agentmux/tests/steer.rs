@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 use agentmux::appserver::mailbox::{Mailbox, SteerReply};
 use agentmux::appserver::{DriverPlan, STOP_BUDGET};
 use agentmux::delegate::{
-    AccountChoice, Billing, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort,
-    Isolation, ModelId,
+    AccountChoice, Billing, Delegate, Effort, Isolation, ModelId, Permissions,
 };
 use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
@@ -24,6 +23,8 @@ use agentmux::run::{
 };
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::{Outcome, TurnState};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// Where a test pretends the agentmux executable lives.
@@ -43,25 +44,25 @@ fn env() -> BTreeMap<String, String> {
 }
 
 fn codex(isolation: Isolation) -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::WorkspaceWrite),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: Some(isolation),
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            network_access: None,
+        }),
     })
 }
 
 fn claude() -> Result<Delegate> {
-    Ok(Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     })
 }
 
@@ -731,6 +732,91 @@ const SUPERVISOR_PATH: &str = "/opt/agentmux/bin/agentmux";
 const CLAUDE_INIT: &str = indoc::indoc! {r#"
     {"type":"system","subtype":"init","session_id":"85ff2d6a-ec24-47cf-a4f8-486a5bb06814"}
 "#};
+
+/// A Claude turn reads its input as stream-json only from a supervisor, which can hold it open for
+/// a steer; a store without one runs `claude --print` on the question as asked.
+#[gtest]
+fn a_claude_turn_reads_stream_json_only_from_its_supervisor() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    // A `claude.exe` on the delegate's `PATH`, which on Windows is what lets Claude start as
+    // itself rather than through a `.cmd` shim.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).or_fail()?;
+    std::fs::write(bin.join("claude.exe"), "").or_fail()?;
+    let mut env = env();
+    env.insert("PATH".to_owned(), bin.display().to_string());
+
+    let direct = launched_claude(&RunStore::open(
+        dir.path(),
+        Arc::new(ScriptedLauncher::new([Script::running("")])),
+        env.clone(),
+    )?)?;
+    assert_that!(direct["mode"], eq(&serde_json::json!("exec")));
+    assert_that!(
+        direct["args"].as_array().or_fail()?,
+        not(contains(eq(&serde_json::json!("--input-format"))))
+    );
+
+    let supervised = launched_claude(
+        &RunStore::open(
+            dir.path(),
+            Arc::new(ScriptedLauncher::new([Script::running("")])),
+            env,
+        )?
+        .with_supervisor(SUPERVISOR_PATH),
+    )?;
+    assert_that!(
+        supervised["mode"],
+        eq(&serde_json::json!("claude_stream_input"))
+    );
+    assert_that!(
+        supervised["args"].as_array().or_fail()?,
+        contains(eq(&serde_json::json!("--input-format")))
+    );
+    Ok(())
+}
+
+/// A supervised Claude that would start through a Windows `.cmd` shim runs in exec mode rather
+/// than on stream-json input, because the shim's process is the command interpreter, through which
+/// a cancellation could not stop Claude.
+#[cfg(windows)]
+#[gtest]
+fn a_supervised_claude_that_would_start_through_a_shim_runs_in_exec_mode() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    // A `PATH` with no `claude.exe` on it, where only a shim could start Claude.
+    let mut env = env();
+    env.insert("PATH".to_owned(), dir.path().display().to_string());
+    let launched = launched_claude(
+        &RunStore::open(
+            dir.path(),
+            Arc::new(ScriptedLauncher::new([Script::running("")])),
+            env,
+        )?
+        .with_supervisor(SUPERVISOR_PATH),
+    )?;
+    assert_that!(launched["mode"], eq(&serde_json::json!("exec")));
+    Ok(())
+}
+
+/// What `store` recorded of the Claude it launched for a new consultation's first turn.
+fn launched_claude(store: &RunStore) -> Result<serde_json::Value> {
+    let started = store.start(&StartRequest {
+        delegate: claude()?,
+        question: "q".to_owned(),
+        cwd: store.root().join("project"),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let record = store
+        .root()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001/invocation.json");
+    serde_json::from_str(&std::fs::read_to_string(record).or_fail()?).or_fail()
+}
 
 /// A Claude turn of a store that supervises its turns, whose supervisor and Claude the test plays.
 ///

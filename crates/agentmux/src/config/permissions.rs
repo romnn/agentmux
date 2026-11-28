@@ -23,10 +23,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use strum::VariantArray as _;
 
-use crate::delegate::{
-    ClaudePermissionMode, ClaudePermissions, ClaudeTool, CodexPermissions, CodexSandbox, Isolation,
-    Vendor,
-};
+use crate::delegate::{Isolation, Vendor};
+use crate::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use crate::vendor::codex::{CodexPermissions, CodexSandbox};
 
 use super::{Account, AccountAlias, ConfigError};
 
@@ -321,29 +320,6 @@ pub struct ClaudeLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_permission_modes: Option<Vec<ClaudePermissionMode>>,
 }
-
-macro_rules! empty_when_default {
-    ($($ty:ident),+ $(,)?) => {$(
-        impl $ty {
-            /// Whether the table says nothing.
-            #[must_use]
-            pub fn is_empty(&self) -> bool {
-                *self == Self::default()
-            }
-        }
-    )+};
-}
-empty_when_default!(
-    CodexPolicy,
-    CodexDefaults,
-    CodexLimits,
-    ClaudePolicy,
-    ClaudeDefaults,
-    ClaudeLimits,
-    AgyPolicy,
-    AgyDefaults,
-    AgyLimits
-);
 
 impl CodexLimits {
     /// The most a delegate may write.

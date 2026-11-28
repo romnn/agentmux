@@ -19,12 +19,12 @@ translated into those and would drift from them.
 
 ## Decision
 
-**The controls are the CLIs' own.** `delegate::CodexPermissions` carries Codex's sandbox mode
-(`CodexSandbox`) and `network_access`; `delegate::ClaudePermissions` carries Claude's permission
-mode (`ClaudePermissionMode`) and its three tool lists. Whether the user's configuration loads is
-the existing `Isolation` choice, spelled `ignore_user_config` in configuration, on the MCP tools and
-on the command line; `inherit_settings`, `--inherit-settings` and `--isolated` remain its inverse
-spellings, and a request that spells it twice inconsistently is refused
+**The controls are the CLIs' own.** `vendor::codex::CodexPermissions` carries Codex's sandbox mode
+(`CodexSandbox`) and `network_access`; `vendor::claude::ClaudePermissions` carries Claude's
+permission mode (`ClaudePermissionMode`) and its three tool lists. Whether the user's configuration
+loads is the existing `Isolation` choice, spelled `ignore_user_config` in configuration, on the MCP
+tools and on the command line; `inherit_settings`, `--inherit-settings` and `--isolated` remain its
+inverse spellings, and a request that spells it twice inconsistently is refused
 (`Isolation::from_spellings`).
 
 **Defaults and limits are per vendor and machine-only.** `[codex.defaults]`, `[codex.limits]`,

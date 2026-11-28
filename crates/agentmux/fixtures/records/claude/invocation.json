@@ -1,0 +1,61 @@
+{
+  "program": "claude",
+  "args": [
+    "--print",
+    "--model",
+    "claude-haiku-5-5",
+    "--effort",
+    "max",
+    "--permission-mode",
+    "acceptEdits",
+    "--tools",
+    "Bash,Read,Grep,Glob,WebFetch,WebSearch",
+    "--allowedTools",
+    "WebFetch",
+    "--disallowedTools",
+    "Bash(git push *)",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--replay-user-messages",
+    "--permission-prompts",
+    "none"
+  ],
+  "env_keys": [
+    "AGENTMUX_DELEGATE",
+    "AGENTMUX_STATE_DIR",
+    "CI",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NO_COLOR",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "USER"
+  ],
+  "cwd": "<cwd>",
+  "mode": "claude_stream_input",
+  "billing": "subscription",
+  "config_dir": "<home>/claude-work",
+  "cli_version": "2.1.277 (Claude Code)",
+  "agentmux_version": "0.0.13",
+  "delegate": {
+    "vendor": "claude",
+    "model": "claude-haiku-5-5",
+    "effort": "max",
+    "account": "work",
+    "isolation": "inherit",
+    "permission_mode": "acceptEdits",
+    "allowed_tools": [
+      "WebFetch"
+    ],
+    "disallowed_tools": [
+      "Bash(git push *)"
+    ]
+  },
+  "label": "claude-inherit"
+}

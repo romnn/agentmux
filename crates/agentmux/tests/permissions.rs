@@ -9,14 +9,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentmux::appserver::DriverPlan;
 use agentmux::config::{Config, ConfigError, PermissionRefusal};
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, ClaudePermissionMode, ClaudePermissions, ClaudeTool,
-    CodexPermissions, CodexSandbox, Delegate, DelegateError, Effort, Invocation, Isolation,
-    ModelId, PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    AccountAlias, AccountChoice, Delegate, DelegateError, Effort, Invocation, Isolation, ModelId,
+    PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
 };
-use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
+use agentmux::run::{ListFilter, NotResumable, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox, codex_supports_permission_profiles};
 use googletest::prelude::*;
 
 /// Where every machine file in these tests claims to live, so a refusal can be checked to name it.
@@ -50,25 +52,25 @@ fn machine(text: &str) -> Result<Config> {
 }
 
 fn codex(sandbox: Option<CodexSandbox>, network_access: Option<bool>) -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6.1-sol").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox,
-            network_access,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox,
+            network_access,
+        }),
     })
 }
 
 fn claude(permissions: ClaudePermissions) -> Result<Delegate> {
-    Ok(Delegate::Claude {
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
-        permissions,
+        permissions: Permissions::Claude(permissions),
     })
 }
 
@@ -388,7 +390,10 @@ fn the_two_isolation_spellings_must_agree() -> Result<()> {
 #[gtest]
 fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Result<()> {
     let personal = AccountAlias::parse("personal").or_fail()?;
-    let named = |delegate: Delegate| delegate.with_account(AccountChoice::Named(personal.clone()));
+    let named = |delegate: Delegate| Delegate {
+        account: AccountChoice::Named(personal.clone()),
+        ..delegate
+    };
     let config = machine(indoc::indoc! {r#"
         [accounts.codex.personal]
         config_dir = "/tmp"
@@ -410,9 +415,11 @@ fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Re
     );
     // The caller wins over both.
     assert_that!(
-        named(codex(None, None)?)
-            .with_isolation(Isolation::Isolated)
-            .resolved_isolation(&config),
+        Delegate {
+            isolation: Some(Isolation::Isolated),
+            ..named(codex(None, None)?)
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Isolated)
     );
     // With nothing configured, the user's configuration loads.
@@ -429,11 +436,12 @@ fn isolation_is_decided_by_the_caller_then_the_account_then_the_defaults() -> Re
 #[gtest]
 fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
     let agy = || -> Result<Delegate> {
-        Ok(Delegate::Agy {
+        Ok(Delegate {
             model: ModelId::parse("gemini-3.8-flash-low").or_fail()?,
             effort: None,
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Agy,
         })
     };
     let config = machine(indoc::indoc! {r#"
@@ -447,17 +455,19 @@ fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
         ignore_user_config = true
     "#})?;
     assert_that!(
-        agy()?
-            .with_account(AccountChoice::CliLogin)
-            .resolved_isolation(&config),
+        Delegate {
+            account: AccountChoice::CliLogin,
+            ..agy()?
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Isolated)
     );
     assert_that!(
-        agy()?
-            .with_account(AccountChoice::Named(
-                AccountAlias::parse("personal").or_fail()?
-            ))
-            .resolved_isolation(&config),
+        Delegate {
+            account: AccountChoice::Named(AccountAlias::parse("personal").or_fail()?),
+            ..agy()?
+        }
+        .resolved_isolation(&config),
         eq(Isolation::Inherit)
     );
 
@@ -467,10 +477,12 @@ fn agy_isolation_is_configured_as_the_other_vendors_is() -> Result<()> {
     "})?;
     assert_that!(agy()?.resolved_isolation(&config), eq(Isolation::Isolated));
     assert_that!(
-        agy()?
-            .with_isolation(Isolation::Inherit)
-            .held_to_limits(&config)
-            .map(|_| ()),
+        Delegate {
+            isolation: Some(Isolation::Inherit),
+            ..agy()?
+        }
+        .held_to_limits(&config)
+        .map(|_| ()),
         err(displays_as(contains_substring("allow_user_config")))
     );
     Ok(())
@@ -622,8 +634,10 @@ fn every_exec_turn_pins_unattended_approval() -> Result<()> {
     for resume in [None, Some(&session)] {
         for isolation in [Isolation::Inherit, Isolation::Isolated] {
             for network in [None, Some(true)] {
-                let delegate =
-                    codex(Some(CodexSandbox::ReadOnly), network)?.with_isolation(isolation);
+                let delegate = Delegate {
+                    isolation: Some(isolation),
+                    ..codex(Some(CodexSandbox::ReadOnly), network)?
+                };
                 let invocation = build(&delegate, &Config::default(), resume).or_fail()?;
                 let args = invocation.args();
                 let label = format!("{resume:?} {isolation:?} {network:?}");
@@ -650,7 +664,10 @@ fn a_codex_delegate_that_loads_the_user_config_still_gets_its_sandbox() -> Resul
     let config = Config::default();
     let inheriting = build(&codex(None, None)?, &config, None).or_fail()?;
     let isolated = build(
-        &codex(None, None)?.with_isolation(Isolation::Isolated),
+        &Delegate {
+            isolation: Some(Isolation::Isolated),
+            ..codex(None, None)?
+        },
         &config,
         None,
     )
@@ -730,7 +747,10 @@ fn a_request_beyond_a_limit_is_refused_naming_the_limit_and_the_file() -> Result
         ))
     );
     assert_that!(
-        refusal(codex(None, None)?.with_isolation(Isolation::Inherit))?,
+        refusal(Delegate {
+            isolation: Some(Isolation::Inherit),
+            ..codex(None, None)?
+        })?,
         eq(&format!(
             "Cannot launch codex: ignore_user_config=false is forbidden by \
              codex.limits.allow_user_config=false in {MACHINE_FILE}. Request \
@@ -853,7 +873,8 @@ fn claude_permissions_reach_the_cli() -> Result<()> {
     Ok(())
 }
 
-/// An option of the other vendor is refused rather than ignored, at the start and on a follow-up.
+/// An option of the other vendor is refused rather than ignored, both at the start and on a
+/// follow-up.
 #[gtest]
 fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
     let network = PermissionOptions {
@@ -884,20 +905,80 @@ fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
         err(matches_pattern!(DelegateError::NotForVendor { .. }))
     );
     assert_that!(
-        claude(ClaudePermissions::default())?.with_options(network),
+        claude(ClaudePermissions::default())?.with_options(network.clone()),
         err(matches_pattern!(DelegateError::NotForVendor { .. }))
     );
+
+    // A model that cannot be used is the first thing a start is refused for.
+    assert_that!(
+        Delegate::from_parts(Vendor::Claude, "-opus", None, None, network),
+        err(matches_pattern!(DelegateError::Argument {
+            field: eq(&"model"),
+            ..
+        }))
+    );
     Ok(())
+}
+
+/// A follow-up on a consultation that is still running is refused for that, which tells the
+/// caller to wait, before an option of the other vendor is.
+#[gtest]
+fn a_running_consultation_is_refused_before_a_foreign_option() -> Result<()> {
+    let machine = Machine::new("", ScriptedLauncher::new([Script::running("")]))?;
+    let started = machine
+        .store
+        .start(&machine.request(claude(ClaudePermissions::default())?))?;
+
+    let refused = machine.store.follow_up_with(
+        &started.run_id,
+        "again",
+        PermissionOptions {
+            network_access: Some(false),
+            ..PermissionOptions::default()
+        },
+        None,
+    );
+
+    assert_that!(
+        refused,
+        err(matches_pattern!(RunError::NotResumable(matches_pattern!(
+            NotResumable::StillRunning { .. }
+        ))))
+    );
+    Ok(())
+}
+
+/// The plan the app-server driver of `delegate`'s first turn runs under, launched by a store with
+/// a driver on a machine with no configuration, where a consultation loads the user's settings.
+fn driver_plan(delegate: Delegate) -> Result<DriverPlan> {
+    let state = tempfile::tempdir().or_fail()?;
+    let host_env = BTreeMap::from([("HOME".to_owned(), "/home/dev".to_owned())]);
+    let launcher = Arc::new(ScriptedLauncher::new([Script::running("")]));
+    let store =
+        RunStore::open(state.path(), launcher, host_env)?.with_codex_app_server("/opt/agentmux");
+    let started = store.start(&StartRequest {
+        delegate,
+        question: "q".to_owned(),
+        cwd: state.path().to_path_buf(),
+        retention: Retention::Ttl,
+        env: BTreeMap::new(),
+        billing: None,
+        force_codex_exec: false,
+        label: None,
+    })?;
+    let turn = state
+        .path()
+        .join("runs")
+        .join(started.run_id.as_str())
+        .join("turns/0001");
+    DriverPlan::read(&turn.join("app-server.json")).or_fail()
 }
 
 /// A driven Codex turn is given the same network as `exec`: a read-only one's as the turn's
 /// sandbox policy, which the driver sends, and a workspace-write one's as a server override.
 #[gtest]
 fn the_app_server_gets_the_same_network_as_exec() -> Result<()> {
-    let config = Config::default();
-    let read_only = codex(Some(CodexSandbox::ReadOnly), Some(true))?
-        .app_server_settings(&config)
-        .or_fail()?;
+    let read_only = driver_plan(codex(Some(CodexSandbox::ReadOnly), Some(true))?)?.settings;
     assert_that!(read_only.sandbox, eq(CodexSandbox::ReadOnly));
     assert_that!(read_only.network_access, some(eq(true)));
     assert_that!(
@@ -908,9 +989,7 @@ fn the_app_server_gets_the_same_network_as_exec() -> Result<()> {
         eq(false)
     );
 
-    let workspace = codex(Some(CodexSandbox::WorkspaceWrite), Some(false))?
-        .app_server_settings(&config)
-        .or_fail()?;
+    let workspace = driver_plan(codex(Some(CodexSandbox::WorkspaceWrite), Some(false))?)?.settings;
     assert_that!(
         has_pair(
             &workspace.args,
@@ -1039,8 +1118,8 @@ fn a_consultation_pins_the_defaults_it_started_with() -> Result<()> {
 
     let started = machine.store.start(&machine.request(codex(None, None)?))?;
     assert_that!(
-        started.delegate.codex_permissions().copied(),
-        some(eq(CodexPermissions {
+        started.delegate.permissions,
+        eq(&Permissions::Codex(CodexPermissions {
             sandbox: Some(CodexSandbox::ReadOnly),
             network_access: Some(true),
         }))
@@ -1049,7 +1128,7 @@ fn a_consultation_pins_the_defaults_it_started_with() -> Result<()> {
         started.delegate.summary(),
         contains_substring("sandbox=read-only+network")
     );
-    assert_that!(started.delegate.isolation(), some(eq(Isolation::Inherit)));
+    assert_that!(started.delegate.isolation, some(eq(Isolation::Inherit)));
     assert_that!(
         machine
             .args(0)?
@@ -1084,9 +1163,9 @@ fn a_follow_up_override_becomes_the_recorded_choice() -> Result<()> {
         &started.run_id,
         "write it out",
         PermissionOptions {
+            isolation: Some(Isolation::Isolated),
             sandbox: Some(CodexSandbox::WorkspaceWrite),
             network_access: Some(false),
-            isolation: Some(Isolation::Isolated),
             ..PermissionOptions::default()
         },
         None,
@@ -1191,30 +1270,33 @@ fn a_refused_start_leaves_no_run() -> Result<()> {
 }
 
 /// Read-only with network over `exec` is refused on a codex whose profile support is not
-/// verified, rather than run under whatever its configuration selects.
+/// verified, a release too old or one whose version cannot be read, rather than run under
+/// whatever its configuration selects.
 #[gtest]
 fn an_unverified_codex_cannot_run_read_only_with_network_over_exec() -> Result<()> {
-    let machine = Machine::new(
-        "",
-        ScriptedLauncher::new(codex_turns(1)).with_cli_version("codex-cli 0.150.0"),
-    )?;
+    for version in ["codex-cli 0.150.0", "codex-cli nightly"] {
+        let machine = Machine::new(
+            "",
+            ScriptedLauncher::new(codex_turns(1)).with_cli_version(version),
+        )?;
 
-    let refused = machine
-        .store
-        .start(&machine.request(codex(Some(CodexSandbox::ReadOnly), Some(true))?))
-        .err()
-        .or_fail()?;
+        let refused = machine
+            .store
+            .start(&machine.request(codex(Some(CodexSandbox::ReadOnly), Some(true))?))
+            .err()
+            .or_fail()?;
 
-    assert_that!(
-        refused.to_string(),
-        contains_substring(
-            "Cannot launch codex exec with sandbox=\"read_only\" and network_access=true: this \
-             Codex installation lacks verified permission-profile support."
-        )
-    );
-    assert_that!(refused.to_string(), contains_substring("codex-cli 0.150.0"));
-    assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
-    assert_that!(machine.launcher.launches(), is_empty());
+        assert_that!(
+            refused.to_string(),
+            contains_substring(
+                "Cannot launch codex exec with sandbox=\"read_only\" and network_access=true: \
+                 this Codex installation lacks verified permission-profile support."
+            )
+        );
+        assert_that!(refused.to_string(), contains_substring(version));
+        assert_that!(machine.store.list(10, &ListFilter::default())?, is_empty());
+        assert_that!(machine.launcher.launches(), is_empty());
+    }
     Ok(())
 }
 
@@ -1360,7 +1442,7 @@ fn a_reopened_turn_is_judged_by_its_own_isolation() -> Result<()> {
         status.hook_reopening,
         some(eq(agentmux::run::HookReopening::Expected))
     );
-    assert_that!(status.delegate.isolation(), some(eq(Isolation::Isolated)));
+    assert_that!(status.delegate.isolation, some(eq(Isolation::Isolated)));
     assert_that!(
         has_pair(&machine.args(1)?, "--setting-sources", ""),
         eq(true)

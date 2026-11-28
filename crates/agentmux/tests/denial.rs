@@ -12,13 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
-    Vendor,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions, Vendor};
 use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
+use strum::VariantArray as _;
 
 fn env() -> BTreeMap<String, String> {
     [("PATH", "/usr/bin"), ("HOME", "/home/dev")]
@@ -28,25 +28,25 @@ fn env() -> BTreeMap<String, String> {
 }
 
 fn claude() -> Result<Delegate> {
-    Ok(Delegate::Claude {
-        permissions: ClaudePermissions::default(),
+    Ok(Delegate {
         model: ModelId::parse("claude-opus-5").or_fail()?,
         effort: Some(Effort::parse("xhigh").or_fail()?),
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Claude(ClaudePermissions::default()),
     })
 }
 
 fn codex() -> Result<Delegate> {
-    Ok(Delegate::Codex {
+    Ok(Delegate {
         model: ModelId::parse("gpt-6-astra").or_fail()?,
         effort: Some(Effort::parse("high").or_fail()?),
-        permissions: CodexPermissions {
-            sandbox: Some(CodexSandbox::ReadOnly),
-            network_access: None,
-        },
         account: AccountChoice::Default,
         isolation: None,
+        permissions: Permissions::Codex(CodexPermissions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: None,
+        }),
     })
 }
 
@@ -159,8 +159,10 @@ fn a_store_denies_nothing_until_it_is_told_to() -> Result<()> {
 
     assert_that!(store.denied_vendors(), is_empty());
     assert_that!(
-        store.with_denied_vendors(Vendor::ALL).denied_vendors(),
-        eq(&BTreeSet::from(Vendor::ALL))
+        store
+            .with_denied_vendors(Vendor::VARIANTS.iter().copied())
+            .denied_vendors(),
+        eq(&Vendor::VARIANTS.iter().copied().collect::<BTreeSet<_>>())
     );
     Ok(())
 }

@@ -18,13 +18,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentmux::delegate::{
-    AccountChoice, ClaudePermissions, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation,
-    ModelId,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::claude::ClaudePermissions;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// The cheapest model on each side that still exercises the whole path.
@@ -68,12 +67,12 @@ async fn consult(
 #[ignore = "spends money and needs a logged-in claude CLI"]
 async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
     let (store, status) = consult(
-        Delegate::Claude {
-            permissions: ClaudePermissions::default(),
+        Delegate {
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Claude(ClaudePermissions::default()),
         },
         "Reply with exactly LIVE_CLAUDE_OK and nothing else.",
     )
@@ -96,15 +95,15 @@ async fn a_live_claude_consultation_returns_its_answer() -> Result<()> {
 #[ignore = "spends money and needs a logged-in codex CLI"]
 async fn a_live_codex_consultation_can_be_followed_up() -> Result<()> {
     let (store, status) = consult(
-        Delegate::Codex {
+        Delegate {
             model: ModelId::parse(CODEX_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         "Remember the secret word ZEPPELIN. Reply with exactly LIVE_CODEX_OK and nothing else.",
     )
@@ -150,16 +149,16 @@ async fn a_live_read_only_codex_turn_with_network_reaches_it_and_writes_nothing(
         Reply on one line as LIVE_NET=<the HTTP code curl printed> LIVE_WRITE=<ok or refused>.
     "};
     let (store, status) = consult(
-        Delegate::Codex {
+        Delegate {
             model: ModelId::parse(CODEX_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: Some(true),
-            },
             account: AccountChoice::Default,
             // Isolated, so the turn runs over `exec`, whose profile path this checks.
             isolation: Some(agentmux::delegate::Isolation::Isolated),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: Some(true),
+            }),
         },
         question,
     )
@@ -188,12 +187,12 @@ async fn a_live_read_only_codex_turn_with_network_reaches_it_and_writes_nothing(
 #[ignore = "needs a logged-in claude CLI"]
 async fn a_live_unknown_model_fails_with_the_vendors_own_message() -> Result<()> {
     let (_store, status) = consult(
-        Delegate::Claude {
-            permissions: ClaudePermissions::default(),
+        Delegate {
             model: ModelId::parse("does-not-exist-9000").or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
             account: AccountChoice::Default,
             isolation: None,
+            permissions: Permissions::Claude(ClaudePermissions::default()),
         },
         "hello",
     )
@@ -252,11 +251,12 @@ fn agy_refused_write(events: &str, target: &str) -> bool {
 
 async fn live_agy_consultation(isolation: Isolation) -> Result<()> {
     let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agentmux-live-agy-probe");
-    let agy = Delegate::Agy {
+    let agy = Delegate {
         model: ModelId::parse(AGY_MODEL).or_fail()?,
         effort: None,
         account: AccountChoice::Default,
         isolation: Some(isolation),
+        permissions: Permissions::Agy,
     };
     let (store, status) = consult(
         agy,

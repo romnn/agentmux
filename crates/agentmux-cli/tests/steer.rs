@@ -18,12 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, Isolation, ModelId,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStore, StartRequest, TURN_END_NOTICE};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use codex_app_server_mock::scenario::{CONFIG_FILE, Config, HELPER, Scenario, ServerExitMode};
 use googletest::prelude::*;
 
@@ -310,15 +309,15 @@ async fn until_resumable(store: &RunStore, id: &RunId) -> Result<bool> {
 async fn a_consultation_is_steered_followed_up_and_cancelled_over_the_app_server() -> Result<()> {
     let harness = cli_harness()?;
     let started = harness.store.start(&StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "Review the repository.".to_owned(),
         cwd: harness.project_dir.clone(),
@@ -510,15 +509,15 @@ async fn what_a_finished_turn_left_running_is_stopped_and_reported() -> Result<(
         },
     )?;
     let started = harness.store.start(&StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "Run the long job.".to_owned(),
         cwd: harness.project_dir.clone(),
@@ -619,7 +618,8 @@ fn record_launch(turn: &Path, driver: u32) -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> Result<()> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let harness = cli_harness()?;
     let turn = harness.state_dir.join("taken-over");
@@ -670,7 +670,8 @@ async fn a_driver_whose_launch_record_names_another_process_starts_nothing() -> 
 #[gtest]
 fn the_driver_hands_the_server_a_key_only_on_api_pricing() -> Result<()> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let harness = cli_harness()?;
     for (billing, expect_key) in [(Billing::Subscription, false), (Billing::Api, true)] {
@@ -766,7 +767,8 @@ fn drive_fake(
     release_marker_paths: Vec<PathBuf>,
 ) -> Result<DriverProcess> {
     use agentmux::appserver::DriverPlan;
-    use agentmux::delegate::{AppServerSettings, Billing};
+    use agentmux::delegate::Billing;
+    use agentmux::vendor::codex::AppServerSettings;
 
     let codex_home = dir.join("codex-home");
     let command_pids_path = dir.join("commands.txt");
@@ -935,15 +937,15 @@ async fn a_driver_reaps_adopted_children_before_the_turn_ends() -> Result<()> {
 async fn agentmux_wait_returns_on_a_question_and_exits_12() -> Result<()> {
     let harness = cli_harness_playing(Scenario::AsksThenSteerable)?;
     let started = harness.store.start(&StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse("gpt-6-astra").or_fail()?,
             effort: Some(Effort::parse("high").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: AccountChoice::Default,
             isolation: Some(Isolation::Inherit),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "Infer the chart schemas.".to_owned(),
         cwd: harness.project_dir.clone(),

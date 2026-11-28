@@ -1,10 +1,11 @@
 //! Folds a delegate's raw event stream into a [`Turn`].
 //!
-//! Every capture is parsed here, and only here.
+//! Every capture is parsed by its vendor's fold, `vendor::<vendor>::fold`, and only there; this
+//! module chooses the fold and defines what every fold returns.
 //! What a fold returns is vendor-neutral, so nothing downstream can be called with the wrong
 //! vendor's shape.
-//! The Codex capture model, [`codex::CaptureEvent`], is also what the app-server driver writes,
-//! and it keeps whatever the server said that could not be decoded verbatim, as evidence.
+//! The Codex capture model, [`codex::fold::CaptureEvent`], is also what the app-server driver
+//! writes, and it keeps whatever the server said that could not be decoded verbatim, as evidence.
 //!
 //! # Why every fold counts what it does not recognise
 //!
@@ -17,14 +18,11 @@
 //! parser does not name.
 //! Drift becomes loud instead of lossy.
 
-pub mod agy;
-pub mod claude;
-pub mod codex;
-
 use uuid::Uuid;
 
 use crate::delegate::{SessionRef, Vendor};
 use crate::transcript::{Outcome, Turn};
+use crate::vendor::{agy, claude, codex};
 
 /// The result of folding one child process's event stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,9 +97,9 @@ pub const MALFORMED_LINE: &str = "<malformed-json-line>";
 #[must_use]
 pub fn fold(vendor: Vendor, index: u32, question: &str, events: &str) -> Fold {
     match vendor {
-        Vendor::Claude => claude::fold(index, question, events),
-        Vendor::Codex => codex::fold(index, question, events),
-        Vendor::Agy => agy::fold(index, question, events),
+        Vendor::Claude => claude::fold::fold(index, question, events),
+        Vendor::Codex => codex::fold::fold(index, question, events),
+        Vendor::Agy => agy::fold::fold(index, question, events),
     }
 }
 

@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{AccountChoice, ClaudePermissions, Delegate, ModelId};
+use agentmux::delegate::{AccountChoice, Delegate, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{AutoResumePolicy, Retention, RunId, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::claude::ClaudePermissions;
 use googletest::prelude::*;
 
 /// The session every fake `claude` announces.
@@ -102,12 +103,12 @@ impl Machine {
     /// Start a Claude consultation in the project, asking `question`.
     fn start(&self, question: &str) -> Result<RunId> {
         let started = self.store.start(&StartRequest {
-            delegate: Delegate::Claude {
-                permissions: ClaudePermissions::default(),
+            delegate: Delegate {
                 model: ModelId::parse("haiku").or_fail()?,
                 effort: None,
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Claude(ClaudePermissions::default()),
             },
             question: question.to_owned(),
             cwd: self.path("project"),

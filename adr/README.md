@@ -67,7 +67,8 @@ A new decision gets a record with the next number.
 
 ## Isolation and delegation
 
-- [0005](0005-isolation-by-argument.md): Isolation is imposed by argument, never by environment.
+- [0005](0005-isolation-by-argument.md): Isolation is imposed by argument, never by environment;
+  superseded by 0036.
 - [0006](0006-server-denies-own-vendor.md): An MCP server denies its own harness's vendor; the store
   enforces it.
 - [0007](0007-recursion-guard.md): agentmux refuses to run inside its own delegate.
@@ -77,6 +78,8 @@ A new decision gets a record with the next number.
   bounded by machine-file limits.
 - [0035](0035-agy-isolation-through-a-home-of-its-own.md): An isolated agy delegate runs in a home
   of its own.
+- [0036](0036-isolation-imposed-by-the-launch-agentmux-builds.md): Isolation is imposed by the
+  launch agentmux builds: by argument, or by environment it sets after every other layer.
 
 ## Run lifecycle and transcripts
 

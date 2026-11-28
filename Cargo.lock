@@ -61,6 +61,7 @@ dependencies = [
  "mimalloc",
  "serde",
  "serde_json",
+ "strum",
  "sysinfo",
  "tempfile",
  "tokio",

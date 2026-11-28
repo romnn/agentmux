@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
-use crate::delegate::{Delegate, Isolation};
+use crate::delegate::{Delegate, Isolation, Permissions};
 use crate::launch::{Launched, Liveness};
 use crate::stream::TurnInput;
 use crate::transcript::Outcome;
@@ -323,13 +323,12 @@ enum ClaudeProgress {
 
 /// Why a turn of this delegate that was launched to read its question once offers no way in.
 pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
-    match delegate {
-        Delegate::Claude { .. } => UnsteerableReason::ClaudePrint,
-        Delegate::Codex {
-            isolation: Some(Isolation::Inherit),
-            ..
-        } => UnsteerableReason::CodexExec,
-        Delegate::Codex { .. } => UnsteerableReason::CodexIsolated,
-        Delegate::Agy { .. } => UnsteerableReason::AgyPrint,
+    match delegate.permissions {
+        Permissions::Claude(_) => UnsteerableReason::ClaudePrint,
+        Permissions::Codex(_) => match delegate.isolation {
+            Some(Isolation::Inherit) => UnsteerableReason::CodexExec,
+            Some(Isolation::Isolated) | None => UnsteerableReason::CodexIsolated,
+        },
+        Permissions::Agy => UnsteerableReason::AgyPrint,
     }
 }

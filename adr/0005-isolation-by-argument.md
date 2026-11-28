@@ -1,6 +1,6 @@
 # 5. Isolation is imposed by argument, never by environment
 
-**Status:** accepted · **Date:** 2026-10-19
+**Status:** superseded by [ADR 36](0036-isolation-imposed-by-the-launch-agentmux-builds.md) · **Date:** 2026-10-19
 
 ## Context
 
@@ -15,10 +15,11 @@ environment reached the child.
 Isolation (`Isolation::Isolated` in `crates/agentmux/src/delegate.rs`, spelled
 `ignore_user_config = true`) is imposed by command-line arguments only:
 
-- Claude (`claude_args`): `--setting-sources ""`, which loads no user, project or local settings,
-  and `--strict-mcp-config` with an empty `--mcp-config`.
-- Codex (`codex_args`): `--ignore-user-config`, the control that actually detaches configured MCP
-  servers, plus `-c features.hooks=false` as insurance against a hook arriving by another route.
+- Claude (`vendor::claude::claude_args`): `--setting-sources ""`, which loads no user, project or
+  local settings, and `--strict-mcp-config` with an empty `--mcp-config`.
+- Codex (`vendor::codex::codex_args`): `--ignore-user-config`, the control that actually detaches
+  configured MCP servers, plus `-c features.hooks=false` as insurance against a hook arriving by
+  another route.
 
 These flags are what suppress settings, hooks and MCP servers; no environment variable can switch
 them on or off. `Isolation::Inherit` drops exactly those flags and nothing else. The sandbox, the

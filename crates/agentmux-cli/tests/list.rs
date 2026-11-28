@@ -4,11 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentmux::delegate::{
-    AccountChoice, CodexPermissions, CodexSandbox, Delegate, Effort, ModelId,
-};
+use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
 use agentmux::run::{Retention, RunStatus, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 
 /// A state directory holding one completed Codex consultation, and its status.
@@ -23,15 +22,15 @@ fn one_consultation(state_dir: &Path) -> Result<RunStatus> {
     .or_fail()?;
     let started = store
         .start(&StartRequest {
-            delegate: Delegate::Codex {
+            delegate: Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: Some(Effort::parse("high").or_fail()?),
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "Review it.".to_owned(),
             cwd: PathBuf::from("/work/project"),

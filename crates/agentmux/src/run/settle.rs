@@ -48,8 +48,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::SystemTime;
 
-use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
-
 use super::id::RunId;
 use super::layout::TurnDir;
 use super::lock::LockedRun;
@@ -274,7 +272,9 @@ pub(super) fn fold_events(
     input: Option<&StreamInput>,
 ) -> Fold {
     match input {
-        Some(input) => stream::claude::fold_stream_input(index, question, events, input),
+        Some(input) => {
+            crate::vendor::claude::fold::fold_stream_input(index, question, events, input)
+        }
         None => stream::fold(vendor, index, question, events),
     }
 }
@@ -298,34 +298,6 @@ fn note_continuity(asked_for: Option<&SessionRef>, opened: Option<&SessionRef>, 
         }
         _ => {}
     }
-}
-
-/// The window a Codex turn's usage is reported against.
-///
-/// An exhausted window is the one a request is refused against, and when several are, the one
-/// that reopens last is the one that decides when a request can succeed again.
-/// With none exhausted it is the one closest to closing, which is what the next question has to
-/// expect.
-/// A window that names no reopening time cannot answer either question, and is passed over.
-fn select_rate_limit_window(snapshot: &RateLimitSnapshot) -> Option<&RateLimitWindow> {
-    [&snapshot.primary, &snapshot.secondary]
-        .into_iter()
-        .flatten()
-        .filter(|window| window.resets_at.is_some())
-        .max_by(|left_window, right_window| {
-            left_window
-                .exhausted()
-                .cmp(&right_window.exhausted())
-                .then_with(|| {
-                    if left_window.exhausted() {
-                        left_window.resets_at.cmp(&right_window.resets_at)
-                    } else {
-                        left_window
-                            .used_percent
-                            .total_cmp(&right_window.used_percent)
-                    }
-                })
-        })
 }
 
 /// The newest modification time among a turn's capture files.
@@ -391,18 +363,7 @@ impl RunStore {
             Vendor::Codex.config_dir(&env)?
         };
 
-        // Only the account-wide bucket is recorded here; the per-model ones are not in a rollout.
-        let snapshot = crate::quota::codex_rollout_rate_limits(&codex_home, thread_id)?;
-        let selected = select_rate_limit_window(&snapshot)?;
-        let resets_at = selected
-            .resets_at
-            .and_then(chrono::DateTime::from_timestamp_secs)?;
-        Some(UsageWindow {
-            resets_at,
-            exhausted: selected.exhausted(),
-            used_percent: Some(selected.used_percent),
-            window: snapshot.limit_id.clone(),
-        })
+        crate::vendor::codex::quota::rollout_usage_window(&codex_home, thread_id)
     }
 }
 
@@ -603,16 +564,15 @@ impl LockedRun<'_> {
         let delegate_gone = self.delegate_gone(files, record.as_ref(), &turn.outcome);
         turn.left_running = left_running(files, record.as_ref(), &turn.outcome, delegate_gone)?;
 
-        let pending_rate_limit_lookup = if vendor == Vendor::Codex {
-            cached_rate_limit_or_lookup(
+        let pending_rate_limit_lookup = match vendor {
+            Vendor::Codex => cached_rate_limit_or_lookup(
                 files,
                 &mut turn,
                 turn_session.as_ref(),
                 invocation.config_dir.as_deref(),
                 delegate_gone,
-            )
-        } else {
-            None
+            ),
+            Vendor::Claude | Vendor::Agy => None,
         };
 
         let finality = self.settle_inputs(
@@ -960,7 +920,7 @@ fn note_launch_record(turn: &mut Turn, invocation: &InvocationRecord, header: &D
     turn.auto_resume = invocation.auto_resume;
     turn.label.clone_from(&invocation.label);
     let ran_as = invocation.delegate.as_ref();
-    turn.isolation = ran_as.and_then(Delegate::isolation);
+    turn.isolation = ran_as.and_then(|delegate| delegate.isolation);
     turn.ran_as = ran_as
         .map(Delegate::summary)
         .filter(|summary| *summary != header.summary());
@@ -1140,7 +1100,7 @@ fn keep_unfinished(turn: &mut Turn, unfinished: Option<String>) {
 /// failed.
 fn classify_exit(vendor: Vendor, detail: &str) -> FailureKind {
     let kind = match vendor {
-        Vendor::Agy => stream::agy::classify(detail),
+        Vendor::Agy => crate::vendor::agy::fold::classify(detail),
         Vendor::Claude | Vendor::Codex => stream::classify(detail),
     };
     match kind {
@@ -1151,10 +1111,9 @@ fn classify_exit(vendor: Vendor, detail: &str) -> FailureKind {
 
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::rollout::{RateLimitSnapshot, RateLimitWindow};
     use googletest::prelude::*;
 
-    use super::{ExitRecord, RunStore, SettledBy, TurnDir, select_rate_limit_window};
+    use super::{ExitRecord, RunStore, SettledBy, TurnDir};
     use crate::delegate::Vendor;
     use crate::launch::ExitStatus;
     use crate::transcript::{FailureKind, Outcome, Turn, Usage};
@@ -1258,63 +1217,5 @@ mod tests {
             settled(&exited(Some(0.into())), None),
             failed_by_the_record()
         );
-    }
-
-    fn window(used_percent: f64, resets_at: Option<i64>) -> RateLimitWindow {
-        RateLimitWindow {
-            used_percent,
-            window_minutes: None,
-            resets_at,
-        }
-    }
-
-    fn selected_reset_timestamp(
-        primary: Option<RateLimitWindow>,
-        secondary: Option<RateLimitWindow>,
-    ) -> Option<i64> {
-        let snapshot = RateLimitSnapshot {
-            limit_id: None,
-            primary,
-            secondary,
-        };
-        select_rate_limit_window(&snapshot).and_then(|window| window.resets_at)
-    }
-
-    /// The window a refusal is reported against is the exhausted one, however full the other is,
-    /// and with both exhausted it is the one that reopens last.
-    #[gtest]
-    fn an_exhausted_window_binds_whichever_slot_it_is_in() {
-        // A five-hour window nearly full and a weekly one used up: waiting for the five-hour
-        // window to reopen would only be refused again.
-        assert_that!(
-            selected_reset_timestamp(Some(window(90.0, Some(10))), Some(window(100.0, Some(500)))),
-            some(eq(500))
-        );
-        assert_that!(
-            selected_reset_timestamp(
-                Some(window(100.0, Some(10))),
-                Some(window(100.0, Some(500)))
-            ),
-            some(eq(500))
-        );
-        assert_that!(
-            selected_reset_timestamp(Some(window(100.0, Some(10))), Some(window(40.0, Some(500)))),
-            some(eq(10))
-        );
-    }
-
-    /// With nothing exhausted, the window closest to closing is the one to expect, and a window
-    /// with no reopening time cannot be reported.
-    #[gtest]
-    fn otherwise_the_fullest_window_with_a_reopening_time_binds() {
-        assert_that!(
-            selected_reset_timestamp(Some(window(20.0, Some(10))), Some(window(60.0, Some(500)))),
-            some(eq(500))
-        );
-        assert_that!(
-            selected_reset_timestamp(Some(window(20.0, Some(10))), Some(window(100.0, None))),
-            some(eq(10))
-        );
-        assert_that!(selected_reset_timestamp(None, None), none());
     }
 }

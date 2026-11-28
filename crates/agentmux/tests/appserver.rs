@@ -16,12 +16,10 @@ use std::time::{Duration, Instant};
 
 use agentmux::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use agentmux::appserver::{DriverOutcome, DriverPlan, DriverTimeouts, drive_with};
-use agentmux::delegate::{
-    AccountChoice, AppServerSettings, Billing, CodexPermissions, CodexSandbox, ModelId, SessionRef,
-    Vendor,
-};
+use agentmux::delegate::{AccountChoice, Billing, ModelId, Permissions, SessionRef, Vendor};
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
+use agentmux::vendor::codex::{AppServerSettings, CodexPermissions, CodexSandbox};
 use codex_app_server_mock::conformance::{self, Side};
 use codex_app_server_mock::fixtures::{self, THREAD_ID, TURN_ID, TokenCounts};
 use codex_app_server_mock::{Peer, PeerError};
@@ -1517,15 +1515,15 @@ fn a_plan_only_turn_keeps_its_report_for_store_readers() -> Result<()> {
     .or_fail()?;
     let started = store
         .start(&StartRequest {
-            delegate: agentmux::delegate::Delegate::Codex {
+            delegate: agentmux::delegate::Delegate {
                 model: ModelId::parse("gpt-6-astra").or_fail()?,
                 effort: None,
-                permissions: CodexPermissions {
-                    sandbox: Some(CodexSandbox::ReadOnly),
-                    network_access: None,
-                },
                 account: AccountChoice::Default,
                 isolation: None,
+                permissions: Permissions::Codex(CodexPermissions {
+                    sandbox: Some(CodexSandbox::ReadOnly),
+                    network_access: None,
+                }),
             },
             question: "q".to_owned(),
             cwd: dir.path().to_path_buf(),

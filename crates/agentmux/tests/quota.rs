@@ -16,6 +16,9 @@ use agentmux::quota::{
 #[cfg(unix)]
 use agentmux::quota::Refresh;
 use googletest::prelude::*;
+// Only a test that drives a shell script reads every vendor, so on Windows it would be unused.
+#[cfg(unix)]
+use strum::VariantArray as _;
 
 /// A probe that answers from a script instead of a machine.
 #[derive(Debug)]
@@ -349,7 +352,9 @@ fn a_codex_rollout_yields_the_window_the_stream_omitted() -> Result<()> {
     )
     .or_fail()?;
 
-    let Some(limits) = agentmux::quota::codex_rollout_rate_limits(home.path(), thread) else {
+    let Some(limits) =
+        agentmux::vendor::codex::quota::codex_rollout_rate_limits(home.path(), thread)
+    else {
         return fail!("the rollout carries rate limits");
     };
 
@@ -369,7 +374,8 @@ fn a_missing_rollout_yields_nothing_rather_than_a_default() -> Result<()> {
     let home = tempfile::tempdir().or_fail()?;
     std::fs::create_dir_all(home.path().join("sessions/2026/09/07")).or_fail()?;
 
-    let limits = agentmux::quota::codex_rollout_rate_limits(home.path(), "no-such-thread");
+    let limits =
+        agentmux::vendor::codex::quota::codex_rollout_rate_limits(home.path(), "no-such-thread");
 
     assert_that!(limits.is_none(), eq(true));
     Ok(())
@@ -718,7 +724,7 @@ fn probe_claude_with_fake_cli(script: &str) -> Result<Observation> {
 fn a_probe_child_is_given_no_billing_credentials() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    for vendor in Vendor::ALL {
+    for &vendor in Vendor::VARIANTS {
         let root = tempfile::tempdir().or_fail()?;
         let config_dir = root.path().join("config");
         let bin = root.path().join("bin");

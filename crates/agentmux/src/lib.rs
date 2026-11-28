@@ -35,7 +35,8 @@
 //! # // Uses `no_run` because the example spawns a real delegate CLI and writes a run directory.
 //! use std::sync::Arc;
 //!
-//! use agentmux::delegate::{AccountChoice, ClaudePermissions, Delegate, Effort, ModelId};
+//! use agentmux::delegate::{AccountChoice, Delegate, Effort, ModelId, Permissions};
+//! use agentmux::vendor::claude::ClaudePermissions;
 //! use agentmux::launch::ProcessLauncher;
 //! use agentmux::run::{Retention, RunStore, StartRequest};
 //!
@@ -48,12 +49,12 @@
 //! )?;
 //!
 //! let status = store.start(&StartRequest {
-//!     delegate: Delegate::Claude {
+//!     delegate: Delegate {
 //!         model: ModelId::parse("opus")?,
 //!         effort: Some(Effort::parse("xhigh")?),
 //!         account: AccountChoice::Default,
 //!         isolation: None,
-//!         permissions: ClaudePermissions::default(),
+//!         permissions: Permissions::Claude(ClaudePermissions::default()),
 //!     },
 //!     question: "Review the merge-base diff for correctness bugs.".to_owned(),
 //!     cwd: std::env::current_dir()?,
@@ -82,6 +83,7 @@ pub mod run;
 pub mod stream;
 pub mod testing;
 pub mod transcript;
+pub mod vendor;
 
 use std::collections::BTreeMap;
 

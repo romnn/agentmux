@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use strum::VariantArray as _;
 
 use crate::delegate::{AccountAlias, Effort, ModelId, Vendor};
 use trust::refuse_if_untrusted;
@@ -388,7 +389,7 @@ impl LaunchEnv {
     /// Whether this layer contributes nothing.
     ///
     /// Compared against the empty layer rather than field by field, so a field added later is
-    /// counted by construction; this is the one gate on what a project file may say.
+    /// counted by construction.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -984,16 +985,15 @@ impl Config {
                 continue;
             }
             let project = Self::read(&path)?;
-            if !project.accounts.is_empty()
-                || !project.launch.is_empty()
-                || !project.model_rewrites.is_empty()
-                || !project.effort_defaults.is_empty()
-                || !project.blocked.is_empty()
-                || project.retention.is_some()
-                || !project.codex.is_empty()
-                || !project.claude.is_empty()
-                || !project.agy.is_empty()
-            {
+            // Compared with the only shape a project file may have, rather than table by table,
+            // so a table added later is the machine file's alone until something says otherwise.
+            let selects_only = Self {
+                defaults: project.defaults.clone(),
+                source: project.source.clone(),
+                unknown: project.unknown.clone(),
+                ..Self::default()
+            };
+            if project != selects_only {
                 return Err(ConfigError::ProjectFileOversteps { path });
             }
             warn_unknown(&project.unknown);
@@ -1044,7 +1044,7 @@ impl Config {
     /// Only here: a project file may set neither, and is refused for setting them at all.
     fn read_as_machine(path: &Path) -> Result<Self, ConfigError> {
         let config = Self::read(path)?;
-        for vendor in Vendor::ALL {
+        for &vendor in Vendor::VARIANTS {
             permissions::validate(
                 path,
                 vendor,
@@ -1166,7 +1166,7 @@ impl Config {
             }
         }
         self.validate_agy_accounts(path)?;
-        for vendor in Vendor::ALL {
+        for &vendor in Vendor::VARIANTS {
             self.model_rules(vendor).validate(path)?;
         }
         self.launch.validate(path)
@@ -1286,7 +1286,7 @@ impl Config {
         let vendor_rules = match vendor {
             Vendor::Claude => self.claude.describe(),
             Vendor::Codex => self.codex.describe(),
-            Vendor::Agy => format!("deny={}", crate::delegate::AGY_DENY_RULES.join(",")),
+            Vendor::Agy => format!("deny={}", crate::vendor::agy::AGY_DENY_RULES.join(",")),
         };
         format!("{} {vendor_rules}", self.permissions(vendor).describe())
     }

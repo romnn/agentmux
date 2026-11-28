@@ -22,13 +22,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::delegate::{
-    AccountAlias, ClaudePermissionMode, ClaudePermissions, ClaudeTool, CodexPermissions,
-    CodexSandbox, Delegate, Effort, Isolation, ModelId,
-};
+use agentmux::delegate::{AccountAlias, Delegate, Effort, Isolation, ModelId, Permissions};
 use agentmux::launch::ProcessLauncher;
 use agentmux::run::{Retention, RunId, RunStatus, RunStore, StartRequest};
 use agentmux::transcript::Outcome;
+use agentmux::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
+use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};
 use googletest::prelude::*;
 use serde_json::Value;
 
@@ -57,15 +56,15 @@ async fn a_live_codex_turn_is_steered_followed_up_and_cancelled() -> Result<()> 
     let account = live_account("AGENTMUX_LIVE_CODEX_ACCOUNT")?;
 
     let started = store.start(&StartRequest {
-        delegate: Delegate::Codex {
+        delegate: Delegate {
             model: ModelId::parse(MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            permissions: CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: None,
-            },
             account: account.into(),
             isolation: Some(Isolation::Inherit),
+            permissions: Permissions::Codex(CodexPermissions {
+                sandbox: Some(CodexSandbox::ReadOnly),
+                network_access: None,
+            }),
         },
         question: "Run the shell command `sleep 20` and wait for it to finish. Then reply with \
                    one line: LIVE_DONE, followed by anything else you have been asked to add."
@@ -180,17 +179,17 @@ async fn a_live_claude_turn_is_steered() -> Result<()> {
         .with_supervisor(env!("CARGO_BIN_EXE_agentmux"));
 
     let started = store.start(&StartRequest {
-        delegate: Delegate::Claude {
+        delegate: Delegate {
             model: ModelId::parse(CLAUDE_MODEL).or_fail()?,
             effort: Some(Effort::parse("low").or_fail()?),
-            permissions: ClaudePermissions {
+            account: live_account("AGENTMUX_LIVE_CLAUDE_ACCOUNT")?.into(),
+            isolation: Some(Isolation::Isolated),
+            permissions: Permissions::Claude(ClaudePermissions {
                 permission_mode: Some(ClaudePermissionMode::Manual),
                 tools: Some(ClaudeTool::parse_all(&["Bash"]).or_fail()?),
                 allowed_tools: Some(ClaudeTool::parse_all(&["Bash(sleep *)"]).or_fail()?),
                 disallowed_tools: None,
-            },
-            account: live_account("AGENTMUX_LIVE_CLAUDE_ACCOUNT")?.into(),
-            isolation: Some(Isolation::Isolated),
+            }),
         },
         question: "Run the shell command `sleep 20` with Bash and wait for it to finish. Then \
                    reply with one line: LIVE_DONE, followed by anything else you have been asked \

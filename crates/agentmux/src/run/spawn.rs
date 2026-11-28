@@ -7,8 +7,8 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, AppServerSettings, Billing, Delegate, DelegateError, Isolation, ModelId,
-    PermissionOptions, SessionRef, TurnPlan, Vendor, codex_supports_permission_profiles,
+    AccountChoice, Admitted, Billing, Delegate, Invocation, Isolation, LaunchRequest, ModelId,
+    PermissionOptions, Permissions, PreparedLaunch, SessionRef, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -20,7 +20,7 @@ use super::label::RunLabel;
 use super::layout::{TurnDir, create_private_dir, reserve_dir};
 use super::lock::LockedRun;
 use super::records::{
-    ExitRecord, InvocationRecord, LaunchMode, LaunchRecord, Meta, ProducerCommand, SettledTurn,
+    ExitRecord, InvocationRecord, LaunchRecord, Meta, ProducerCommand, SettledTurn,
     SupervisorPhase, SupervisorPlan, SupervisorRecord, read_json, write_json,
 };
 use super::retention::Retention;
@@ -122,38 +122,28 @@ pub(super) enum Resolution<'a> {
 }
 
 impl Resolution<'_> {
-    /// Build `delegate`'s child for `plan`, from `host_env`, the environment the store was opened
-    /// with, and with `agy_home` as the home an isolated agy delegate runs in.
+    /// What `delegate`'s launch for `plan` starts from, with `host_env` the environment the store
+    /// was opened with.
     fn resolve(
         self,
         delegate: &Delegate,
         plan: &TurnPlan<'_>,
         host_env: &BTreeMap<String, String>,
-        agy_home: &Path,
-    ) -> Result<Resolved, RunError> {
+    ) -> Result<Admitted, RunError> {
         Ok(match self {
-            Self::Configured(config) => Resolved {
-                invocation: delegate.invocation_in(plan, host_env, config, Some(agy_home))?,
-                app_server_settings: delegate.app_server_settings(config),
-                auto_resume: None,
-            },
-            Self::Inherited(Inherited { billing, attempt }) => Resolved {
-                invocation: delegate.continuation(plan, host_env.clone(), billing)?,
-                app_server_settings: delegate
-                    .app_server_settings_under(delegate.isolation().unwrap_or(Isolation::Isolated)),
-                auto_resume: Some(attempt),
+            Self::Configured(config) => delegate.admitted(plan, host_env, config)?,
+            // Nothing is resolved again: the identity, the request's environment, the billing scrub
+            // and the recursion marker are already in the environment the supervisor holds, and
+            // the delegate is held to the limits the turn it continues was admitted under.
+            Self::Inherited(Inherited { billing, .. }) => Admitted {
+                delegate: delegate.clone(),
+                env: host_env.clone(),
+                billing,
+                // A record from before isolation was pinned could only have run isolated.
+                isolation: delegate.isolation.unwrap_or(Isolation::Isolated),
             },
         })
     }
-}
-
-/// A turn's child as a [`Resolution`] built it.
-struct Resolved {
-    invocation: crate::delegate::Invocation,
-    /// How it runs over `codex app-server`, when it can.
-    app_server_settings: Option<AppServerSettings>,
-    /// Which automatic resume it is, when it is one.
-    auto_resume: Option<ResumeAttempt>,
 }
 
 /// What an automatic resume carries over from the turn it continues.
@@ -259,7 +249,7 @@ impl RunStore {
     /// inside a delegate, the run directory cannot be created, or the delegate cannot be launched
     /// — which includes a working directory that is not there.
     /// Returns [`RunError::ModelBlocked`] when the machine's configuration blocks the model that
-    /// would run, and [`RunError::Delegate`] with [`DelegateError::Permission`] when the
+    /// would run, and [`RunError::Delegate`] with [`DelegateError::Permission`](crate::delegate::DelegateError::Permission) when the
     /// isolation or a permission exceeds the machine file's limits, both before anything is
     /// written or launched; a follow-up is never refused for a block added after its
     /// consultation started, but is for a limit tightened since.
@@ -404,13 +394,12 @@ impl RunStore {
         let fill_defaults = matches!(admission, Admission::New);
         let isolation = delegate.resolved_isolation(config);
         let mut pinned = delegate.clone();
-        if *pinned.account() == AccountChoice::Default {
+        if pinned.account == AccountChoice::Default {
             // With no default, the CLI's own login, from now on, whatever default is added later.
-            let resolved = match config.default_account(pinned.vendor()) {
+            pinned.account = match config.default_account(pinned.vendor()) {
                 None => AccountChoice::CliLogin,
                 Some(default) => AccountChoice::Named(default.alias.clone()),
             };
-            pinned = pinned.with_account(resolved);
         }
         let vendor = pinned.vendor();
         // Only `start` calls this, so only a new consultation can meet a block.
@@ -418,21 +407,18 @@ impl RunStore {
             launched,
             rewritten_from,
             default_effort,
-        } = config.model_rules(vendor).resolve(pinned.model()).map_err(
+        } = config.model_rules(vendor).resolve(&pinned.model).map_err(
             |RefusedModel { model, blocked }| RunError::ModelBlocked {
                 vendor,
                 model,
                 blocked,
             },
         )?;
-        pinned = pinned.with_model(launched);
-        if fill_defaults
-            && pinned.effort().is_none()
-            && let Some(effort) = default_effort
-        {
-            pinned = pinned.with_effort(effort);
+        pinned.model = launched;
+        if fill_defaults && pinned.effort.is_none() {
+            pinned.effort = default_effort;
         }
-        pinned = pinned.with_isolation(isolation);
+        pinned.isolation = Some(isolation);
         if fill_defaults {
             pinned = pinned.with_default_permissions(config);
         }
@@ -473,8 +459,8 @@ impl RunStore {
     /// # Errors
     ///
     /// Returns the errors of [`RunStore::follow_up`], [`RunError::Delegate`] with
-    /// [`DelegateError::NotForVendor`] for an override of another vendor, and with
-    /// [`DelegateError::Permission`] when the turn would exceed the current limits, and
+    /// [`DelegateError::NotForVendor`](crate::delegate::DelegateError::NotForVendor) for an override of another vendor, and with
+    /// [`DelegateError::Permission`](crate::delegate::DelegateError::Permission) when the turn would exceed the current limits, and
     /// [`NotResumable::AgyIsolationChange`] for an agy consultation asked to change its
     /// isolation, before the turn is claimed.
     pub fn follow_up_with(
@@ -502,20 +488,23 @@ impl RunStore {
             let mut delegate =
                 self.current_delegate(&meta, state.newest.map(|newest| newest.index))?;
             // A record from before isolation was pinned could only have run isolated.
-            if delegate.isolation().is_none() {
-                delegate = delegate.with_isolation(Isolation::Isolated);
+            if delegate.isolation.is_none() {
+                delegate.isolation = Some(Isolation::Isolated);
             }
             // Re-read each turn rather than cached at `start`: a follow-up hours later should see
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
-            let ran_with = delegate.isolation();
+            let ran_with = delegate.isolation;
             let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
-            // Isolation decides which home agy runs in, and so where its conversation is kept.
-            if delegate.vendor() == Vendor::Agy && delegate.isolation() != ran_with {
-                return Err(NotResumable::AgyIsolationChange {
-                    run_id: run_id.clone(),
+            match delegate.permissions {
+                // Isolation decides which home agy runs in, and so where its conversation is kept.
+                Permissions::Agy if delegate.isolation != ran_with => {
+                    return Err(NotResumable::AgyIsolationChange {
+                        run_id: run_id.clone(),
+                    }
+                    .into());
                 }
-                .into());
+                Permissions::Claude(_) | Permissions::Codex(_) | Permissions::Agy => {}
             }
             let index = u32::try_from(state.transcript.turns.len()).unwrap_or(u32::MAX);
             let next = NextTurn {
@@ -741,79 +730,15 @@ impl LockedRun<'_> {
     }
 }
 
-/// What a Claude turn whose supervisor holds its input runs with, beside the arguments
-/// `claude --print` has anyway.
-///
-/// - `--input-format stream-json`: the question, and then each steer, arrive as lines of input
-///   for as long as stdin is open.
-/// - `--replay-user-messages`: Claude echoes each input line as it takes it, with the id it was
-///   sent under, which is what places a steer in the transcript and proves it arrived.
-/// - `--permission-prompts none`: nobody is there to answer a permission prompt over the open
-///   input, so anything that would prompt is denied rather than waited for.
-const CLAUDE_STREAM_INPUT_ARGS: [&str; 5] = [
-    "--input-format",
-    "stream-json",
-    "--replay-user-messages",
-    "--permission-prompts",
-    "none",
-];
-
 impl RunStore {
-    /// Decide how a turn runs, and point `invocation` at the driver when it is driven.
-    ///
-    /// Decided per turn, from the delegate's vendor, its app-server `settings` and this store: the
-    /// environment, the refusals and the billing already in `invocation` are the same either way,
-    /// and only what is run differs.
-    /// A Claude turn reads its input as stream-json from its supervisor, when it has one and the
-    /// CLI starts as itself rather than through a Windows `.cmd` shim, whose process a
-    /// cancellation could not stop the CLI through.
-    ///
-    /// Refused once an agentmux executable the turn would run has been replaced.
-    /// Asked after the delegate CLI's version probe, which can take seconds, because an upgrade
-    /// during it would otherwise launch the new build with the plan this one writes; the caller
-    /// gives the claimed turn back.
-    pub(super) fn prepare_launch_mode(
-        &self,
-        turn: &TurnDir,
-        meta: &Meta,
-        settings: Option<AppServerSettings>,
-        resume: Option<&SessionRef>,
-        invocation: &mut crate::delegate::Invocation,
-    ) -> Result<LaunchMode, RunError> {
-        self.refuse_replaced_executables()?;
-        if meta.delegate.vendor() == Vendor::Claude {
-            if self.supervisor.is_none() || !crate::launch::starts_natively(invocation) {
-                return Ok(LaunchMode::DirectCli);
-            }
-            invocation.push_args(&CLAUDE_STREAM_INPUT_ARGS);
-            return Ok(LaunchMode::ClaudeStreamInput);
-        }
-        let (Some(driver), Some(settings), false) =
-            (&self.codex_driver, settings, meta.force_codex_exec)
-        else {
-            return Ok(LaunchMode::DirectCli);
-        };
-        let plan_path = turn.app_server_plan_path();
-        write_json(
-            &plan_path,
-            &crate::appserver::DriverPlan {
-                settings,
-                cwd: meta.cwd.clone(),
-                resume_thread_id: resume.cloned(),
-                billing: invocation.billing(),
-                turn_dir: turn.root.clone(),
-            },
-        )?;
-        invocation.set_driver_command(driver.path(), crate::appserver::SUBCOMMAND, &plan_path);
-        Ok(LaunchMode::AppServer)
-    }
-
     /// Everything between claiming a turn directory and recording the running child in it.
     ///
     /// The turn's delegate was held to the machine file's limits by the caller that admitted it;
-    /// [`Delegate::invocation`] holds it once more as it builds the launch.
+    /// [`Delegate::admitted`] holds it once more as it builds the launch's environment.
     /// An automatic resume runs as the turn it continues ran, held to the limits that turn was
     /// admitted under, because its supervisor has no configuration to hold it to.
+    /// Every vendor's CLI is built, marked, told this store and asked its version here alike, and
+    /// its vendor then decides how it runs.
     pub(super) fn launch_into(
         &self,
         turn: &TurnDir,
@@ -828,41 +753,68 @@ impl RunStore {
             resume,
             label,
         } = *next;
-        write_question(turn, delegate.vendor(), index, question)?;
+        // Asked of the consultation's vendor, as its supervisor asks when it picks the file.
+        write_question(turn, index, meta.delegate.vendor(), question)?;
 
-        let last_message = turn.last_message();
         // The consultation this one continues holds the transcript its first question points at.
         let read_dirs: Vec<PathBuf> = meta.continues.iter().map(|id| self.run_dir(id)).collect();
         let plan = TurnPlan {
             question_path: &turn.question(),
-            last_message_path: &last_message,
+            last_message_path: &turn.last_message(),
             resume,
             extra_env: &meta.env,
             billing: meta.billing,
             read_dirs: &read_dirs,
         };
-        let Resolved {
-            mut invocation,
-            app_server_settings,
-            auto_resume,
-        } = resolution.resolve(delegate, &plan, &self.host_env, &self.agy_home())?;
+        let auto_resume = match resolution {
+            Resolution::Configured(_) => None,
+            Resolution::Inherited(inherited) => Some(inherited.attempt),
+        };
+        let Admitted {
+            delegate: admitted,
+            env,
+            billing,
+            isolation,
+        } = resolution.resolve(delegate, &plan, &self.host_env)?;
+
+        let mut invocation = admitted.native(&plan, isolation, env, billing, Some(&self.root))?;
         // The store's own root, resolved, rather than whatever the host exported: an agentmux
         // started underneath this delegate has to open the same store to recognise the delegate
         // as its ancestor, and the platform default can differ between the two environments.
         invocation.set_state_dir_env(Self::STATE_DIR_ENV, &self.root);
-
-        // Asked of the delegate's own CLI before the launch mode can put the driver in its place.
+        // Asked of the delegate's own CLI before its vendor can put a driver in its place.
         let cli_version = self.launcher.version(&invocation, &meta.cwd);
-        let launch_mode =
-            self.prepare_launch_mode(turn, meta, app_server_settings, resume, &mut invocation)?;
-        refuse_an_unverified_profile(launch_mode, delegate, cli_version.as_deref())?;
+        // Asked after the version probe, which can take seconds, because an upgrade during it
+        // would otherwise launch the new build with the plan this one writes; the caller gives
+        // the claimed turn back.
+        self.refuse_replaced_executables()?;
+        let PreparedLaunch {
+            invocation,
+            mode: launch_mode,
+            driver_plan,
+        } = admitted.prepare(
+            invocation,
+            &LaunchRequest {
+                turn,
+                cwd: &meta.cwd,
+                resume,
+                isolation,
+                cli_version: cli_version.as_deref(),
+                supervisor: self.supervisor.is_some(),
+                codex_driver: self.codex_driver.as_ref().map(super::Executable::path),
+                codex_exec: meta.force_codex_exec,
+            },
+        )?;
+        if let Some(driver_plan) = &driver_plan {
+            write_json(&turn.app_server_plan_path(), driver_plan)?;
+        }
 
         // Asked of the environment the child gets, before the spawn: a delegate inherits whatever
         // confines this process, so a session store this process cannot write to is one the
         // delegate cannot save into, and a follow-up would resume a session that was never kept.
         // Both directories are as the child resolves them: a relative one from its own working
         // directory, not from this process's.
-        let vendor = delegate.vendor();
+        let vendor = admitted.vendor();
         let config_dir = vendor
             .config_dir(invocation.env())
             .map(|dir| meta.cwd.join(dir));
@@ -918,13 +870,25 @@ impl RunStore {
             "launching delegate",
         );
 
+        self.start_child(turn, meta, index, &invocation)
+    }
+
+    /// Start turn `index`'s delegate as `invocation`, under its supervisor when this store
+    /// supervises its turns, and record it.
+    fn start_child(
+        &self,
+        turn: &TurnDir,
+        meta: &Meta,
+        index: u32,
+        invocation: &Invocation,
+    ) -> Result<(), RunError> {
         if let Some(supervisor) = &self.supervisor {
-            return self.launch_supervisor(turn, meta, index, &invocation, supervisor.path());
+            return self.launch_supervisor(turn, meta, index, invocation, supervisor.path());
         }
         let launched = self.launcher.launch(&LaunchSpec {
-            invocation: &invocation,
+            invocation,
             cwd: &meta.cwd,
-            input: LaunchInput::Question(&turn.stdin(delegate.vendor())),
+            input: LaunchInput::Question(&turn.stdin(meta.delegate.vendor())),
             events: &turn.events(),
             stderr: &turn.stderr(),
         })?;
@@ -958,7 +922,7 @@ impl RunStore {
         turn: &TurnDir,
         meta: &Meta,
         index: u32,
-        delegate: &crate::delegate::Invocation,
+        delegate: &Invocation,
         supervisor: &Path,
     ) -> Result<(), RunError> {
         let launch_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1022,52 +986,20 @@ impl RunStore {
     }
 }
 
-/// Write turn `index`'s question, and for a CLI that reads it as a record, the record it reads,
-/// which the transcript never shows.
+/// Write turn `index`'s question, and beside it the record a `vendor` CLI reads in its place when
+/// it reads one, which the transcript never shows.
 fn write_question(
     turn: &TurnDir,
-    vendor: Vendor,
     index: u32,
+    vendor: Vendor,
     question: &str,
 ) -> Result<(), RunError> {
     std::fs::write(turn.question(), question)
         .map_err(RunError::io(format!("writing turn {index} question")))?;
-    match vendor {
-        Vendor::Agy => std::fs::write(
-            turn.encoded_question(),
-            crate::delegate::agy_input(question),
-        )
-        .map_err(RunError::io(format!(
-            "writing turn {index} encoded question"
-        ))),
-        Vendor::Claude | Vendor::Codex => Ok(()),
-    }
-}
-
-/// Refuse a `codex exec` turn that needs a permission profile from a codex whose `--version`,
-/// `cli_version`, is not one verified to honour it.
-///
-/// `codex exec` reaches read-only with network only through a permission profile, which a codex
-/// that does not honour it would replace with whatever its configuration selects.
-/// The app-server sets the same policy as a field of the turn instead, and needs no profile.
-fn refuse_an_unverified_profile(
-    launch_mode: LaunchMode,
-    delegate: &Delegate,
-    cli_version: Option<&str>,
-) -> Result<(), RunError> {
-    let needs_profile = delegate
-        .codex_permissions()
-        .is_some_and(|permissions| permissions.needs_permission_profile());
-    if launch_mode == LaunchMode::DirectCli
-        && needs_profile
-        && !codex_supports_permission_profiles(cli_version)
-    {
-        return Err(DelegateError::Permission(
-            crate::config::PermissionRefusal::PermissionProfileUnsupported {
-                version: cli_version.map(ToOwned::to_owned),
-            },
-        )
-        .into());
+    if let Some(encode) = vendor.question_encoder() {
+        std::fs::write(turn.encoded_question(), encode(question)).map_err(RunError::io(
+            format!("writing turn {index} encoded question"),
+        ))?;
     }
     Ok(())
 }

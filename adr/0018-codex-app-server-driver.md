@@ -38,10 +38,11 @@ cancellation grace still depend on the recorded launch mode (`LaunchMode`). What
 becomes follows codex's own exec client, written as the `codex_app_server_protocol::exec` mirror
 ([0019](0019-generated-app-server-protocol.md)).
 
-`Delegate::app_server_settings` is the one place that decides a delegate can run this way — Codex
-and `Isolation::Inherit` only, which is what a Codex consultation gets unless the caller or the
-machine file chooses `ignore_user_config = true` ([0026](0026-delegate-permissions.md)) — and
-`RunStore::with_codex_app_server` opts a store in; without it every Codex turn is `exec`.
+Codex's launch preparation (`vendor::codex::prepare`) is the one place that decides a delegate can
+run this way — Codex and `Isolation::Inherit` only, which is what a Codex consultation gets unless
+the caller or the machine file chooses `ignore_user_config = true`
+([0026](0026-delegate-permissions.md)) — and `RunStore::with_codex_app_server` opts a store in;
+without it every Codex turn is `exec`.
 
 Under a supervisor ([0025](0025-eager-settlement-and-terminal-waiting.md)) the driver is the
 delegate the supervisor starts and records, and the supervisor settles the turn once the driver has

@@ -88,5 +88,5 @@ Moving it is deliberate:
 `codex-app-server-codegen refresh` refuses a codex other than the pin, and one whose app-server
 accepts `--ignore-user-config`. Treat the second refusal as a decision to revisit, not something to
 work around: ADR [0019](../../../adr/0019-generated-app-server-protocol.md) explains the gate,
-and `Delegate::app_server_settings` with ADR
+and `vendor::codex::prepare` with ADR
 [0018](../../../adr/0018-codex-app-server-driver.md) governs which delegates are driven.

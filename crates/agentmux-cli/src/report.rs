@@ -19,6 +19,7 @@ use agentmux::run::{
 use agentmux::transcript::{Outcome, TurnState};
 use color_eyre::eyre::Result;
 use serde::Serialize;
+use strum::VariantArray as _;
 
 use crate::cli::{TailArgs, WaitArgs};
 
@@ -674,8 +675,9 @@ pub fn accounts(
             project_config_path: config.project_source.as_deref(),
             config,
             unknown_keys: &config.unknown,
-            permits: Vendor::ALL
-                .into_iter()
+            permits: Vendor::VARIANTS
+                .iter()
+                .copied()
                 .map(|vendor| (vendor, config.describe_permissions(vendor)))
                 .collect(),
         };
@@ -755,7 +757,7 @@ pub fn accounts(
 
     let home = agentmux::config::home_dir(host_env);
 
-    for vendor in Vendor::ALL {
+    for &vendor in Vendor::VARIANTS {
         println!();
         let label = format!("{vendor}");
         match config.default_account(vendor) {

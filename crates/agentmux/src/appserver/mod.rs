@@ -23,7 +23,7 @@
 //!   supervisor that launches it, as the delegate it starts, and records it; the driver itself is
 //!   unchanged, and the supervisor settles the turn once the driver has gone.
 //! - Its stdin is the turn's question file; its stdout is the turn's `events.jsonl`, written in
-//!   the `codex exec --json` shape, so [`crate::stream::codex`] folds both launch modes and the
+//!   the `codex exec --json` shape, so [`crate::vendor::codex::fold`] folds both launch modes and the
 //!   rendered transcript does not depend on which one ran; its stderr, shared with the server it
 //!   spawns, is the turn's `stderr.log`.
 //! - It spawns `codex app-server` as its own child, in the driver's process group, so a driver the
@@ -101,7 +101,7 @@
 //! A claimed message is answered with exactly what the driver knows:
 //!
 //! - accepted, once the server's answer names the turn it was sent into and the capture holds it
-//!   as a [`CaptureEvent::Steer`](crate::stream::codex::CaptureEvent::Steer), where it arrived
+//!   as a [`CaptureEvent::Steer`](crate::vendor::codex::fold::CaptureEvent::Steer), where it arrived
 //!   and before the end of the turn, which the fold stops at;
 //! - rejected, when the server refused it or it was never sent;
 //! - unconfirmed, whenever it was sent and its acceptance cannot be established and recorded —
@@ -137,8 +137,7 @@
 //!
 //! # What runs this way
 //!
-//! Only a Codex delegate that inherits its account's settings: see
-//! [`crate::delegate::Delegate::app_server_settings`].
+//! Only a Codex delegate that inherits its account's settings: see `vendor::codex::prepare`.
 //! An isolated delegate's isolation is `codex exec --ignore-user-config`, and codex-cli 0.159.3's
 //! app-server has no such flag; its own source keeps that loader override to `exec` and the TUI.
 //! Running it with a private `CODEX_HOME` holding only the login instead was rejected, because
@@ -179,8 +178,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::delegate::{AppServerSettings, Billing, SessionRef};
+use crate::delegate::{Billing, SessionRef};
 use crate::run::layout::TurnDir;
+use crate::vendor::codex::AppServerSettings;
 
 pub use driver::{DriverOutcome, DriverTimeouts, STOP_BUDGET, drive, drive_with};
 pub(crate) use protocol::initialize_params;

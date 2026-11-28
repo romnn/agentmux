@@ -85,7 +85,8 @@ Both check messages against codex's own schema; see ADR
 
 The recorded streams live under `crates/agentmux/fixtures/{claude,codex,agy}/`, registered in
 `agentmux::testing::fixtures`. They were captured from real runs with the exact flags
-`crates/agentmux/src/delegate.rs` builds. `crates/agentmux/tests/capture.rs` checks them:
+each vendor's module under `crates/agentmux/src/vendor/` builds.
+`crates/agentmux/tests/capture.rs` checks them:
 `no_committed_fixture_contains_an_unnamed_event_type` fails if a fixture contains an event type the
 parser does not name, which is how a CLI's format change becomes loud instead of lossy, and
 `every_fixture_renders_monotonically_over_its_prefixes` renders every fixture at every line cut.

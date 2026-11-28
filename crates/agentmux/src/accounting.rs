@@ -4,22 +4,12 @@
 //!
 //! A turn keeps the vendor's figures exactly as they were reported, in a [`SpendReport`], and its
 //! footer quotes them so; nothing here changes that evidence.
-//! What the figures mean depends on who reported them, and this module is the one place that
-//! knows:
-//!
-//! - Codex's tokens are its thread's running total, which a resumed thread carries on from, and
-//!   it reports no price.
-//! - Claude's tokens cover the one call.
-//!   Its `total_cost_usd` covered the one call until Claude Code 2.1.277, and has been the
-//!   session's running total across `--resume` since.
-//!   A price whose release cannot be read has no known scope, so it is not counted rather than
-//!   guessed at.
-//! - agy's tokens are its conversation's running total, which `--conversation` carries on from,
-//!   and it reports no price.
-//!
-//! Codex counts cache reads inside its prompt tokens, and Claude and agy count cache reads beside
-//! them, Claude cache writes too, so a [`Tokens`] figure counts every prompt token, with the cached
-//! ones as a part of it, and counts reasoning as a part of the output, as every vendor does.
+//! What the figures mean depends on who reported them, which each vendor's module says in its
+//! `read_spend`: what its tokens count, and what its tokens and its price cover, one turn or the
+//! session so far.
+//! This module takes it from there, and keeps every vendor's figures in one set of categories:
+//! a [`Tokens`] figure counts every prompt token, with the cached ones as a part of it, and counts
+//! reasoning as a part of the output, as every vendor does.
 //!
 //! # Deriving spend
 //!
@@ -59,12 +49,9 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
-use crate::delegate::{Vendor, release_of};
+use crate::delegate::Vendor;
 use crate::transcript::{SpendReport, Turn, Usage};
-
-/// The first Claude Code release whose `total_cost_usd` is the session's running total across
-/// `--resume` rather than the one call's, as Anthropic's cost-tracking documentation says.
-const CLAUDE_SESSION_COST_SINCE: (u64, u64, u64) = (2, 1, 277);
+use crate::vendor::{agy, claude, codex};
 
 /// Token counts in one set of categories whatever the vendor.
 ///
@@ -95,8 +82,9 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// What a vendor's figures count, in these categories.
-    fn reported(vendor: Vendor, usage: &Usage) -> Self {
+    /// What figures whose `input_tokens` already count the cached prompt tokens count, as
+    /// Codex's do.
+    pub(crate) fn cache_inside_input(usage: &Usage) -> Self {
         let Usage {
             input_tokens,
             cached_input_tokens,
@@ -104,22 +92,29 @@ impl Tokens {
             output_tokens,
             reasoning_output_tokens,
         } = *usage;
-        let input_tokens = match vendor {
-            Vendor::Codex => input_tokens,
-            // Claude and agy count the cached prompt tokens beside their `input_tokens`, not
-            // inside it; agy reports no cache writes.
-            Vendor::Claude | Vendor::Agy => input_tokens.map(|uncached| {
-                uncached
-                    .saturating_add(cached_input_tokens.unwrap_or(0))
-                    .saturating_add(cache_write_input_tokens.unwrap_or(0))
-            }),
-        };
         Self {
             input_tokens,
             cached_input_tokens,
             cache_write_input_tokens,
             output_tokens,
             reasoning_output_tokens,
+        }
+    }
+
+    /// What figures that count the cached prompt tokens beside their `input_tokens`, not inside
+    /// it, count, as Claude's and agy's do.
+    ///
+    /// Claude counts the prompt tokens written to the cache beside them too; agy reports no cache
+    /// writes.
+    pub(crate) fn cache_beside_input(usage: &Usage) -> Self {
+        let counted = Self::cache_inside_input(usage);
+        Self {
+            input_tokens: counted.input_tokens.map(|uncached| {
+                uncached
+                    .saturating_add(counted.cached_input_tokens.unwrap_or(0))
+                    .saturating_add(counted.cache_write_input_tokens.unwrap_or(0))
+            }),
+            ..counted
         }
     }
 
@@ -248,36 +243,21 @@ impl Measure for f64 {
 
 /// What a vendor's figure covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
+pub(crate) enum Scope {
     /// What the one turn spent.
     Turn,
     /// The session's running total.
     Session,
 }
 
-/// What a vendor's token figures cover.
-fn token_scope(vendor: Vendor) -> Scope {
-    match vendor {
-        Vendor::Codex | Vendor::Agy => Scope::Session,
-        Vendor::Claude => Scope::Turn,
-    }
-}
-
-/// What a vendor's price covers, or `None` when that cannot be known.
-fn price_scope(vendor: Vendor, cli_version: Option<&str>) -> Option<Scope> {
-    match vendor {
-        // Neither Codex nor agy reports a price, so a price one did report would be in a scope
-        // nothing documents.
-        Vendor::Codex | Vendor::Agy => None,
-        Vendor::Claude => {
-            let release = cli_version.and_then(release_of)?;
-            Some(if release < CLAUDE_SESSION_COST_SINCE {
-                Scope::Turn
-            } else {
-                Scope::Session
-            })
-        }
-    }
+/// What one vendor's report of a turn says, read as that vendor means it.
+pub(crate) struct ReadSpend {
+    /// The tokens it reports, in the categories every vendor's are kept in.
+    pub(crate) tokens: Tokens,
+    /// What those tokens cover.
+    pub(crate) tokens_cover: Scope,
+    /// What its price covers, or `None` when that cannot be known.
+    pub(crate) price_covers: Option<Scope>,
 }
 
 /// What a run of turns spent of one measure, by the turns it covers.
@@ -476,18 +456,26 @@ impl Accounting {
                 continue;
             };
 
-            let reported_tokens = Tokens::reported(vendor, usage);
+            let ReadSpend {
+                tokens: reported_tokens,
+                tokens_cover,
+                price_covers,
+            } = match vendor {
+                Vendor::Claude => claude::read_spend(usage, cli_version.as_deref()),
+                Vendor::Codex => codex::read_spend(usage),
+                Vendor::Agy => agy::read_spend(usage),
+            };
             // Token scopes are fixed per vendor, so no token figure is refused today; one that
             // were refused would still be a figure the totals leave out.
             if !reported_tokens.is_nothing()
-                && !tokens.record(number, reported_tokens, token_scope(vendor))
+                && !tokens.record(number, reported_tokens, tokens_cover)
             {
                 unattributed.insert(number);
                 tokens_incomplete = true;
             }
 
             if let Some(price) = cost_usd.filter(|price| !price.is_nothing()) {
-                let attributed = if let Some(scope) = price_scope(vendor, cli_version.as_deref()) {
+                let attributed = if let Some(scope) = price_covers {
                     prices.record(number, price, scope)
                 } else {
                     prices.lose_track(number);

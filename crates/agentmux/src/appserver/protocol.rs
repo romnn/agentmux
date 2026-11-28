@@ -9,7 +9,8 @@ use codex_app_server_protocol::envelope::{EncodeError, Message, RequestId};
 use codex_app_server_protocol::methods::{self, AnyServerRequest};
 use codex_app_server_protocol::{Method as _, ServerRequest, TypedResponse, types as wire};
 
-use crate::delegate::{CodexSandbox, SessionRef};
+use crate::delegate::SessionRef;
+use crate::vendor::codex::CodexSandbox;
 
 /// Notifications the driver asks the server not to send.
 ///
