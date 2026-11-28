@@ -14,9 +14,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use agentmux::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use agentmux::appserver::{DriverOutcome, DriverPlan, DriverTimeouts, drive_with};
 use agentmux::delegate::{AccountChoice, Billing, ModelId, Permissions, SessionRef, Vendor};
+use agentmux::driver::mailbox::{Mailbox, SteerId, SteerReply};
 use agentmux::stream::{self, Fold};
 use agentmux::transcript::{MessageSource, Outcome, render_turn};
 use agentmux::vendor::codex::{AppServerSettings, CodexPermissions, CodexSandbox};

@@ -1199,8 +1199,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use agentmux::appserver::DriverPlan;
-    use agentmux::appserver::mailbox::{Mailbox, SteerReply};
     use agentmux::delegate::{AccountChoice, Delegate, Effort, Isolation, ModelId, Permissions};
+    use agentmux::driver::mailbox::{Mailbox, SteerReply};
     use agentmux::run::{Retention, RunStore, StartRequest};
     use agentmux::testing::{Script, ScriptedLauncher};
     use agentmux::vendor::codex::{CodexPermissions, CodexSandbox};

@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentmux::appserver::mailbox::{Mailbox, SteerReply};
-use agentmux::appserver::{DriverPlan, STOP_BUDGET};
+use agentmux::appserver::DriverPlan;
 use agentmux::delegate::{
     AccountChoice, Billing, Delegate, Effort, Isolation, ModelId, Permissions,
 };
+use agentmux::driver::STOP_BUDGET;
+use agentmux::driver::mailbox::{Mailbox, SteerReply};
 use agentmux::launch::{Launched, Launcher as _};
 use agentmux::run::{
     NotRunningReason, Retention, RunError, RunId, RunStatus, RunStore, StartRequest, SteerError,

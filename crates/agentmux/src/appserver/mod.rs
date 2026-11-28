@@ -32,34 +32,9 @@
 //! - Two threads move the bytes — one reads the server's output, one writes its input — and the
 //!   driver's own thread decides everything, so a server that stops reading cannot keep the driver
 //!   from its deadlines or from a cancellation.
-//! - When the turn is over it closes the server's input, gives the server a few seconds, and then
-//!   stops whatever the server left running: codex's sandbox starts each command in a session of
-//!   its own, which no signal to a process group reaches, so the driver reads the server's
-//!   process tree while it still holds the server's input open, and signals what survives by pid
-//!   and start time.
-//!   On Linux it adopts what the server orphans, so a command a crashed server left behind is
-//!   still found below it, and it waits for each adopted orphan that exits so none lingers in
-//!   the process table.
-//!   Elsewhere it records that tree every second while the turn runs instead, which is best
-//!   effort: on macOS, any process started and orphaned between two records is out of reach,
-//!   whether or not the server crashed — a job a command backgrounds with `nohup … &` is
-//!   orphaned as soon as its shell exits.
-//!   On Windows the driver holds everything below it in a kill-on-close job object instead, and
-//!   reads no process tree, because a recorded parent pid proves nothing there; a process codex
-//!   deliberately starts outside the job is let go.
-//!   All of it is bounded and best effort: the sweep gives up at its deadline, and a driver that
-//!   cannot adopt or cannot make the job says so on stderr and contains less.
-//! - What the turn left running is what the driver knew of before closing the server's input
-//!   that was already outside the server's process tree — an orphan whose shell exited, as a
-//!   job backgrounded with `nohup … &` is — and that the sweep still found alive once the server
-//!   had exited.
-//!   Everything below the server then is codex's to stop: its MCP servers, and its command
-//!   shells with whatever still runs below them, which is swept but not reported.
-//!   The driver looks once more after its last signal, and keeps each such process's pid, start
-//!   time, name and whether it still runs in the turn's `left-running.json` before it exits, so
-//!   the transcript and `status` can say that work in them may be incomplete
-//!   ([`crate::left_running`]).
-//!   Nothing is kept for a cancelled turn, nor on Windows, where nothing is read.
+//! - When the turn is over it closes the server's input, gives the server a few seconds, and stops
+//!   whatever the server left running, keeping what it finds in the turn's `left-running.json`,
+//!   as [`crate::driver`] describes for every driver.
 //!
 //! # Protocol flow
 //!
@@ -93,7 +68,7 @@
 //!
 //! # Steering and cancelling go through files
 //!
-//! Whoever steers writes a request into the turn's [`mailbox`]; the driver claims it by creating
+//! Whoever steers writes a request into the turn's [`mailbox`](crate::driver::mailbox); the driver claims it by creating
 //! its one decision file, sends `turn/steer`, and writes a reply beside it.
 //! A caller that gives up first withdraws the request by creating that same decision file, and
 //! exactly one of the two can create it, so a message is either claimed or withdrawn, and a
@@ -169,8 +144,6 @@
 //!
 
 mod driver;
-mod leftovers;
-pub mod mailbox;
 mod protocol;
 mod translate;
 
@@ -182,7 +155,7 @@ use crate::delegate::{Billing, SessionRef};
 use crate::run::layout::TurnDir;
 use crate::vendor::codex::AppServerSettings;
 
-pub use driver::{DriverOutcome, DriverTimeouts, STOP_BUDGET, drive, drive_with};
+pub use driver::{DriverOutcome, DriverTimeouts, drive, drive_with};
 pub(crate) use protocol::initialize_params;
 
 /// What to do when a driven Codex turn fails or codex sends what agentmux cannot read: run the

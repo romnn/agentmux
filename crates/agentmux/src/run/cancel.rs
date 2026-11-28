@@ -31,10 +31,10 @@ impl RunStore {
     /// How long a cancelled turn run by an agentmux driver is given to interrupt itself and
     /// leave, before it is signalled like any other child.
     ///
-    /// The driver takes at most [`crate::appserver::STOP_BUDGET`] to interrupt the turn, let the
+    /// The driver takes at most [`crate::driver::STOP_BUDGET`] to interrupt the turn, let the
     /// server exit and stop what it left running, so this outlasts all of it.
     pub(super) const DRIVER_EXIT_GRACE: Duration =
-        crate::appserver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
+        crate::driver::STOP_BUDGET.saturating_add(Duration::from_secs(5));
 
     /// Stop a running consultation.
     ///

@@ -776,7 +776,7 @@ commands it left running are stopped too, within a time budget and on a best-eff
 macOS, a command started by a crashed server's command after the driver's last once-a-second check
 is out of reach.
 [ADR 0018](adr/0018-codex-app-server-driver.md) explains why it is built this way, and
-`crates/agentmux/src/appserver/mod.rs` how the process tree is found on each platform.
+`crates/agentmux/src/driver/mod.rs` how the process tree is found on each platform.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
 with `codex exec` instead, for a CLI whose app-server cannot run them; no Codex turn is steerable

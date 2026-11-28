@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::appserver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::delegate::{Delegate, Isolation, Permissions};
+use crate::driver::mailbox::{Mailbox, SteerId, SteerReply};
 use crate::launch::{Launched, Liveness};
 use crate::stream::TurnInput;
 use crate::transcript::Outcome;

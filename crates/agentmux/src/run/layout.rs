@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::appserver::mailbox::Mailbox;
 use crate::delegate::Vendor;
+use crate::driver::mailbox::Mailbox;
 use crate::launch::Launched;
 
 use super::RunStore;

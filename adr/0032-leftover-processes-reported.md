@@ -36,10 +36,10 @@ session already holds it. It is never sent as `developer_instructions`, which wo
 user's own configured value.
 
 **The app-server driver reports what the turn left running, on Unix.** In `stop_server`
-(`crates/agentmux/src/appserver/driver.rs`):
+(`crates/agentmux/src/driver/mod.rs`):
 
 - Before closing the server's input, it reads its descendants with each one's parent.
-- The cohort (`appserver::leftovers::Cohort`) is every process the driver knew of then — that
+- The cohort (`driver::leftovers::Cohort`) is every process the driver knew of then — that
   live tree, and the identities the once-a-second record saw while the turn ran — that was not the
   server or below it in that tree, and that one of the sweep's reads after the server exited found
   alive, pid and start time matching and not a zombie. On Linux these are orphans the driver
