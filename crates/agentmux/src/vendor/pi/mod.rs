@@ -7,7 +7,6 @@
 
 pub mod driver;
 pub mod fold;
-pub(crate) mod quota;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,8 +20,8 @@ use crate::run::LaunchMode;
 use crate::transcript::Usage;
 use driver::{PiPlan, PiSession};
 
-/// pi's own arguments for one turn under `isolation`, before the run store adds where its session
-/// is kept.
+/// pi's own arguments for one turn under `isolation`, before its driver adds where its session is
+/// kept.
 ///
 /// - `--mode rpc`: the driver sends the model, the effort and the question as commands, and steers
 ///   the running turn, so none of them is in the argument vector.
@@ -64,20 +63,13 @@ pub(crate) fn prepare(
     request: &LaunchRequest<'_>,
 ) -> Result<PreparedLaunch, DelegateError> {
     let driver = request.driver.ok_or(DelegateError::PiUndriven)?;
-    let session_dir = request.run_dir.join("pi");
-    let file = session_dir.join("session.jsonl");
-    let mut args = invocation.args().to_vec();
-    for (flag, path) in [("--session-dir", &session_dir), ("--session", &file)] {
-        args.push(flag.to_owned());
-        args.push(path.to_string_lossy().into_owned());
-    }
     let plan = PiPlan {
         program: Vendor::Pi.program().to_owned(),
-        args,
+        args: invocation.args().to_vec(),
         model: delegate.model.clone(),
         effort: delegate.effort.clone(),
         session: PiSession {
-            file,
+            file: request.run_dir.join("pi").join("session.jsonl"),
             expect_id: request.resume.cloned(),
         },
         cwd: request.cwd.to_path_buf(),
@@ -144,10 +136,13 @@ pub(crate) fn is_billing_env_name(upper: &str) -> bool {
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_LOGIN_CACHE_DIRECTORY",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_GENAI_USE_VERTEXAI",
         "GOOGLE_GENAI_USE_ENTERPRISE",
         "CLOUDSDK_CONFIG",
+        "GOOGLE_CLOUD_LOCATION",
         "AZURE_OPENAI_BASE_URL",
         "AZURE_OPENAI_ENDPOINT",
         "AZURE_OPENAI_RESOURCE_NAME",

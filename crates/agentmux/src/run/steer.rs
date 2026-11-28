@@ -204,9 +204,12 @@ impl RunStore {
             Err(Refusal::ReadsQuestionOnce) => {
                 // The running turn's own isolation, which a follow-up may have changed.
                 let current = self.current_delegate(&meta, Some(files.index))?;
-                return Err(SteerError::NotSteerable {
-                    run_id: run_id.clone(),
-                    reason: why_not_steerable(&current),
+                return Err(match why_not_steerable(&current) {
+                    Some(reason) => SteerError::NotSteerable {
+                        run_id: run_id.clone(),
+                        reason,
+                    },
+                    None => not_running(NotRunningReason::NotLaunched),
                 }
                 .into());
             }
@@ -321,15 +324,16 @@ enum ClaudeProgress {
     TurnEnded,
 }
 
-/// Why a turn of this delegate that was launched to read its question once offers no way in.
-pub(super) fn why_not_steerable(delegate: &Delegate) -> UnsteerableReason {
-    match delegate.permissions {
+/// Why a turn of this delegate that was launched to read its question once offers no way in, or
+/// `None` for pi, whose every turn is driven, so its record names no such launch.
+pub(super) fn why_not_steerable(delegate: &Delegate) -> Option<UnsteerableReason> {
+    Some(match delegate.permissions {
         Permissions::Claude(_) => UnsteerableReason::ClaudePrint,
         Permissions::Codex(_) => match delegate.isolation {
             Some(Isolation::Inherit) => UnsteerableReason::CodexExec,
             Some(Isolation::Isolated) | None => UnsteerableReason::CodexIsolated,
         },
         Permissions::Agy => UnsteerableReason::AgyPrint,
-        Permissions::Pi => UnsteerableReason::PiUndriven,
-    }
+        Permissions::Pi => return None,
+    })
 }

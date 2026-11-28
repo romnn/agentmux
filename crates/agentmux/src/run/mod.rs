@@ -252,14 +252,15 @@ impl RunStore {
         self
     }
 
-    /// Drive every Codex turn that can run over `codex app-server` through `driver`, so it can be
-    /// steered while it runs.
+    /// Drive every Codex turn that can run over `codex app-server`, and every pi turn, through
+    /// `driver`, so they can be steered while they run.
     ///
     /// `driver` is an `agentmux` executable: the run store launches it as
-    /// `<driver> codex-app-server <plan>`, and it runs [`crate::appserver::drive`].
+    /// `<driver> codex-app-server <plan>`, which runs [`crate::appserver::drive`], or as
+    /// `<driver> pi-rpc <plan>`, which runs [`crate::vendor::pi::driver::drive`].
     /// Only a Codex delegate that inherits its account's settings runs this way — see
-    /// `vendor::codex::prepare` — and every other turn still runs over `codex exec`,
-    /// `claude --print` or `agy --print`.
+    /// `vendor::codex::prepare` — and every other Codex turn still runs over `codex exec`; a store
+    /// without a driver refuses a pi turn.
     /// [`RunStore::with_codex_exec`] keeps Codex turns on `codex exec` all the same.
     /// Like the supervisor, the file is remembered as it is now, and a launch is refused once it
     /// changes.

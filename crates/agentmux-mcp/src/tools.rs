@@ -1134,8 +1134,9 @@ instruction to a turn that is still running, which the delegate sees before its 
 only a turn `status` reports as `steerable: yes` takes one: a running `claude` turn until it has
 reported its result, a running `codex` turn whose consultation inherits its account's
 settings, because only those are launched over Codex's app-server, and a running `pi` turn until
-it settles. A `pi` turn takes a steer only between its model calls, so `steer` may report one it
-has not taken yet as unconfirmed, and it still arrives.
+it settles. A `pi` steer is confirmed when pi takes it between model calls, which on a slow model
+can take longer than `steer` waits: an unconfirmed steer may still be taken, so read the transcript
+before resending it. One that arrives after the turn has settled is refused.
 
 A `codex` delegate over the app-server can ask you a question mid-turn, and does not wait for the
 answer: it carries on under an assumption of its own, or polls for a reply. The

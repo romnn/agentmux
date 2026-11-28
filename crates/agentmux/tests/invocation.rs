@@ -2019,6 +2019,7 @@ fn a_pi_turn_carries_no_credential_into_its_launch() -> Result<()> {
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "HF_TOKEN",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_LOCATION",
         "KIMI_OAUTH_HOST",
     ];
     let config = state.path().join("agentmux.toml");

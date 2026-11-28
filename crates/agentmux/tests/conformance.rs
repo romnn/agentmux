@@ -27,8 +27,8 @@ struct Conformance {
     follow_up: &'static str,
     /// The session `first` opened.
     session: &'static str,
-    /// The argument the session to resume follows on the CLI's command line, which for pi
-    /// names the file the session is in.
+    /// The argument the session to resume follows on the CLI's command line; pi's driver gives
+    /// it the session file its plan names, which every turn shares.
     resume_arg: &'static str,
 }
 
@@ -158,13 +158,13 @@ fn every_vendor_settles_a_turn_and_resumes_its_session() -> Result<()> {
             // pi's command is in its driver's plan, which names the session's file and the
             // session the driver checks the file holds.
             Vendor::Pi => {
-                let plan = PiPlan::read(Path::new(resumed.args.get(1).or_fail()?)).or_fail()?;
-                let file = plan.session.file.to_string_lossy();
-                plan.session.expect_id.as_ref().map(SessionRef::as_str) == Some(case.session)
-                    && plan
-                        .args
-                        .windows(2)
-                        .any(|pair| pair == [case.resume_arg, file.as_ref()])
+                let plan = |launch: usize| -> Result<PiPlan> {
+                    let path = launches.get(launch).or_fail()?.args.get(1).or_fail()?;
+                    PiPlan::read(Path::new(path)).or_fail()
+                };
+                let (first, resumed) = (plan(0)?, plan(1)?);
+                resumed.session.expect_id.as_ref().map(SessionRef::as_str) == Some(case.session)
+                    && resumed.session.file == first.session.file
             }
             Vendor::Claude | Vendor::Codex | Vendor::Agy => {
                 resumed.has_flag_with(case.resume_arg, case.session)

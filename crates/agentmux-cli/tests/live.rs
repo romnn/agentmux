@@ -368,8 +368,9 @@ async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
             permissions: Permissions::Pi,
         },
         question:
-            "Read the file notes.txt with your read tool. Then reply with one line: LIVE_DONE, \
-                   followed by anything else you have been asked to add."
+            "Remember the secret word ZEPPELIN. Read the file notes.txt with your read tool. \
+                   Then reply with one line: LIVE_DONE, followed by anything else you have been \
+                   asked to add."
                 .to_owned(),
         cwd: project,
         retention: Retention::UntilReleased,
@@ -405,12 +406,13 @@ async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
     assert_that!(reply, contains_substring("LIVE_DONE"));
     assert_that!(reply, contains_substring("STEERED"));
 
-    // A follow-up continues the session pi saved in the consultation's directory.
+    // A follow-up continues the session pi saved in the consultation's directory, so it recalls
+    // the word only the first question named.
     wait_for_status(&store, &id, "the driver never left", |status| {
         status.resumable
     })
     .await?;
-    store.follow_up(&id, "Reply with exactly LIVE_AGAIN and nothing else.")?;
+    store.follow_up(&id, "What was the secret word? Reply with only the word.")?;
     store
         .wait_until_terminal(&id, Duration::from_secs(300))
         .await?;
@@ -421,7 +423,7 @@ async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
     );
     assert_that!(followed.broke_continuity, eq(false));
     let (_, replies) = page.text.split_once("### assistant").or_fail()?;
-    assert_that!(replies, contains_substring("LIVE_AGAIN"));
+    assert_that!(replies, contains_substring("ZEPPELIN"));
 
     // A long turn is aborted over RPC once it runs, and nothing of pi's is left running.
     wait_for_status(&store, &id, "the driver never left", |status| {
@@ -449,6 +451,7 @@ async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
         .split_once("### assistant")
         .map_or("", |(_, replies)| replies);
     assert_that!(replies, not(contains_substring("LIVE_LATE")));
+    #[cfg(target_os = "linux")]
     assert_that!(processes_naming(&run_dir)?, is_empty());
     assert_that!(
         cancelled.unrecognised.summary(),
@@ -459,7 +462,8 @@ async fn a_live_pi_turn_is_steered_followed_up_and_cancelled() -> Result<()> {
 }
 
 /// The pid of every process whose command line names `path`, which for a pi turn's driver and
-/// pi is its consultation's directory; Linux only, where `/proc` says.
+/// pi is its consultation's directory, as Linux's `/proc` says.
+#[cfg(target_os = "linux")]
 fn processes_naming(path: &Path) -> Result<Vec<u32>> {
     let path = path.to_string_lossy();
     let mut found = Vec::new();

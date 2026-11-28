@@ -15,8 +15,9 @@ What the probe and the live runs established:
   `stopReason`.
   pi exits 0 even when the provider failed, so only that message says so.
 - **Input.** Closing pi's stdin aborts a running turn, and SIGTERM ends pi without a terminal event.
-- **Steering.** `steer` is answered `queued` at once, and pi takes the message after the tool calls
-  it is running, before its next model call, when it starts a `user` message carrying it.
+- **Steering.** `steer` is answered `queued` as soon as pi has queued the message, which says
+  nothing about when pi takes it: after the tool calls it is running, before its next model call,
+  when it starts a `user` message carrying it.
   No id ties the two together.
   A message still queued when the run settles is held for a later prompt.
 - **Sessions.** `--session <path>` opens that file, or silently starts a new session there when it
@@ -55,35 +56,42 @@ The live test passed with its first turn on pi 1.6.0 and its follow-ups on 1.6.1
 record check, the spawn in the driver's process group with the billing scrub, the descendant
 monitor, the stop and sweep, and `STOP_BUDGET`.
 A store without a driver refuses a pi launch with `DelegateError::PiUndriven`.
-The command is `pi --mode rpc --no-extensions --offline --tools read,grep,find,ls`, with
-`--session-dir <run>/pi --session <run>/pi/session.jsonl`: one session file per consultation, so
-`continue_fresh` starts a new one.
+The command is `pi --mode rpc --no-extensions --offline --tools read,grep,find,ls`, to which the
+driver adds `--session-dir <run>/pi --session <run>/pi/session.jsonl` from the one session file its
+plan names: one per consultation, so `continue_fresh` starts a new one.
 Its supervisor plan carries no automatic resume, because pi retries an overloaded provider itself.
 
-**The driver checks what it is handed before it asks anything.**
-A follow-up whose session file is missing fails before pi starts, and one whose `get_state` names
-another session than the consultation's fails before anything else is sent.
+**The driver checks what it is handed before it sends the question.**
+A follow-up whose `get_state` names another session than the consultation's fails before anything
+else is sent, which covers a session file gone missing too: pi opens a new session there.
 The model must equal exactly one `provider/id` that `get_available_models` lists, and is chosen with
 `set_model`.
 An effort is set with `set_thinking_level` and read back, and a level pi changed is a warning in the
 capture.
-A refused question fails the turn with pi's reason on stderr.
+Once the question is sent, the driver follows the turn alone: an answer refusing it, or one that
+starts no run, fails the turn with pi's reason on stderr.
 
 **The capture is pi's events, and the driver adds three of its own.**
 Every event but `response` is kept, streaming deltas included, so an answer the turn ended in the
 middle of is still recovered.
-`{"type":"session","id":…}` is written once the session file holds that id in its header, so a turn
-that saved nothing advertises nothing to resume; `agentmux.steer` records a steer pi took, and
-`agentmux.warning` what the turn ran with that was not asked for.
+`{"type":"session","id":…}` is written once the turn is over, before its `agent_settled`, when the
+session file's header holds that id: pi appends to the file after it reports a message, so only
+then does the header say whether the turn saved anything to resume.
+A cancelled turn names it too, though a cancelled consultation is never resumed: the store checks
+every follow-up that ended for the session it continued.
+`agentmux.steer` records a steer pi took, and `agentmux.warning` what the turn ran with that was
+not asked for.
 
 **Steers are sent one at a time, and the driver is the only source of pi's queue.**
 Steering opens at `agent_start`, and the next steer is sent once the one before it was answered.
 With extensions off, every `user` message pi starts after the question is the oldest steer still
 waiting: the driver records it and then answers it accepted.
-At `agent_settled` a steer pi queued and never took is rejected, one pi did not answer is
-unconfirmed, and a request nobody claimed is rejected.
-A cancelled turn is aborted with `abort` once its run has started, and its end is left to the
-store's record, as for Codex.
+At `agent_settled` every steer pi did not take is rejected, the one still unanswered included, and
+so is a request nobody claimed; only a stream that broke, or a capture that could not be written,
+leaves an unanswered steer unconfirmed.
+A cancellation once the question is sent is an `abort`, which also stops a compaction before the
+run; a run it aborted ends as the store records the cancellation, and one that settled on its own
+first ends as pi says, as for Codex.
 
 **pi always runs with the user's configuration, and only reads.**
 `ignore_user_config: true` is refused with `DelegateError::PiIsolated`, under
@@ -94,6 +102,9 @@ There is no `[pi]` table and no pi account; an `[accounts.pi.*]` table is refuse
 Under a subscription, every variable pi 1.6.0 and its bundled AWS SDK read to choose a provider, a
 credential, an endpoint or an auth host is a billing name ([0017](0017-billing-env-scrub.md)),
 listed in `vendor::pi::is_billing_env_name`.
+`GOOGLE_CLOUD_PROJECT` is not among them, though pi's Vertex provider reads it: agy reads it beside
+its login, so withholding it could break agy, and withholding `GOOGLE_CLOUD_LOCATION` already turns
+pi's environment-driven Vertex path off.
 
 **Spend is every usage pi reports, once; quota is unavailable.**
 A turn counts each assistant message's usage, a compaction's and a cache refresh's, with cache reads

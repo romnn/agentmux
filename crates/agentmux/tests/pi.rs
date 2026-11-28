@@ -117,11 +117,10 @@ fn set_up_then(
     })
 }
 
-/// Run the driver against `script` with short deadlines, while `during` acts on the turn from
-/// outside.
+/// Run the driver against `script` with short deadlines, as the `pi-rpc` subcommand would.
 ///
 /// pi's side ends when the driver closes its input, as pi's does.
-fn run(plan: &PiPlan, mut script: Script, during: impl FnOnce(&PiPlan)) -> Result<DriverRun> {
+fn run(plan: &PiPlan, mut script: Script) -> Result<DriverRun> {
     let (pi_in, to_pi) = std::io::pipe().or_fail()?;
     let (from_pi, mut pi_out) = std::io::pipe().or_fail()?;
     let (received, commands) = channel();
@@ -143,28 +142,20 @@ fn run(plan: &PiPlan, mut script: Script, during: impl FnOnce(&PiPlan)) -> Resul
             }
         }
     });
-    let driver = std::thread::spawn({
-        let plan = plan.clone();
-        move || {
-            let mut capture = Vec::new();
-            let outcome = drive_with(
-                &plan,
-                "q",
-                &mut capture,
-                to_pi,
-                BufReader::new(from_pi),
-                &mut || false,
-                DriverTimeouts {
-                    setup_response: Duration::from_secs(5),
-                    interrupt_completion: Duration::from_secs(2),
-                    steer_settlement: Duration::from_millis(300),
-                },
-            );
-            (outcome, capture)
-        }
-    });
-    during(plan);
-    let (outcome, capture) = driver.join().ok().or_fail()?;
+    let mut capture = Vec::new();
+    let outcome = drive_with(
+        plan,
+        "q",
+        &mut capture,
+        to_pi,
+        BufReader::new(from_pi),
+        &mut || false,
+        DriverTimeouts {
+            setup_response: Duration::from_secs(5),
+            interrupt_completion: Duration::from_secs(2),
+            steer_settlement: Duration::from_millis(300),
+        },
+    );
     pi.join().ok().or_fail()?;
     Ok(DriverRun {
         outcome,
@@ -186,8 +177,8 @@ fn replies(
 /// Three steers wait when the turn starts, and pi answers each its own way: it takes the first,
 /// queues the second without taking it before the turn settles, and settles before it answers the
 /// third.
-/// Only the taken steer is in the capture and accepted; the one pi held is rejected, and the one
-/// pi never answered is unconfirmed.
+/// Only the taken steer is in the capture and accepted; the other two never reached the turn and
+/// are rejected.
 /// The effort pi did not take is a warning in the capture.
 #[gtest]
 fn steers_race_the_settlement() -> Result<()> {
@@ -219,7 +210,7 @@ fn steers_race_the_settlement() -> Result<()> {
         }
     });
 
-    let driven = run(&plan, script, |_| {})?;
+    let driven = run(&plan, script)?;
 
     expect_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
     expect_that!(
@@ -227,7 +218,7 @@ fn steers_race_the_settlement() -> Result<()> {
         elements_are![
             eq(&SteerReply::Accepted),
             matches_pattern!(SteerReply::Rejected { .. }),
-            matches_pattern!(SteerReply::Unconfirmed { .. })
+            matches_pattern!(SteerReply::Rejected { .. })
         ]
     );
     expect_that!(
@@ -266,7 +257,7 @@ fn a_cancel_before_the_prompt_sends_nothing_more() -> Result<()> {
         })
     };
 
-    let driven = run(&plan, script, |_| {})?;
+    let driven = run(&plan, script)?;
 
     expect_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
     expect_that!(
@@ -304,7 +295,7 @@ fn a_cancel_during_preflight_aborts_the_run_that_started() -> Result<()> {
         })
     };
 
-    let driven = run(&plan, script, |_| {})?;
+    let driven = run(&plan, script)?;
 
     expect_that!(driven.outcome, eq(&DriverOutcome::Cancelled));
     expect_that!(driven.command_types().last(), some(eq("abort")));
@@ -325,7 +316,7 @@ fn a_refused_prompt_fails_with_pis_reason() -> Result<()> {
         })
     };
 
-    let driven = run(&plan(dir.path())?, script, |_| {})?;
+    let driven = run(&plan(dir.path())?, script)?;
 
     expect_that!(
         driven.outcome,
@@ -345,7 +336,7 @@ fn a_follow_up_into_another_session_fails() -> Result<()> {
     plan.session.expect_id =
         Some(SessionRef::parse("01a22003-2387-70c1-8ca5-f7c07cf68cb0").or_fail()?);
 
-    let driven = run(&plan, set_up_then("medium", |_| Vec::new()), |_| {})?;
+    let driven = run(&plan, set_up_then("medium", |_| Vec::new()))?;
 
     expect_that!(
         driven.outcome,
@@ -389,7 +380,7 @@ fn a_model_must_name_exactly_one_of_pis() -> Result<()> {
             })
         };
 
-        let driven = run(&plan, script, |_| {})?;
+        let driven = run(&plan, script)?;
 
         expect_that!(
             driven.outcome,
@@ -402,5 +393,38 @@ fn a_model_must_name_exactly_one_of_pis() -> Result<()> {
             "{model}"
         );
     }
+    Ok(())
+}
+
+/// A cancellation that pi's own end overtakes leaves that end in place: the run settled without
+/// being aborted, so the turn ended as pi says, not as a cancellation.
+#[gtest]
+fn a_run_that_settles_on_its_own_while_cancelled_keeps_its_end() -> Result<()> {
+    let dir = tempfile::tempdir().or_fail()?;
+    let plan = plan(dir.path())?;
+    let marker = dir.path().join("cancelling");
+    let set_up = set_up_then("medium", |command| match command["type"].as_str() {
+        Some("abort") => vec![
+            json!({"type": "agent_settled", "aborted": false}),
+            answer(command, &Value::Null),
+        ],
+        _ => Vec::new(),
+    });
+    let script: Script = {
+        let mut set_up = set_up;
+        Box::new(move |command| {
+            // The caller cancels once the run has started.
+            if command["type"] == "prompt" && std::fs::write(&marker, "").is_err() {
+                return Vec::new();
+            }
+            set_up(command)
+        })
+    };
+
+    let driven = run(&plan, script)?;
+
+    expect_that!(driven.outcome, eq(&DriverOutcome::TurnEnded));
+    expect_that!(driven.command_types().last(), some(eq("abort")));
+    expect_that!(driven.captured("agent_settled").len(), eq(1));
     Ok(())
 }

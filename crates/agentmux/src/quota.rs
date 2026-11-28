@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, Config};
 use crate::delegate::{AccountAlias, Vendor, base_env, credential_vars, scrub_billing_env};
-use crate::vendor::{agy, claude, codex, pi};
+use crate::vendor::{agy, claude, codex};
 
 /// How long a single account's probe may take before it is abandoned.
 ///
@@ -367,7 +367,9 @@ impl QuotaProbe for SystemProbe {
             Vendor::Claude => claude::quota::probe(request),
             Vendor::Codex => codex::quota::probe(request),
             Vendor::Agy => agy::quota::probe(request),
-            Vendor::Pi => pi::quota::probe(),
+            Vendor::Pi => Observation::Unavailable {
+                reason: "pi reports no usage window for the providers it reaches".to_owned(),
+            },
         }
     }
 }

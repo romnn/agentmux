@@ -24,8 +24,8 @@
 //! extension that could add one.
 //! So every user message pi starts after the question is the steer that has waited longest, and
 //! is recorded and answered as accepted then.
-//! A steer still waiting when the turn settles was never taken and is rejected; pi would only hold
-//! it for a later prompt that never comes.
+//! A steer pi has not taken when the turn settles never will be, and is rejected; pi would only
+//! hold it for a later prompt that never comes.
 //!
 //! Closing pi's input aborts a running turn, so it stays open until the turn has settled or been
 //! cancelled.
@@ -61,7 +61,7 @@ pub const SUBCOMMAND: &str = "pi-rpc";
 pub struct PiPlan {
     /// The executable to run, `pi`.
     pub program: String,
-    /// Its arguments, which name the session file.
+    /// Its arguments, to which the driver adds where the session is kept.
     pub args: Vec<String>,
     /// The model, as `provider/id`.
     pub model: ModelId,
@@ -106,19 +106,18 @@ impl PiPlan {
             root: self.turn_dir.clone(),
         }
     }
-}
 
-/// Why a follow-up cannot start: the session it continues is not in its file.
-///
-/// pi would start a new session at a missing path without a word, and the follow-up would answer
-/// without the consultation's history.
-fn missing_session(session: &PiSession) -> Option<String> {
-    (session.expect_id.is_some() && !session.file.is_file()).then(|| {
-        format!(
-            "the session this follow-up continues is not at {}, so pi was not started",
-            session.file.display()
-        )
-    })
+    /// pi's arguments with the session file and, as its session directory, the file's own.
+    fn command_args(&self) -> Vec<String> {
+        let file = &self.session.file;
+        let dir = file.parent().unwrap_or(file);
+        let mut args = self.args.clone();
+        for (flag, path) in [("--session-dir", dir), ("--session", file)] {
+            args.push(flag.to_owned());
+            args.push(path.to_string_lossy().into_owned());
+        }
+        args
+    }
 }
 
 /// Run the turn a plan describes, as the `pi-rpc` subcommand.
@@ -143,10 +142,6 @@ pub fn drive(plan_path: &Path) -> i32 {
         eprintln!("agentmux: {reason}, so pi was not started");
         return 2;
     }
-    if let Some(reason) = missing_session(&plan.session) {
-        eprintln!("agentmux: {reason}");
-        return 1;
-    }
     let mut question = String::new();
     if let Err(err) = std::io::stdin().read_to_string(&mut question) {
         eprintln!("agentmux: cannot read the question: {err}");
@@ -158,7 +153,7 @@ pub fn drive(plan_path: &Path) -> i32 {
     let Server {
         mut child,
         to_server,
-    } = match spawn_server(&plan.program, &plan.args, &plan.cwd, plan.billing) {
+    } = match spawn_server(&plan.program, &plan.command_args(), &plan.cwd, plan.billing) {
         Ok(spawned) => spawned,
         Err(err) => {
             eprintln!(
@@ -239,24 +234,21 @@ pub fn drive_with(
         next_id: 0,
         cancellation_observed_at: None,
         session_id: None,
-        session_announced: false,
         run_started: false,
         question_echoed: false,
-        settled: false,
+        settled: None,
+        settled_line: None,
         in_flight: None,
         queued: VecDeque::new(),
     };
     let outcome = match driver.set_up(question) {
-        Ok(()) => driver.follow(),
+        Ok(prompt_id) => driver.follow(&prompt_id),
         Err(SetupExit::Cancelled) => Ok(DriverOutcome::Cancelled),
         Err(SetupExit::Failed(reason)) => Err(reason),
-    };
-    let outcome = outcome.unwrap_or_else(DriverOutcome::Failed);
-    driver.answer_unsettled_steers(match outcome {
-        DriverOutcome::TurnEnded => "the turn ended before pi took it",
-        DriverOutcome::Cancelled => "the consultation was cancelled before pi took it",
-        DriverOutcome::Failed(_) => "pi went away before it took it",
-    });
+    }
+    .and_then(|outcome| driver.close(outcome))
+    .unwrap_or_else(DriverOutcome::Failed);
+    driver.answer_unsettled_steers(&outcome);
     outcome
 }
 
@@ -318,14 +310,14 @@ struct TurnDriver<'a> {
     cancellation_observed_at: Option<Instant>,
     /// The session pi runs, as `get_state` named it.
     session_id: Option<String>,
-    /// Whether the capture names the session, which it does once pi has saved it.
-    session_announced: bool,
     /// Whether pi started the turn's run, which is when it takes a steer.
     run_started: bool,
     /// Whether pi has started the question's own user message.
     question_echoed: bool,
-    /// Whether pi said the turn has settled.
-    settled: bool,
+    /// How the turn ended, once pi settled it.
+    settled: Option<DriverOutcome>,
+    /// The `agent_settled` line to record last, which a cancelled turn's abort leaves to the store.
+    settled_line: Option<String>,
     in_flight: Option<InFlight>,
     /// Steers pi queued and has not taken yet, oldest first.
     queued: VecDeque<ClaimedSteer>,
@@ -398,12 +390,20 @@ impl TurnDriver<'_> {
         let role = value.pointer("/message/role").and_then(Value::as_str);
         match kind {
             "agent_start" => self.run_started = true,
-            // A cancelled turn's end is the store's to record.
-            "agent_settled" if self.cancellation_observed_at.is_some() => {
-                self.settled = true;
+            // A run the cancellation aborted ends as the store records it; one that ended on its
+            // own ends as pi says.
+            "agent_settled"
+                if value.get("aborted") == Some(&Value::Bool(true))
+                    && self.cancellation_observed_at.is_some() =>
+            {
+                self.settled = Some(DriverOutcome::Cancelled);
                 return Ok(());
             }
-            "agent_settled" => self.settled = true,
+            "agent_settled" => {
+                self.settled = Some(DriverOutcome::TurnEnded);
+                self.settled_line = Some(line.to_owned());
+                return Ok(());
+            }
             _ => {}
         }
         self.record(line)?;
@@ -412,7 +412,6 @@ impl TurnDriver<'_> {
                 self.question_echoed = true;
             }
             ("message_start", Some("user")) => self.deliver_oldest_steer()?,
-            ("message_end", _) => self.announce_saved_session()?,
             _ => {}
         }
         Ok(())
@@ -439,27 +438,6 @@ impl TurnDriver<'_> {
             return Err(reason);
         }
         self.write_steer_reply(&claim, &SteerReply::Accepted);
-        Ok(())
-    }
-
-    /// Name the session in the capture once pi has saved it, so a turn that saved nothing
-    /// advertises nothing to resume.
-    fn announce_saved_session(&mut self) -> Result<(), String> {
-        let Some(id) = self.session_id.clone().filter(|_| !self.session_announced) else {
-            return Ok(());
-        };
-        let mut header = String::new();
-        let saved = std::fs::File::open(&self.plan.session.file)
-            .and_then(|file| BufReader::new(file).read_line(&mut header))
-            .is_ok_and(|_| {
-                serde_json::from_str::<Value>(&header).is_ok_and(|header| {
-                    text(&header, "type") == "session" && text(&header, "id") == id
-                })
-            });
-        if saved {
-            self.session_announced = true;
-            self.record(&json!({"type": "session", "id": id}).to_string())?;
-        }
         Ok(())
     }
 
@@ -520,8 +498,10 @@ impl TurnDriver<'_> {
         }
     }
 
-    /// Check the session, choose the model and the effort, and start the turn with the question.
-    fn set_up(&mut self, question: &str) -> Result<(), SetupExit> {
+    /// Check the session, choose the model and the effort, and send the question.
+    ///
+    /// Returns the question's command id, whose answer [`Self::follow`] reads.
+    fn set_up(&mut self, question: &str) -> Result<String, SetupExit> {
         let state = self.call(json!({"type": "get_state"}))?;
         let session_id = text(&state, "sessionId").to_owned();
         if let Some(expected) = &self.plan.session.expect_id
@@ -576,72 +556,32 @@ impl TurnDriver<'_> {
                     .map_err(SetupExit::Failed)?;
             }
         }
-        self.start(question)
-    }
-
-    /// Send the question, and wait for pi to say it started the run.
-    ///
-    /// Once sent, a cancellation waits for the answer within the interrupt grace, because a run
-    /// that started has to be aborted.
-    fn start(&mut self, question: &str) -> Result<(), SetupExit> {
         if self.notice_cancellation() {
             return Err(SetupExit::Cancelled);
         }
-        let id = self
-            .send(json!({"type": "prompt", "message": question}))
-            .map_err(SetupExit::Failed)?;
-        let deadline = Instant::now() + self.timeouts.setup_response;
-        loop {
-            self.notice_cancellation();
-            if self.cancellation_grace_over() {
-                return Err(SetupExit::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(SetupExit::Failed(format!(
-                    "pi did not answer `prompt` within {:?}",
-                    self.timeouts.setup_response
-                )));
-            }
-            let Some(response) = self.receive(POLL_INTERVAL).map_err(SetupExit::Failed)? else {
-                continue;
-            };
-            if text(&response, "id") != id {
-                continue;
-            }
-            if response.get("success") != Some(&Value::Bool(true)) {
-                return Err(SetupExit::Failed(format!(
-                    "pi refused the question: {}",
-                    refusal(&response)
-                )));
-            }
-            return match response
-                .pointer("/data/disposition")
-                .and_then(Value::as_str)
-            {
-                Some("started") => Ok(()),
-                disposition => Err(SetupExit::Failed(format!(
-                    "pi did not start a run for the question: it answered `{}`",
-                    disposition.unwrap_or("no disposition")
-                ))),
-            };
-        }
+        self.send(json!({"type": "prompt", "message": question}))
+            .map_err(SetupExit::Failed)
     }
 
-    /// Follow the running turn until it settles, steering it and honouring a cancellation.
-    fn follow(&mut self) -> Result<DriverOutcome, String> {
+    /// Follow the turn from its question until it settles, steering it and honouring a
+    /// cancellation.
+    ///
+    /// The question's answer, `prompt_id`'s, fails the turn unless pi started a run for it.
+    /// A cancellation once the question is sent aborts whatever pi is doing, a compaction before
+    /// the run included.
+    fn follow(&mut self, prompt_id: &str) -> Result<DriverOutcome, String> {
         let mut abort_sent = false;
         let mut last_control_poll_at = Instant::now();
         loop {
-            if self.settled {
-                return Ok(if self.cancellation_observed_at.is_some() {
-                    DriverOutcome::Cancelled
-                } else {
-                    self.settle_in_flight_steer();
-                    DriverOutcome::TurnEnded
-                });
-            }
             if let Some(response) = self.receive(POLL_INTERVAL)? {
-                self.resolve_steer(&response);
+                if text(&response, "id") == prompt_id {
+                    started(&response)?;
+                } else {
+                    self.resolve_steer(&response);
+                }
+            }
+            if let Some(outcome) = self.settled.take() {
+                return Ok(outcome);
             }
             // The files are looked at on a clock rather than per event.
             if last_control_poll_at.elapsed() < POLL_INTERVAL {
@@ -670,36 +610,49 @@ impl TurnDriver<'_> {
         }
     }
 
-    /// Wait, within the settlement wait, for pi to answer the steer in flight when the turn
-    /// settled: answered, it was queued too late for the turn, and is rejected with the others.
-    fn settle_in_flight_steer(&mut self) {
-        let deadline = Instant::now() + self.timeouts.steer_settlement;
-        while self.in_flight.is_some() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return;
-            }
-            match self.events.recv_timeout(remaining) {
-                Ok(Event::Line(line)) => {
-                    if let Ok(response) = serde_json::from_str::<Value>(&line) {
-                        self.resolve_steer(&response);
-                    }
-                }
-                Ok(Event::OutputClosed(_)) | Err(_) => return,
-            }
+    /// Name the session in the capture if pi saved it, then record the turn's end, which the fold
+    /// stops at.
+    ///
+    /// Read from the file's header once the turn is over, because pi appends to the file after it
+    /// reports a message, so a turn that saved nothing advertises nothing to resume.
+    /// A cancelled turn names it too, which is how the store sees a follow-up kept its session.
+    fn close(&mut self, outcome: DriverOutcome) -> Result<DriverOutcome, String> {
+        let mut header = String::new();
+        let saved = std::fs::File::open(&self.plan.session.file)
+            .and_then(|file| BufReader::new(file).read_line(&mut header))
+            .is_ok_and(|_| {
+                serde_json::from_str::<Value>(&header).is_ok_and(|header| {
+                    text(&header, "type") == "session"
+                        && Some(text(&header, "id")) == self.session_id.as_deref()
+                })
+            });
+        if let (true, Some(id)) = (saved, self.session_id.clone()) {
+            self.record(&json!({"type": "session", "id": id}).to_string())?;
         }
+        if let Some(settled) = self.settled_line.take() {
+            self.record(&settled)?;
+        }
+        Ok(outcome)
     }
 
-    /// Answer every steer the turn did not take: rejected, unless it was sent and pi never said
-    /// whether it took it, and every request still waiting in the mailbox.
-    fn answer_unsettled_steers(&mut self, why: &str) {
+    /// Answer every steer the turn did not take, and every request still waiting in the mailbox:
+    /// rejected, unless pi went away or the capture failed while one it never answered was in
+    /// flight, which it may have taken.
+    fn answer_unsettled_steers(&mut self, outcome: &DriverOutcome) {
+        let why = match outcome {
+            DriverOutcome::TurnEnded => "the turn settled before pi took it",
+            DriverOutcome::Cancelled => "the consultation was cancelled before pi took it",
+            DriverOutcome::Failed(_) => "the turn broke before pi took it",
+        };
         if let Some(InFlight { claim, .. }) = self.in_flight.take() {
-            self.write_steer_reply(
-                &claim,
-                &SteerReply::Unconfirmed {
-                    reason: format!("pi did not answer it: {why}"),
-                },
-            );
+            let reason = why.to_owned();
+            let reply = match outcome {
+                DriverOutcome::Failed(_) => SteerReply::Unconfirmed { reason },
+                DriverOutcome::TurnEnded | DriverOutcome::Cancelled => {
+                    SteerReply::Rejected { reason }
+                }
+            };
+            self.write_steer_reply(&claim, &reply);
         }
         let not_taken: Vec<ClaimedSteer> = self
             .queued
@@ -728,42 +681,27 @@ fn text<'v>(value: &'v Value, key: &str) -> &'v str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// Fail the turn unless pi's answer to the question says it started a run.
+fn started(response: &Value) -> Result<(), String> {
+    if response.get("success") != Some(&Value::Bool(true)) {
+        return Err(format!("pi refused the question: {}", refusal(response)));
+    }
+    match response
+        .pointer("/data/disposition")
+        .and_then(Value::as_str)
+    {
+        Some("started") => Ok(()),
+        disposition => Err(format!(
+            "pi did not start a run for the question: it answered `{}`",
+            disposition.unwrap_or("no disposition")
+        )),
+    }
+}
+
 /// What pi said when it refused a command.
 fn refusal(response: &Value) -> String {
     match text(response, "error") {
         "" => "pi gave no reason".to_owned(),
         error => error.to_owned(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use googletest::prelude::*;
-
-    use super::{PiSession, missing_session};
-    use crate::delegate::SessionRef;
-
-    /// A follow-up whose session file is gone does not start pi, which would open a new session
-    /// there; a first turn, which has no file yet, does.
-    #[gtest]
-    fn a_follow_up_needs_its_session_file() -> Result<()> {
-        let dir = tempfile::tempdir().or_fail()?;
-        let file = dir.path().join("session.jsonl");
-        let first = PiSession {
-            file: file.clone(),
-            expect_id: None,
-        };
-        let follow_up = PiSession {
-            file: file.clone(),
-            expect_id: Some(SessionRef::parse("01a22003-2387-70c1-8ca5-f7c07cf68cb0").or_fail()?),
-        };
-        expect_that!(missing_session(&first), none());
-        expect_that!(
-            missing_session(&follow_up),
-            some(contains_substring("is not at"))
-        );
-        std::fs::write(&file, "{}\n").or_fail()?;
-        expect_that!(missing_session(&follow_up), none());
-        Ok(())
     }
 }

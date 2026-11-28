@@ -708,9 +708,8 @@ names: `--model` is `provider/id`, exactly as one of the models `pi --list-model
   options.
 - **There are no pi accounts.** pi runs as your own login; an `[accounts.pi.<alias>]` table is
   refused, and `quota` reports pi as unavailable, because pi reports no usage window.
-- **A turn can be steered.** agentmux drives every pi turn over `pi --mode rpc`, as it drives a
-  Codex turn over its app-server, so `steer` reaches it until it settles. pi takes a steer only
-  between its model calls, so `steer` can report one unconfirmed that it takes later.
+- **A turn can be steered** until it settles; agentmux drives every pi turn over `pi --mode rpc`,
+  as it drives a Codex turn over its app-server.
 - **Its session is kept with the consultation**, in `pi/session.jsonl` of its directory, which a
   follow-up resumes; `continue_fresh` starts another.
 
@@ -806,11 +805,10 @@ is out of reach.
 [ADR 0018](adr/0018-codex-app-server-driver.md) explains why it is built this way, and
 `crates/agentmux/src/driver/mod.rs` how the process tree is found on each platform.
 
-**How a pi turn runs.** The same way, with `agentmux` driving `pi --mode rpc`: it chooses the model
-and the effort over RPC, sends the question, writes every event pi reports into the turn's capture,
-and sends each steer once the one before it was queued. pi takes a steer after the tool calls it is
-running and before its next model call; the transcript shows it there, and a steer pi had queued
-but not taken when the turn settled is refused. `cancel` aborts the run over RPC.
+**How a pi turn takes a steer.** A steer is confirmed when pi takes it, between its model calls,
+which on a slow model can take longer than `steer` waits; an unconfirmed steer may still be taken,
+so read the transcript before sending it again. A steer that arrives after the turn has settled is
+refused. `cancel` aborts the run over RPC.
 [ADR 0037](adr/0037-pi-driven-over-rpc-with-the-users-configuration.md) explains why.
 
 `--codex-launch exec`, or `AGENTMUX_CODEX_LAUNCH=exec` for an MCP server, launches every Codex turn
