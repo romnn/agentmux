@@ -13,9 +13,9 @@ use agentmux::appserver::DriverPlan;
 use agentmux::config::{Config, ConfigError, PermissionRefusal};
 use agentmux::delegate::{
     AccountAlias, AccountChoice, Delegate, DelegateError, Effort, Invocation, Isolation, ModelId,
-    Overrides, PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
+    PermissionOptions, Permissions, SessionRef, TurnPlan, Vendor,
 };
-use agentmux::run::{ListFilter, Retention, RunError, RunStore, StartRequest};
+use agentmux::run::{ListFilter, NotResumable, Retention, RunError, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::vendor::claude::{ClaudePermissionMode, ClaudePermissions, ClaudeTool};
 use agentmux::vendor::codex::{CodexPermissions, CodexSandbox, codex_supports_permission_profiles};
@@ -873,8 +873,8 @@ fn claude_permissions_reach_the_cli() -> Result<()> {
     Ok(())
 }
 
-/// An option of the other vendor is refused rather than ignored: a flat one where a front end maps
-/// it, and another vendor's permissions at the start and on a follow-up.
+/// An option of the other vendor is refused rather than ignored, both at the start and on a
+/// follow-up.
 #[gtest]
 fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
     let network = PermissionOptions {
@@ -886,40 +886,64 @@ fn an_option_for_the_other_vendor_is_refused() -> Result<()> {
         ..PermissionOptions::default()
     };
 
-    // The flat names, which a front end maps onto the vendor it was asked for.
     assert_that!(
-        network.clone().for_vendor(Vendor::Claude),
+        Delegate::from_parts(Vendor::Claude, "opus", None, None, network.clone()),
         err(matches_pattern!(DelegateError::NotForVendor {
             option: eq(&"network_access"),
             ..
         }))
     );
     assert_that!(
-        mode.clone().for_vendor(Vendor::Codex),
+        Delegate::from_parts(Vendor::Codex, "sol", None, None, mode.clone()),
         err(matches_pattern!(DelegateError::NotForVendor {
             option: eq(&"permission_mode"),
             ..
         }))
     );
+    assert_that!(
+        codex(None, None)?.with_options(mode),
+        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+    );
+    assert_that!(
+        claude(ClaudePermissions::default())?.with_options(network.clone()),
+        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+    );
 
-    // Another vendor's permissions, at the start and on a follow-up.
-    let codex_overrides = network.for_vendor(Vendor::Codex).or_fail()?;
-    let claude_overrides = mode.for_vendor(Vendor::Claude).or_fail()?;
+    // A model that cannot be used is the first thing a start is refused for.
     assert_that!(
-        Delegate::from_parts(Vendor::Claude, "opus", None, None, codex_overrides.clone()),
-        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+        Delegate::from_parts(Vendor::Claude, "-opus", None, None, network),
+        err(matches_pattern!(DelegateError::Argument {
+            field: eq(&"model"),
+            ..
+        }))
     );
-    assert_that!(
-        Delegate::from_parts(Vendor::Codex, "sol", None, None, claude_overrides.clone()),
-        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+    Ok(())
+}
+
+/// A follow-up on a consultation that is still running is refused for that, which tells the
+/// caller to wait, before an option of the other vendor is.
+#[gtest]
+fn a_running_consultation_is_refused_before_a_foreign_option() -> Result<()> {
+    let machine = Machine::new("", ScriptedLauncher::new([Script::running("")]))?;
+    let started = machine
+        .store
+        .start(&machine.request(claude(ClaudePermissions::default())?))?;
+
+    let refused = machine.store.follow_up_with(
+        &started.run_id,
+        "again",
+        PermissionOptions {
+            network_access: Some(false),
+            ..PermissionOptions::default()
+        },
+        None,
     );
+
     assert_that!(
-        codex(None, None)?.with_overrides(claude_overrides),
-        err(matches_pattern!(DelegateError::NotForVendor { .. }))
-    );
-    assert_that!(
-        claude(ClaudePermissions::default())?.with_overrides(codex_overrides),
-        err(matches_pattern!(DelegateError::NotForVendor { .. }))
+        refused,
+        err(matches_pattern!(RunError::NotResumable(matches_pattern!(
+            NotResumable::StillRunning { .. }
+        ))))
     );
     Ok(())
 }
@@ -1138,12 +1162,11 @@ fn a_follow_up_override_becomes_the_recorded_choice() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "write it out",
-        Overrides {
+        PermissionOptions {
             isolation: Some(Isolation::Isolated),
-            permissions: Some(Permissions::Codex(CodexPermissions {
-                sandbox: Some(CodexSandbox::WorkspaceWrite),
-                network_access: Some(false),
-            })),
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            network_access: Some(false),
+            ..PermissionOptions::default()
         },
         None,
     )?;
@@ -1212,12 +1235,9 @@ fn a_tightened_limit_refuses_the_next_turn() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, offline",
-        Overrides {
-            permissions: Some(Permissions::Codex(CodexPermissions {
-                network_access: Some(false),
-                ..CodexPermissions::default()
-            })),
-            ..Overrides::default()
+        PermissionOptions {
+            network_access: Some(false),
+            ..PermissionOptions::default()
         },
         None,
     )?;
@@ -1361,12 +1381,9 @@ fn a_permission_change_leaves_the_rendered_transcript_in_place() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, read-only",
-        Overrides {
-            permissions: Some(Permissions::Codex(CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                ..CodexPermissions::default()
-            })),
-            ..Overrides::default()
+        PermissionOptions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            ..PermissionOptions::default()
         },
         None,
     )?;
@@ -1413,9 +1430,9 @@ fn a_reopened_turn_is_judged_by_its_own_isolation() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, isolated",
-        Overrides {
+        PermissionOptions {
             isolation: Some(Isolation::Isolated),
-            ..Overrides::default()
+            ..PermissionOptions::default()
         },
         None,
     )?;
@@ -1444,12 +1461,10 @@ fn list_and_status_agree_after_an_override() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, offline and read-only",
-        Overrides {
-            permissions: Some(Permissions::Codex(CodexPermissions {
-                sandbox: Some(CodexSandbox::ReadOnly),
-                network_access: Some(false),
-            })),
-            ..Overrides::default()
+        PermissionOptions {
+            sandbox: Some(CodexSandbox::ReadOnly),
+            network_access: Some(false),
+            ..PermissionOptions::default()
         },
         None,
     )?;
@@ -1483,9 +1498,9 @@ async fn a_steer_refusal_names_the_running_turns_isolation() -> Result<()> {
     machine.store.follow_up_with(
         &started.run_id,
         "again, isolated",
-        Overrides {
+        PermissionOptions {
             isolation: Some(Isolation::Isolated),
-            ..Overrides::default()
+            ..PermissionOptions::default()
         },
         None,
     )?;

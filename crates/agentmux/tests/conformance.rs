@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agentmux::delegate::{Delegate, Overrides, Vendor};
+use agentmux::delegate::{Delegate, PermissionOptions, Vendor};
 use agentmux::run::{Retention, RunStore, StartRequest};
 use agentmux::testing::{Script, ScriptedLauncher, fixtures};
 use agentmux::transcript::Outcome;
@@ -44,7 +44,7 @@ fn request(vendor: Vendor) -> Result<StartRequest> {
         fixtures::conformance(vendor).model,
         None,
         None,
-        Overrides::default(),
+        PermissionOptions::default(),
     )
     .or_fail()?;
     Ok(StartRequest {

@@ -7,8 +7,8 @@ use chrono::Utc;
 
 use crate::config::{RefusedModel, ResolvedModel};
 use crate::delegate::{
-    AccountChoice, Admitted, Billing, Delegate, Isolation, LaunchRequest, ModelId, Overrides,
-    Permissions, PreparedLaunch, SessionRef, Stdin, TurnPlan, Vendor,
+    AccountChoice, Admitted, Billing, Delegate, Isolation, LaunchRequest, ModelId,
+    PermissionOptions, Permissions, PreparedLaunch, SessionRef, Stdin, TurnPlan, Vendor,
 };
 use crate::launch::{LaunchInput, LaunchSpec, Liveness};
 use crate::transcript::{Outcome, ResumeAttempt};
@@ -464,7 +464,7 @@ impl RunStore {
     /// [`RunError::NotResumable`] when the previous turn is still running, was cancelled, never
     /// announced a session id, or ended without the delegate saying anything.
     pub fn follow_up(&self, run_id: &RunId, question: &str) -> Result<RunStatus, RunError> {
-        self.follow_up_with(run_id, question, Overrides::default(), None)
+        self.follow_up_with(run_id, question, PermissionOptions::default(), None)
     }
 
     /// Continue a consultation, with the isolation or permissions `overrides` names in place of
@@ -490,7 +490,7 @@ impl RunStore {
         &self,
         run_id: &RunId,
         question: &str,
-        overrides: Overrides,
+        overrides: PermissionOptions,
         label: Option<&RunLabel>,
     ) -> Result<RunStatus, RunError> {
         // Asked before the lock, which would otherwise leave a lock file for a run that is not
@@ -518,9 +518,7 @@ impl RunStore {
             // the configuration as it is now, not as it was.
             let config = crate::config::Config::load(&self.host_env, &meta.cwd)?;
             let ran_with = delegate.isolation;
-            let delegate = delegate
-                .with_overrides(overrides)?
-                .held_to_limits(&config)?;
+            let delegate = delegate.with_options(overrides)?.held_to_limits(&config)?;
             match delegate.permissions {
                 // Isolation decides which home agy runs in, and so where its conversation is kept.
                 Permissions::Agy if delegate.isolation != ran_with => {

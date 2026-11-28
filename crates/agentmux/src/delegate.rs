@@ -540,8 +540,9 @@ impl Isolation {
 
 /// The permission options a front end presents flat, for every vendor.
 ///
-/// The one place the flat names are mapped onto a vendor: [`PermissionOptions::for_vendor`]
-/// turns them into the [`Overrides`] the core takes.
+/// What [`Delegate::from_parts`] builds a request from, and what [`Delegate::with_options`]
+/// applies to a recorded consultation as a follow-up's overrides; an absent value takes the
+/// default there, and keeps the recorded choice here.
 /// Each option belongs to one vendor except the isolation, and one given for another vendor is
 /// refused rather than ignored.
 /// agy has none of its own: its permissions are fixed, as `agy_args` describes.
@@ -607,56 +608,49 @@ impl PermissionOptions {
         }
     }
 
-    /// The overrides these options name for a `vendor` delegate.
-    ///
-    /// What [`Delegate::from_parts`] builds a request from, and what
-    /// [`Delegate::with_overrides`] applies to a recorded consultation as a follow-up's; an absent
-    /// value takes the default there, and keeps the recorded choice here.
+    /// The permissions these options name for a `vendor` delegate, each one they leave out unset.
     ///
     /// # Errors
     ///
     /// Returns [`DelegateError::NotForVendor`] when an option belongs to another vendor.
-    pub fn for_vendor(self, vendor: Vendor) -> Result<Overrides, DelegateError> {
+    fn for_vendor(self, vendor: Vendor) -> Result<Permissions, DelegateError> {
         self.refuse_foreign(vendor)?;
+        Ok(match vendor {
+            Vendor::Claude => Permissions::Claude(self.claude()),
+            Vendor::Codex => Permissions::Codex(self.codex()),
+            Vendor::Agy => Permissions::Agy,
+        })
+    }
+
+    /// The Claude permissions these options name.
+    fn claude(self) -> ClaudePermissions {
         let Self {
-            isolation,
-            sandbox,
-            network_access,
             permission_mode,
             tools,
             allowed_tools,
             disallowed_tools,
+            ..
         } = self;
-        let permissions = match vendor {
-            Vendor::Claude => Permissions::Claude(ClaudePermissions {
-                permission_mode,
-                tools,
-                allowed_tools,
-                disallowed_tools,
-            }),
-            Vendor::Codex => Permissions::Codex(CodexPermissions {
-                sandbox,
-                network_access,
-            }),
-            Vendor::Agy => Permissions::Agy,
-        };
-        Ok(Overrides {
-            isolation,
-            permissions: Some(permissions),
-        })
+        ClaudePermissions {
+            permission_mode,
+            tools,
+            allowed_tools,
+            disallowed_tools,
+        }
     }
-}
 
-/// What a caller asks to change of a delegate: its isolation, and its vendor's permissions.
-///
-/// A patch, not a replacement: each value it sets takes the place of the recorded one, field by
-/// field down to each permission, and each it leaves out keeps it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Overrides {
-    /// Whether to skip the user's own configuration; see [`Isolation::from_spellings`].
-    pub isolation: Option<Isolation>,
-    /// The permissions to change, which must be the delegate's own vendor's.
-    pub permissions: Option<Permissions>,
+    /// The Codex permissions these options name.
+    fn codex(self) -> CodexPermissions {
+        let Self {
+            sandbox,
+            network_access,
+            ..
+        } = self;
+        CodexPermissions {
+            sandbox,
+            network_access,
+        }
+    }
 }
 
 /// Whether a delegate's environment may carry billing credentials and endpoint overrides.
@@ -724,32 +718,6 @@ pub enum Permissions {
     Codex(CodexPermissions),
     /// Google's Antigravity CLI, `agy`.
     Agy,
-}
-
-impl Permissions {
-    /// These permissions, with every one `asked` sets in place of the recorded one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DelegateError::NotForVendor`] when `asked` belongs to another vendor.
-    fn overridden_by(self, asked: Self) -> Result<Self, DelegateError> {
-        Ok(match (self, asked) {
-            (Self::Claude(recorded), Self::Claude(asked)) => {
-                Self::Claude(recorded.overridden_by(asked))
-            }
-            (Self::Codex(recorded), Self::Codex(asked)) => {
-                Self::Codex(recorded.overridden_by(asked))
-            }
-            (Self::Agy, Self::Agy) => Self::Agy,
-            (recorded @ (Self::Claude(_) | Self::Codex(_) | Self::Agy), asked) => {
-                return Err(DelegateError::NotForVendor {
-                    option: "permissions",
-                    owner: Vendor::from(&asked),
-                    vendor: Vendor::from(&recorded),
-                });
-            }
-        })
-    }
 }
 
 impl Vendor {
@@ -905,8 +873,8 @@ mod stored_account {
 /// What every vendor shares is a field here, and what only one vendor accepts is in its
 /// [`Permissions`]: a Claude consultation with a sandbox mode does not compile.
 /// The flat shapes a tool schema or a command line present are turned into this by
-/// [`PermissionOptions::for_vendor`] and [`Delegate::from_parts`], which is where a
-/// vendor-specific option given for another vendor is refused.
+/// [`Delegate::from_parts`], which is where a vendor-specific option given for another vendor is
+/// refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegate {
     /// Model identifier, forwarded verbatim.
@@ -947,56 +915,53 @@ pub struct Delegate {
 }
 
 impl Delegate {
-    /// Build a delegate from the parts a tool schema or a command line presents.
+    /// Build a delegate from the flat shape a tool schema or a command line presents.
     ///
     /// This is the one parse step both front ends share, so they cannot come to accept
     /// different things.
-    /// What `overrides` leaves out stays unset, for [`crate::run::RunStore::start`] to fill from
-    /// the machine file's defaults once it knows which configuration applies.
+    /// What `options` leaves out stays unset, for [`crate::run::RunStore::start`] to fill from the
+    /// machine file's defaults once it knows which configuration applies.
     ///
     /// # Errors
     ///
     /// Returns [`DelegateError::Argument`] when the model, effort or alias is not argv-safe, and
-    /// [`DelegateError::NotForVendor`] when `overrides` names another vendor's permissions.
+    /// [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
     pub fn from_parts(
         vendor: Vendor,
         model: &str,
         effort: Option<&str>,
         account: Option<&str>,
-        overrides: Overrides,
+        options: PermissionOptions,
     ) -> Result<Self, DelegateError> {
-        let unset = Self {
+        Ok(Self {
             model: ModelId::parse(model)?,
             effort: effort.map(Effort::parse).transpose()?,
             account: AccountChoice::from(account.map(AccountAlias::parse).transpose()?),
-            isolation: None,
-            permissions: match vendor {
-                Vendor::Claude => Permissions::Claude(ClaudePermissions::default()),
-                Vendor::Codex => Permissions::Codex(CodexPermissions::default()),
-                Vendor::Agy => Permissions::Agy,
-            },
-        };
-        unset.with_overrides(overrides)
+            isolation: options.isolation,
+            permissions: options.for_vendor(vendor)?,
+        })
     }
 
-    /// The same delegate, with every value `overrides` sets in place of the recorded one.
+    /// The same delegate, with every option `options` sets in place of the recorded one.
     ///
-    /// What a follow-up's explicit overrides do: a value left out keeps the consultation's
+    /// What a follow-up's explicit overrides do: an option left out keeps the consultation's
     /// recorded choice, and the machine file's defaults are not consulted again.
     ///
     /// # Errors
     ///
-    /// Returns [`DelegateError::NotForVendor`] when `overrides` names another vendor's
-    /// permissions.
-    pub fn with_overrides(mut self, overrides: Overrides) -> Result<Self, DelegateError> {
-        let Overrides {
-            isolation,
-            permissions,
-        } = overrides;
-        if let Some(asked) = permissions {
-            self.permissions = self.permissions.overridden_by(asked)?;
-        }
-        self.isolation = isolation.or(self.isolation);
+    /// Returns [`DelegateError::NotForVendor`] when `options` sets an option of another vendor.
+    pub fn with_options(mut self, options: PermissionOptions) -> Result<Self, DelegateError> {
+        options.refuse_foreign(self.vendor())?;
+        self.isolation = options.isolation.or(self.isolation);
+        self.permissions = match self.permissions {
+            Permissions::Claude(recorded) => {
+                Permissions::Claude(recorded.overridden_by(options.claude()))
+            }
+            Permissions::Codex(recorded) => {
+                Permissions::Codex(recorded.overridden_by(options.codex()))
+            }
+            Permissions::Agy => Permissions::Agy,
+        };
         Ok(self)
     }
 

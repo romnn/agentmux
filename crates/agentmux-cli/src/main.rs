@@ -101,14 +101,10 @@ async fn main() -> Result<()> {
             report::transcript(&status, &page, cli.json)
         }
         Command::FollowUp(args) => {
-            let question = args.text()?;
-            let options = args.permissions.options()?;
-            // The flags are the consultation's vendor's, which its record names.
-            let vendor = store.meta(args.run_id.id())?.delegate.vendor();
             let status = store.follow_up_with(
                 args.run_id.id(),
-                &question,
-                options.for_vendor(vendor)?,
+                &args.text()?,
+                args.permissions.options()?,
                 args.label.as_ref(),
             )?;
             store

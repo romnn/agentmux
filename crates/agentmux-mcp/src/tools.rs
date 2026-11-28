@@ -581,17 +581,16 @@ impl AgentMux {
                 None,
             ));
         }
-        let options = params.permissions.options()?;
+        let overrides = params.permissions.options()?;
         let label = label(params.label.as_deref())?;
         // Read before the turn is claimed, so it is the length through the previous turn exactly.
         // The rendered transcript is append-only, which is what makes that a turn boundary and
         // not a cut through the middle of one.
-        let before = self.store.status(&id).map_err(|error| run_error(&error))?;
-        // The fields are the consultation's vendor's, which its status names.
-        let overrides = options
-            .for_vendor(before.delegate.vendor())
-            .map_err(|error| run_error(&error.into()))?;
-        let before = before.transcript_bytes;
+        let before = self
+            .store
+            .status(&id)
+            .map_err(|error| run_error(&error))?
+            .transcript_bytes;
         let status = self
             .store
             .follow_up_with(&id, &params.question, overrides, label.as_ref())

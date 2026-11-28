@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentmux::delegate::{
-    AccountChoice, Delegate, ModelId, Overrides, Permissions, SessionRef, Vendor,
+    AccountChoice, Delegate, ModelId, PermissionOptions, Permissions, SessionRef, Vendor,
 };
 use agentmux::run::{ListFilter, Retention, RunId, RunStore, StartRequest};
 use agentmux::testing::{RecordedLaunch, Script, ScriptedLauncher, fixtures};
@@ -453,12 +453,9 @@ fn a_partial_override_keeps_a_frozen_network_choice() -> Result<()> {
     machine.store.follow_up_with(
         &run_id,
         "write it out",
-        Overrides {
-            permissions: Some(Permissions::Codex(CodexPermissions {
-                sandbox: Some(CodexSandbox::WorkspaceWrite),
-                ..CodexPermissions::default()
-            })),
-            ..Overrides::default()
+        PermissionOptions {
+            sandbox: Some(CodexSandbox::WorkspaceWrite),
+            ..PermissionOptions::default()
         },
         None,
     )?;

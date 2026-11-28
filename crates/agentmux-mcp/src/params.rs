@@ -280,19 +280,14 @@ impl DelegateParams {
     /// argv-safe, when the two isolation spellings disagree, or when a vendor-specific field was
     /// set for another vendor.
     pub fn build(&self) -> Result<Delegate, ErrorData> {
-        self.permissions
-            .options()?
-            .for_vendor(self.delegate)
-            .and_then(|overrides| {
-                Delegate::from_parts(
-                    self.delegate,
-                    &self.model,
-                    self.effort.as_deref(),
-                    self.account.as_deref(),
-                    overrides,
-                )
-            })
-            .map_err(|error| invalid_delegate(&error))
+        Delegate::from_parts(
+            self.delegate,
+            &self.model,
+            self.effort.as_deref(),
+            self.account.as_deref(),
+            self.permissions.options()?,
+        )
+        .map_err(|error| invalid_delegate(&error))
     }
 }
 

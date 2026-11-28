@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentmux::delegate::{
-    AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, Overrides, Permissions,
+    AccountAlias, AccountChoice, Delegate, Effort, Isolation, ModelId, PermissionOptions,
+    Permissions,
 };
 use agentmux::launch::Launcher as _;
 use agentmux::run::{
@@ -704,9 +705,9 @@ fn an_agy_follow_up_cannot_change_its_isolation() -> Result<()> {
         let refused = harness.store.follow_up_with(
             &run.run_id,
             "Again?",
-            Overrides {
+            PermissionOptions {
                 isolation: Some(asked),
-                ..Overrides::default()
+                ..PermissionOptions::default()
             },
             None,
         );
@@ -822,7 +823,7 @@ async fn a_label_follows_the_consultation_until_a_follow_up_renames_it() -> Resu
     let renamed = harness.store.follow_up_with(
         &started.run_id,
         "review the rework",
-        Overrides::default(),
+        PermissionOptions::default(),
         Some(&label("RE-REVIEW after rework")?),
     )?;
     assert_that!(renamed.label, some(eq(&label("RE-REVIEW after rework")?)));

@@ -59,7 +59,7 @@ supervisor runs exactly the argument vector recorded there (`SupervisorPlan`), s
 flags, the approval pins and the profile named for that launch are what the CLI gets. A follow-up
 is admitted, resolved and claimed under one hold of the run's lock: the newest turn published and
 settled, its delegate gone, then its record read (`RunStore::current_delegate`) and the overrides
-applied (`Delegate::with_overrides`), so no concurrent follow-up can launch from an older record.
+applied (`Delegate::with_options`), so no concurrent follow-up can launch from an older record.
 `Meta` and the transcript header rendered from it never change: the transcript stays append-only
 ([0009](0009-append-only-transcript.md)), so a turn that ran with other settings says so under its
 own question, and what a hook reopening a turn means is judged by that turn's own isolation
